@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from pernix.crawler import Crawler
 from pernix.request import Request
+from pernix.settings import load_settings
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Mapping, Sequence
 
     from pernix.request import CallbackResult
     from pernix.response import Response
@@ -25,6 +27,8 @@ class Spider:
     Attributes:
         name: Identifies the Spider in logs; defaults to the lower-cased class name.
         start_urls: URLs fetched with a GET when `start()` is not overridden.
+        settings: Settings for this Spider, by dotted key; they override the project
+            file and the environment, and are overridden by run arguments.
 
     Example:
         >>> class Titles(Spider):
@@ -36,6 +40,7 @@ class Spider:
 
     name: ClassVar[str] = ""
     start_urls: ClassVar[Sequence[str]] = ()
+    settings: ClassVar[Mapping[str, Any]] = MappingProxyType({})
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -69,21 +74,42 @@ class Spider:
         raise NotImplementedError(f"{type(self).__name__}.parse() is not implemented")
 
     @classmethod
-    async def crawl(cls, *, output: str | os.PathLike[str] | None = None, concurrency: int = 16) -> None:
+    async def crawl(
+        cls,
+        *,
+        output: str | os.PathLike[str] | None = None,
+        settings: Mapping[str, Any] | None = None,
+    ) -> None:
         """Run this Spider inside an existing event loop.
 
         Args:
             output: A JSON-lines file for the Items; `None` discards them.
-            concurrency: The maximum number of Requests processed at once.
+            settings: Settings for this Run, by dotted key; they take precedence over
+                every other layer.
+
+        Raises:
+            pernix.errors.SettingsError: The settings are invalid; nothing has been
+                fetched or written yet.
         """
-        await Crawler(cls(), output=output, concurrency=concurrency).crawl()
+        loaded = load_settings(spider_settings=cls.settings, overrides=settings)
+        await Crawler(cls(), settings=loaded, output=output).crawl()
 
     @classmethod
-    def run(cls, *, output: str | os.PathLike[str] | None = None, concurrency: int = 16) -> None:
+    def run(
+        cls,
+        *,
+        output: str | os.PathLike[str] | None = None,
+        settings: Mapping[str, Any] | None = None,
+    ) -> None:
         """Run this Spider to completion in a new event loop.
 
         Args:
             output: A JSON-lines file for the Items; `None` discards them.
-            concurrency: The maximum number of Requests processed at once.
+            settings: Settings for this Run, by dotted key; they take precedence over
+                every other layer.
+
+        Raises:
+            pernix.errors.SettingsError: The settings are invalid; nothing has been
+                fetched or written yet.
         """
-        asyncio.run(cls.crawl(output=output, concurrency=concurrency))
+        asyncio.run(cls.crawl(output=output, settings=settings))

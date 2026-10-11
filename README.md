@@ -36,6 +36,33 @@ if __name__ == "__main__":
 
 Each Callback is an async generator that yields Requests to follow and Items (dicts) to store. `run()` blocks until every Request has been fetched; `await Titles.crawl(...)` does the same inside an existing event loop.
 
+## Configuration
+
+Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, and the `settings=` argument of `run()` / `crawl()`.
+
+```python
+class Titles(Spider):
+    settings = {"concurrency": 8}
+
+
+Titles.run(output="titles.jsonl", settings={"concurrency": 4})
+```
+
+```toml
+# pernix.toml, or [tool.pernix] in pyproject.toml; found by walking up from the working directory
+concurrency = 8
+```
+
+```bash
+PERNIX_CONCURRENCY=4 python titles.py
+```
+
+Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). Settings are validated at startup: a misspelled key fails with a suggestion, and a wrong value names the layer it came from. See [`docs/design.md`](docs/design.md) §4.11.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | `16` | Maximum number of Requests processed at once |
+
 ## Documentation
 
 - [`CONTEXT.md`](CONTEXT.md): terminology
@@ -52,13 +79,22 @@ src/pernix/
 ├── request.py           Request
 ├── response.py          Response, selectors
 ├── headers.py           Headers
-├── crawler.py           assembles the components of one Run
+├── crawler.py           assembles the components of one Run, builds components
+├── components.py        loads components from import paths and builds them
+├── errors.py            exception hierarchy
 ├── engine.py            worker loop: fetch, run Callbacks, dispatch outputs
 ├── memory_frontier.py   in-memory Frontier
 ├── feeds.py             Item output files
-└── fetchers/
-    ├── fetcher.py       Fetcher protocol
-    └── http_fetcher.py  curl-cffi HTTP Fetcher
+├── fetchers/
+│   ├── fetcher.py       Fetcher protocol
+│   └── http_fetcher.py  curl-cffi HTTP Fetcher
+└── settings/
+    ├── loader.py        merges and validates the settings layers
+    ├── sources.py       project file and environment variables
+    ├── settings.py      Settings, the immutable result
+    ├── section.py       Section base class, ComponentMap
+    ├── core_settings.py settings of the crawl loop
+    └── secret.py        Secret, a redacted value
 tests/                   one test module per source module, plus end-to-end crawls
 ```
 
