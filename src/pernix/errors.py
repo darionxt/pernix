@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__all__ = ["ComponentError", "PernixError", "SettingsError"]
+__all__ = ["AddonError", "ComponentError", "PernixError", "SettingsError"]
 
 
 class PernixError(Exception):
@@ -26,3 +26,7 @@ class SettingsError(PernixError, ValueError):
 
 class ComponentError(PernixError):
     """A component could not be loaded or constructed."""
+
+
+class AddonError(PernixError):
+    """An Addon cannot be loaded, is incompatible, or misused its setup API."""

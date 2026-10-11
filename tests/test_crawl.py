@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import pytest
 
-from pernix import Request, Response, Spider
+from pernix import Request, Response, Spider, events
 from pernix.errors import SettingsError
 
 if TYPE_CHECKING:
@@ -246,3 +246,69 @@ async def test_unsupported_outputs_are_logged(server: LoopbackServer, caplog: py
         await Odd.crawl()
 
     assert any("unsupported output 42" in r.getMessage() for r in caplog.records)
+
+
+class Observer:
+    """Records the Request, Response, and Item Events of a Run; vetoes offsite Requests."""
+
+    def __init__(self, allowed_host: str) -> None:
+        self.allowed_host = allowed_host
+        self.log: list[str] = []
+
+    @events.on(events.RequestScheduled)
+    def schedule(self, event: events.RequestScheduled) -> events.Veto | None:
+        return None if self.allowed_host in event.request.url else events.Veto("offsite")
+
+    @events.on(events.RequestDropped)
+    def dropped(self, event: events.RequestDropped) -> None:
+        self.log.append(f"dropped {event.request.url.rsplit('/', 1)[-1]} {event.reason}")
+
+    @events.on(events.ResponseReceived)
+    def received(self, event: events.ResponseReceived) -> None:
+        self.log.append(f"received {event.response.url.rsplit('/', 1)[-1]}")
+
+    @events.on(events.ItemScraped)
+    def scraped(self, event: events.ItemScraped) -> None:
+        self.log.append(f"item {event.item['n']} from {event.response.url.rsplit('/', 1)[-1]}")
+
+    @events.on(events.RequestFailed)
+    def failed(self, event: events.RequestFailed) -> None:
+        self.log.append(f"failed {event.request.url.rsplit('/', 1)[-1]} {type(event.error).__name__}")
+
+
+async def test_the_engine_emits_request_response_and_item_events(server: LoopbackServer) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+    server.route("/start", "ok")
+    server.route("/broken", "ok")
+    observer = Observer(allowed_host="127.0.0.1")
+
+    class Eventful(Spider):
+        start_urls = (server.url("/start"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"n": 1}
+            yield Request("https://elsewhere.example/offsite")
+            yield Request(server.url("/start"))  # a duplicate
+            yield Request(server.url("/broken"), callback=self.parse_broken)
+            yield Request(f"http://127.0.0.1:{closed_port}/unreachable")
+
+        async def parse_broken(self, response: Response) -> AsyncIterator[Any]:
+            raise ValueError("bad page")
+            yield
+
+    async with asyncio.timeout(10):
+        await Eventful.crawl(settings={"concurrency": 1, "extensions": {observer: 1}})
+
+    assert observer.log[:4] == [
+        "received start",
+        "item 1 from start",
+        "dropped offsite offsite",
+        "dropped start duplicate",
+    ]
+    assert sorted(observer.log[4:]) == [
+        "failed broken ValueError",
+        "failed unreachable ConnectionError",
+        "received broken",
+    ]

@@ -10,6 +10,7 @@ dependencies = [
     "curl-cffi>=0.16.3",
     "msgspec>=0.21",
     "orjson>=3.12",
+    "packaging>=24",
     "parsel>=1.12",
 ]
 classifiers = [

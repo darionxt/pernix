@@ -7,9 +7,11 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, cast
 
+from pernix.events import ItemScraped, RequestDropped, RequestFailed, RequestScheduled, ResponseReceived
 from pernix.request import Request
 
 if TYPE_CHECKING:
+    from pernix.events import EventBus
     from pernix.fetchers import Fetcher
     from pernix.memory_frontier import MemoryFrontier
     from pernix.response import Response
@@ -27,8 +29,13 @@ class Engine:
     """Runs a fixed number of workers that fetch Requests and run their Callbacks.
 
     The Run ends once `start()` is exhausted, the Frontier is empty, and nothing is in
-    flight. Exceptions raised while fetching or inside a Callback are logged and do not
-    stop the Run; an exception raised while storing an Item ends it.
+    flight. Exceptions raised while fetching or inside a Callback are logged, emitted
+    as `RequestFailed`, and do not stop the Run; an exception raised while storing an
+    Item ends it.
+
+    Every Request passes the `RequestScheduled` gate before entering the Frontier; a
+    vetoed or duplicate Request is emitted as `RequestDropped`. Each fetched Response
+    is emitted as `ResponseReceived`, and each stored Item as `ItemScraped`.
     """
 
     def __init__(
@@ -38,6 +45,7 @@ class Engine:
         frontier: MemoryFrontier,
         fetcher: Fetcher,
         item_sink: ItemSink,
+        events: EventBus,
         concurrency: int,
     ) -> None:
         """Wire the Engine to its collaborators.
@@ -47,6 +55,7 @@ class Engine:
             frontier: Where pending Requests are stored.
             fetcher: Turns Requests into Responses.
             item_sink: Receives every Item the Callbacks produce.
+            events: Where Request, Response, and Item Events are emitted.
             concurrency: The number of workers, which is also the maximum number of
                 Requests processed at once.
 
@@ -59,6 +68,7 @@ class Engine:
         self._frontier = frontier
         self._fetcher = fetcher
         self._item_sink = item_sink
+        self._events = events
         self._concurrency = concurrency
 
     async def run(self) -> None:
@@ -78,7 +88,7 @@ class Engine:
         try:
             async with aclosing(_iterate(self._spider.start())) as requests:
                 async for request in requests:
-                    self._frontier.add(request)
+                    await self._schedule(request)
         except Exception:
             logger.exception("start() of spider %r failed", self._spider.name)
 
@@ -96,9 +106,11 @@ class Engine:
     async def _process(self, request: Request) -> None:
         try:
             response = await self._fetcher.fetch(request)
-        except Exception:
+        except Exception as exc:
             logger.exception("Fetching %r failed", request)
+            await self._events.emit(RequestFailed(request, exc))
             return
+        await self._events.emit(ResponseReceived(response))
 
         callback = request.callback or self._spider.parse
         async with aclosing(_outputs(callback, response)) as outputs:
@@ -109,21 +121,30 @@ class Engine:
                     output = await anext(outputs)
                 except StopAsyncIteration:
                     return
-                except Exception:
+                except Exception as exc:
                     logger.exception("Callback %s failed for %r", _name(callback), response)
+                    await self._events.emit(RequestFailed(request, exc))
                     return
-                self._handle_output(output, request)
+                await self._handle_output(output, response)
 
-    def _handle_output(self, output: object, source: Request) -> None:
+    async def _schedule(self, request: Request) -> None:
+        veto = await self._events.gate(RequestScheduled(request))
+        if veto is not None:
+            await self._events.emit(RequestDropped(request, veto.reason))
+        elif not self._frontier.add(request):
+            await self._events.emit(RequestDropped(request, "duplicate"))
+
+    async def _handle_output(self, output: object, response: Response) -> None:
         match output:
             case None:
                 pass
             case Request():
-                self._frontier.add(output)
+                await self._schedule(output)
             case Mapping():
                 self._item_sink(output)  # pyright: ignore[reportUnknownArgumentType]
+                await self._events.emit(ItemScraped(output, response))
             case _:
-                logger.warning("Ignoring unsupported output %r from the Callback for %r", output, source)
+                logger.warning("Ignoring unsupported output %r from the Callback for %r", output, response.request)
 
 
 async def _iterate[T](items: AsyncIterator[T]) -> AsyncGenerator[T]:

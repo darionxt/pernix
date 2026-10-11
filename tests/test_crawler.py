@@ -12,7 +12,7 @@ from loopback import ReceivedRequest, Reply
 from pernix import Response, Spider
 from pernix.crawler import Crawler
 from pernix.errors import ComponentError
-from pernix.settings import ComponentMap, CoreSettings, Section, Settings, load_settings
+from pernix.settings import CORE_SECTIONS, ComponentMap, Section, Settings, load_settings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -78,7 +78,7 @@ class Idle(Spider):
 
 def _crawler(tmp_path: Path, **overrides: Any) -> Crawler:
     settings = load_settings(
-        sections=(CoreSettings, PluginSettings), project_dir=tmp_path, environ={}, overrides=overrides
+        sections=(*CORE_SECTIONS, PluginSettings), project_dir=tmp_path, environ={}, overrides=overrides
     )
     return Crawler(Idle(), settings=settings)
 

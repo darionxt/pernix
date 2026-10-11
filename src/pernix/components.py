@@ -3,12 +3,13 @@ from __future__ import annotations
 import importlib
 import inspect
 import typing
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from pernix.errors import ComponentError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 __all__ = ["build_component", "init_type_hints", "load_object", "resolve_component"]
 
@@ -58,29 +59,42 @@ def resolve_component(spec: object) -> object:
     return load_object(spec) if isinstance(spec, str) else spec
 
 
-def init_type_hints(component: type) -> dict[str, Any]:
-    """Return the resolved type annotations of a class's `__init__`.
+def init_type_hints(component: type, *, known_types: Mapping[str, type] | None = None) -> dict[str, Any]:
+    """Resolve the annotations of a class's `__init__`, parameter by parameter.
+
+    A name the component's module defines only under `TYPE_CHECKING` is looked up in
+    `known_types`, so linters may keep such imports type-only. Annotations that still
+    cannot be resolved are left out.
 
     Args:
         component: The class to inspect.
+        known_types: Types to resolve by name when the module does not define them.
 
     Returns:
-        A mapping of parameter name to annotation.
-
-    Raises:
-        ComponentError: An annotation names a type that is not importable at runtime,
-            for example one imported only under `TYPE_CHECKING`.
+        Parameter name to resolved annotation.
     """
-    try:
-        return typing.get_type_hints(component.__init__)
-    except NameError as exc:
-        raise ComponentError(
-            f"cannot resolve the __init__ annotations of {component.__qualname__}: {exc}. "
-            "Types used for injection must be importable at runtime."
-        ) from exc
+    function = component.__init__
+    annotations: dict[str, Any] = dict(getattr(function, "__annotations__", {}))
+    module_globals: dict[str, Any] = getattr(function, "__globals__", {})
+    hints: dict[str, Any] = {}
+    for name, annotation in annotations.items():
+        if name == "return":
+            continue
+        holder = SimpleNamespace(__annotations__={name: annotation})
+        try:
+            hints[name] = typing.get_type_hints(holder, globalns=module_globals, localns=dict(known_types or {}))[name]
+        except NameError:
+            continue
+    return hints
 
 
-def build_component(spec: object, *, crawler: object, provide: Callable[[type], object | None]) -> object:
+def build_component(
+    spec: object,
+    *,
+    crawler: object,
+    provide: Callable[[type], object | None],
+    known_types: Mapping[str, type] | None = None,
+) -> object:
     """Construct a component from its specification.
 
     An object is returned as is. A class with a `from_crawler(crawler)` classmethod is
@@ -92,6 +106,8 @@ def build_component(spec: object, *, crawler: object, provide: Callable[[type], 
         crawler: Passed to `from_crawler`.
         provide: Returns the service for an annotated parameter type, or `None` if it
             has none.
+        known_types: The service types by name, for annotations whose types the
+            component's module imports only under `TYPE_CHECKING`.
 
     Returns:
         The component.
@@ -106,11 +122,13 @@ def build_component(spec: object, *, crawler: object, provide: Callable[[type], 
     from_crawler = getattr(component, "from_crawler", None)
     if callable(from_crawler):
         return from_crawler(crawler)
-    return component(**_injected_arguments(component, provide))
+    return component(**_injected_arguments(component, provide, known_types))
 
 
-def _injected_arguments(component: type, provide: Callable[[type], object | None]) -> dict[str, object]:
-    hints = init_type_hints(component)
+def _injected_arguments(
+    component: type, provide: Callable[[type], object | None], known_types: Mapping[str, type] | None
+) -> dict[str, object]:
+    hints = init_type_hints(component, known_types=known_types)
     arguments: dict[str, object] = {}
     for name, parameter in inspect.signature(component).parameters.items():
         if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
@@ -120,9 +138,11 @@ def _injected_arguments(component: type, provide: Callable[[type], object | None
         if service is not None and parameter.kind is not parameter.POSITIONAL_ONLY:
             arguments[name] = service
         elif parameter.default is parameter.empty:
+            unresolved = name not in hints and parameter.annotation is not parameter.empty
+            reason = f" (its annotation {parameter.annotation!r} cannot be resolved at runtime)" if unresolved else ""
             raise ComponentError(
                 f"cannot build {component.__qualname__}: no service can be injected for the required "
-                f"parameter {name!r}. Annotate it with Crawler, Settings, or a settings Section, "
-                "give it a default, or define a from_crawler() classmethod."
+                f"parameter {name!r}{reason}. Annotate it with Crawler, Settings, EventBus, or a settings "
+                "Section, give it a default, or define a from_crawler() classmethod."
             )
     return arguments

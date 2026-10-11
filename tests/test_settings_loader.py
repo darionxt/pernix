@@ -417,6 +417,8 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
     assert settings.section(DomainSettings) == DomainSettings()
     assert dict(settings) == {
         "concurrency": 16,
+        "extensions": {},
+        "addons": (),
         "domain.delay": 0.0,
         "domain.verify": True,
         "domain.codes": [],

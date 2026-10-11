@@ -13,7 +13,7 @@ from msgspec import structs
 
 from pernix.components import init_type_hints, resolve_component
 from pernix.errors import ComponentError, SettingsError
-from pernix.settings.core_settings import CoreSettings
+from pernix.settings.core_settings import CORE_SECTIONS
 from pernix.settings.secret import Secret
 from pernix.settings.section import ComponentMap, Section
 from pernix.settings.settings import Settings
@@ -29,12 +29,13 @@ _FROM_STRING: tuple[type, ...] = (Secret, PurePath)
 
 def load_settings(
     *,
-    sections: Iterable[type[Section]] = (CoreSettings,),
+    sections: Iterable[type[Section]] = CORE_SECTIONS,
     addon_layers: Sequence[Mapping[str, Any]] = (),
     project_dir: str | os.PathLike[str] | None = None,
     environ: Mapping[str, str] | None = None,
     spider_settings: Mapping[str, Any] | None = None,
     overrides: Mapping[str, Any] | None = None,
+    ignore_unknown: bool = False,
 ) -> Settings:
     """Merge every settings layer, validate the result, and freeze it.
 
@@ -56,6 +57,8 @@ def load_settings(
             `os.environ`.
         spider_settings: The `settings` attribute of the Spider.
         overrides: Settings passed to `run()` or on the command line.
+        ignore_unknown: Skip keys that no known Section declares instead of failing,
+            to read a few settings before every Section is known.
 
     Returns:
         The validated, immutable settings.
@@ -79,7 +82,7 @@ def load_settings(
     )
     sources.append(_Source(spider_settings or {}, "Spider.settings"))
     sources.append(_Source(overrides or {}, "run() arguments"))
-    return _Loader(sources, sections).load()
+    return _Loader(sources, sections, ignore_unknown=ignore_unknown).load()
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +119,9 @@ class _Merged:
 
 
 class _Loader:
-    def __init__(self, sources: Sequence[_Source], sections: Iterable[type[Section]]) -> None:
+    def __init__(self, sources: Sequence[_Source], sections: Iterable[type[Section]], *, ignore_unknown: bool) -> None:
         self._sources = sources
+        self._ignore_unknown = ignore_unknown
         self._sections: list[type[Section]] = []
         self._fields: dict[str, _Field] = {}
         self._schema_problems: list[str] = []
@@ -126,14 +130,15 @@ class _Loader:
             self._add_section(section)
 
     def load(self) -> Settings:
-        merged, discovery_problems = self._merge_until_schema_is_complete()
-        problems = [*self._schema_problems, *merged.problems, *discovery_problems]
+        merged = self._merge_until_schema_is_complete()
+        problems = [*self._schema_problems, *merged.problems]
         values = {key: field.default for key, field in self._fields.items()}
         for key, raw in merged.values.items():
             known = self._fields.get(key)
             if known is None:
-                origin = merged.origins[key]
-                problems.append(f"unknown setting {key!r} from {origin}{did_you_mean(key, self._fields)}")
+                if not self._ignore_unknown:
+                    origin = merged.origins[key]
+                    problems.append(f"unknown setting {key!r} from {origin}{did_you_mean(key, self._fields)}")
             elif known.is_component_map:
                 values[key] = raw
             else:
@@ -148,14 +153,13 @@ class _Loader:
                 values[key] = MappingProxyType(dict(values[key]))
         return Settings(values, origins=merged.origins, sections=self._build_sections(values))
 
-    def _merge_until_schema_is_complete(self) -> tuple[_Merged, list[str]]:
+    def _merge_until_schema_is_complete(self) -> _Merged:
         # Components named in component maps can register Sections that declare more
         # keys, including more component maps, so merge again until nothing new appears.
         while True:
             merged = self._merge()
-            discovered, problems = self._discover_sections(merged)
-            if not discovered:
-                return merged, problems
+            if not self._discover_sections(merged):
+                return merged
 
     def _merge(self) -> _Merged:
         merged = _Merged()
@@ -213,20 +217,14 @@ class _Loader:
             self._resolved[spec] = resolve_component(spec)
         return self._resolved[spec]
 
-    def _discover_sections(self, merged: _Merged) -> tuple[bool, list[str]]:
+    def _discover_sections(self, merged: _Merged) -> bool:
         discovered = False
-        problems: list[str] = []
         component_maps = [key for key, known in self._fields.items() if known.is_component_map]
         for key in component_maps:
             for component in merged.values.get(key, {}):
-                try:
-                    sections = _sections_of(component)
-                except ComponentError as exc:
-                    problems.append(f"{key}: {exc}")
-                    continue
-                for section in sections:
+                for section in _sections_of(component, {s.__name__: s for s in self._sections}):
                     discovered |= self._add_section(section)
-        return discovered, problems
+        return discovered
 
     def _add_section(self, section: object) -> bool:
         if not (isinstance(section, type) and issubclass(section, Section)):
@@ -279,10 +277,10 @@ def _flatten(values: Mapping[str, Any], known: Mapping[str, _Field], prefix: str
             yield key, value
 
 
-def _sections_of(component: object) -> list[object]:
+def _sections_of(component: object, known_sections: Mapping[str, type]) -> list[object]:
     sections: list[object] = list(getattr(component, "settings_sections", ()))
     if isinstance(component, type):
-        hints = init_type_hints(component)
+        hints = init_type_hints(component, known_types=known_sections)
         sections += [hint for hint in hints.values() if isinstance(hint, type) and issubclass(hint, Section)]
     return sections
 

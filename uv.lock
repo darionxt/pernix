@@ -383,6 +383,7 @@ dependencies = [
     { name = "curl-cffi" },
     { name = "msgspec" },
     { name = "orjson" },
+    { name = "packaging" },
     { name = "parsel" },
 ]
 
@@ -399,6 +400,7 @@ requires-dist = [
     { name = "curl-cffi", specifier = ">=0.16.3" },
     { name = "msgspec", specifier = ">=0.21" },
     { name = "orjson", specifier = ">=3.12" },
+    { name = "packaging", specifier = ">=24" },
     { name = "parsel", specifier = ">=1.12" },
 ]
 

@@ -35,7 +35,7 @@ def settings(tmp_path: Path) -> Settings:
 def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
     assert settings["concurrency"] == 4
     assert "concurrency" in settings
-    assert set(settings) == {"concurrency", "test.plugins"}
+    assert set(settings) == {"concurrency", "extensions", "addons", "test.plugins"}
 
     with pytest.raises(TypeError):
         settings["concurrency"] = 8  # type: ignore[index]
