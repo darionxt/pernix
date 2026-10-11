@@ -1,0 +1,79 @@
+[project]
+name = "pernix"
+version = "0.1.0.dev0"
+description = "An asyncio crawling framework with HTTP and browser fetching as peers."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+dependencies = []
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/darionxt/pernix"
+
+[build-system]
+requires = ["uv_build>=0.12,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.17",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.format]
+# Code in Markdown docs is illustrative and laid out for reading.
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # simplify
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific
+    "ASYNC",    # async pitfalls
+    "PT",       # pytest style
+    "PERF",     # performance anti-patterns
+    "TC",       # type-checking imports
+    "S",        # security
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S310"]  # asserts; urllib against the loopback server
+
+[tool.pyright]
+include = ["src", "tests"]
+strict = ["src"]
+pythonVersion = "3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+filterwarnings = ["error"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
