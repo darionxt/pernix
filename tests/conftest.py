@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,6 +19,14 @@ def _block_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
     This covers Python sockets only; native transports are guarded at the Fetcher level.
     """
     netguard.install(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep PERNIX_* variables of the developer's shell out of the tests."""
+    for name in list(os.environ):
+        if name.startswith("PERNIX_"):
+            monkeypatch.delenv(name)
 
 
 @pytest.fixture

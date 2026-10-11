@@ -11,6 +11,7 @@ import orjson
 import pytest
 
 from pernix import Request, Response, Spider
+from pernix.errors import SettingsError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -97,7 +98,7 @@ async def test_crawl_runs_inside_an_event_loop(bookstore: LoopbackServer, tmp_pa
 
     output = tmp_path / "books.jsonl"
     async with asyncio.timeout(10):
-        await LocalBooks.crawl(output=output, concurrency=2)
+        await LocalBooks.crawl(output=output, settings={"concurrency": 2})
 
     assert _sorted(_read_items(output)) == _sorted(EXPECTED_BOOKS)
 
@@ -198,8 +199,8 @@ async def test_invalid_concurrency_fails_before_touching_the_output(tmp_path: Pa
     class Anything(Spider):
         start_urls = ("http://127.0.0.1:9/",)
 
-    with pytest.raises(ValueError, match="concurrency must be at least 1"):
-        await Anything.crawl(output=output, concurrency=concurrency)
+    with pytest.raises(SettingsError, match=r"concurrency: Expected `int` >= 1"):
+        await Anything.crawl(output=output, settings={"concurrency": concurrency})
 
     assert output.read_text() == "previous run\n"
 

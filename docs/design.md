@@ -300,27 +300,51 @@ Layers, from lowest to highest precedence:
 
 1. Built-in defaults
 2. Addons
-3. Project file (`pernix.toml`, or `[tool.pernix]` in `pyproject.toml`)
+3. Project file (`pernix.toml`, or `[tool.pernix]` in `pyproject.toml`), found by walking up from the working directory; the nearest `pyproject.toml` ends the search
 4. Environment variables `PERNIX_*`
 5. `Spider.settings`
 6. `run()` arguments or CLI arguments
 
+```python
+class Books(Spider):
+    settings = {"concurrency": 32, "domain.delay": 0.5}        # dotted keys
+
+Books.run(output="books.jsonl", settings={"concurrency": 8})   # run arguments
+```
+
+```toml
+# pernix.toml
+concurrency = 32
+
+[domain]                                   # nested tables are the same as dotted keys
+delay = 0.5
+
+[middlewares]
+"myproject.middlewares.Sign" = 500
+"myproject.middlewares.Legacy" = false     # TOML has no null: false disables
+```
+
 Rules:
 
-- Keys are lowercase with dot-separated namespaces, for example `concurrency`, `domain.delay`, `http.impersonate`, `browser.headless`, `retry.times`.
-- Settings are merged and type-checked at startup; a misspelled key raises an error that suggests similar key names. After startup the settings are frozen and no longer change.
-- Components (Middleware, Pipelines, Extensions) are registered as `{component: order}`, and a value of `None` disables a component, for example `"middlewares": {SignRequest: 500, "pernix.retry": None}`. A component can be given as a class, an object, or an import path.
-- Components can declare their own settings section, which takes part in validation; at construction time the framework injects the Crawler and the settings, and there is no global service locator.
-- Secret settings use the Secret type and are automatically redacted in logs and stats.
+- Keys are lowercase with dot-separated namespaces, for example `concurrency`, `domain.delay`, `http.impersonate`, `browser.headless`, `retry.times`. Nested mappings and dotted keys are equivalent.
+- Environment variables map `PERNIX_DOMAIN__DELAY` to `domain.delay`; their string values are parsed by the declared type, and container values are written as JSON. Values from Python layers are type-checked strictly.
+- Settings are merged and validated at startup. Every problem is reported at once: a misspelled key suggests the closest known key, and a wrong value names the layer it came from (for example the environment variable). After startup the settings are immutable, and every Crawler has its own instance.
+- Settings are declared as typed **Sections**: a key prefix plus fields with defaults and optional constraints. `settings.section(RetrySettings)` returns the validated values.
+- Components (Middleware, Pipelines, Extensions) are registered as `{component: order}`, lowest order first. A later layer adds or overrides entries, and `None` (`false` in TOML and JSON) disables one. A component can be given as a class, an object, or an import path.
+- A component registers its own Sections by annotating `__init__` parameters with them (which also injects them) or by listing them in `settings_sections`; their keys are validated together with the core keys. Sections of a disabled component stay registered, so its settings can remain in the project file.
+- Construction: an object is used as is; a class with `from_crawler(crawler)` is built through it; otherwise `__init__` parameters annotated with `Crawler`, `Settings`, or a registered Section are injected. There is no global service locator.
+- Secret settings use the `Secret` type and are automatically redacted in reprs, logs, and stats.
 
 ### 4.12 Running and the CLI
 
 ```python
-Books.run(output="books.jsonl", concurrency=32)       # synchronous entry point, suited to scripts
-await Books.crawl(keyword="x")                        # run inside an existing event loop
+Books.run(output="books.jsonl", settings={"concurrency": 32})  # synchronous entry point, suited to scripts
+await Books.crawl(keyword="x")                        # run inside an existing event loop; keyword arguments are Spider arguments
 async for item in Books.stream(keyword="x"):          # bounded streaming consumption, suited to embedding in other applications
     ...
 ```
+
+Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (see §4.2); settings for the Run are passed in `settings=`.
 
 | Command | Purpose |
 | --- | --- |
