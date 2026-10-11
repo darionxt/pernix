@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import MappingProxyType, UnionType
 from typing import Annotated, Any, TypeAliasType, Union, cast, get_args, get_origin
 
@@ -23,6 +23,8 @@ from pernix.settings.suggestions import did_you_mean
 __all__ = ["load_settings"]
 
 _CONTAINERS: tuple[object, ...] = (dict, list, tuple, set, frozenset, Mapping, Sequence)
+_FROM_STRING: tuple[type, ...] = (Secret, PurePath)
+"""Types without native msgspec support that settings may give as a string."""
 
 
 def load_settings(
@@ -291,13 +293,18 @@ def _convert(value: object, target: Any, *, lenient: bool) -> Any:
     return msgspec.convert(value, target, strict=not lenient, dec_hook=_decode_custom)
 
 
-def _decode_custom(target: type, value: object) -> object:
-    if target is Secret:
-        if isinstance(value, Secret):
+def _decode_custom(target: object, value: object) -> object:
+    """Validate a value whose declared type msgspec does not handle natively.
+
+    An instance of the declared type is kept as is. A string is converted only for the
+    types in `_FROM_STRING`; other types are never built from arbitrary input.
+    """
+    if isinstance(target, type):
+        if isinstance(value, target):
             return value
-        if isinstance(value, str):
-            return Secret(value)
-    raise TypeError(f"Expected `{target.__name__}`, got `{type(value).__name__}`")
+        if isinstance(value, str) and issubclass(target, _FROM_STRING):
+            return target(value)
+    raise TypeError(f"Expected `{getattr(target, '__name__', target)}`, got `{type(value).__name__}`")
 
 
 def _is_container(target: Any) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar
 
 import msgspec
@@ -9,8 +10,6 @@ from pernix.errors import SettingsError
 from pernix.settings import ComponentMap, CoreSettings, Secret, Section, load_settings
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from pernix.settings import Settings
 
 
@@ -71,6 +70,19 @@ class Cache:
 class Disk:
     def __init__(self, settings: DiskSettings) -> None:
         self.settings = settings
+
+
+class Marker:
+    pass
+
+
+DEFAULT_MARKER = Marker()
+
+
+class StorageSettings(Section):
+    __prefix__ = "storage"
+    cache_dir: Path = Path("cache")
+    marker: Marker = DEFAULT_MARKER
 
 
 class BuiltinSettings(Section):
@@ -202,6 +214,50 @@ def test_secrets_load_from_strings_and_stay_redacted(tmp_path: Path) -> None:
     assert settings["domain.token"].reveal() == "s3cr3t"
     assert "s3cr3t" not in repr(settings)
     assert "Secret('**********')" in repr(settings)
+
+
+def test_custom_type_defaults_are_kept(tmp_path: Path) -> None:
+    settings = load_settings(sections=(CoreSettings, StorageSettings), project_dir=tmp_path, environ={})
+
+    assert settings.section(StorageSettings) == StorageSettings()
+    assert settings["storage.cache_dir"] == Path("cache")
+    assert settings["storage.marker"] is DEFAULT_MARKER
+
+
+@pytest.mark.parametrize("layer", ["project", "environment", "spider"])
+def test_paths_load_from_strings_and_instances(tmp_path: Path, layer: str) -> None:
+    if layer == "project":
+        (tmp_path / "pernix.toml").write_text('[storage]\ncache_dir = "/data/cache"\n')
+    environ = {"PERNIX_STORAGE__CACHE_DIR": "/data/cache"} if layer == "environment" else {}
+    spider_settings = {"storage.cache_dir": Path("/data/cache")} if layer == "spider" else None
+
+    settings = load_settings(
+        sections=(CoreSettings, StorageSettings), project_dir=tmp_path, environ=environ, spider_settings=spider_settings
+    )
+
+    assert settings["storage.cache_dir"] == Path("/data/cache")
+
+
+def test_custom_types_are_not_built_from_arbitrary_input(tmp_path: Path) -> None:
+    other = Marker()
+
+    with pytest.raises(SettingsError) as excinfo:
+        load_settings(
+            sections=(CoreSettings, StorageSettings),
+            project_dir=tmp_path,
+            environ={},
+            spider_settings={"storage.cache_dir": 5, "storage.marker": "x"},
+        )
+    kept = load_settings(
+        sections=(CoreSettings, StorageSettings),
+        project_dir=tmp_path,
+        environ={},
+        spider_settings={"storage.marker": other},
+    )
+
+    assert "storage.cache_dir: Expected `Path`, got `int` (from Spider.settings)" in excinfo.value.problems
+    assert "storage.marker: Expected `Marker`, got `str` (from Spider.settings)" in excinfo.value.problems
+    assert kept["storage.marker"] is other
 
 
 # Component maps
