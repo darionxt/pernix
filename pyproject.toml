@@ -6,7 +6,11 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "curl-cffi>=0.16.3",
+    "orjson>=3.12",
+    "parsel>=1.12",
+]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: AsyncIO",
@@ -36,7 +40,7 @@ dev = [
 ]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py313"
 src = ["src", "tests"]
 
@@ -59,10 +63,20 @@ select = [
     "PERF",     # performance anti-patterns
     "TC",       # type-checking imports
     "S",        # security
+    "D",        # docstrings
+]
+ignore = [
+    "E501",  # line length is handled by the formatter
+    "D100",  # module docstrings are optional
+    "D104",  # package docstrings are optional
+    "D105",  # magic methods are self-describing
 ]
 
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S310"]  # asserts; urllib against the loopback server
+"tests/**" = ["S101", "S310", "D"]  # asserts; urllib against the loopback server; no docstring rules
 
 [tool.pyright]
 include = ["src", "tests"]

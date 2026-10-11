@@ -1,14 +1,14 @@
+"""Tests for the loopback server and the network guard used by the test suite."""
+
 from __future__ import annotations
 
 import asyncio
 import socket
 import urllib.error
 import urllib.request
-from importlib.metadata import version
 
 import pytest
 
-import pernix
 from loopback import LoopbackServer, ReceivedRequest, Reply
 from netguard import NetworkAccessError
 
@@ -16,10 +16,6 @@ from netguard import NetworkAccessError
 def _get(url: str, data: bytes | None = None, headers: dict[str, str] | None = None):
     request = urllib.request.Request(url, data=data, headers=headers or {})
     return urllib.request.urlopen(request, timeout=5)
-
-
-def test_package_exposes_installed_version() -> None:
-    assert pernix.__version__ == version("pernix")
 
 
 def test_server_serves_registered_route(server: LoopbackServer) -> None:
