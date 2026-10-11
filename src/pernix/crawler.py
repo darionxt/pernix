@@ -145,9 +145,9 @@ class Crawler:
                     events=self.events,
                     concurrency=concurrency,
                 )
-                await self.events.emit(SpiderOpened(self.spider))
                 reason = "failed"
                 try:
+                    await self.events.emit(SpiderOpened(self.spider))
                     await engine.run()
                     reason = "finished"
                 except asyncio.CancelledError:

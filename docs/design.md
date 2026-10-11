@@ -316,7 +316,7 @@ Core Events:
 | `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed |
 | `StatsSnapshot` | observe | A periodic copy of the stats |
 
-Lifecycle: Extensions (the `extensions` setting) are built in order, subscribed, and opened, as async context managers or through `open()`. They are closed in reverse after `SpiderClosed`. Every close step runs even when earlier ones fail, and the failures are raised together as an `ExceptionGroup`. If opening a component fails, the ones already open are closed in reverse.
+Lifecycle: Extensions (the `extensions` setting) are built in order, subscribed, and opened, as async context managers or through `open()`. They are closed in reverse after `SpiderClosed`; `__aexit__` receives the exception that ended the Run, so a component can roll back, but cannot suppress it. Every close step runs even when earlier ones fail or are cancelled: failures are raised together as an `ExceptionGroup`, and a cancellation is re-raised after the last component is closed. If opening a component fails, the ones already open are closed in reverse. Once `SpiderOpened` has been dispatched, `SpiderClosed` always follows, even on cancellation.
 
 **Addons** bundle settings changes and registrations:
 

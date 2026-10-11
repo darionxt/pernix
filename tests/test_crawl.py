@@ -214,9 +214,18 @@ async def test_item_storage_failure_ends_the_run(server: LoopbackServer, tmp_pat
         async def parse(self, response: Response) -> AsyncIterator[Any]:
             yield {"tags": {"a", "b"}}  # a set is not JSON-serializable
 
+    errors: list[tuple[Any, str, type[Exception]]] = []
+
+    class ItemErrors:
+        @events.on(events.ItemError)
+        def failed(self, event: events.ItemError) -> None:
+            errors.append((event.item, event.response.url, type(event.error)))
+
     with pytest.RaisesGroup(TypeError):
         async with asyncio.timeout(10):
-            await Unserializable.crawl(output=tmp_path / "items.jsonl")
+            await Unserializable.crawl(output=tmp_path / "items.jsonl", settings={"extensions": {ItemErrors(): 1}})
+
+    assert errors == [({"tags": {"a", "b"}}, server.url("/"), TypeError)]
 
 
 async def test_missing_parse_is_logged_and_run_continues(

@@ -7,7 +7,15 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, cast
 
-from pernix.events import ItemScraped, RequestDropped, RequestFailed, RequestScheduled, ResponseReceived
+from pernix.events import (
+    ItemError,
+    ItemScraped,
+    RequestDropped,
+    RequestFailed,
+    RequestScheduled,
+    ResponseReceived,
+    SpiderIdle,
+)
 from pernix.request import Request
 
 if TYPE_CHECKING:
@@ -35,7 +43,9 @@ class Engine:
 
     Every Request passes the `RequestScheduled` gate before entering the Frontier; a
     vetoed or duplicate Request is emitted as `RequestDropped`. Each fetched Response
-    is emitted as `ResponseReceived`, and each stored Item as `ItemScraped`.
+    is emitted as `ResponseReceived`, each stored Item as `ItemScraped`, and an Item
+    that fails to be stored as `ItemError`. `SpiderIdle` is emitted once the Frontier
+    has drained, before the workers stop.
     """
 
     def __init__(
@@ -82,6 +92,7 @@ class Engine:
                 tasks.create_task(self._work())
             await self._add_start_requests()
             await self._frontier.join()
+            await self._events.emit(SpiderIdle(self._spider))
             self._frontier.shutdown()
 
     async def _add_start_requests(self) -> None:
@@ -141,7 +152,11 @@ class Engine:
             case Request():
                 await self._schedule(output)
             case Mapping():
-                self._item_sink(output)  # pyright: ignore[reportUnknownArgumentType]
+                try:
+                    self._item_sink(output)  # pyright: ignore[reportUnknownArgumentType]
+                except Exception as exc:
+                    await self._events.emit(ItemError(output, response, exc))
+                    raise
                 await self._events.emit(ItemScraped(output, response))
             case _:
                 logger.warning("Ignoring unsupported output %r from the Callback for %r", output, response.request)

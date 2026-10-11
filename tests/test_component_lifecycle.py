@@ -127,3 +127,91 @@ async def test_cancellation_is_not_replaced_by_close_failures(caplog: pytest.Log
         await task
     assert recorder.calls == ["open a", "close a"]
     assert any(r.levelno == logging.ERROR and "during CancelledError" in r.getMessage() for r in caplog.records)
+
+
+class TransactionComponent:
+    """An async context manager that records the exception it was closed with."""
+
+    def __init__(self, recorder: Recorder) -> None:
+        self.recorder = recorder
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> bool:
+        self.recorder.calls.append("commit" if exc is None else f"rollback {type(exc).__name__}")
+        return True  # must not suppress the Run's exception
+
+
+class CancelledOnClose:
+    def __init__(self, recorder: Recorder) -> None:
+        self.recorder = recorder
+
+    async def close(self) -> None:
+        self.recorder.calls.append("close cancelled")
+        raise asyncio.CancelledError
+
+
+async def test_context_managers_receive_the_exception_that_ended_the_run() -> None:
+    recorder = Recorder()
+
+    async def run() -> None:
+        async with ComponentLifecycle() as lifecycle:
+            await lifecycle.open(TransactionComponent(recorder))
+            raise ValueError("run failed")
+
+    with pytest.raises(ValueError, match="run failed"):
+        await run()
+    async with ComponentLifecycle() as lifecycle:
+        await lifecycle.open(TransactionComponent(recorder))
+
+    assert recorder.calls == ["rollback ValueError", "commit"]
+
+
+async def test_context_managers_see_a_later_component_failing_to_open() -> None:
+    recorder = Recorder()
+
+    async def start() -> None:
+        async with ComponentLifecycle() as lifecycle:
+            await lifecycle.open(TransactionComponent(recorder))
+            await lifecycle.open(AsyncComponent("b", recorder, fail_open=True))
+
+    with pytest.raises(RuntimeError, match="cannot open b"):
+        await start()
+    assert recorder.calls == ["open b", "rollback RuntimeError"]
+
+
+async def test_a_cancelled_close_step_does_not_skip_the_others(caplog: pytest.LogCaptureFixture) -> None:
+    recorder = Recorder()
+    lifecycle = ComponentLifecycle()
+    await lifecycle.open(AsyncComponent("a", recorder))
+    await lifecycle.open(AsyncComponent("b", recorder, fail_close=True))
+    await lifecycle.open(CancelledOnClose(recorder))
+
+    with pytest.raises(asyncio.CancelledError):
+        await lifecycle.aclose()
+
+    assert recorder.calls == ["open a", "open b", "close cancelled", "close b", "close a"]
+    assert any("Closing components failed during CancelledError" in r.getMessage() for r in caplog.records)
+
+
+async def test_cancellation_during_cleanup_still_closes_every_component() -> None:
+    recorder = Recorder()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class SlowClose:
+        async def close(self) -> None:
+            recorder.calls.append("slow close started")
+            started.set()
+            await release.wait()
+
+    lifecycle = ComponentLifecycle()
+    await lifecycle.open(AsyncComponent("a", recorder))
+    await lifecycle.open(SlowClose())
+    task = asyncio.create_task(lifecycle.aclose())
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert recorder.calls == ["open a", "slow close started", "close a"]

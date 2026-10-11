@@ -159,3 +159,35 @@ async def test_concurrency_setting_bounds_requests_in_flight(
 
     assert len(peaks) == 6
     assert max(peaks) == concurrency
+
+
+SAME_NAMED_PLUGIN = """
+from __future__ import annotations
+
+from pernix.settings import Section
+
+
+class PluginSettings(Section):
+    __prefix__ = "{prefix}"
+    value: str = "{prefix}-default"
+
+
+class Plugin:
+    def __init__(self, settings: PluginSettings) -> None:
+        self.settings = settings
+"""
+
+
+def test_same_named_sections_in_different_modules_stay_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for prefix in ("alpha", "beta"):
+        (tmp_path / f"pernix_plugin_{prefix}.py").write_text(SAME_NAMED_PLUGIN.format(prefix=prefix))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    plugins = {"pernix_plugin_alpha.Plugin": 1, "pernix_plugin_beta.Plugin": 2}
+
+    crawler = _crawler(tmp_path, **{"test.plugins": plugins, "beta.value": "set"})
+    alpha, beta = (crawler.build_component(spec) for spec in crawler.settings.components("test.plugins"))
+
+    assert alpha.settings.value == "alpha-default"  # type: ignore[attr-defined]
+    assert beta.settings.value == "set"  # type: ignore[attr-defined]

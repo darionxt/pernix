@@ -124,3 +124,11 @@ def test_init_type_hints_skips_unresolvable_annotations() -> None:
     assert init_type_hints(TypeOnly) == {}
     assert init_type_hints(TypeOnly, known_types={"Ghost": Service}) == {"service": Service}
     assert init_type_hints(NeedsService) == {"service": Service, "label": str}
+
+
+class Other:
+    pass
+
+
+def test_names_defined_by_the_module_win_over_known_types() -> None:
+    assert init_type_hints(NeedsService, known_types={"Service": Other}) == {"service": Service, "label": str}

@@ -117,3 +117,47 @@ async def test_a_crawler_runs_only_once(server: LoopbackServer) -> None:
 
     with pytest.raises(RuntimeError, match="runs only once"):
         await crawler.crawl()
+
+
+class SlowOpening(Journal):
+    started: ClassVar[asyncio.Event | None] = None
+
+    @events.on(events.SpiderOpened)
+    async def opened(self, event: events.SpiderOpened) -> None:  # type: ignore[override]
+        assert SlowOpening.started is not None
+        SlowOpening.started.set()
+        await asyncio.sleep(10)
+
+
+async def test_spider_closed_follows_a_cancelled_spider_opened(server: LoopbackServer) -> None:
+    SlowOpening.started = asyncio.Event()
+    spider = _spider(server)
+    task = asyncio.create_task(spider.crawl(settings={"extensions": {SlowOpening: 1}, "events.timeout": 60}))
+    await SlowOpening.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert Journal.entries == ["SlowOpening open", "SlowOpening closed cancelled", "SlowOpening close"]
+
+
+class IdleWatcher(Journal):
+    @events.on(events.SpiderIdle)
+    def idle(self, event: events.SpiderIdle) -> None:
+        self.entries.append(f"{self.label} idle")
+
+
+@pytest.mark.parametrize("empty", [False, True])
+async def test_spider_idle_is_emitted_once_the_frontier_drains(server: LoopbackServer, empty: bool) -> None:
+    spider = _spider(server)
+    if empty:
+        spider = type("Empty", (spider,), {"start_urls": ()})
+
+    async with asyncio.timeout(10):
+        await spider.crawl(settings={"extensions": {IdleWatcher: 1}})
+
+    assert Journal.entries[1:4] == [
+        f"IdleWatcher opened {spider.name}",
+        "IdleWatcher idle",
+        "IdleWatcher closed finished",
+    ]

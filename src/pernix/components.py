@@ -62,8 +62,9 @@ def resolve_component(spec: object) -> object:
 def init_type_hints(component: type, *, known_types: Mapping[str, type] | None = None) -> dict[str, Any]:
     """Resolve the annotations of a class's `__init__`, parameter by parameter.
 
-    A name the component's module defines only under `TYPE_CHECKING` is looked up in
-    `known_types`, so linters may keep such imports type-only. Annotations that still
+    A name the component's module does not define at runtime, for example one it imports
+    only under `TYPE_CHECKING`, is looked up in `known_types`, so linters may keep such
+    imports type-only; names the module does define always win. Annotations that still
     cannot be resolved are left out.
 
     Args:
@@ -75,14 +76,15 @@ def init_type_hints(component: type, *, known_types: Mapping[str, type] | None =
     """
     function = component.__init__
     annotations: dict[str, Any] = dict(getattr(function, "__annotations__", {}))
-    module_globals: dict[str, Any] = getattr(function, "__globals__", {})
+    # The module's own names win; known types only fill in names it lacks at runtime.
+    namespace: dict[str, Any] = {**(known_types or {}), **getattr(function, "__globals__", {})}
     hints: dict[str, Any] = {}
     for name, annotation in annotations.items():
         if name == "return":
             continue
         holder = SimpleNamespace(__annotations__={name: annotation})
         try:
-            hints[name] = typing.get_type_hints(holder, globalns=module_globals, localns=dict(known_types or {}))[name]
+            hints[name] = typing.get_type_hints(holder, globalns=namespace)[name]
         except NameError:
             continue
     return hints
