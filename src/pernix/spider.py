@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pernix.crawler import Crawler
 from pernix.request import Request
-from pernix.settings import load_settings
 
 if TYPE_CHECKING:
     import os
@@ -90,9 +89,9 @@ class Spider:
         Raises:
             pernix.errors.SettingsError: The settings are invalid; nothing has been
                 fetched or written yet.
+            pernix.errors.AddonError: An enabled Addon cannot be loaded.
         """
-        loaded = load_settings(spider_settings=cls.settings, overrides=settings)
-        await Crawler(cls(), settings=loaded, output=output).crawl()
+        await Crawler.from_spider(cls, settings=settings, output=output).crawl()
 
     @classmethod
     def run(

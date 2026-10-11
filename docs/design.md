@@ -275,24 +275,55 @@ class DropEmpty(SpiderMiddleware):
 from pernix import Extension, events
 
 class Notify(Extension):
-    @events.on(events.SpiderClosed)
-    async def closed(self, event): ...
+    def __init__(self, crawler: Crawler) -> None: ...   # injected, see §4.11
+    async def open(self) -> None: ...                   # before the Run
+    async def close(self) -> None: ...                  # after the Run, in reverse order
 
-crawler.events.on(events.ItemScraped, handler)   # can also be registered dynamically
+    @events.on(events.SpiderClosed)
+    async def closed(self, event: events.SpiderClosed) -> None: ...
+
+class Books(Spider):
+    settings = {"extensions": {Notify: 100}}
+
+unsubscribe = crawler.events.on(events.ItemScraped, handler, priority=0, timeout=5)   # dynamic subscription
 ```
 
-Events are typed dataclasses, and each Event declares how it is executed:
+Events are frozen dataclasses. Each Event class declares how it is dispatched, and is dispatched with the matching method of the event bus:
 
-| Form | Execution | Use case |
-| --- | --- | --- |
-| `observe` | Awaited in order; if a subscriber raises, the exception is logged and isolated without affecting the other subscribers | Most notification Events |
-| `gate` | A veto from any subscriber short-circuits; each Event declares individually whether it is fail-open or fail-closed | For example, filtering before admission to the Frontier |
-| `transform` | Applied in sequence, with each subscriber's output passed to the next | Events whose data is rewritten layer by layer |
+| Dispatch | Method | Execution | Use case |
+| --- | --- | --- | --- |
+| `observe` | `await bus.emit(event)` | Subscribers run in order; one that raises or times out is logged and isolated, and return values are ignored | Most notification Events |
+| `gate` | `await bus.gate(event)` returns a `Veto` or `None` | Subscribers run in order until one returns `Veto(reason)`. A subscriber that raises or times out is ignored (fail-open), or vetoes if the Event sets `fail_closed = True` | For example, admission to the Frontier |
+| `transform` | `await bus.transform(event)` returns the Event | Each subscriber may return a replacement Event of the same class, or `None` to keep it; failures and wrong results are logged and discarded | Events whose data is rewritten layer by layer |
 
 Other conventions:
 
-- Both sync and async subscribers are supported, and coroutines are never silently dropped. Each subscriber has a timeout, and shutdown Events run their subscribers in reverse order of registration.
-- **Addons** bundle "settings changes + component registrations" together and declare the range of API versions they are compatible with. They can be discovered through entry points, but are loaded only when explicitly enabled.
+- Subscribers run in `(priority, registration order)`; Events that set `reverse = True`, such as `SpiderClosed`, run them in reverse. A subscription to a class also receives its subclasses. Dispatch takes a snapshot of the subscribers.
+- Both sync and async subscribers are supported, and a returned awaitable is always awaited. An async subscriber is cancelled after its own timeout, or `events.timeout` (30 s by default). `CancelledError` always propagates.
+- `events.on()` marks methods; the Crawler subscribes the marked methods of every component it builds.
+
+Core Events:
+
+| Event | Dispatch | When |
+| --- | --- | --- |
+| `SpiderOpened` | observe | Components are open; nothing has been fetched yet |
+| `SpiderIdle` | observe | The Frontier is empty and nothing is in flight |
+| `SpiderClosed(reason)` | observe, reverse | The Run ended: `finished`, `failed`, or `cancelled` |
+| `RequestScheduled` | gate (fail-open) | A Request is about to enter the Frontier |
+| `RequestDropped(reason)` | observe | A Request was vetoed, or was a duplicate |
+| `RequestFailed(error)` | observe | Fetching a Request, or its Callback, raised |
+| `ResponseReceived` | observe | A Response was fetched, before its Callback runs |
+| `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed |
+| `StatsSnapshot` | observe | A periodic copy of the stats |
+
+Lifecycle: Extensions (the `extensions` setting) are built in order, subscribed, and opened, as async context managers or through `open()`. They are closed in reverse after `SpiderClosed`; `__aexit__` receives the exception that ended the Run, so a component can roll back, but cannot suppress it. Every close step runs even when earlier ones fail or are cancelled: failures are raised together as an `ExceptionGroup`, and a cancellation is re-raised after the last component is closed. If opening a component fails, the ones already open are closed in reverse. Once `SpiderOpened` has been dispatched, `SpiderClosed` always follows, even on cancellation.
+
+**Addons** bundle settings changes and registrations:
+
+- **Enabling**: an Addon is enabled explicitly with the `addons` setting, by entry point name (group `pernix.addons`), import path, class, or object. An installed Addon that is not listed is never loaded.
+- **Compatibility**: an Addon declares `api_version`, a version range such as `">=1,<2"`; this Pernix provides Addon API `1.0`.
+- **Settings**: `update_settings(settings)` contributes the Addon layer of the settings, below the project file. The `addons` setting is read first, ignoring keys that only the Addons' components declare.
+- **Setup**: the synchronous `setup(api)` may only register, for example `api.on(...)`, and only during the call; resources belong in an Extension's `open()`.
 
 ### 4.11 Settings
 
@@ -332,7 +363,7 @@ Rules:
 - Settings are declared as typed **Sections**: a key prefix plus fields with defaults and optional constraints. `settings.section(RetrySettings)` returns the validated values.
 - Components (Middleware, Pipelines, Extensions) are registered as `{component: order}`, lowest order first. A later layer adds or overrides entries, and `None` (`false` in TOML and JSON) disables one. A component can be given as a class, an object, or an import path.
 - A component registers its own Sections by annotating `__init__` parameters with them (which also injects them) or by listing them in `settings_sections`; their keys are validated together with the core keys. Sections of a disabled component stay registered, so its settings can remain in the project file.
-- Construction: an object is used as is; a class with `from_crawler(crawler)` is built through it; otherwise `__init__` parameters annotated with `Crawler`, `Settings`, or a registered Section are injected. There is no global service locator.
+- Construction: an object is used as is; a class with `from_crawler(crawler)` is built through it. Otherwise, `__init__` parameters annotated with exactly `Crawler`, `Settings`, `EventBus`, or a registered Section are injected, and other parameters keep their defaults. These types may be imported only under `TYPE_CHECKING`. There is no global service locator.
 - Secret settings use the `Secret` type and are automatically redacted in reprs, logs, and stats.
 
 ### 4.12 Running and the CLI

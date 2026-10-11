@@ -74,6 +74,10 @@ class Settings(Mapping[str, Any]):
         except KeyError:
             raise KeyError(f"{section_type.__qualname__} is not a registered settings section") from None
 
+    def sections(self) -> list[type[Section]]:
+        """Return every registered Section type."""
+        return list(self._sections)
+
     def components(self, key: str) -> list[object]:
         """Return the enabled components of a component map, in order.
 

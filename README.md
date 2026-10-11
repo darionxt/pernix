@@ -62,6 +62,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `concurrency` | `16` | Maximum number of Requests processed at once |
+| `extensions` | `{}` | Extensions to run, as `{extension: order}` |
+| `addons` | `()` | Addons to enable, by entry point name or import path |
+| `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 
 ## Documentation
 
@@ -74,17 +77,24 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 
 ```
 src/pernix/
-├── __init__.py          public API: Spider, Request, Response, Headers
+├── __init__.py          public API: Spider, Request, Response, Headers, Extension
 ├── spider.py            Spider base class and run()/crawl() entry points
 ├── request.py           Request
 ├── response.py          Response, selectors
 ├── headers.py           Headers
 ├── crawler.py           assembles the components of one Run, builds components
 ├── components.py        loads components from import paths and builds them
+├── component_lifecycle.py opens components in order, closes them in reverse
+├── extension.py         Extension base class
+├── addons.py            Addon loading, entry point discovery, setup API
 ├── errors.py            exception hierarchy
 ├── engine.py            worker loop: fetch, run Callbacks, dispatch outputs
 ├── memory_frontier.py   in-memory Frontier
 ├── feeds.py             Item output files
+├── events/
+│   ├── event.py         Event base class, Dispatch, Veto
+│   ├── event_bus.py     EventBus, events.on()
+│   └── lifecycle_events.py core Events of a Run
 ├── fetchers/
 │   ├── fetcher.py       Fetcher protocol
 │   └── http_fetcher.py  curl-cffi HTTP Fetcher

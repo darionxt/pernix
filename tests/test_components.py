@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pernix.components import build_component, load_object, resolve_component
+from pernix.components import build_component, init_type_hints, load_object, resolve_component
 from pernix.errors import ComponentError
 
 
@@ -102,5 +102,33 @@ def test_required_parameters_without_a_service_fail() -> None:
 
 
 def test_unresolvable_annotations_fail_clearly() -> None:
-    with pytest.raises(ComponentError, match="must be importable at runtime"):
+    with pytest.raises(ComponentError, match=r"its annotation .Undefined. cannot be resolved at runtime"):
         build_component(NeedsUnresolvable, crawler=CRAWLER, provide=_provide_service)
+
+
+class TypeOnly:
+    def __init__(self, service: Ghost, extra: Phantom = None) -> None:  # type: ignore[name-defined]  # noqa: F821
+        self.service = service
+        self.extra = extra
+
+
+def test_known_types_resolve_names_the_module_only_imports_for_type_checking() -> None:
+    component: Any = build_component(
+        TypeOnly, crawler=CRAWLER, provide=_provide_service, known_types={"Ghost": Service}
+    )
+
+    assert (component.service, component.extra) == (SERVICE, None)
+
+
+def test_init_type_hints_skips_unresolvable_annotations() -> None:
+    assert init_type_hints(TypeOnly) == {}
+    assert init_type_hints(TypeOnly, known_types={"Ghost": Service}) == {"service": Service}
+    assert init_type_hints(NeedsService) == {"service": Service, "label": str}
+
+
+class Other:
+    pass
+
+
+def test_names_defined_by_the_module_win_over_known_types() -> None:
+    assert init_type_hints(NeedsService, known_types={"Service": Other}) == {"service": Service, "label": str}
