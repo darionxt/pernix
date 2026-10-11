@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import msgspec
 import pytest
@@ -47,6 +47,31 @@ class OtherSettings(Section):
     __prefix__ = "other"
 
 
+class Hooks(Protocol):
+    def on_open(self) -> None: ...
+
+
+class NoHooks:
+    def on_open(self) -> None:
+        pass
+
+
+NO_HOOKS = NoHooks()
+
+
+class Configurable:
+    def __init__(self, crawler: Crawler, options: Any = None, hooks: Hooks = NO_HOOKS, fallback: object = None) -> None:
+        self.crawler = crawler
+        self.options = options
+        self.hooks = hooks
+        self.fallback = fallback
+
+
+class NeedsAnything:
+    def __init__(self, options: Any) -> None:
+        self.options = options
+
+
 class Idle(Spider):
     pass
 
@@ -75,6 +100,18 @@ def test_build_component_cannot_inject_unregistered_sections(tmp_path: Path) -> 
 
     with pytest.raises(ComponentError, match="required parameter 'other'"):
         crawler.build_component(NeedsUnregisteredSection)
+
+
+def test_only_exact_service_types_are_injected(tmp_path: Path) -> None:
+    crawler = _crawler(tmp_path)
+
+    component = crawler.build_component(Configurable)
+
+    assert isinstance(component, Configurable)
+    assert component.crawler is crawler
+    assert (component.options, component.hooks, component.fallback) == (None, NO_HOOKS, None)
+    with pytest.raises(ComponentError, match="required parameter 'options'"):
+        crawler.build_component(NeedsAnything)
 
 
 def test_crawlers_do_not_share_settings(tmp_path: Path) -> None:

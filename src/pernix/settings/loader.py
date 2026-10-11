@@ -157,6 +157,10 @@ class _Loader:
 
     def _merge(self) -> _Merged:
         merged = _Merged()
+        for key, known in self._fields.items():
+            if known.is_component_map and known.default:
+                origin = f"the default of {known.section.__qualname__}"
+                merged.values[key] = self._component_entries(key, known.default, origin, False, merged.problems)
         for source in self._sources:
             for key, value in _flatten(source.values, self._fields):
                 origin = source.describe(key)
@@ -244,7 +248,15 @@ class _Loader:
                     f"setting {key!r} is declared by both {existing.section.__qualname__} and {section.__qualname__}"
                 )
                 continue
-            self._fields[key] = _Field(section, info.name, info.type, getattr(defaults, info.name))
+            default = getattr(defaults, info.name)
+            if info.type is not ComponentMap:
+                try:
+                    default = _convert(default, info.type, lenient=False)
+                except msgspec.ValidationError as exc:
+                    self._schema_problems.append(
+                        f"settings section {section.__qualname__}: the default of {info.name!r} is invalid: {exc}"
+                    )
+            self._fields[key] = _Field(section, info.name, info.type, default)
         return True
 
     def _build_sections(self, values: Mapping[str, Any]) -> dict[type[Section], Section]:

@@ -79,9 +79,11 @@ class Crawler:
                 await engine.run()
 
     def _provide(self, service_type: type) -> object | None:
-        if service_type is not object and isinstance(self, service_type):
+        # Match annotations exactly: isinstance() would fail on Any and on Protocols
+        # that are not runtime-checkable, and would inject for loose types like object.
+        if service_type in (Crawler, type(self)):
             return self
-        if service_type is not object and isinstance(self.settings, service_type):
+        if service_type is Settings:
             return self.settings
         if issubclass(service_type, Section):
             try:

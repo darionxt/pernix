@@ -73,6 +73,11 @@ class Disk:
         self.settings = settings
 
 
+class BuiltinSettings(Section):
+    __prefix__ = "builtin"
+    plugins: ComponentMap = msgspec.field(default_factory=lambda: {f"{__name__}.Retry": 100, Alpha: 200})
+
+
 SECTIONS = (CoreSettings, DomainSettings, PluginSettings)
 
 
@@ -245,6 +250,35 @@ def test_invalid_component_entries_are_reported(tmp_path: Path) -> None:
     assert "has no attribute 'Missing'" in problems
 
 
+def test_component_map_defaults_are_kept_and_resolved(tmp_path: Path) -> None:
+    settings = load_settings(sections=(CoreSettings, BuiltinSettings), project_dir=tmp_path, environ={})
+
+    assert settings.components("builtin.plugins") == [Retry, Alpha]
+    assert settings.origin("builtin.plugins") == "built-in default"
+
+
+def test_layers_add_to_and_disable_component_map_defaults(tmp_path: Path) -> None:
+    settings = load_settings(
+        sections=(CoreSettings, BuiltinSettings),
+        project_dir=tmp_path,
+        environ={},
+        spider_settings={"builtin.plugins": {Gamma: 150, f"{__name__}.Alpha": None}},
+        overrides={"retry.times": 7},
+    )
+
+    assert settings.components("builtin.plugins") == [Retry, Gamma]
+    assert settings.section(RetrySettings).times == 7
+
+
+def test_invalid_component_map_defaults_are_reported(tmp_path: Path) -> None:
+    class BrokenDefaults(Section):
+        __prefix__ = "broken"
+        plugins: ComponentMap = msgspec.field(default_factory=lambda: {Alpha: "first"})  # pyright: ignore[reportAssignmentType]
+
+    with pytest.raises(SettingsError, match=r"the order of .*Alpha.* \(from the default of .*BrokenDefaults\)"):
+        load_settings(sections=(CoreSettings, BrokenDefaults), project_dir=tmp_path, environ={})
+
+
 # Sections registered by components
 
 
@@ -276,6 +310,20 @@ def test_disabled_components_still_register_their_sections(tmp_path: Path) -> No
 def test_keys_of_unregistered_sections_are_unknown(tmp_path: Path) -> None:
     with pytest.raises(SettingsError, match=r"unknown setting 'retry.times' from Spider.settings"):
         _load(tmp_path, spider_settings={"retry.times": 5})
+
+
+def test_section_defaults_are_validated(tmp_path: Path) -> None:
+    class Misdeclared(Section):
+        __prefix__ = "misdeclared"
+        workers: Annotated[int, msgspec.Meta(ge=1)] = 0
+        name: str = 5  # type: ignore[assignment]
+
+    with pytest.raises(SettingsError) as excinfo:
+        load_settings(sections=(CoreSettings, Misdeclared), project_dir=tmp_path, environ={})
+
+    problems = _problems(excinfo)
+    assert "Misdeclared: the default of 'workers' is invalid: Expected `int` >= 1" in problems
+    assert "Misdeclared: the default of 'name' is invalid: Expected `str`, got `int`" in problems
 
 
 def test_sections_need_defaults_and_unique_keys(tmp_path: Path) -> None:
