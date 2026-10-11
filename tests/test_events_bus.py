@@ -335,3 +335,40 @@ async def test_subscribe_methods_registers_marked_methods() -> None:
     await bus.emit(Shutdown())
 
     assert listener.calls == ["both Ping", "ping 7", "both Shutdown"]
+
+
+async def _cancelled_by_itself(event: Event) -> None:
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    future.cancel()
+    await future
+
+
+async def test_a_subscriber_raising_cancelled_error_by_itself_is_isolated(caplog: pytest.LogCaptureFixture) -> None:
+    bus = EventBus()
+    calls: list[str] = []
+    bus.on(Ping, _cancelled_by_itself)
+    bus.on(Ping, recorder(calls, "after"))
+
+    await bus.emit(Ping())
+
+    assert calls == ["after"]
+    assert any("_cancelled_by_itself failed handling Ping" in r.getMessage() for r in caplog.records)
+
+
+async def test_gates_treat_a_self_cancelled_subscriber_as_a_failure() -> None:
+    bus = EventBus()
+    bus.on(Admit, _cancelled_by_itself)
+    bus.on(StrictAdmit, _cancelled_by_itself)
+
+    assert await bus.gate(Admit()) is None
+    veto = await bus.gate(StrictAdmit())
+    assert veto is not None
+    assert "raised CancelledError" in veto.reason
+
+
+async def test_transforms_discard_a_self_cancelled_subscriber() -> None:
+    bus = EventBus()
+    bus.on(Rewrite, _cancelled_by_itself)
+    bus.on(Rewrite, lambda event: replace(event, text="kept"))
+
+    assert await bus.transform(Rewrite("x")) == Rewrite("kept")

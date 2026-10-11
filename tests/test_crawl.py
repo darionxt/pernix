@@ -321,3 +321,32 @@ async def test_the_engine_emits_request_response_and_item_events(server: Loopbac
         "failed unreachable ConnectionError",
         "received broken",
     ]
+
+
+async def test_a_self_cancelled_item_error_subscriber_does_not_hide_the_storage_failure(
+    server: LoopbackServer, tmp_path: Path
+) -> None:
+    server.route("/", "ok")
+    server.route("/next", "ok")
+
+    class CancelsItself:
+        @events.on(events.ItemError)
+        async def failed(self, event: events.ItemError) -> None:
+            future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            future.cancel()
+            await future
+
+    class Unserializable(Spider):
+        start_urls = (server.url("/"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield Request(server.url("/next"), callback=self.parse_next)
+            yield {"tags": {"a"}}
+
+        async def parse_next(self, response: Response) -> AsyncIterator[Any]:
+            yield {"ok": True}
+
+    settings = {"concurrency": 1, "extensions": {CancelsItself(): 1}}
+    with pytest.RaisesGroup(TypeError):
+        async with asyncio.timeout(10):
+            await Unserializable.crawl(output=tmp_path / "items.jsonl", settings=settings)

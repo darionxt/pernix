@@ -76,8 +76,9 @@ class EventBus:
     Every Event declares how it is dispatched (see `Dispatch`); call the method that
     matches: `emit()` for observe, `gate()` for gate, and `transform()` for transform
     Events. Subscribers may be sync or async; a returned awaitable is always awaited.
-    Each async subscriber runs under a timeout. `asyncio.CancelledError` always
-    propagates.
+    Each async subscriber runs under a timeout. Cancelling the dispatching task always
+    propagates; a `CancelledError` that a subscriber raises on its own, without the
+    task being cancelled, is handled like any other subscriber failure.
     """
 
     def __init__(self, *, timeout: float = 30.0) -> None:
@@ -215,17 +216,31 @@ class EventBus:
 
     async def _call(self, subscription: _Subscription, event: Event, *, isolate: bool = True) -> object:
         try:
-            result = subscription.subscriber(event)
-            if inspect.isawaitable(result):
-                timeout = self._timeout if subscription.timeout is None else subscription.timeout
-                async with asyncio.timeout(timeout):
-                    result = await result
+            try:
+                result = subscription.subscriber(event)
+                if inspect.isawaitable(result):
+                    timeout = self._timeout if subscription.timeout is None else subscription.timeout
+                    async with asyncio.timeout(timeout):
+                        result = await result
+            except asyncio.CancelledError as exc:
+                if _dispatch_is_cancelled():
+                    raise
+                # The subscriber raised CancelledError on its own, for example by awaiting an
+                # already-cancelled Future. Propagating it would silently end the calling task
+                # as if the Run were cancelled, so it counts as an ordinary subscriber failure.
+                raise RuntimeError(f"{_describe(subscription.subscriber)} raised CancelledError") from exc
         except Exception as exc:
             if not isolate:
                 raise
             _log_failure(subscription, event, exc)
             return None
         return result
+
+
+def _dispatch_is_cancelled() -> bool:
+    """Whether the task dispatching the Event has a pending cancellation request."""
+    task = asyncio.current_task()
+    return task is None or task.cancelling() > 0
 
 
 def _is_event_class(value: object) -> bool:
