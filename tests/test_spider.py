@@ -29,11 +29,24 @@ async def test_start_yields_a_get_per_start_url() -> None:
     ]
 
 
-async def test_default_parse_must_be_implemented() -> None:
+def test_default_parse_must_be_implemented() -> None:
     response = Response(
         url="https://example.com/", status=200, headers=Headers(), body=b"", request=Request("https://example.com/")
     )
-    outputs: AsyncIterator[Any] = Spider().parse(response)
 
     with pytest.raises(NotImplementedError, match=r"Spider\.parse\(\) is not implemented"):
-        await anext(outputs)
+        Spider().parse(response)
+
+
+def test_generator_and_coroutine_overrides_satisfy_the_parse_contract() -> None:
+    # Type-checked: both override styles must be accepted without suppressions.
+    class Generating(Spider):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"url": response.url}
+
+    class Returning(Spider):
+        async def parse(self, response: Response) -> list[dict[str, str]]:
+            return [{"url": response.url}]
+
+    assert Generating.parse is not Spider.parse
+    assert Returning.parse is not Spider.parse

@@ -180,7 +180,7 @@ async def test_coroutine_callbacks_may_return_a_list(server: LoopbackServer, tmp
     class Paragraphs(Spider):
         start_urls = (server.url("/"),)
 
-        async def parse(self, response: Response) -> list[dict[str, str | None]]:  # type: ignore[override]
+        async def parse(self, response: Response) -> list[dict[str, str | None]]:
             return [{"text": text} for text in response.css("p::text").getall()]
 
     output = tmp_path / "items.jsonl"
@@ -188,6 +188,48 @@ async def test_coroutine_callbacks_may_return_a_list(server: LoopbackServer, tmp
         await Paragraphs.crawl(output=output)
 
     assert _read_items(output) == [{"text": "a"}, {"text": "b"}]
+
+
+@pytest.mark.parametrize("concurrency", [0, -1])
+async def test_invalid_concurrency_fails_before_touching_the_output(tmp_path: Path, concurrency: int) -> None:
+    output = tmp_path / "items.jsonl"
+    output.write_text("previous run\n")
+
+    class Anything(Spider):
+        start_urls = ("http://127.0.0.1:9/",)
+
+    with pytest.raises(ValueError, match="concurrency must be at least 1"):
+        await Anything.crawl(output=output, concurrency=concurrency)
+
+    assert output.read_text() == "previous run\n"
+
+
+async def test_item_storage_failure_ends_the_run(server: LoopbackServer, tmp_path: Path) -> None:
+    server.route("/", "ok")
+
+    class Unserializable(Spider):
+        start_urls = (server.url("/"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"tags": {"a", "b"}}  # a set is not JSON-serializable
+
+    with pytest.RaisesGroup(TypeError):
+        async with asyncio.timeout(10):
+            await Unserializable.crawl(output=tmp_path / "items.jsonl")
+
+
+async def test_missing_parse_is_logged_and_run_continues(
+    server: LoopbackServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.route("/", "ok")
+
+    class Unfinished(Spider):
+        start_urls = (server.url("/"),)
+
+    async with asyncio.timeout(10):
+        await Unfinished.crawl()
+
+    assert any("Unfinished.parse() is not implemented" in (r.exc_text or "") for r in caplog.records)
 
 
 async def test_unsupported_outputs_are_logged(server: LoopbackServer, caplog: pytest.LogCaptureFixture) -> None:

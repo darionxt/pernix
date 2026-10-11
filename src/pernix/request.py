@@ -11,9 +11,12 @@ from pernix.headers import Headers, HeadersInput
 if TYPE_CHECKING:
     from pernix.response import Response
 
-__all__ = ["Callback", "Request"]
+__all__ = ["Callback", "CallbackResult", "Request"]
 
-type Callback = Callable[[Response], AsyncIterator[Any] | Awaitable[Any]]
+type CallbackResult = AsyncIterator[Any] | Awaitable[Any]
+"""What a Callback returns: an async generator of outputs, or an awaitable of one output or a list."""
+
+type Callback = Callable[[Response], CallbackResult]
 """A Spider method that receives a Response and produces Requests and Items."""
 
 

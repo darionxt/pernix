@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     import os
     from collections.abc import AsyncIterator, Sequence
 
+    from pernix.request import CallbackResult
     from pernix.response import Response
 
 __all__ = ["Spider"]
@@ -50,20 +51,22 @@ class Spider:
         for url in self.start_urls:
             yield Request(url)
 
-    async def parse(self, response: Response) -> AsyncIterator[Any]:
+    def parse(self, response: Response) -> CallbackResult:
         """Handle a Response whose Request names no Callback.
+
+        Override it as an async generator that yields Requests and Items, or as a
+        coroutine that returns one output or a list of them.
 
         Args:
             response: The Response to parse.
 
-        Yields:
-            Requests to follow and Items to store.
+        Returns:
+            The outputs, as an async iterator or an awaitable.
 
         Raises:
             NotImplementedError: The subclass did not implement it.
         """
         raise NotImplementedError(f"{type(self).__name__}.parse() is not implemented")
-        yield  # pragma: no cover - makes this an async generator
 
     @classmethod
     async def crawl(cls, *, output: str | os.PathLike[str] | None = None, concurrency: int = 16) -> None:

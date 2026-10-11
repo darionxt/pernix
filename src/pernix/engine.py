@@ -12,6 +12,7 @@ from pernix.request import Request
 if TYPE_CHECKING:
     from pernix.fetchers import Fetcher
     from pernix.memory_frontier import MemoryFrontier
+    from pernix.response import Response
     from pernix.spider import Spider
 
 __all__ = ["Engine", "ItemSink"]
@@ -27,7 +28,7 @@ class Engine:
 
     The Run ends once `start()` is exhausted, the Frontier is empty, and nothing is in
     flight. Exceptions raised while fetching or inside a Callback are logged and do not
-    stop the Run.
+    stop the Run; an exception raised while storing an Item ends it.
     """
 
     def __init__(
@@ -61,7 +62,11 @@ class Engine:
         self._concurrency = concurrency
 
     async def run(self) -> None:
-        """Run until every Request has been fetched and its Callback has finished."""
+        """Run until every Request has been fetched and its Callback has finished.
+
+        Raises:
+            ExceptionGroup: Storing an Item failed; it holds the original exception.
+        """
         async with asyncio.TaskGroup() as tasks:
             for _ in range(self._concurrency):
                 tasks.create_task(self._work())
@@ -96,12 +101,18 @@ class Engine:
             return
 
         callback = request.callback or self._spider.parse
-        try:
-            async with aclosing(_outputs(callback(response))) as outputs:
-                async for output in outputs:
-                    self._handle_output(output, request)
-        except Exception:
-            logger.exception("Callback %s failed for %r", _name(callback), response)
+        async with aclosing(_outputs(callback, response)) as outputs:
+            while True:
+                # Only advancing the Callback is isolated: a failure to store its
+                # output is not the Callback's fault and must not be swallowed.
+                try:
+                    output = await anext(outputs)
+                except StopAsyncIteration:
+                    return
+                except Exception:
+                    logger.exception("Callback %s failed for %r", _name(callback), response)
+                    return
+                self._handle_output(output, request)
 
     def _handle_output(self, output: object, source: Request) -> None:
         match output:
@@ -126,8 +137,13 @@ async def _iterate[T](items: AsyncIterator[T]) -> AsyncGenerator[T]:
             yield item
 
 
-async def _outputs(result: object) -> AsyncGenerator[object]:
-    """Normalize a Callback's result: an async iterator, or an awaitable of a value or list."""
+async def _outputs(callback: Callable[[Response], object], response: Response) -> AsyncGenerator[object]:
+    """Call a Callback and yield its outputs, from an async iterator or an awaitable of a value or list.
+
+    The Callback is called on the first iteration, so an exception raised by the call
+    itself surfaces from `anext()` like any other Callback exception.
+    """
+    result = callback(response)
     if isinstance(result, AsyncIterator):
         async with aclosing(_iterate(cast("AsyncIterator[object]", result))) as outputs:
             async for output in outputs:

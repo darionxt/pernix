@@ -33,7 +33,12 @@ class Crawler:
             spider: The Spider to run.
             output: A JSON-lines file for the Items; `None` discards them.
             concurrency: The maximum number of Requests processed at once.
+
+        Raises:
+            ValueError: `concurrency` is less than 1.
         """
+        if concurrency < 1:
+            raise ValueError(f"concurrency must be at least 1, got {concurrency}")
         self.spider = spider
         self._output = output
         self._concurrency = concurrency
