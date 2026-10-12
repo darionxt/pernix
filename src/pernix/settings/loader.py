@@ -151,7 +151,8 @@ class _Loader:
         for key, known in self._fields.items():
             if known.is_component_map:
                 values[key] = MappingProxyType(dict(values[key]))
-        return Settings(values, origins=merged.origins, sections=self._build_sections(values))
+        sections = self._build_sections(values, merged.origins)
+        return Settings(values, origins=merged.origins, sections=sections)
 
     def _merge_until_schema_is_complete(self) -> _Merged:
         # Components named in component maps can register Sections that declare more
@@ -233,14 +234,16 @@ class _Loader:
         if section in self._sections:
             return False
         self._sections.append(section)
-        try:
-            defaults = section()
-        except TypeError as exc:
+        # Read the defaults field by field: building the Section would run its
+        # __post_init__ checks, which apply to the final values only.
+        fields = structs.fields(section)
+        missing = [info.name for info in fields if info.required]
+        if missing:
             self._schema_problems.append(
-                f"settings section {section.__qualname__} must give every setting a default: {exc}"
+                f"settings section {section.__qualname__} must give every setting a default; missing for {missing}"
             )
             return True
-        for info in structs.fields(section):
+        for info in fields:
             key = section.key(info.name)
             existing = self._fields.get(key)
             if existing is not None:
@@ -248,7 +251,7 @@ class _Loader:
                     f"setting {key!r} is declared by both {existing.section.__qualname__} and {section.__qualname__}"
                 )
                 continue
-            default = getattr(defaults, info.name)
+            default = info.default if info.default_factory is msgspec.NODEFAULT else info.default_factory()
             if info.type is not ComponentMap:
                 try:
                     default = _convert(default, info.type, lenient=False)
@@ -259,11 +262,19 @@ class _Loader:
             self._fields[key] = _Field(section, info.name, info.type, default)
         return True
 
-    def _build_sections(self, values: Mapping[str, Any]) -> dict[type[Section], Section]:
+    def _build_sections(self, values: Mapping[str, Any], origins: Mapping[str, str]) -> dict[type[Section], Section]:
+        """Build every Section, reporting the problems their `__post_init__` checks find all at once."""
         built: dict[type[Section], Section] = {}
+        problems: list[str] = []
         for section in self._sections:
-            fields = {info.name: values[section.key(info.name)] for info in structs.fields(section)}
-            built[section] = section(**fields)
+            keys = {info.name: section.key(info.name) for info in structs.fields(section)}
+            try:
+                built[section] = section(**{name: values[key] for name, key in keys.items()})
+            except (TypeError, ValueError) as exc:
+                sources = sorted({origins[key] for key in keys.values() if key in origins})
+                problems.append(f"{exc} (from {', '.join(sources)})" if sources else str(exc))
+        if problems:
+            raise SettingsError(problems)
         return built
 
 

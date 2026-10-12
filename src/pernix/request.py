@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -11,8 +13,9 @@ from urllib.parse import urlencode
 import orjson
 
 from pernix.headers import Headers, HeadersInput
+from pernix.urls import clean_url, is_absolute
 
-__all__ = ["Callback", "CallbackResult", "FormData", "Request"]
+__all__ = ["Callback", "CallbackResult", "FormData", "Request", "resolve_relative_urls"]
 
 type CallbackResult = AsyncIterator[Any] | Awaitable[Any]
 """What a Callback returns: an async generator of outputs, or an awaitable of one output or a list."""
@@ -26,6 +29,28 @@ type FormData = Mapping[str, str | Sequence[str]] | Sequence[tuple[str, str]]
 _JSON_CONTENT_TYPE = "application/json"
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 
+_url_resolver: ContextVar[Callable[[str], str] | None] = ContextVar("pernix_url_resolver", default=None)
+
+
+@contextmanager
+def resolve_relative_urls(urljoin: Callable[[str], str]) -> Generator[None]:
+    """Resolve relative URLs of the Requests constructed inside the block with `urljoin`.
+
+    The Engine wraps each step of a Callback in this, passing the `urljoin` of the
+    Response being handled.
+
+    Args:
+        urljoin: Turns a relative URL into an absolute one.
+
+    Yields:
+        Nothing; the block runs with the resolver in effect.
+    """
+    token = _url_resolver.set(urljoin)
+    try:
+        yield
+    finally:
+        _url_resolver.reset(token)
+
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
 class Request:
@@ -34,6 +59,11 @@ class Request:
     Requests are independent by default: a Request sends only the cookies it carries,
     and no cookies persist from one Request to another (see ADR 0011). Derive
     modified copies with `replace()`.
+
+    A relative URL is resolved when the Request is constructed, against the Response
+    whose Callback is running (its final URL, or its `<base href>`), so `url` is
+    always absolute. Outside a Callback, such as in `start()`, a relative URL is an
+    error.
 
     Attributes:
         url: The absolute URL to fetch.
@@ -105,7 +135,9 @@ class Request:
         """Create a Request.
 
         Args:
-            url: The absolute URL to fetch.
+            url: The URL to fetch. Inside a Callback it may be relative to the
+                Response being handled. Surrounding whitespace, tabs, and newlines are
+                removed, as browsers do.
             method: The HTTP method; any case is accepted.
             headers: Request headers as a mapping or as `(name, value)` pairs.
             body: The raw request body; a `str` is encoded as UTF-8.
@@ -131,10 +163,12 @@ class Request:
             ext: Component-private data, by component name.
 
         Raises:
-            ValueError: More than one of `body`, `json`, and `data` is given; `cookies`
-                is combined with a `Cookie` header; or `timeout` is not positive.
+            ValueError: `url` is relative outside a Callback; more than one of `body`,
+                `json`, and `data` is given; `cookies` is combined with a `Cookie`
+                header; or `timeout` is not positive.
             TypeError: `callback` or `errback` is not a method of an object.
         """
+        url = _absolute(url)
         if sum(value is not None for value in (body, json, data)) > 1:
             raise ValueError("body, json, and data are mutually exclusive")
         request_headers = Headers(headers)
@@ -197,6 +231,19 @@ class Request:
 
     def __repr__(self) -> str:
         return f"<Request {self.method} {self.url}>"
+
+
+def _absolute(url: str) -> str:
+    url = clean_url(url)
+    if is_absolute(url):
+        return url
+    resolve = _url_resolver.get()
+    if resolve is None:
+        raise ValueError(
+            f"{url!r} is a relative URL; Requests constructed outside a Callback, such as in start(), "
+            "need an absolute URL"
+        )
+    return resolve(url)
 
 
 def _frozen[V](values: Mapping[str, V] | None) -> Mapping[str, V]:

@@ -32,7 +32,9 @@ class Section(msgspec.Struct, metaclass=_SectionMeta):
     prefix. Constraints use `typing.Annotated` with `msgspec.Meta`. Sections are
     frozen and keyword-only; prefer immutable container types (`tuple`, `frozenset`)
     so values cannot be changed through the Section either, and use
-    `msgspec.field(default_factory=...)` for mutable defaults.
+    `msgspec.field(default_factory=...)` for mutable defaults. Checks that
+    constraints cannot express go in `__post_init__`, which raises `ValueError`
+    with a message naming the key; it is reported with the other settings problems.
 
     Example:
         >>> class RetrySettings(Section):

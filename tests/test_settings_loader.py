@@ -7,7 +7,7 @@ import msgspec
 import pytest
 
 from pernix.errors import SettingsError
-from pernix.settings import ComponentMap, CoreSettings, Secret, Section, load_settings
+from pernix.settings import ComponentMap, CoreSettings, ResponseSettings, Secret, Section, load_settings
 
 if TYPE_CHECKING:
     from pernix.settings import Settings
@@ -380,6 +380,60 @@ def test_section_defaults_are_validated(tmp_path: Path) -> None:
     problems = _problems(excinfo)
     assert "Misdeclared: the default of 'workers' is invalid: Expected `int` >= 1" in problems
     assert "Misdeclared: the default of 'name' is invalid: Expected `str`, got `int`" in problems
+
+
+class WindowSettings(Section):
+    __prefix__ = "window"
+    low: int = 0
+    high: int = 10
+
+    def __post_init__(self) -> None:
+        if self.low > self.high:
+            raise ValueError(f"window.low must not exceed window.high, got {self.low} > {self.high}")
+
+
+def test_section_checks_are_reported_together_with_their_origins(tmp_path: Path) -> None:
+    (tmp_path / "pernix.toml").write_text("[window]\nlow = 20\n")
+
+    with pytest.raises(SettingsError) as excinfo:
+        load_settings(
+            sections=(WindowSettings, ResponseSettings),
+            project_dir=tmp_path,
+            environ={"PERNIX_RESPONSE__DEFAULT_ENCODING": "klingon"},
+        )
+
+    window, encoding = excinfo.value.problems
+    assert window.startswith("window.low must not exceed window.high, got 20 > 10 (from pernix.toml (")
+    assert encoding == (
+        "response.default_encoding: unknown encoding 'klingon' (from environment variable "
+        "PERNIX_RESPONSE__DEFAULT_ENCODING)"
+    )
+
+
+def test_section_checks_of_defaults_name_no_origin(tmp_path: Path) -> None:
+    class Inverted(Section):
+        __prefix__ = "inverted"
+        low: int = 2
+        high: int = 1
+
+        def __post_init__(self) -> None:
+            raise ValueError("inverted.low must not exceed inverted.high")
+
+    with pytest.raises(SettingsError) as excinfo:
+        load_settings(sections=(Inverted,), project_dir=tmp_path, environ={})
+
+    assert excinfo.value.problems == ["inverted.low must not exceed inverted.high"]
+
+
+def test_encoding_labels_and_codec_names_are_valid_default_encodings(tmp_path: Path) -> None:
+    for label in ("GBK", "cp936", "latin1"):
+        settings = load_settings(
+            sections=(ResponseSettings,),
+            project_dir=tmp_path,
+            environ={},
+            overrides={"response.default_encoding": label},
+        )
+        assert settings.section(ResponseSettings).default_encoding == label
 
 
 def test_sections_need_defaults_and_unique_keys(tmp_path: Path) -> None:

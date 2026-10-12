@@ -7,6 +7,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
+    "charset-normalizer>=3.4",
     "curl-cffi>=0.16.3",
     "msgspec>=0.21",
     "orjson>=3.12",
