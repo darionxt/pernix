@@ -4,13 +4,20 @@ from typing import Any, ClassVar, dataclass_transform
 
 import msgspec
 
-__all__ = ["ComponentMap", "Section"]
+__all__ = ["ComponentMap", "NamedComponents", "Section"]
 
 type ComponentMap = dict[Any, int | None]
 """A registry of components and their order; `None` (or `false` in TOML) disables one.
 
 A component is a class, an object, or an import path such as `"myproject.middlewares.Sign"`.
 Lower orders come first.
+"""
+
+type NamedComponents = dict[str, Any]
+"""A registry of components by name; `None` (or `false` in TOML) disables one.
+
+A component is a class, an object, or an import path. A later settings layer
+replaces the component of a name, so `{"http": MyFetcher}` swaps out a built-in one.
 """
 
 

@@ -15,7 +15,7 @@ from pernix.components import init_type_hints, resolve_component
 from pernix.errors import ComponentError, SettingsError
 from pernix.settings.core_settings import CORE_SECTIONS
 from pernix.settings.secret import Secret
-from pernix.settings.section import ComponentMap, Section
+from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.settings.settings import Settings
 from pernix.settings.sources import find_project_file, read_environment
 from pernix.settings.suggestions import did_you_mean
@@ -109,6 +109,15 @@ class _Field:
     def is_component_map(self) -> bool:
         return self.type is ComponentMap
 
+    @property
+    def is_named_components(self) -> bool:
+        return self.type is NamedComponents
+
+    @property
+    def is_registry(self) -> bool:
+        """Whether layers merge the value entry by entry instead of replacing it."""
+        return self.is_component_map or self.is_named_components
+
 
 @dataclass(slots=True)
 class _Merged:
@@ -139,7 +148,7 @@ class _Loader:
                 if not self._ignore_unknown:
                     origin = merged.origins[key]
                     problems.append(f"unknown setting {key!r} from {origin}{did_you_mean(key, self._fields)}")
-            elif known.is_component_map:
+            elif known.is_registry:
                 values[key] = raw
             else:
                 try:
@@ -149,7 +158,7 @@ class _Loader:
         if problems:
             raise SettingsError(problems)
         for key, known in self._fields.items():
-            if known.is_component_map:
+            if known.is_registry:
                 values[key] = MappingProxyType(dict(values[key]))
         sections = self._build_sections(values, merged.origins)
         return Settings(values, origins=merged.origins, sections=sections)
@@ -165,15 +174,15 @@ class _Loader:
     def _merge(self) -> _Merged:
         merged = _Merged()
         for key, known in self._fields.items():
-            if known.is_component_map and known.default:
+            if known.is_registry and known.default:
                 origin = f"the default of {known.section.__qualname__}"
-                merged.values[key] = self._component_entries(key, known.default, origin, False, merged.problems)
+                merged.values[key] = self._registry_entries(known, known.default, origin, False, merged.problems)
         for source in self._sources:
             for key, value in _flatten(source.values, self._fields):
                 origin = source.describe(key)
                 known = self._fields.get(key)
-                if known is not None and known.is_component_map:
-                    entries = self._component_entries(key, value, origin, source.lenient, merged.problems)
+                if known is not None and known.is_registry:
+                    entries = self._registry_entries(known, value, origin, source.lenient, merged.problems)
                     merged.values.setdefault(key, {}).update(entries)
                 else:
                     merged.values[key] = value
@@ -181,20 +190,47 @@ class _Loader:
                 merged.origins[key] = origin
         return merged
 
-    def _component_entries(
-        self, key: str, value: object, origin: str, lenient: bool, problems: list[str]
-    ) -> dict[object, int | None]:
+    def _registry_entries(
+        self, known: _Field, value: object, origin: str, lenient: bool, problems: list[str]
+    ) -> dict[Any, Any]:
+        key = known.section.key(known.name)
         if lenient and isinstance(value, str):
             try:
                 value = orjson.loads(value)
             except orjson.JSONDecodeError as exc:
                 problems.append(f"{key}: expected a JSON object, {exc} (from {origin})")
                 return {}
+        shape = "name to component" if known.is_named_components else "component to order"
         if not isinstance(value, Mapping):
-            problems.append(f"{key}: expected a mapping of component to order, got {value!r} (from {origin})")
+            problems.append(f"{key}: expected a mapping of {shape}, got {value!r} (from {origin})")
             return {}
+        entries = cast("Mapping[object, object]", value)
+        if known.is_named_components:
+            return self._named_entries(key, entries, origin, problems)
+        return self._ordered_entries(key, entries, origin, problems)
+
+    def _named_entries(
+        self, key: str, value: Mapping[object, object], origin: str, problems: list[str]
+    ) -> dict[str, object | None]:
+        entries: dict[str, object | None] = {}
+        for name, spec in value.items():
+            if not isinstance(name, str) or not name:
+                problems.append(f"{key}: names must be non-empty strings, got {name!r} (from {origin})")
+                continue
+            if spec is None or spec is False:
+                entries[name] = None
+                continue
+            try:
+                entries[name] = self._resolve(spec)
+            except ComponentError as exc:
+                problems.append(f"{key}: {exc} (from {origin})")
+        return entries
+
+    def _ordered_entries(
+        self, key: str, value: Mapping[object, object], origin: str, problems: list[str]
+    ) -> dict[object, int | None]:
         entries: dict[object, int | None] = {}
-        for spec, order in cast("Mapping[object, object]", value).items():
+        for spec, order in value.items():
             if order is False:
                 order = None
             if order is not None and (isinstance(order, bool) or not isinstance(order, int)):
@@ -220,9 +256,12 @@ class _Loader:
 
     def _discover_sections(self, merged: _Merged) -> bool:
         discovered = False
-        component_maps = [key for key, known in self._fields.items() if known.is_component_map]
-        for key in component_maps:
-            for component in merged.values.get(key, {}):
+        for key, known in list(self._fields.items()):
+            if not known.is_registry:
+                continue
+            registry: Mapping[object, object] = merged.values.get(key, {})
+            components = registry.values() if known.is_named_components else registry.keys()
+            for component in [component for component in components if component is not None]:
                 for section in _sections_of(component, {s.__name__: s for s in self._sections}):
                     discovered |= self._add_section(section)
         return discovered
@@ -252,7 +291,7 @@ class _Loader:
                 )
                 continue
             default = info.default if info.default_factory is msgspec.NODEFAULT else info.default_factory()
-            if info.type is not ComponentMap:
+            if info.type not in (ComponentMap, NamedComponents):
                 try:
                     default = _convert(default, info.type, lenient=False)
                 except msgspec.ValidationError as exc:

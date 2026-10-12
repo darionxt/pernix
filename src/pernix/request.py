@@ -243,7 +243,10 @@ def _absolute(url: str) -> str:
             f"{url!r} is a relative URL; Requests constructed outside a Callback, such as in start(), "
             "need an absolute URL"
         )
-    return resolve(url)
+    resolved = resolve(url)
+    if not is_absolute(resolved):  # the Response URL has a scheme relative URLs cannot be resolved against
+        raise ValueError(f"the relative URL {url!r} cannot be resolved against the Response being handled")
+    return resolved
 
 
 def _frozen[V](values: Mapping[str, V] | None) -> Mapping[str, V]:

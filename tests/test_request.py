@@ -150,3 +150,8 @@ def test_relative_urls_resolve_while_a_resolver_is_in_effect() -> None:
 
 def test_urls_are_cleaned_as_browsers_do() -> None:
     assert Request("  https://example.com/a\n/b\t?q=1 ").url == "https://example.com/a/b?q=1"
+
+
+def test_relative_urls_that_cannot_be_resolved_are_rejected() -> None:
+    with resolve_relative_urls(lambda url: url), pytest.raises(ValueError, match="cannot be resolved"):
+        Request("page-2.html")

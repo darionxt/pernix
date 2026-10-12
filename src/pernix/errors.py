@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-__all__ = ["AddonError", "ComponentError", "PernixError", "SerializationError", "SettingsError"]
+__all__ = [
+    "AddonError",
+    "ComponentError",
+    "DropItem",
+    "IgnoreRequest",
+    "PernixError",
+    "Retry",
+    "SerializationError",
+    "SettingsError",
+]
 
 
 class PernixError(Exception):
@@ -34,3 +43,45 @@ class AddonError(PernixError):
 
 class SerializationError(PernixError):
     """A Request cannot be persisted, or a persisted Request cannot be restored."""
+
+
+class _ControlFlow(Exception):
+    """Base of the exceptions that steer processing instead of reporting a failure.
+
+    They are not `PernixError`s, so handlers of Pernix errors never catch them.
+
+    Attributes:
+        reason: Why, for logs and Events.
+    """
+
+    def __init__(self, reason: str = "") -> None:
+        """Create the exception.
+
+        Args:
+            reason: Why, for logs and Events.
+        """
+        super().__init__(reason)
+        self.reason = reason
+
+
+class IgnoreRequest(_ControlFlow):
+    """Drop the Request being downloaded, from download Middleware or a Fetcher.
+
+    The Request does not count as failed and its Callback does not run;
+    `RequestIgnored` is emitted with the reason.
+    """
+
+
+class Retry(_ControlFlow):
+    """Ask for another attempt at the current Request.
+
+    Retries are not implemented yet; until they are, this fails the Request like any
+    other exception.
+    """
+
+
+class DropItem(_ControlFlow):
+    """Discard the Item being processed, from a Pipeline.
+
+    Pipelines are not implemented yet; until they are, this is an ordinary exception.
+    """

@@ -7,18 +7,22 @@ from typing import TYPE_CHECKING, Any
 from pernix.addons import addon_settings, load_addons, setup_addon
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
-from pernix.engine import Engine
+from pernix.engine import Engine, run_callbacks
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.feeds import JsonLinesFeed
-from pernix.fetchers import HTTPFetcher
+from pernix.fetchers import FetcherDispatch
 from pernix.memory_frontier import MemoryFrontier
-from pernix.settings import CoreSettings, EventSettings, ResponseSettings, Section, Settings, load_settings
+from pernix.middleware import build_download_chain
+from pernix.settings import CoreSettings, EventSettings, Section, Settings, load_settings
+from pernix.spider_middleware import build_spider_chain
 
 if TYPE_CHECKING:
     import os
     from collections.abc import Mapping, Sequence
 
+    from pernix.middleware import Download
     from pernix.spider import Spider
+    from pernix.spider_middleware import HandleResponse
 
 __all__ = ["Crawler"]
 
@@ -113,49 +117,66 @@ class Crawler:
     async def crawl(self) -> None:
         """Run the Spider to completion.
 
-        Addons register their subscribers, Extensions are built and opened in order,
-        `SpiderOpened` is emitted, the Engine runs, `SpiderClosed` is emitted, and the
-        Extensions are closed in reverse order.
+        Addons register their subscribers. Then every component is built: Extensions,
+        Fetchers, download Middleware, and spider Middleware, and the chains are
+        checked, before anything is opened. The components are subscribed and opened
+        in that order, `SpiderOpened` is emitted, the Engine runs, `SpiderClosed` is
+        emitted, and the components are closed in reverse order.
 
         Raises:
             RuntimeError: This Crawler already ran.
+            pernix.errors.ComponentError: A component cannot be built, or does not fit
+                its role.
+            pernix.errors.SettingsError: Two Fetchers claim the same URL scheme.
         """
         if self._started:
             raise RuntimeError("a Crawler runs only once; create a new one for another Run")
         self._started = True
         for addon in self._addons:
             setup_addon(addon, events=self.events, settings=self.settings)
+        extensions = self._build_all("extensions")
+        fetchers = self._build_named("fetchers")
+        middlewares = self._build_all("middlewares")
+        spider_middlewares = self._build_all("spider_middlewares")
+        download = build_download_chain(middlewares, FetcherDispatch(fetchers))
+        handle = build_spider_chain(spider_middlewares, run_callbacks(self.spider))
         async with ComponentLifecycle() as lifecycle:
-            for spec in self.settings.components("extensions"):
-                extension = self.build_component(spec)
-                self.events.subscribe_methods(extension)
-                await lifecycle.open(extension)
-            await self._run()
+            for component in (*extensions, *fetchers.values(), *middlewares, *spider_middlewares):
+                self.events.subscribe_methods(component)
+                await lifecycle.open(component)
+            await self._run(download, handle)
 
-    async def _run(self) -> None:
+    def _build_all(self, key: str) -> list[object]:
+        """Build the enabled components of a `{component: order}` setting, in order."""
+        return [self.build_component(spec) for spec in self.settings.components(key)]
+
+    def _build_named(self, key: str) -> dict[str, object]:
+        """Build the enabled components of a `{name: component}` setting."""
+        return {name: self.build_component(spec) for name, spec in self.settings.named_components(key).items()}
+
+    async def _run(self, download: Download, handle: HandleResponse) -> None:
         concurrency = self.settings.section(CoreSettings).concurrency
         with ExitStack() as stack:
             item_sink = _discard if self._output is None else stack.enter_context(JsonLinesFeed(self._output)).write
-            default_encoding = self.settings.section(ResponseSettings).default_encoding
-            async with HTTPFetcher(max_clients=concurrency, default_encoding=default_encoding) as fetcher:
-                engine = Engine(
-                    self.spider,
-                    frontier=MemoryFrontier(),
-                    fetcher=fetcher,
-                    item_sink=item_sink,
-                    events=self.events,
-                    concurrency=concurrency,
-                )
-                reason = "failed"
-                try:
-                    await self.events.emit(SpiderOpened(self.spider))
-                    await engine.run()
-                    reason = "finished"
-                except asyncio.CancelledError:
-                    reason = "cancelled"
-                    raise
-                finally:
-                    await self.events.emit(SpiderClosed(self.spider, reason))
+            engine = Engine(
+                self.spider,
+                frontier=MemoryFrontier(),
+                download=download,
+                handle=handle,
+                item_sink=item_sink,
+                events=self.events,
+                concurrency=concurrency,
+            )
+            reason = "failed"
+            try:
+                await self.events.emit(SpiderOpened(self.spider))
+                await engine.run()
+                reason = "finished"
+            except asyncio.CancelledError:
+                reason = "cancelled"
+                raise
+            finally:
+                await self.events.emit(SpiderClosed(self.spider, reason))
 
     def _service_types(self) -> dict[str, type]:
         sections = {section.__name__: section for section in self.settings.sections()}

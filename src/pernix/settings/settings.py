@@ -99,6 +99,26 @@ class Settings(Mapping[str, Any]):
         enabled = [(order, component) for component, order in entries if order is not None]
         return [component for _, component in sorted(enabled, key=lambda entry: entry[0])]
 
+    def named_components(self, key: str) -> dict[str, object]:
+        """Return the enabled components of a `NamedComponents` registry, by name.
+
+        Args:
+            key: The key of a `NamedComponents` setting.
+
+        Returns:
+            The resolved components that are not disabled, in registration order.
+            They are not constructed.
+
+        Raises:
+            KeyError: The key is unknown.
+            TypeError: The setting is not a registry.
+        """
+        registry = self[key]
+        if not isinstance(registry, Mapping):
+            raise TypeError(f"setting {key!r} is not a registry of named components")
+        entries = cast("Mapping[str, object | None]", registry).items()
+        return {name: component for name, component in entries if component is not None}
+
     def origin(self, key: str) -> str:
         """Describe where the value of a setting came from.
 

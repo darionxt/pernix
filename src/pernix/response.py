@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.text_decoding import DecodedText, EncodingSource
 
-__all__ = ["Redirect", "Response"]
+__all__ = ["Redirect", "Response", "expect_response"]
 
 _UNSET: Any = object()
 
@@ -359,3 +359,21 @@ class Response:
             "fetcher": self.fetcher,
             "session": self.session,
         }
+
+
+def expect_response(value: object, source: str) -> Response:
+    """Check that a component returned a Response, as components may break their contract.
+
+    Args:
+        value: What the component returned.
+        source: Names the component in the error, such as `"Fetcher 'http'"`.
+
+    Returns:
+        `value`, as a Response.
+
+    Raises:
+        TypeError: `value` is not a Response.
+    """
+    if not isinstance(value, Response):
+        raise TypeError(f"{source} returned {value!r}, which is not a Response")
+    return value

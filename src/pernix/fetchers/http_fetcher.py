@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from curl_cffi import CurlHttpVersion
 from curl_cffi.requests import AsyncSession
@@ -8,11 +8,13 @@ from curl_cffi.requests import AsyncSession
 from pernix.cookies import merge_set_cookies, parse_cookie_header
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
+from pernix.settings import CoreSettings, ResponseSettings
 
 if TYPE_CHECKING:
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
 
+    from pernix.crawler import Crawler
     from pernix.request import Request
 
 __all__ = ["HTTPFetcher"]
@@ -35,7 +37,12 @@ class HTTPFetcher:
     Requests are independent (ADR 0011): each transfer sends only `request.cookies`,
     cookies set during it flow within its own redirect chain, and none are kept for
     later Requests. Connections are still reused.
+
+    Attributes:
+        schemes: The URL schemes it fetches by default: `http` and `https`.
     """
+
+    schemes: ClassVar[frozenset[str]] = frozenset({"http", "https"})
 
     def __init__(self, *, max_clients: int = 16, default_encoding: str = "utf-8") -> None:
         """Configure the fetcher.
@@ -47,6 +54,22 @@ class HTTPFetcher:
         self._max_clients = max_clients
         self._default_encoding = default_encoding
         self._session: AsyncSession | None = None
+
+    @classmethod
+    def from_crawler(cls, crawler: Crawler) -> Self:
+        """Build the fetcher for a Run from its settings.
+
+        Args:
+            crawler: The Crawler of the Run.
+
+        Returns:
+            A fetcher allowing `concurrency` requests in flight, whose Responses use
+            `response.default_encoding`.
+        """
+        return cls(
+            max_clients=crawler.settings.section(CoreSettings).concurrency,
+            default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
+        )
 
     async def __aenter__(self) -> Self:
         self._session = AsyncSession(max_clients=self._max_clients, trust_env=False)
@@ -68,13 +91,10 @@ class HTTPFetcher:
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
-            ValueError: The Request needs rendering or another Fetcher.
             curl_cffi.requests.exceptions.RequestException: The transfer failed.
         """
         if self._session is None:
             raise RuntimeError("HTTPFetcher must be entered with 'async with' before fetching")
-        if request.render or request.fetcher not in (None, "http"):
-            raise ValueError(f"{request!r} needs a Fetcher other than HTTP, which is not available yet")
         options: dict[str, Any] = {}
         if request.timeout is not None:
             options["timeout"] = request.timeout

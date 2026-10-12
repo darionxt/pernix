@@ -65,6 +65,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `concurrency` | `16` | Maximum number of Requests processed at once |
 | `extensions` | `{}` | Extensions to run, as `{extension: order}` |
 | `addons` | `()` | Addons to enable, by entry point name or import path |
+| `middlewares` | `{}` | Download Middleware, as `{middleware: order}`; lower orders are further out |
+| `spider_middlewares` | `{}` | Spider Middleware, as `{middleware: order}`; lower orders are further out |
+| `fetchers` | `{"http": HTTPFetcher}` | Fetchers by name; `Request(fetcher=name)` selects one |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
 
@@ -79,7 +82,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 
 ```
 src/pernix/
-├── __init__.py          public API: Spider, Request, Response, Headers, Extension
+├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
 ├── spider.py            Spider base class and run()/crawl() entry points
 ├── request.py           Request
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
@@ -93,8 +96,10 @@ src/pernix/
 ├── component_lifecycle.py opens components in order, closes them in reverse
 ├── extension.py         Extension base class
 ├── addons.py            Addon loading, entry point discovery, setup API
-├── errors.py            exception hierarchy
+├── errors.py            exception hierarchy, control-flow exceptions
 ├── engine.py            worker loop: fetch, run Callbacks, dispatch outputs
+├── middleware.py        download Middleware, NodeMiddleware, the download chain
+├── spider_middleware.py spider Middleware and their chain
 ├── memory_frontier.py   in-memory Frontier
 ├── feeds.py             Item output files
 ├── events/
@@ -103,6 +108,7 @@ src/pernix/
 │   └── lifecycle_events.py core Events of a Run
 ├── fetchers/
 │   ├── fetcher.py       Fetcher protocol
+│   ├── fetcher_dispatch.py picks the Fetcher of each Request
 │   └── http_fetcher.py  curl-cffi HTTP Fetcher
 └── settings/
     ├── loader.py        merges and validates the settings layers
