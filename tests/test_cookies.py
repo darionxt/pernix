@@ -101,3 +101,11 @@ def test_leading_zeros_do_not_change_the_max_age(max_age: str, expired: bool) ->
     assert cookie is not None
     assert cookie.expired(NOW) is expired
     assert merge_set_cookies({"a": "old"}, [f"a=1; Max-Age={max_age}"], now=NOW) == ({} if expired else {"a": "1"})
+
+
+@pytest.mark.parametrize(("max_age", "seconds"), [("0" * 5000 + "5", 5), ("-" + "0" * 5000 + "5", -5)])
+def test_long_zero_padded_max_age_values_convert_their_significant_digits(max_age: str, seconds: int) -> None:
+    cookie = parse_set_cookie(f"a=1; Max-Age={max_age}")
+
+    assert cookie is not None
+    assert cookie.max_age == seconds

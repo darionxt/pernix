@@ -141,12 +141,14 @@ def merge_set_cookies(
 
 def _bounded_seconds(text: str) -> int:
     """Convert a `Max-Age` value, clamping very long ones instead of building huge integers."""
+    negative = text.startswith("-")
     significant = text.lstrip("-").lstrip("0")
     if not significant:
         return 0
-    if len(significant) <= _MAX_AGE_DIGITS:
-        return int(text)
-    return -1 if text.startswith("-") else 10**_MAX_AGE_DIGITS
+    if len(significant) > _MAX_AGE_DIGITS:
+        return -1 if negative else 10**_MAX_AGE_DIGITS
+    value = int(significant)  # never the zero-padded text, which may exceed the conversion limit
+    return -value if negative else value
 
 
 def _parse_date(value: str) -> dt.datetime | None:
