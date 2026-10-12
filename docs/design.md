@@ -249,7 +249,7 @@ class SaveMySQL(Pipeline):
 Download Middleware uses the onion model:
 
 ```python
-from pernix import Middleware, IgnoreRequest
+from pernix import Middleware, IgnoreRequest, middleware
 
 class SignRequest(Middleware):
     async def __call__(self, request, call_next):
@@ -273,9 +273,16 @@ class DropEmpty(SpiderMiddleware):
                 yield out
 ```
 
-- On a single chain, the order in the request direction and in the response direction is naturally symmetric, and exceptions propagate naturally along the chain; there is no asymmetry such as "exceptions raised in the response phase bypass exception handling".
-- Control flow is expressed with exceptions such as `IgnoreRequest`, `Retry`, and `DropItem`; the framework emits the corresponding Events uniformly (`request_ignored`, `retry_exhausted`, etc.).
-- A `NodeMiddleware` adapter is also provided, which wraps `process_request` / `process_response` / `process_exception`-style classes into the onion to make migrating existing code easier.
+- Registration: `middlewares` and `spider_middlewares` are `{component: order}` maps; a lower order is further out. A spider Middleware can also be written as a function with `@spider_middleware`.
+- Middleware are components like Extensions: services are injected, `events.on()` methods are subscribed, and they are opened and closed with the Run. The chains are built once at startup, and a Middleware that is not an async callable (download) or an async generator (spider) is rejected then, before anything is opened.
+- On a single chain, the order in the request direction and in the response direction is naturally symmetric, and exceptions propagate naturally along the chain; there is no asymmetry such as "exceptions raised in the response phase bypass exception handling". Only `Exception` is caught by the framework, so `CancelledError` always propagates.
+- A spider Middleware may pass another Response to `call_next`; exceptions raised by the Callback come out of its `async for`, so it can catch them. Requests constructed in a layer, or in the Callback, resolve relative URLs against the Response that layer, or the Callback, received. When a layer ends, even early, the inner layers and the Callback it started are closed with it.
+- Control flow is expressed with exceptions such as `IgnoreRequest`, `Retry`, and `DropItem`, which are not `PernixError`s. `IgnoreRequest` raised by download Middleware or a Fetcher drops the Request without counting it as failed and emits `RequestIgnored(reason)`; the handling of the others comes with retries and Pipelines.
+- A `NodeMiddleware` adapter is also provided, which wraps `process_request` / `process_response` / `process_exception`-style classes into the onion to make migrating existing code easier. The hooks may be plain or `async` methods:
+  - `process_request(request)` returns `None` to continue inward, or a Response that skips the inner layers.
+  - `process_response(request, response)` returns the Response or a replacement; it also sees Responses returned by the other two hooks.
+  - `process_exception(request, exception)` sees exceptions from the inner layers and returns `None` to let them propagate, or a Response.
+  - Any hook may return a Request instead, which is fetched in place of the original, starting again at this layer; it does not go back to the Frontier.
 
 ### 4.10 Events and Extensions
 
@@ -320,6 +327,7 @@ Core Events:
 | `RequestScheduled` | gate (fail-open) | A Request is about to enter the Frontier |
 | `RequestDropped(reason)` | observe | A Request was vetoed, or was a duplicate |
 | `RequestFailed(error)` | observe | Fetching a Request, or its Callback, raised |
+| `RequestIgnored(reason)` | observe | Download Middleware or a Fetcher raised `IgnoreRequest` |
 | `ResponseReceived` | observe | A Response was fetched, before its Callback runs |
 | `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed |
 | `StatsSnapshot` | observe | A periodic copy of the stats |
@@ -361,6 +369,9 @@ delay = 0.5
 [middlewares]
 "myproject.middlewares.Sign" = 500
 "myproject.middlewares.Legacy" = false     # TOML has no null: false disables
+
+[fetchers]
+s3 = "myproject.fetchers.S3Fetcher"        # registered by name; Request(fetcher="s3")
 ```
 
 Rules:
@@ -369,7 +380,7 @@ Rules:
 - Environment variables map `PERNIX_DOMAIN__DELAY` to `domain.delay`; their string values are parsed by the declared type, and container values are written as JSON. Values from Python layers are type-checked strictly.
 - Settings are merged and validated at startup. Every problem is reported at once: a misspelled key suggests the closest known key, and a wrong value names the layer it came from (for example the environment variable). After startup the settings are immutable, and every Crawler has its own instance.
 - Settings are declared as typed **Sections**: a key prefix plus fields with defaults and optional constraints. `settings.section(RetrySettings)` returns the validated values.
-- Components (Middleware, Pipelines, Extensions) are registered as `{component: order}`, lowest order first. A later layer adds or overrides entries, and `None` (`false` in TOML and JSON) disables one. A component can be given as a class, an object, or an import path.
+- Components (Middleware, Pipelines, Extensions) are registered as `{component: order}`, lowest order first. A later layer adds or overrides entries, and `None` (`false` in TOML and JSON) disables one. Fetchers are registered by name instead, as `{name: component}`, merged name by name. A component can be given as a class, an object, or an import path.
 - A component registers its own Sections by annotating `__init__` parameters with them (which also injects them) or by listing them in `settings_sections`; their keys are validated together with the core keys. Sections of a disabled component stay registered, so its settings can remain in the project file.
 - Construction: an object is used as is; a class with `from_crawler(crawler)` is built through it. Otherwise, `__init__` parameters annotated with exactly `Crawler`, `Settings`, `EventBus`, or a registered Section are injected, and other parameters keep their defaults. These types may be imported only under `TYPE_CHECKING`. There is no global service locator.
 - Secret settings use the `Secret` type and are automatically redacted in reprs, logs, and stats.
@@ -395,6 +406,8 @@ Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (se
 | `pernix browser install` | Install browser engines |
 
 ## 5. Fetching layer
+
+A Fetcher is a component with `async def fetch(self, request) -> Response` and a `schemes` attribute, the URL schemes it fetches by default. Fetchers are registered by name with the `fetchers` setting, `{"http": HTTPFetcher}` by default; registering another component under a built-in name replaces it, and `None` (`false`) disables one. The innermost step of the download chain picks the Fetcher: the one named by `Request(fetcher=...)`, otherwise `browser` if the Request needs rendering, otherwise the one whose `schemes` include the URL's scheme. No two Fetchers may claim the same scheme, and a Request no Fetcher fits fails. `Response.fetcher` records the name. Like other components, Fetchers get services injected and are opened and closed with the Run.
 
 ### 5.1 HTTP Fetcher (curl-cffi)
 

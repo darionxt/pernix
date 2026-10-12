@@ -4,7 +4,7 @@ from typing import Annotated, Any
 
 import msgspec
 
-from pernix.settings.section import ComponentMap, Section
+from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.text_decoding import codec_for
 
 __all__ = ["CORE_SECTIONS", "CoreSettings", "EventSettings", "ResponseSettings"]
@@ -18,11 +18,20 @@ class CoreSettings(Section):
         extensions: Extensions to run, as `{extension: order}`.
         addons: Addons to enable, in order, by entry point name, import path, class,
             or object.
+        middlewares: Download Middleware, as `{middleware: order}`; lower orders are
+            further out.
+        spider_middlewares: Spider Middleware, as `{middleware: order}`; lower orders
+            are further out.
+        fetchers: Fetchers by name, as `{name: fetcher}`; `Request(fetcher=name)`
+            selects one by that name.
     """
 
     concurrency: Annotated[int, msgspec.Meta(ge=1)] = 16
     extensions: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     addons: tuple[Any, ...] = ()
+    middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
+    spider_middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
+    fetchers: NamedComponents = msgspec.field(default_factory=lambda: {"http": "pernix.fetchers.HTTPFetcher"})
 
 
 class EventSettings(Section):

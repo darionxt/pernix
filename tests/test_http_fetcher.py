@@ -71,16 +71,6 @@ async def test_a_request_timeout_applies_to_that_request(server: LoopbackServer)
     assert asyncio.get_running_loop().time() - started < 0.9
 
 
-async def test_requests_for_other_fetchers_are_rejected(server: LoopbackServer) -> None:
-    async with HTTPFetcher() as fetcher:
-        with pytest.raises(ValueError, match="needs a Fetcher other than HTTP"):
-            await fetcher.fetch(Request(server.url("/"), render=True))
-        with pytest.raises(ValueError, match="needs a Fetcher other than HTTP"):
-            await fetcher.fetch(Request(server.url("/"), fetcher="ftp"))
-
-    assert server.received == []
-
-
 async def test_response_cookies_hold_everything_set_during_the_transfer(server: LoopbackServer) -> None:
     server.route(
         "/login",

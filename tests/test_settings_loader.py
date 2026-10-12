@@ -7,7 +7,16 @@ import msgspec
 import pytest
 
 from pernix.errors import SettingsError
-from pernix.settings import ComponentMap, CoreSettings, ResponseSettings, Secret, Section, load_settings
+from pernix.fetchers import HTTPFetcher
+from pernix.settings import (
+    ComponentMap,
+    CoreSettings,
+    NamedComponents,
+    ResponseSettings,
+    Secret,
+    Section,
+    load_settings,
+)
 
 if TYPE_CHECKING:
     from pernix.settings import Settings
@@ -335,6 +344,95 @@ def test_invalid_component_map_defaults_are_reported(tmp_path: Path) -> None:
         load_settings(sections=(CoreSettings, BrokenDefaults), project_dir=tmp_path, environ={})
 
 
+# Named component registries
+
+
+class TransportSettings(Section):
+    __prefix__ = "transport"
+    fetchers: NamedComponents = msgspec.field(default_factory=lambda: {"http": f"{__name__}.Alpha"})
+
+
+class BucketSettings(Section):
+    __prefix__ = "bucket"
+    name: str = "data"
+
+
+class Bucket:
+    def __init__(self, settings: BucketSettings) -> None:
+        self.settings = settings
+
+
+def _load_transport(tmp_path: Path, **kwargs: Any) -> Settings:
+    return load_settings(sections=(CoreSettings, TransportSettings), project_dir=tmp_path, **kwargs)
+
+
+def test_named_components_merge_name_by_name_across_layers(tmp_path: Path) -> None:
+    (tmp_path / "pernix.toml").write_text(f'[transport.fetchers]\nftp = "{__name__}.Beta"\ns3 = "{__name__}.Gamma"\n')
+
+    settings = _load_transport(
+        tmp_path,
+        environ={},
+        spider_settings={"transport.fetchers": {"http": Gamma}},
+        overrides={"transport.fetchers": {"ftp": False, "s3": None}},
+    )
+
+    assert settings.named_components("transport.fetchers") == {"http": Gamma}
+    assert settings["transport.fetchers"] == {"http": Gamma, "ftp": None, "s3": None}
+
+
+def test_named_component_defaults_are_resolved(tmp_path: Path) -> None:
+    settings = _load_transport(tmp_path, environ={})
+
+    assert settings.named_components("transport.fetchers") == {"http": Alpha}
+    assert settings.origin("transport.fetchers") == "built-in default"
+
+
+def test_named_components_register_their_sections_from_the_environment(tmp_path: Path) -> None:
+    settings = _load_transport(
+        tmp_path,
+        environ={
+            "PERNIX_TRANSPORT__FETCHERS": f'{{"s3": "{__name__}.Bucket", "http": null}}',
+            "PERNIX_BUCKET__NAME": "logs",
+        },
+    )
+
+    assert settings.named_components("transport.fetchers") == {"s3": Bucket}
+    assert settings.section(BucketSettings).name == "logs"
+
+
+def test_disabled_named_components_still_register_their_sections(tmp_path: Path) -> None:
+    (tmp_path / "pernix.toml").write_text(
+        f'[transport.fetchers]\ns3 = "{__name__}.Bucket"\n\n[bucket]\nname = "logs"\n'
+    )
+
+    settings = _load_transport(tmp_path, environ={}, overrides={"transport.fetchers": {"s3": None}})
+
+    assert settings.named_components("transport.fetchers") == {"http": Alpha}
+    assert settings.section(BucketSettings).name == "logs"
+
+
+def test_invalid_named_components_are_reported(tmp_path: Path) -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        _load_transport(
+            tmp_path,
+            environ={"PERNIX_TRANSPORT__FETCHERS": "[1]"},
+            spider_settings={"transport.fetchers": {"": Alpha, 3: Beta, "x": "no_such_module_xyz.Thing"}},
+        )
+
+    problems = _problems(excinfo)
+    assert "transport.fetchers: expected a mapping of name to component, got [1]" in problems
+    assert "names must be non-empty strings, got '' (from Spider.settings)" in problems
+    assert "names must be non-empty strings, got 3 (from Spider.settings)" in problems
+    assert "cannot import module 'no_such_module_xyz'" in problems
+
+
+def test_named_components_are_not_ordered_component_maps(tmp_path: Path) -> None:
+    settings = _load_transport(tmp_path, environ={})
+
+    with pytest.raises(TypeError, match="is not a registry of named components"):
+        settings.named_components("concurrency")
+
+
 # Sections registered by components
 
 
@@ -473,6 +571,9 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "concurrency": 16,
         "extensions": {},
         "addons": (),
+        "middlewares": {},
+        "spider_middlewares": {},
+        "fetchers": {"http": HTTPFetcher},
         "domain.delay": 0.0,
         "domain.verify": True,
         "domain.codes": [],

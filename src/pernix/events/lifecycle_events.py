@@ -18,6 +18,7 @@ __all__ = [
     "ItemScraped",
     "RequestDropped",
     "RequestFailed",
+    "RequestIgnored",
     "RequestScheduled",
     "ResponseReceived",
     "SpiderClosed",
@@ -103,6 +104,19 @@ class RequestFailed(Event):
 
     request: Request
     error: Exception
+
+
+@dataclass(frozen=True)
+class RequestIgnored(Event):
+    """Download Middleware or a Fetcher raised `IgnoreRequest`; the Callback does not run.
+
+    Attributes:
+        request: The Request.
+        reason: The reason given to `IgnoreRequest`.
+    """
+
+    request: Request
+    reason: str
 
 
 @dataclass(frozen=True)
