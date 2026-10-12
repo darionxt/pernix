@@ -1,26 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pernix.addons import addon_settings, load_addons, setup_addon
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
 from pernix.engine import Engine, run_callbacks
+from pernix.errors import ComponentError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.feeds import JsonLinesFeed
 from pernix.fetchers import FetcherDispatch
+from pernix.fingerprint import request_fingerprint
 from pernix.memory_frontier import MemoryFrontier
 from pernix.middleware import build_download_chain
-from pernix.settings import CoreSettings, EventSettings, Section, Settings, load_settings
+from pernix.settings import (
+    CoreSettings,
+    EventSettings,
+    FingerprintSettings,
+    FrontierSettings,
+    Section,
+    Settings,
+    load_settings,
+)
 from pernix.spider_middleware import build_spider_chain
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
+    from pernix.frontier import Frontier
     from pernix.middleware import Download
+    from pernix.request import Request
     from pernix.spider import Spider
     from pernix.spider_middleware import HandleResponse
 
@@ -118,10 +131,11 @@ class Crawler:
         """Run the Spider to completion.
 
         Addons register their subscribers. Then every component is built: Extensions,
-        Fetchers, download Middleware, and spider Middleware, and the chains are
-        checked, before anything is opened. The components are subscribed and opened
-        in that order, `SpiderOpened` is emitted, the Engine runs, `SpiderClosed` is
-        emitted, and the components are closed in reverse order.
+        Fetchers, download Middleware, spider Middleware, and the Fingerprint function,
+        and the chains are checked, before anything is opened. The components are
+        subscribed and opened in that order, `SpiderOpened` is emitted, the Engine runs
+        with an in-memory Frontier, `SpiderClosed` is emitted, and the components are
+        closed in reverse order.
 
         Raises:
             RuntimeError: This Crawler already ran.
@@ -140,11 +154,15 @@ class Crawler:
         spider_middlewares = self._build_all("spider_middlewares")
         download = build_download_chain(middlewares, FetcherDispatch(fetchers))
         handle = build_spider_chain(spider_middlewares, run_callbacks(self.spider))
+        frontier = MemoryFrontier(fingerprint=self._fingerprint_function())
         async with ComponentLifecycle() as lifecycle:
             for component in (*extensions, *fetchers.values(), *middlewares, *spider_middlewares):
                 self.events.subscribe_methods(component)
                 await lifecycle.open(component)
-            await self._run(download, handle)
+            try:
+                await self._run(frontier, download, handle)
+            finally:
+                await frontier.close()
 
     def _build_all(self, key: str) -> list[object]:
         """Build the enabled components of a `{component: order}` setting, in order."""
@@ -154,18 +172,29 @@ class Crawler:
         """Build the enabled components of a `{name: component}` setting."""
         return {name: self.build_component(spec) for name, spec in self.settings.named_components(key).items()}
 
-    async def _run(self, download: Download, handle: HandleResponse) -> None:
+    def _fingerprint_function(self) -> Callable[[Request], str]:
+        """The `fingerprint.function` setting, or the default Fingerprint with its options."""
+        options = self.settings.section(FingerprintSettings)
+        if options.function is None:
+            return functools.partial(request_fingerprint, headers=options.headers, sort_query=options.sort_query)
+        function = self.build_component(options.function)
+        if not callable(function):
+            raise ComponentError(f"fingerprint.function must be callable as function(request) -> str, got {function!r}")
+        return cast("Callable[[Request], str]", function)
+
+    async def _run(self, frontier: Frontier, download: Download, handle: HandleResponse) -> None:
         concurrency = self.settings.section(CoreSettings).concurrency
         with ExitStack() as stack:
             item_sink = _discard if self._output is None else stack.enter_context(JsonLinesFeed(self._output)).write
             engine = Engine(
                 self.spider,
-                frontier=MemoryFrontier(),
+                frontier=frontier,
                 download=download,
                 handle=handle,
                 item_sink=item_sink,
                 events=self.events,
                 concurrency=concurrency,
+                lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
             )
             reason = "failed"
             try:

@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- The Frontier contract (ADR 0003): `add` deduplicating atomically, `claim` under token-carrying Leases with priorities, FIFO within a priority, and skippable slots, `renew`, `ack`, `nack` with delays, `dead`, `counts`, `wait`, and `close`, with every write conditional on the Lease. `MemoryFrontier` implements it, and `pernix.testing.frontier` ships the conformance suite for other backends.
+- Fingerprints: method, WHATWG-normalized URL without fragment and with sorted query, body digest, and declared headers, never cookies. `fingerprint.headers`, `fingerprint.sort_query`, and `fingerprint.function` configure them; `request_fingerprint()` is public.
+- The Engine claims Requests under Leases, renews them while it works, acknowledges them once the Callback's outputs are added, and keeps failed Requests as Dead Requests. `Spider.on_idle()` can add Requests when the Run is idle; the Run ends once it adds none. `frontier.lease_ttl` sets the Lease lifetime.
 - Onion Middleware (ADR 0002): download `Middleware` (classes, or functions with `@middleware`) registered with `middlewares`, and spider `SpiderMiddleware` (async generators, or `@spider_middleware`) registered with `spider_middlewares`, built and checked once at startup and opened with the Run like Extensions. `NodeMiddleware` adapts `process_request` / `process_response` / `process_exception` hooks.
 - Fetchers registered by name with the `fetchers` setting and selected per Request: `Request(fetcher=...)`, then `browser` for rendering, then the URL scheme a Fetcher declares in `schemes`. Settings gain `NamedComponents` registries, merged name by name.
 - Control-flow exceptions `IgnoreRequest`, `Retry`, and `DropItem`; `IgnoreRequest` from download Middleware or a Fetcher emits the new `RequestIgnored` Event.

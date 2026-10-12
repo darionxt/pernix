@@ -70,6 +70,10 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `fetchers` | `{"http": HTTPFetcher}` | Fetchers by name; `Request(fetcher=name)` selects one |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
+| `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
+| `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
+| `fingerprint.sort_query` | `true` | Sort query parameters, so their order does not make a Request new |
+| `fingerprint.function` | `None` | A replacement Fingerprint function, `(request) -> str` |
 
 ## Documentation
 
@@ -100,7 +104,9 @@ src/pernix/
 ├── engine.py            worker loop: fetch, run Callbacks, dispatch outputs
 ├── middleware.py        download Middleware, NodeMiddleware, the download chain
 ├── spider_middleware.py spider Middleware and their chain
+├── frontier.py          Frontier protocol, Lease
 ├── memory_frontier.py   in-memory Frontier
+├── fingerprint.py       Fingerprints and URL normalization
 ├── feeds.py             Item output files
 ├── events/
 │   ├── event.py         Event base class, Dispatch, Veto
@@ -110,6 +116,8 @@ src/pernix/
 │   ├── fetcher.py       Fetcher protocol
 │   ├── fetcher_dispatch.py picks the Fetcher of each Request
 │   └── http_fetcher.py  curl-cffi HTTP Fetcher
+├── testing/
+│   └── frontier.py      conformance suite for Frontier backends
 └── settings/
     ├── loader.py        merges and validates the settings layers
     ├── sources.py       project file and environment variables

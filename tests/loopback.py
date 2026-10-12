@@ -128,6 +128,12 @@ class LoopbackServer:
                     body=body,
                 )
                 reply = server._dispatch(request)  # pyright: ignore[reportPrivateUsage]
+                try:
+                    self._reply(reply)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True  # the client gave up waiting, as timeout tests make it
+
+            def _reply(self, reply: Reply) -> None:
                 payload = reply.encoded_body()
                 self.send_response(reply.status)
                 for name, value in reply.headers:

@@ -111,7 +111,7 @@ class Search(Spider):
         yield Request(f"https://api.example.com/s?q={self.keyword}", callback=self.parse_list)
 
     async def on_start(self): ...        # optional: before crawling starts (e.g. to warm up a login)
-    async def on_idle(self): ...         # optional: can still yield new Requests when the Frontier is idle
+    async def on_idle(self): ...         # optional: yields more Requests when the Frontier is idle; the Run ends once it adds none
     async def on_close(self, reason): ...  # optional: on close
 ```
 
@@ -322,7 +322,7 @@ Core Events:
 | Event | Dispatch | When |
 | --- | --- | --- |
 | `SpiderOpened` | observe | Components are open; nothing has been fetched yet |
-| `SpiderIdle` | observe | The Frontier is empty and nothing is in flight |
+| `SpiderIdle` | observe | Nothing is ready, delayed, or leased, and `start()` is exhausted; `Spider.on_idle()` runs next |
 | `SpiderClosed(reason)` | observe, reverse | The Run ended: `finished`, `failed`, or `cancelled` |
 | `RequestScheduled` | gate (fail-open) | A Request is about to enter the Frontier |
 | `RequestDropped(reason)` | observe | A Request was vetoed, or was a duplicate |
@@ -550,6 +550,17 @@ Rules:
 
 - All write operations are conditional on `(id, token)`; writes from a stale old Lease have no effect.
 - Lease deadlines are taken from the backend clock.
+- A Lease carries the item id, a token that increases with every claim, the attempt number (from 1; `nack(count_attempt=False)` does not count, an expired Lease does), the expiry time, the concurrency slot (the host by default, used by `claim(skip_slots=...)`), and the Request.
+- `claim` hands out higher priorities first and, within a priority, the Request that became ready first; a Request returned with `nack` queues behind the ready ones. A Request whose Lease expires becomes ready again.
+- `wait()` returns once something may have changed (an add, a settled Lease, a passed delay, an expired Lease), so idle Workers do not poll; distributed backends may return after a polling interval.
+- Every backend passes the conformance suite in `pernix.testing.frontier`.
+
+Engine integration:
+
+- Each worker claims one Request at a time and renews its Lease every third of `frontier.lease_ttl` (60 s by default) while it works.
+- The Lease is acknowledged only after the Callback's outputs have been added, so the Requests a Callback adds are in the Frontier before their parent leaves it, and the Run can never end early.
+- A Request that was fetched and handled, or ignored with `IgnoreRequest`, is acknowledged; one whose fetch or Callback failed is kept as a Dead Request with the error as the reason. Retries return Requests with `nack` (§6.4).
+- A Finite Run is idle once `start()` is exhausted and nothing is ready, delayed, or leased. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the Run ends when it adds no new Request to the Frontier, including when everything it yields is a duplicate or vetoed.
 
 | Implementation | Role |
 | --- | --- |
@@ -563,10 +574,11 @@ Rules:
 ### 6.2 Deduplication and Fingerprints
 
 - Deduplication is handled by the Frontier, in the same atomic operation as insertion.
-- Default Fingerprint: `version | method | normalized URL | body digest | explicitly declared headers`.
+- Default Fingerprint: `version | method | normalized URL | body digest | explicitly declared headers`, hashed to 32 hexadecimal characters (`pernix.fingerprint.request_fingerprint`). Headers are declared with `fingerprint.headers`.
   - It never includes cookies, whether passed as `cookies=` or as a `Cookie` header; declaring the `Cookie` header for the Fingerprint is rejected. By default it does not include the fetcher or the Session either, so the same URL is not fetched again just because it was switched to Render or carries different cookies; fetching it again is the application's explicit decision, through `dont_filter` or a Fingerprint it supplies.
-  - The Fingerprint function can be customized, or the application can pass in a Fingerprint directly.
-- URL normalization does only three things: serialize according to WHATWG rules, remove the fragment, and stably sort query parameters (can be turned off).
+  - The Fingerprint function can be replaced with `fingerprint.function`, a callable `(request) -> str` that may fall back to `request_fingerprint()`, or the application can pass in a Fingerprint directly with `Request(fingerprint=...)`.
+  - `dont_filter` bypasses deduplication: such a Request is neither checked nor recorded.
+- URL normalization does only three things: serialize according to WHATWG rules, remove the fragment, and stably sort query parameters by name (`fingerprint.sort_query`, on by default).
   - It does not change path case, remove trailing slashes, or remove tracking parameters; these can be enabled with optional rules when needed.
   - Percent-encoded bytes are preserved as is.
 
