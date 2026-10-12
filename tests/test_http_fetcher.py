@@ -105,3 +105,12 @@ async def test_response_cookies_include_those_sent_in_a_cookie_header(server: Lo
         response = await fetcher.fetch(Request(server.url("/"), headers={"Cookie": "session=abc; lang=en"}))
 
     assert dict(response.cookies) == {"session": "abc", "lang": "en", "theme": "dark"}
+
+
+async def test_an_oversized_max_age_does_not_fail_the_fetch(server: LoopbackServer) -> None:
+    server.route("/", "ok", headers=[("Set-Cookie", f"a=1; Max-Age={'9' * 5000}")])
+
+    async with HTTPFetcher() as fetcher:
+        response = await fetcher.fetch(Request(server.url("/")))
+
+    assert (response.status, dict(response.cookies)) == (200, {"a": "1"})

@@ -23,6 +23,8 @@ __all__ = ["SetCookie", "merge_set_cookies", "parse_cookie_header", "parse_set_c
 logger = logging.getLogger(__name__)
 
 _MAX_AGE = re.compile(r"-?\d+")
+_MAX_AGE_DIGITS = 18
+"""Longer `Max-Age` values are not converted: they only decide between expired and kept."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +82,7 @@ def parse_set_cookie(header: str) -> SetCookie | None:
         key, _, attribute_value = attribute.partition("=")
         key, attribute_value = key.strip().lower(), attribute_value.strip()
         if key == "max-age" and _MAX_AGE.fullmatch(attribute_value):
-            max_age = int(attribute_value)
+            max_age = _bounded_seconds(attribute_value)
         elif key == "expires" and (parsed := _parse_date(attribute_value)) is not None:
             expires = parsed
     return SetCookie(name, value, max_age, expires)
@@ -135,6 +137,13 @@ def merge_set_cookies(
         else:
             current[cookie.name] = cookie.value
     return current
+
+
+def _bounded_seconds(text: str) -> int:
+    """Convert a `Max-Age` value, clamping very long ones instead of building huge integers."""
+    if len(text.lstrip("-")) <= _MAX_AGE_DIGITS:
+        return int(text)
+    return -1 if text.startswith("-") else 10**_MAX_AGE_DIGITS
 
 
 def _parse_date(value: str) -> dt.datetime | None:

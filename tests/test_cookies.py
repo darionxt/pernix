@@ -79,3 +79,16 @@ def test_cookie_headers_parse_into_cookies_by_name() -> None:
         "lang": "en",
         "quoted": '"v"',
     }
+
+
+def test_oversized_max_age_values_decide_without_failing() -> None:
+    huge = "9" * 5000
+
+    kept = parse_set_cookie(f"a=1; Max-Age={huge}")
+    removed = parse_set_cookie(f"b=2; Max-Age=-{huge}")
+
+    assert kept is not None
+    assert not kept.expired(NOW)
+    assert removed is not None
+    assert removed.expired(NOW)
+    assert merge_set_cookies({"b": "old"}, [f"a=1; Max-Age={huge}", f"b=2; Max-Age=-{huge}"], now=NOW) == {"a": "1"}
