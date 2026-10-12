@@ -23,7 +23,7 @@ from pernix.request import Request
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pernix.frontier import Frontier, Lease
+    from pernix.frontiers import Frontier, Lease
 
 __all__ = ["FakeClock", "FrontierConformance"]
 

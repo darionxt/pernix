@@ -14,8 +14,8 @@ from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.feeds import JsonLinesFeed
 from pernix.fetchers import FetcherDispatch
 from pernix.fingerprint import request_fingerprint
-from pernix.memory_frontier import MemoryFrontier
-from pernix.middleware import build_download_chain
+from pernix.frontiers import MemoryFrontier
+from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.settings import (
     CoreSettings,
     EventSettings,
@@ -25,17 +25,15 @@ from pernix.settings import (
     Settings,
     load_settings,
 )
-from pernix.spider_middleware import build_spider_chain
 
 if TYPE_CHECKING:
     import os
     from collections.abc import Callable, Mapping, Sequence
 
-    from pernix.frontier import Frontier
-    from pernix.middleware import Download
+    from pernix.frontiers import Frontier
+    from pernix.middlewares import Download, HandleResponse
     from pernix.request import Request
     from pernix.spider import Spider
-    from pernix.spider_middleware import HandleResponse
 
 __all__ = ["Crawler"]
 

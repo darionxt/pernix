@@ -1,10 +1,12 @@
-"""URL clean-up and joining shared by Requests and Responses."""
+"""URL clean-up, joining, and normalization shared by Requests, Responses, and Fingerprints."""
 
 from __future__ import annotations
 
 from urllib.parse import urljoin, urlsplit, uses_relative
 
-__all__ = ["clean_url", "document_base", "is_absolute", "join_url"]
+from ada_url import URL
+
+__all__ = ["clean_url", "document_base", "is_absolute", "join_url", "normalize_url"]
 
 _C0_CONTROL_OR_SPACE = "".join(chr(code) for code in range(0x21))
 _TAB_OR_NEWLINE = str.maketrans("", "", "\t\n\r")
@@ -72,3 +74,29 @@ def document_base(url: str, href: str | None) -> str:
     except ValueError:
         return url
     return base if scheme and scheme in uses_relative else url
+
+
+def normalize_url(url: str, *, sort_query: bool = True) -> str:
+    """Normalize a URL for comparison, such as in Fingerprints.
+
+    It does three things only: serialize the URL by WHATWG rules, drop the fragment,
+    and sort the query parameters stably by name. Percent-encoded bytes are kept as
+    they are.
+
+    Args:
+        url: An absolute URL.
+        sort_query: Sort the query parameters stably by name.
+
+    Returns:
+        The URL serialized by WHATWG rules, without its fragment, with sorted query
+        parameters; a URL WHATWG rules cannot parse is returned as it is.
+    """
+    try:
+        parsed = URL(url)
+    except ValueError:
+        return url
+    parsed.hash = ""
+    if sort_query and parsed.search:
+        parameters = parsed.search.removeprefix("?").split("&")
+        parsed.search = "&".join(sorted(parameters, key=lambda parameter: parameter.partition("=")[0]))
+    return parsed.href

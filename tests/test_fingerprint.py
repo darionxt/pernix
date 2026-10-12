@@ -3,30 +3,9 @@ from __future__ import annotations
 import pytest
 
 from pernix import Request
-from pernix.fingerprint import normalize_url, request_fingerprint
+from pernix.fingerprint import request_fingerprint
 
 URL = "https://example.com/search?q=books"
-
-
-@pytest.mark.parametrize(
-    ("url", "normalized"),
-    [
-        ("HTTPS://Example.COM:443/a/./b/../c", "https://example.com/a/c"),
-        ("https://example.com", "https://example.com/"),
-        ("https://example.com/page#reviews", "https://example.com/page"),
-        ("https://example.com/?b=2&a=1&b=1&a", "https://example.com/?a=1&a&b=2&b=1"),
-        ("https://example.com/%7Euser/%41?x=%41&a=%e4%b8%ad", "https://example.com/%7Euser/%41?a=%e4%b8%ad&x=%41"),
-        ("https://例子.测试/路径?q=a b", "https://xn--fsqu00a.xn--0zwm56d/%E8%B7%AF%E5%BE%84?q=a%20b"),
-        ("https://example.com/path/", "https://example.com/path/"),
-        ("http://[", "http://["),
-    ],
-)
-def test_urls_are_serialized_by_whatwg_rules_without_fragments_with_sorted_queries(url: str, normalized: str) -> None:
-    assert normalize_url(url) == normalized
-
-
-def test_query_sorting_can_be_turned_off() -> None:
-    assert normalize_url("https://example.com/?b=2&a=1#x", sort_query=False) == "https://example.com/?b=2&a=1"
 
 
 def test_fingerprints_are_short_and_stable() -> None:

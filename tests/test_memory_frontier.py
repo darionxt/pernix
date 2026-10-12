@@ -6,14 +6,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pernix import Request
-from pernix.frontier import host_slot
-from pernix.memory_frontier import MemoryFrontier
+from pernix.frontiers import MemoryFrontier, host_slot
 from pernix.testing.frontier import FakeClock, FrontierConformance
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from pernix.frontier import Frontier
+    from pernix.frontiers import Frontier
 
 URL = "https://example.com/"
 

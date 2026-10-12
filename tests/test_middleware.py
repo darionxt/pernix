@@ -7,10 +7,10 @@ import pytest
 
 from pernix import Request, Response
 from pernix.errors import ComponentError
-from pernix.middleware import Middleware, NodeMiddleware, build_download_chain, middleware
+from pernix.middlewares import Middleware, NodeMiddleware, build_download_chain, middleware
 
 if TYPE_CHECKING:
-    from pernix.middleware import Download
+    from pernix.middlewares import Download
 
 URL = "https://example.com/"
 
