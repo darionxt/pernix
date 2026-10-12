@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from contextlib import aclosing
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 
@@ -10,7 +11,7 @@ from pernix.errors import ComponentError
 from pernix.spider_middleware import SpiderMiddleware, build_spider_chain, spider_middleware
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
     from pernix.spider_middleware import HandleResponse
 
@@ -110,6 +111,77 @@ async def test_middleware_may_hand_the_callback_another_response() -> None:
     outputs = await _collect(build_spider_chain([Mirror()], run_callbacks(Shop())), _response())
 
     assert outputs[-1].url == "https://mirror.example/list/page-2.html"
+
+
+async def test_each_layer_resolves_relative_urls_against_its_own_response() -> None:
+    class Mirror(SpiderMiddleware):
+        async def __call__(self, response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
+            yield Request("outer.html")
+            async for output in call_next(response.replace(url="https://mirror.example/list/")):
+                yield output
+
+    class Inner(SpiderMiddleware):
+        async def __call__(self, response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
+            yield Request("inner.html")
+            async for output in call_next(response):
+                yield output
+
+    outputs = await _collect(build_spider_chain([Mirror(), Inner()], run_callbacks(Shop())), _response())
+    urls = [output.url for output in outputs if isinstance(output, Request)]
+
+    assert urls == [
+        "https://example.com/list/outer.html",
+        "https://mirror.example/list/inner.html",
+        "https://mirror.example/list/page-2.html",
+    ]
+
+
+class Cleanup(Spider):
+    log: ClassVar[list[str]] = []
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        try:
+            yield {"n": 1}
+            yield {"n": 2}
+        finally:
+            self.log.append("callback cleaned up")
+
+
+class PassThrough(SpiderMiddleware):
+    async def __call__(self, response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
+        try:
+            async for output in call_next(response):
+                yield output
+        finally:
+            Cleanup.log.append("middleware cleaned up")
+
+
+async def test_inner_iterators_close_when_a_layer_stops_early() -> None:
+    class First(SpiderMiddleware):
+        async def __call__(self, response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
+            async for output in call_next(response):
+                yield output
+                return
+
+    Cleanup.log.clear()
+    handle = build_spider_chain([First(), PassThrough()], run_callbacks(Cleanup()))
+
+    outputs = await _collect(handle, _response())
+    Cleanup.log.append("chain done")
+
+    assert outputs == [{"n": 1}]
+    assert Cleanup.log == ["middleware cleaned up", "callback cleaned up", "chain done"]
+
+
+async def test_closing_the_chain_closes_every_layer_and_the_callback() -> None:
+    Cleanup.log.clear()
+    handle = build_spider_chain([PassThrough(), PassThrough()], run_callbacks(Cleanup()))
+
+    async with aclosing(cast("AsyncGenerator[Any]", handle(_response()))) as outputs:
+        assert await anext(outputs) == {"n": 1}
+    Cleanup.log.append("chain closed")
+
+    assert Cleanup.log == ["middleware cleaned up", "middleware cleaned up", "callback cleaned up", "chain closed"]
 
 
 async def test_function_spider_middleware() -> None:

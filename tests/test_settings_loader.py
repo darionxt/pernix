@@ -400,6 +400,17 @@ def test_named_components_register_their_sections_from_the_environment(tmp_path:
     assert settings.section(BucketSettings).name == "logs"
 
 
+def test_disabled_named_components_still_register_their_sections(tmp_path: Path) -> None:
+    (tmp_path / "pernix.toml").write_text(
+        f'[transport.fetchers]\ns3 = "{__name__}.Bucket"\n\n[bucket]\nname = "logs"\n'
+    )
+
+    settings = _load_transport(tmp_path, environ={}, overrides={"transport.fetchers": {"s3": None}})
+
+    assert settings.named_components("transport.fetchers") == {"http": Alpha}
+    assert settings.section(BucketSettings).name == "logs"
+
+
 def test_invalid_named_components_are_reported(tmp_path: Path) -> None:
     with pytest.raises(SettingsError) as excinfo:
         _load_transport(

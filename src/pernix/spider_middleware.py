@@ -3,7 +3,8 @@
 Each layer is an async generator that receives the Response and `call_next`, which
 runs the layers inside it and the Callback and yields their outputs. A layer may
 pass on a different Response, filter, add, or change outputs, and catch the
-exceptions the Callback raises while it iterates `call_next`.
+exceptions the Callback raises while it iterates `call_next`. Requests a layer
+constructs resolve relative URLs against the Response that layer received.
 """
 
 from __future__ import annotations
@@ -11,10 +12,11 @@ from __future__ import annotations
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import aclosing
+from contextlib import AsyncExitStack, aclosing
 from typing import TYPE_CHECKING, Any, cast
 
 from pernix.errors import ComponentError
+from pernix.request import resolve_relative_urls
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -115,10 +117,43 @@ def build_spider_chain(middlewares: Sequence[object], handle: HandleResponse) ->
 
 
 def _link(layer: Callable[[Response, HandleResponse], AsyncIterator[Any]], call_next: HandleResponse) -> HandleResponse:
-    def handle(response: Response) -> AsyncIterator[Any]:
-        return layer(response, call_next)
+    """Run `layer` with `call_next` as its inner chain.
+
+    Each step of the layer resolves relative URLs against the Response the layer
+    received. When the layer ends, however it ends, the inner iterators it opened
+    through `call_next` are closed too, so their cleanup runs before the chain is
+    done rather than whenever they are garbage collected.
+    """
+
+    async def handle(response: Response) -> AsyncGenerator[Any]:
+        opened: list[AsyncIterator[Any]] = []
+
+        def tracked_call_next(inner_response: Response) -> AsyncIterator[Any]:
+            outputs = call_next(inner_response)
+            opened.append(outputs)
+            return outputs
+
+        outputs = layer(response, tracked_call_next)
+        try:
+            while True:
+                with resolve_relative_urls(response.urljoin):
+                    try:
+                        output = await anext(outputs)
+                    except StopAsyncIteration:
+                        return
+                yield output
+        finally:
+            async with AsyncExitStack() as stack:  # closes the layer first, then the inner iterators
+                for iterator in (*opened, outputs):
+                    stack.push_async_callback(_aclose, iterator)
 
     return handle
+
+
+async def _aclose(iterator: AsyncIterator[Any]) -> None:
+    aclose = getattr(iterator, "aclose", None)
+    if aclose is not None:
+        await aclose()
 
 
 def _is_async_generator(component: object) -> bool:

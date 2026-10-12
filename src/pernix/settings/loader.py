@@ -125,6 +125,12 @@ class _Merged:
     origins: dict[str, str] = field(default_factory=dict[str, str])
     lenient: dict[str, bool] = field(default_factory=dict[str, bool])
     problems: list[str] = field(default_factory=list[str])
+    registered: dict[str, list[object]] = field(default_factory=dict[str, list[object]])
+    """Every component any layer registered, by registry key, even if later replaced or disabled."""
+
+    def register(self, known: _Field, key: str, entries: Mapping[Any, Any]) -> None:
+        components = entries.values() if known.is_named_components else entries.keys()
+        self.registered.setdefault(key, []).extend(component for component in components if component is not None)
 
 
 class _Loader:
@@ -177,6 +183,7 @@ class _Loader:
             if known.is_registry and known.default:
                 origin = f"the default of {known.section.__qualname__}"
                 merged.values[key] = self._registry_entries(known, known.default, origin, False, merged.problems)
+                merged.register(known, key, merged.values[key])
         for source in self._sources:
             for key, value in _flatten(source.values, self._fields):
                 origin = source.describe(key)
@@ -184,6 +191,7 @@ class _Loader:
                 if known is not None and known.is_registry:
                     entries = self._registry_entries(known, value, origin, source.lenient, merged.problems)
                     merged.values.setdefault(key, {}).update(entries)
+                    merged.register(known, key, entries)
                 else:
                     merged.values[key] = value
                     merged.lenient[key] = source.lenient
@@ -255,13 +263,10 @@ class _Loader:
         return self._resolved[spec]
 
     def _discover_sections(self, merged: _Merged) -> bool:
+        # Disabled and replaced components count too, so their settings may stay configured.
         discovered = False
-        for key, known in list(self._fields.items()):
-            if not known.is_registry:
-                continue
-            registry: Mapping[object, object] = merged.values.get(key, {})
-            components = registry.values() if known.is_named_components else registry.keys()
-            for component in [component for component in components if component is not None]:
+        for components in merged.registered.values():
+            for component in components:
                 for section in _sections_of(component, {s.__name__: s for s in self._sections}):
                     discovered |= self._add_section(section)
         return discovered

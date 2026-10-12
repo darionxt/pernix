@@ -53,8 +53,8 @@ class Engine:
     that fails to be stored as `ItemError`. `SpiderIdle` is emitted once the Frontier
     has drained, before the workers stop.
 
-    While the spider chain runs, Requests constructed in it resolve relative URLs
-    against the Response being handled.
+    Requests constructed in the spider chain resolve relative URLs against the
+    Response handled by the layer, or the Callback, that constructs them.
     """
 
     def __init__(
@@ -153,8 +153,7 @@ class Engine:
                 # Only advancing the Callback is isolated: a failure to store its
                 # output is not the Callback's fault and must not be swallowed.
                 try:
-                    with resolve_relative_urls(response.urljoin):
-                        output = await anext(outputs)
+                    output = await anext(outputs)
                 except StopAsyncIteration:
                     return
                 except Exception as exc:
