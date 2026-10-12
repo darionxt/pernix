@@ -80,6 +80,7 @@ src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Headers, Extension
 ├── spider.py            Spider base class and run()/crawl() entry points
 ├── request.py           Request
+├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors
 ├── headers.py           Headers
 ├── crawler.py           assembles the components of one Run, builds components

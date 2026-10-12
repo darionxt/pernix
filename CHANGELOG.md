@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- The full `Request` model: `json=` and `data=` bodies, `errback`, `kwargs` passed to the Callback, `priority`, `dont_filter`, `fingerprint`, `cookies`, per-Request `timeout` / `proxy` / `impersonate`, and component-private `ext`; plus `encode_request()` / `decode_request()` for persistent Frontiers, with Callbacks stored by method name and JSON-only user data.
 - Events: typed `Event` dataclasses dispatched as observe, gate, or transform; an `EventBus` with priorities, per-subscriber timeouts, isolation of failing subscribers, and `events.on()` for methods; core Run Events (`SpiderOpened`, `SpiderClosed`, `RequestScheduled`, `RequestDropped`, `RequestFailed`, `ResponseReceived`, `ItemScraped`, and more), emitted by the Engine and the Crawler.
 - `Extension` components registered with the `extensions` setting, opened in order and closed in reverse, with close failures grouped in an `ExceptionGroup`.
 - Addons enabled with the `addons` setting by entry point name or import path, with an `api_version` check, a settings layer, and a registration-only `setup()`.
@@ -15,4 +16,5 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- Requests are independent: cookies no longer persist from one Request to another. Pass `cookies=` explicitly, or use a Session Pool once available (ADR 0011).
 - `Spider.run()` and `Spider.crawl()` take `settings={"concurrency": ...}` instead of a `concurrency` argument.

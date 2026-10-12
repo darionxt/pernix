@@ -350,3 +350,42 @@ async def test_a_self_cancelled_item_error_subscriber_does_not_hide_the_storage_
     with pytest.RaisesGroup(TypeError):
         async with asyncio.timeout(10):
             await Unserializable.crawl(output=tmp_path / "items.jsonl", settings=settings)
+
+
+async def test_callbacks_receive_the_request_kwargs(server: LoopbackServer, tmp_path: Path) -> None:
+    server.route("/", "ok")
+    server.route("/item", "item")
+
+    class Catalogue(Spider):
+        start_urls = (server.url("/"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield Request(server.url("/item"), callback=self.parse_item, kwargs={"category": "books", "page": 2})
+
+        async def parse_item(self, response: Response, category: str, page: int) -> AsyncIterator[Any]:
+            yield {"category": category, "page": page, "body": response.text}
+
+    output = tmp_path / "items.jsonl"
+    async with asyncio.timeout(10):
+        await Catalogue.crawl(output=output)
+
+    assert _read_items(output) == [{"category": "books", "page": 2, "body": "item"}]
+
+
+async def test_dont_filter_bypasses_deduplication(server: LoopbackServer) -> None:
+    server.route("/", "ok")
+    server.route("/again", "again")
+
+    class Repeat(Spider):
+        start_urls = (server.url("/"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            if response.url.endswith("/"):
+                yield Request(server.url("/again"))
+                yield Request(server.url("/again"))
+                yield Request(server.url("/again"), dont_filter=True)
+
+    async with asyncio.timeout(10):
+        await Repeat.crawl()
+
+    assert [r.path for r in server.received].count("/again") == 2
