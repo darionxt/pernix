@@ -79,3 +79,20 @@ async def test_requests_for_other_fetchers_are_rejected(server: LoopbackServer) 
             await fetcher.fetch(Request(server.url("/"), fetcher="ftp"))
 
     assert server.received == []
+
+
+async def test_response_cookies_hold_everything_set_during_the_transfer(server: LoopbackServer) -> None:
+    server.route(
+        "/login",
+        status=302,
+        headers=[("Location", server.url("/home")), ("Set-Cookie", "auth=ok; Path=/"), ("Set-Cookie", "tmp=1")],
+    )
+    server.route("/home", "home", headers=[("Set-Cookie", "theme=dark"), ("Set-Cookie", "tmp=; Max-Age=0")])
+    server.route("/account", handler=_cookie_echo)
+
+    async with HTTPFetcher() as fetcher:
+        response = await fetcher.fetch(Request(server.url("/login"), cookies={"lang": "en"}))
+        follow_up = await fetcher.fetch(Request(server.url("/account"), cookies=response.cookies))
+
+    assert dict(response.cookies) == {"lang": "en", "auth": "ok", "theme": "dark"}
+    assert sorted(follow_up.text.split("; ")) == ["auth=ok", "lang=en", "theme=dark"]

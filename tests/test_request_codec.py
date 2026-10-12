@@ -137,3 +137,25 @@ def test_unknown_fields_from_newer_additive_changes_are_ignored() -> None:
 def test_garbage_is_not_a_request() -> None:
     with pytest.raises(SerializationError, match="not a valid persisted Request"):
         decode_request(b"\x00not msgpack", Shop())
+
+
+def test_nested_read_only_mappings_are_stored_as_plain_data() -> None:
+    shop = Shop()
+    parent = Request(URL, meta={"depth": 1, "trail": ["a"]})
+    request = Request(URL, meta={"parent": parent.meta}, ext={"retry": {"history": parent.meta}})
+
+    restored = decode_request(encode_request(request, shop), shop)
+
+    assert restored.meta == {"parent": {"depth": 1, "trail": ["a"]}}
+    assert restored.ext["retry"] == {"history": {"depth": 1, "trail": ["a"]}}
+
+
+def test_integers_must_fit_in_64_bits() -> None:
+    shop = Shop()
+    limits = Request(URL, meta={"low": -(2**63), "high": 2**64 - 1})
+
+    assert decode_request(encode_request(limits, shop), shop).meta == {"low": -(2**63), "high": 2**64 - 1}
+    with pytest.raises(SerializationError, match=r"meta\['ids'\]\[1\] holds the integer 1208925819614629174706176"):
+        encode_request(Request(URL, meta={"ids": [1, 2**80]}), shop)
+    with pytest.raises(SerializationError, match=r"kwargs\['offset'\] holds the integer"):
+        encode_request(Request(URL, kwargs={"offset": -(2**63) - 1}), shop)

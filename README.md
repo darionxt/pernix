@@ -83,6 +83,7 @@ src/pernix/
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors
 ├── headers.py           Headers
+├── cookies.py           applies Set-Cookie headers to cookies held by name
 ├── crawler.py           assembles the components of one Run, builds components
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 from curl_cffi.requests import AsyncSession
 
+from pernix.cookies import merge_set_cookies
 from pernix.headers import Headers
 from pernix.response import Response
 
@@ -76,10 +77,13 @@ class HTTPFetcher:
             impersonate=cast("Any", request.impersonate),
             **options,
         )
+        hops = [*result.history, result]
+        set_cookies = [value for hop in hops for value in hop.headers.get_list("set-cookie") if value is not None]
         return Response(
             url=result.url,
             status=result.status_code,
             headers=Headers((k, v) for k, v in result.headers.multi_items() if v is not None),
             body=result.content,
             request=request,
+            cookies=merge_set_cookies(request.cookies, set_cookies),
         )

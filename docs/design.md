@@ -152,7 +152,7 @@ Request(
 ### 4.4 Response
 
 - Common fields: `url` (final URL), `status`, `headers` (multi-valued), `body: bytes`, `request`, `meta`, `session`, `cookies`, `history` (redirect chain), `elapsed`, `ip_address`, `http_version`, `fetcher`.
-- `cookies`: the cookies the client holds after the fetch, as name → value: those the Request carried plus those set during the fetch, including on redirects. `Request(next_url, cookies=response.cookies)` continues the conversation without a Session.
+- `cookies`: the cookies the client holds after the fetch, as name → value: those the Request carried plus those set during the fetch, including on redirects, with expired ones removed. Domain and path are not tracked, so same-named cookies collapse into one; full cookie records come with Sessions. `Request(next_url, cookies=response.cookies)` continues the conversation without a Session.
 - `text`: decoded lazily, in this order: user-specified → BOM → HTTP charset → `<meta>` / XML declaration → strict UTF-8 → encoding detection → configurable default. Encoding labels are mapped following browser rules; for example, both `gb2312` and `gbk` are decoded as `gb18030`. The encoding actually used and its source are stored in `encoding` / `encoding_source`.
 - Selectors: `css()`, `xpath()`, `re()`, `jmespath()`; the document is parsed only on first call. `json()` decodes with orjson and caches the decoded value.
 - Links: `urljoin()` resolves a URL against the Response's base URL (final URL, honoring `<base href>`), for example to store absolute links in Items. There are no `follow` helpers: Requests are always written out explicitly, and relative URLs are resolved automatically (see §4.3).
@@ -547,7 +547,7 @@ Rules:
 
 - Deduplication is handled by the Frontier, in the same atomic operation as insertion.
 - Default Fingerprint: `version | method | normalized URL | body digest | explicitly declared headers`.
-  - By default it does not include the fetcher, the Session, or cookies, so the same URL is not fetched again just because it was switched to Render or carries different cookies; use `dont_filter` or an explicit Fingerprint when it should be.
+  - It never includes cookies, whether passed as `cookies=` or as a `Cookie` header; declaring the `Cookie` header for the Fingerprint is rejected. By default it does not include the fetcher or the Session either, so the same URL is not fetched again just because it was switched to Render or carries different cookies; fetching it again is the application's explicit decision, through `dont_filter` or a Fingerprint it supplies.
   - The Fingerprint function can be customized, or the application can pass in a Fingerprint directly.
 - URL normalization does only three things: serialize according to WHATWG rules, remove the fragment, and stably sort query parameters (can be turned off).
   - It does not change path case, remove trailing slashes, or remove tracking parameters; these can be enabled with optional rules when needed.

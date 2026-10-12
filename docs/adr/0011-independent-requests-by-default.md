@@ -11,4 +11,4 @@ By default, no cookies persist from one Request to another, on the HTTP side and
 
 - Sites that rely on cookie continuity need either `cookies=response.cookies` on follow-up Requests or a Session Pool. This differs from frameworks that share one cookie jar per Spider, and must be stated prominently in the documentation.
 - Connections are still reused between independent Requests. Many independent visitors sharing one connection can itself be a signal; full identity separation comes from Sessions with their own proxies.
-- `cookies` is not part of the default Fingerprint, so the same URL with different cookies is a duplicate unless `dont_filter` or an explicit Fingerprint says otherwise.
+- Cookies never take part in computing a Fingerprint, whether passed as `cookies=` or as a `Cookie` header, so the same URL with different cookies is a duplicate. Fetching it again is the application's explicit decision: `dont_filter=True`, or a Fingerprint it supplies itself.

@@ -3,8 +3,9 @@
 Requests are encoded as msgpack with a schema version. Callbacks are stored by the
 name of the Spider method and looked up again when decoding; a missing method is an
 error, never a fallback to `parse`. User data (`kwargs`, `meta`, `ext`) must be
-JSON-compatible: `None`, booleans, numbers, strings, lists, and dicts with string
-keys. Tuples come back as lists. Nothing is ever pickled.
+JSON-compatible: `None`, booleans, numbers (integers within 64 bits), strings, lists,
+and mappings with string keys. Tuples come back as lists, and mappings as dicts.
+Nothing is ever pickled.
 
 `REQUEST_SCHEMA_VERSION` changes only for incompatible changes. Fields added later
 have defaults, and fields a decoder does not know are ignored, so older and newer
@@ -54,6 +55,9 @@ class _RequestRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
     ext: dict[str, dict[str, Any]] = msgspec.field(default_factory=dict[str, dict[str, Any]])
 
 
+_MIN_INT = -(2**63)
+_MAX_INT = 2**64 - 1
+
 _encoder = msgspec.msgpack.Encoder()
 _decoder = msgspec.msgpack.Decoder(_RequestRecord)
 
@@ -70,13 +74,12 @@ def encode_request(request: Request, spider: object) -> bytes:
 
     Raises:
         SerializationError: The Callback or errback is not a method of `spider`, or
-            `kwargs`, `meta`, or `ext` holds a value that is not JSON-compatible; the
-            message names its key.
+            `kwargs`, `meta`, or `ext` holds a value that is not JSON-compatible or an
+            integer outside 64 bits; the message names its key.
     """
-    _check_json("kwargs", request.kwargs)
-    _check_json("meta", request.meta)
-    for component, data in request.ext.items():
-        _check_json(f"ext[{component!r}]", data)
+    kwargs = _json_object("kwargs", request.kwargs)
+    meta = _json_object("meta", request.meta)
+    ext = {component: _json_object(f"ext[{component!r}]", data) for component, data in request.ext.items()}
     record = _RequestRecord(
         schema_version=REQUEST_SCHEMA_VERSION,
         url=request.url,
@@ -85,8 +88,8 @@ def encode_request(request: Request, spider: object) -> bytes:
         body=request.body,
         callback=_method_name(request.callback, spider, "callback"),
         errback=_method_name(request.errback, spider, "errback"),
-        kwargs=dict(request.kwargs),
-        meta=dict(request.meta),
+        kwargs=kwargs,
+        meta=meta,
         priority=request.priority,
         dont_filter=request.dont_filter,
         fingerprint=request.fingerprint,
@@ -97,7 +100,7 @@ def encode_request(request: Request, spider: object) -> bytes:
         timeout=request.timeout,
         proxy=request.proxy,
         impersonate=request.impersonate,
-        ext={component: dict(data) for component, data in request.ext.items()},
+        ext=ext,
     )
     return _encoder.encode(record)
 
@@ -174,17 +177,28 @@ def _resolve_method(spider: object, name: str | None, role: str) -> Callback | N
     return method
 
 
-def _check_json(path: str, value: object) -> None:
+def _json_object(path: str, value: Mapping[str, Any]) -> dict[str, Any]:
+    return cast("dict[str, Any]", _to_json(path, value))
+
+
+def _to_json(path: str, value: object) -> object:
+    """Copy a value as plain JSON-compatible data, or raise naming the offending key."""
     match value:
-        case None | bool() | int() | float() | str():
-            return
+        case bool() | None | float() | str():
+            return value
+        case int():
+            if not _MIN_INT <= value <= _MAX_INT:
+                raise SerializationError(f"{path} holds the integer {value}, which does not fit in 64 bits")
+            return value
         case Mapping():
+            plain: dict[str, object] = {}
             for key, item in cast("Mapping[object, object]", value).items():
                 if not isinstance(key, str):
                     raise SerializationError(f"{path} has the key {key!r}; keys must be strings")
-                _check_json(f"{path}[{key!r}]", item)
+                plain[key] = _to_json(f"{path}[{key!r}]", item)
+            return plain
         case list() | tuple():
-            for index, item in enumerate(cast("list[object] | tuple[object, ...]", value)):
-                _check_json(f"{path}[{index}]", item)
+            items = cast("list[object] | tuple[object, ...]", value)
+            return [_to_json(f"{path}[{index}]", item) for index, item in enumerate(items)]
         case _:
             raise SerializationError(f"{path} holds a {type(value).__name__}, which is not JSON-compatible")
