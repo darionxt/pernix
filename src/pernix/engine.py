@@ -173,13 +173,14 @@ async def _iterate[T](items: AsyncIterator[T]) -> AsyncGenerator[T]:
             yield item
 
 
-async def _outputs(callback: Callable[[Response], object], response: Response) -> AsyncGenerator[object]:
+async def _outputs(callback: Callable[..., object], response: Response) -> AsyncGenerator[object]:
     """Call a Callback and yield its outputs, from an async iterator or an awaitable of a value or list.
 
-    The Callback is called on the first iteration, so an exception raised by the call
-    itself surfaces from `anext()` like any other Callback exception.
+    The Callback is called on the first iteration, with the Request's `kwargs`, so an
+    exception raised by the call itself surfaces from `anext()` like any other Callback
+    exception.
     """
-    result = callback(response)
+    result = callback(response, **response.request.kwargs)
     if isinstance(result, AsyncIterator):
         async with aclosing(_iterate(cast("AsyncIterator[object]", result))) as outputs:
             async for output in outputs:

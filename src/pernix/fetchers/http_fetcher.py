@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from curl_cffi.requests import AsyncSession
 
+from pernix.cookies import merge_set_cookies, parse_cookie_header
 from pernix.headers import Headers
 from pernix.response import Response
 
@@ -20,6 +21,10 @@ class HTTPFetcher:
 
     Use it as an async context manager: the underlying session is created on entry,
     bound to the running event loop, and closed on exit.
+
+    Requests are independent (ADR 0011): each transfer sends only `request.cookies`,
+    cookies set during it flow within its own redirect chain, and none are kept for
+    later Requests. Connections are still reused.
     """
 
     def __init__(self, *, max_clients: int = 16) -> None:
@@ -51,20 +56,43 @@ class HTTPFetcher:
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
+            ValueError: The Request needs rendering or another Fetcher.
             curl_cffi.requests.exceptions.RequestException: The transfer failed.
         """
         if self._session is None:
             raise RuntimeError("HTTPFetcher must be entered with 'async with' before fetching")
+        if request.render or request.fetcher not in (None, "http"):
+            raise ValueError(f"{request!r} needs a Fetcher other than HTTP, which is not available yet")
+        options: dict[str, Any] = {}
+        if request.timeout is not None:
+            options["timeout"] = request.timeout
         result = await self._session.request(
             cast("HttpMethod", request.method),
             request.url,
             headers=request.headers.items(),
             data=request.body,
+            cookies=dict(request.cookies),
+            discard_cookies=True,
+            proxy=request.proxy,
+            impersonate=cast("Any", request.impersonate),
+            **options,
         )
+        hops = [*result.history, result]
+        set_cookies = [value for hop in hops for value in hop.headers.get_list("set-cookie") if value is not None]
         return Response(
             url=result.url,
             status=result.status_code,
             headers=Headers((k, v) for k, v in result.headers.multi_items() if v is not None),
             body=result.content,
             request=request,
+            cookies=merge_set_cookies(_sent_cookies(request), set_cookies),
         )
+
+
+def _sent_cookies(request: Request) -> dict[str, str]:
+    """The cookies a Request carries, whether as `cookies=` or as `Cookie` headers."""
+    sent: dict[str, str] = {}
+    for header in request.headers.get_all("Cookie"):
+        sent.update(parse_cookie_header(header))
+    sent.update(request.cookies)
+    return sent

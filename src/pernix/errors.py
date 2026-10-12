@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__all__ = ["AddonError", "ComponentError", "PernixError", "SettingsError"]
+__all__ = ["AddonError", "ComponentError", "PernixError", "SerializationError", "SettingsError"]
 
 
 class PernixError(Exception):
@@ -30,3 +30,7 @@ class ComponentError(PernixError):
 
 class AddonError(PernixError):
     """An Addon cannot be loaded, is incompatible, or misused its setup API."""
+
+
+class SerializationError(PernixError):
+    """A Request cannot be persisted, or a persisted Request cannot be restored."""

@@ -12,6 +12,10 @@ __all__ = ["MemoryFrontier"]
 class MemoryFrontier:
     """An in-memory FIFO Frontier with exact-match deduplication.
 
+    Requests are deduplicated by their explicit `fingerprint` if they have one, and by
+    method, URL, and body otherwise; cookies never take part. Requests with
+    `dont_filter` are always enqueued.
+
     Every Request handed out by `get()` must be reported with `done()` after the
     Requests it produced have been added, so `join()` returns only once the Frontier is
     empty and nothing is in flight.
@@ -20,7 +24,7 @@ class MemoryFrontier:
     def __init__(self) -> None:
         """Create an empty Frontier."""
         self._queue: asyncio.Queue[Request] = asyncio.Queue()
-        self._seen: set[tuple[str, str, bytes | None]] = set()
+        self._seen: set[str | tuple[str, str, bytes | None]] = set()
 
     def add(self, request: Request) -> bool:
         """Enqueue a Request unless an identical one was added before.
@@ -31,10 +35,12 @@ class MemoryFrontier:
         Returns:
             `True` if it was enqueued, `False` if it was a duplicate.
         """
-        key = (request.method, request.url, request.body)
-        if key in self._seen:
-            return False
-        self._seen.add(key)
+        if not request.dont_filter:
+            fingerprint = request.fingerprint
+            key = fingerprint if fingerprint is not None else (request.method, request.url, request.body)
+            if key in self._seen:
+                return False
+            self._seen.add(key)
         self._queue.put_nowait(request)
         return True
 

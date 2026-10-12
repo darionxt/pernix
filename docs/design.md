@@ -133,22 +133,26 @@ Request(
     priority=0,            # higher goes first; FIFO within the same priority
     dont_filter=False,     # skip deduplication
     fingerprint=None,      # application-supplied Fingerprint; computed by default, see §6.2
-    session=None,          # pin a Session; assigned by the Session Pool by default, see §5.3
+    cookies=None,          # name -> value, sent with this Request only; cannot be combined with a Cookie header
+    session=None,          # pin a Session; none by default (Requests are independent), see §5.3
     render=None,           # browser Render options, see §4.7
     fetcher=None,          # explicit Fetcher; inferred from render and the URL scheme by default
     timeout=None,
     proxy=None, impersonate=None,   # per-Request overrides, rarely needed
+    ext=None,              # component-private data, by component name
 )
 ```
 
 - Requests are immutable; derive new ones with `request.replace(...)`.
+- Requests are independent by default (ADR 0011): no cookies persist from one Request to another. A Request sends only the cookies it carries (`cookies=`, which cannot be combined with a `Cookie` header). Within one Request's redirect chain cookies flow as in a browser. To continue a conversation explicitly, pass `cookies=response.cookies`; to keep state across many Requests, use a Session Pool (§5.3).
 - Relative URLs: a Request created while a Callback is running resolves a relative `url` against that Callback's Response, using its final URL after redirects and honoring `<base href>` in HTML. `request.url` is therefore absolute as soon as the Request is constructed; this also applies to Inline Fetch. Outside a Callback (for example in `start()` or `on_idle()`), `url` must be absolute, and a relative URL raises an error.
 - `meta` holds only user data. Framework-internal state (retry count, the Session used, etc.) lives in typed fields, and component-private data lives in namespaces keyed by component name, so different components do not become implicitly coupled through `meta`.
-- Serialization uses msgspec with a schema version. Callbacks are referenced by method name; if the method cannot be found on resume, an error is raised immediately, and it never silently falls back to `parse`.
+- Serialization uses msgspec (msgpack) with a schema version. Callbacks are referenced by method name; if the method cannot be found on resume, an error is raised immediately, and it never silently falls back to `parse`. `kwargs`, `meta`, and `ext` must be JSON-compatible, and a violation names the offending key. The schema version changes only for incompatible changes: added fields have defaults, and unknown fields are ignored.
 
 ### 4.4 Response
 
 - Common fields: `url` (final URL), `status`, `headers` (multi-valued), `body: bytes`, `request`, `meta`, `session`, `cookies`, `history` (redirect chain), `elapsed`, `ip_address`, `http_version`, `fetcher`.
+- `cookies`: the cookies the client holds after the fetch, as name → value: those the Request carried (`cookies=` or a `Cookie` header) plus those set during the fetch, including on redirects, with expired ones removed. `Set-Cookie` is parsed as one cookie per header, ignoring attributes other than `Max-Age` and `Expires`. Domain and path are not tracked, so same-named cookies collapse into one; full cookie records come with Sessions. `Request(next_url, cookies=response.cookies)` continues the conversation without a Session.
 - `text`: decoded lazily, in this order: user-specified → BOM → HTTP charset → `<meta>` / XML declaration → strict UTF-8 → encoding detection → configurable default. Encoding labels are mapped following browser rules; for example, both `gb2312` and `gbk` are decoded as `gb18030`. The encoding actually used and its source are stored in `encoding` / `encoding_source`.
 - Selectors: `css()`, `xpath()`, `re()`, `jmespath()`; the document is parsed only on first call. `json()` decodes with orjson and caches the decoded value.
 - Links: `urljoin()` resolves a URL against the Response's base URL (final URL, honoring `<base href>`), for example to store absolute links in Items. There are no `follow` helpers: Requests are always written out explicitly, and relative URLs are resolved automatically (see §4.3).
@@ -174,7 +178,7 @@ async def parse_detail(self, response):
 
 - Use cases: logging in, exchanging for a Token, paging sequentially through a paginated API, and cases such as "detail page + comments API" where the output has to be assembled within one Callback.
 - Semantics:
-  - Goes through the same download Middleware chain and the same rate limiter, and uses the current Request's Session by default.
+  - Goes through the same download Middleware chain and the same rate limiter. It uses the current Request's Session if it has one; otherwise it is independent like any Request and sends only the cookies passed to it.
   - **Does not enter the Frontier, is not deduplicated, and is not persisted**; on failure it is retried in place according to the retry policy, and `FetchError` is raised if it ultimately fails.
   - When the parent Request is cancelled, its Inline Fetches are cancelled with it.
 
@@ -413,14 +417,14 @@ Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (se
 
 **Delegated to the framework**
 
-- Cookies are managed by the framework's Session, see §5.3.
+- Without a Session, no cookies persist between Requests (ADR 0011): each transfer starts with only the Request's cookies, and cookies set during it, including on redirects, go to `Response.cookies` instead of shared state. Connections are still reused. With a Session, its cookies are managed by the framework, see §5.3.
 - Retries are handled by the framework; curl-cffi's built-in retries are turned off.
 
 ### 5.2 Browser Fetcher (patchright)
 
 **Topology**
 
-- patchright is started once per process; it launches one browser with `launch()` and creates multiple contexts, one per Session.
+- patchright is started once per process; it launches one browser with `launch()` and creates multiple contexts, one per Session. Without a Session, each rendered Request gets a fresh context, so Requests stay independent as on the HTTP side.
 - A context's proxy, storage state, locale, and time zone are set once at creation and never modified afterward; switching proxies means creating a new context.
 
 **Capacity**
@@ -447,7 +451,7 @@ Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (se
 - **What a Session contains**: a Session holds Cookies and browser storage state, a bound proxy, a Profile, and an optional reference to an Account. The HTTP side and the browser side are both just caches of the same Session state.
   - **HTTP side**: Cookies are written before a Request is sent, and changes are merged after the Response arrives. curl-cffi's Cookie format loses attributes such as SameSite, so the merge preserves that metadata.
   - **Browser side**: storage state is injected when a context is created, and is exported and merged back into the Session before the context closes.
-- **Session Pool**: by default a Request leases a Session from the Session Pool. This includes Requests created in a Callback: they do not inherit the Session of the page they were found on. `Request(session="xxx")` pins a specific Session; to continue with the current page's Session, pass `session=response.session`. Inline Fetch is the exception: it continues the current Request's Session by default (see §4.6).
+- **Session Pool**: no Session is used by default; Requests are independent (ADR 0011). A Session Pool is opt-in, enabled at the Spider level; once enabled, a Request leases a Session from it by default. This includes Requests created in a Callback: they do not inherit the Session of the page they were found on. `Request(session="xxx")` pins a specific Session; to continue with the current page's Session, pass `session=response.session`. Inline Fetch is the exception: it continues the current Request's Session by default (see §4.6).
 - **Health management**:
   - There are three states: available, in Cooldown, and Retired.
   - When Rate Limited (429), a Session only enters Cooldown and is not Retired.
@@ -543,7 +547,7 @@ Rules:
 
 - Deduplication is handled by the Frontier, in the same atomic operation as insertion.
 - Default Fingerprint: `version | method | normalized URL | body digest | explicitly declared headers`.
-  - By default it does not include the fetcher or the Session, so the same URL is not fetched again just because it was switched to Render.
+  - It never includes cookies, whether passed as `cookies=` or as a `Cookie` header; declaring the `Cookie` header for the Fingerprint is rejected. By default it does not include the fetcher or the Session either, so the same URL is not fetched again just because it was switched to Render or carries different cookies; fetching it again is the application's explicit decision, through `dont_filter` or a Fingerprint it supplies.
   - The Fingerprint function can be customized, or the application can pass in a Fingerprint directly.
 - URL normalization does only three things: serialize according to WHATWG rules, remove the fragment, and stably sort query parameters (can be turned off).
   - It does not change path case, remove trailing slashes, or remove tracking parameters; these can be enabled with optional rules when needed.
@@ -611,7 +615,7 @@ Rules:
 | Retries | Enabled | ✓ |
 | Rate limiting / concurrency slots | Enabled | ✓ |
 | robots.txt | Disabled (enable with `robots.obey`) | ✓ |
-| Session / Cookie | Enabled | ✓ |
+| Session Pool | Opt-in; Requests are independent by default (ADR 0011) | ✓ |
 | Proxies | Enabled when configured | ✓ |
 | Blocked-response detection | Enabled (status-code rules) | ✓ |
 | Stats / event loop lag sampling | Enabled | ✓ |

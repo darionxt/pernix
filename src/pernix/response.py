@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from parsel import Selector, SelectorList
@@ -22,9 +23,13 @@ class Response:
         headers: The response headers, in wire order.
         body: The raw response body.
         request: The Request that produced this Response.
+        cookies: Read-only cookies the client holds after the fetch, by name: those the
+            Request carried (`cookies=` or a `Cookie` header) plus those set during the
+            fetch, including on redirects.
+            Pass them on with `Request(url, cookies=response.cookies)`.
     """
 
-    __slots__ = ("_selector", "_text", "body", "headers", "request", "status", "url")
+    __slots__ = ("_selector", "_text", "body", "cookies", "headers", "request", "status", "url")
 
     def __init__(
         self,
@@ -34,6 +39,7 @@ class Response:
         headers: Headers,
         body: bytes,
         request: Request,
+        cookies: Mapping[str, str] | None = None,
     ) -> None:
         """Create a Response. Fetchers build these; user code rarely needs to.
 
@@ -43,12 +49,14 @@ class Response:
             headers: The response headers.
             body: The raw response body.
             request: The Request that produced this Response.
+            cookies: The cookies the client holds after the fetch, by name.
         """
         self.url = url
         self.status = status
         self.headers = headers
         self.body = body
         self.request = request
+        self.cookies: Mapping[str, str] = MappingProxyType(dict(cookies or {}))
         self._text: str | None = None
         self._selector: Selector | None = None
 
