@@ -6,6 +6,7 @@ import orjson
 import pytest
 
 from pernix import Request, Response, Spider
+from pernix.request import resolve_relative_urls
 
 URL = "https://example.com/"
 
@@ -128,3 +129,24 @@ def test_replace_accepts_only_fields_and_revalidates() -> None:
         request.replace(json={"b": 2})
     with pytest.raises(ValueError, match="not both"):
         request.replace(headers={"Cookie": "b=2"})
+
+
+@pytest.mark.parametrize("url", ["/catalogue/page-2.html", "page-2.html", "//cdn.example.com/a", "?page=2", ""])
+def test_relative_urls_are_rejected_outside_a_callback(url: str) -> None:
+    with pytest.raises(ValueError, match="relative URL; Requests constructed outside a Callback"):
+        Request(url)
+
+
+def test_relative_urls_resolve_while_a_resolver_is_in_effect() -> None:
+    with resolve_relative_urls(lambda url: f"https://example.com/base/{url}"):
+        request = Request(" page-2.html\n", callback=Shop().parse_item)
+        absolute = Request("https://other.example/")
+
+    assert request.url == "https://example.com/base/page-2.html"
+    assert absolute.url == "https://other.example/"
+    with pytest.raises(ValueError, match="relative URL"):
+        Request("page-3.html")
+
+
+def test_urls_are_cleaned_as_browsers_do() -> None:
+    assert Request("  https://example.com/a\n/b\t?q=1 ").url == "https://example.com/a/b?q=1"

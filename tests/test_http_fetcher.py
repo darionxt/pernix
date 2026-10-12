@@ -114,3 +114,31 @@ async def test_an_oversized_max_age_does_not_fail_the_fetch(server: LoopbackServ
         response = await fetcher.fetch(Request(server.url("/")))
 
     assert (response.status, dict(response.cookies)) == (200, {"a": "1"})
+
+
+async def test_responses_record_the_redirect_chain_and_transfer_metadata(server: LoopbackServer) -> None:
+    server.route("/a", status=301, headers=[("Location", "/b"), ("X-Hop", "a")])
+    server.route("/b", status=302, headers=[("Location", "/c"), ("X-Hop", "b")])
+    server.route("/c", "done")
+
+    async with HTTPFetcher() as fetcher:
+        response = await fetcher.fetch(Request(server.url("/a")))
+
+    assert (response.url, response.status, response.text) == (server.url("/c"), 200, "done")
+    assert [(hop.url, hop.status, hop.headers.get("X-Hop")) for hop in response.history] == [
+        (server.url("/a"), 301, "a"),
+        (server.url("/b"), 302, "b"),
+    ]
+    assert (response.fetcher, response.http_version, response.ip_address) == ("http", "HTTP/1.1", "127.0.0.1")
+    assert response.elapsed is not None
+    assert response.elapsed > 0
+
+
+async def test_responses_use_the_configured_default_encoding(server: LoopbackServer) -> None:
+    body = ("<html><body>" + "中文内容\uff0c这是一个测试。" * 20 + "</body></html>").encode()
+    server.route("/page", body[:100] + b"\xff" + body[100:])
+
+    async with HTTPFetcher(default_encoding="gb18030") as fetcher:
+        response = await fetcher.fetch(Request(server.url("/page")))
+
+    assert (response.encoding, response.encoding_source) == ("gb18030", "default")

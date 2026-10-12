@@ -12,7 +12,7 @@ from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.feeds import JsonLinesFeed
 from pernix.fetchers import HTTPFetcher
 from pernix.memory_frontier import MemoryFrontier
-from pernix.settings import CoreSettings, EventSettings, Section, Settings, load_settings
+from pernix.settings import CoreSettings, EventSettings, ResponseSettings, Section, Settings, load_settings
 
 if TYPE_CHECKING:
     import os
@@ -136,7 +136,8 @@ class Crawler:
         concurrency = self.settings.section(CoreSettings).concurrency
         with ExitStack() as stack:
             item_sink = _discard if self._output is None else stack.enter_context(JsonLinesFeed(self._output)).write
-            async with HTTPFetcher(max_clients=concurrency) as fetcher:
+            default_encoding = self.settings.section(ResponseSettings).default_encoding
+            async with HTTPFetcher(max_clients=concurrency, default_encoding=default_encoding) as fetcher:
                 engine = Engine(
                     self.spider,
                     frontier=MemoryFrontier(),

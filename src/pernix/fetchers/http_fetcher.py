@@ -2,18 +2,28 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Self, cast
 
+from curl_cffi import CurlHttpVersion
 from curl_cffi.requests import AsyncSession
 
 from pernix.cookies import merge_set_cookies, parse_cookie_header
 from pernix.headers import Headers
-from pernix.response import Response
+from pernix.response import Redirect, Response
 
 if TYPE_CHECKING:
+    import curl_cffi
     from curl_cffi.requests.session import HttpMethod
 
     from pernix.request import Request
 
 __all__ = ["HTTPFetcher"]
+
+_HTTP_VERSIONS: dict[int, str] = {
+    CurlHttpVersion.V1_0: "HTTP/1.0",
+    CurlHttpVersion.V1_1: "HTTP/1.1",
+    CurlHttpVersion.V2_0: "HTTP/2",
+    CurlHttpVersion.V3: "HTTP/3",
+}
+"""What libcurl reports as the HTTP version of a transfer, by name."""
 
 
 class HTTPFetcher:
@@ -27,13 +37,15 @@ class HTTPFetcher:
     later Requests. Connections are still reused.
     """
 
-    def __init__(self, *, max_clients: int = 16) -> None:
+    def __init__(self, *, max_clients: int = 16, default_encoding: str = "utf-8") -> None:
         """Configure the fetcher.
 
         Args:
             max_clients: The maximum number of requests in flight at once.
+            default_encoding: The `default_encoding` of the Responses.
         """
         self._max_clients = max_clients
+        self._default_encoding = default_encoding
         self._session: AsyncSession | None = None
 
     async def __aenter__(self) -> Self:
@@ -82,11 +94,21 @@ class HTTPFetcher:
         return Response(
             url=result.url,
             status=result.status_code,
-            headers=Headers((k, v) for k, v in result.headers.multi_items() if v is not None),
+            headers=_headers(result),
             body=result.content,
             request=request,
             cookies=merge_set_cookies(_sent_cookies(request), set_cookies),
+            default_encoding=self._default_encoding,
+            history=[Redirect(hop.url, hop.status_code, _headers(hop)) for hop in result.history],
+            elapsed=result.elapsed.total_seconds(),
+            ip_address=result.primary_ip or None,
+            http_version=_HTTP_VERSIONS.get(result.http_version),
+            fetcher="http",
         )
+
+
+def _headers(response: curl_cffi.Response) -> Headers:
+    return Headers((name, value) for name, value in response.headers.multi_items() if value is not None)
 
 
 def _sent_cookies(request: Request) -> dict[str, str]:

@@ -16,7 +16,7 @@ from pernix.events import (
     ResponseReceived,
     SpiderIdle,
 )
-from pernix.request import Request
+from pernix.request import Request, resolve_relative_urls
 
 if TYPE_CHECKING:
     from pernix.events import EventBus
@@ -46,6 +46,9 @@ class Engine:
     is emitted as `ResponseReceived`, each stored Item as `ItemScraped`, and an Item
     that fails to be stored as `ItemError`. `SpiderIdle` is emitted once the Frontier
     has drained, before the workers stop.
+
+    While a Callback runs, Requests it constructs resolve relative URLs against its
+    Response.
     """
 
     def __init__(
@@ -129,7 +132,8 @@ class Engine:
                 # Only advancing the Callback is isolated: a failure to store its
                 # output is not the Callback's fault and must not be swallowed.
                 try:
-                    output = await anext(outputs)
+                    with resolve_relative_urls(response.urljoin):
+                        output = await anext(outputs)
                 except StopAsyncIteration:
                     return
                 except Exception as exc:

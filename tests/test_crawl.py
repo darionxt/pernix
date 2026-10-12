@@ -24,34 +24,35 @@ FIRST_PAGE = "/catalogue/page-1.html"
 BOOKS_PER_PAGE = 3
 
 
-def _list_page(server: LoopbackServer, page: int) -> str:
+def _list_page(page: int, *, base: str | None = None) -> str:
+    """A list page with links relative to /catalogue/, as written on real sites."""
     books = range((page - 1) * BOOKS_PER_PAGE + 1, page * BOOKS_PER_PAGE + 1)
-    articles = "".join(
-        f'<article><h3><a href="{server.url(f"/book/{n}.html")}">Book {n}</a></h3></article>' for n in books
-    )
-    first = f'<a class="first" href="{server.url(FIRST_PAGE)}">first</a>'
-    after = server.url(f"/catalogue/page-{page + 1}.html")
-    following = f'<li class="next"><a href="{after}">next</a></li>' if page < PAGES else ""
-    return f"<html><body>{articles}{first}<ul>{following}</ul></body></html>"
+    articles = "".join(f'<article><h3><a href="../book/{n}.html">Book {n}</a></h3></article>' for n in books)
+    first = f'<a class="first" href="{FIRST_PAGE}">first</a>'
+    following = f'<li class="next"><a href="page-{page + 1}.html">next</a></li>' if page < PAGES else ""
+    head = "" if base is None else f'<head><base href="{base}"></head>'
+    return f"<html>{head}<body>{articles}{first}<ul>{following}</ul></body></html>"
 
 
 def _book_page(n: int) -> str:
     return f'<html><body><h1>Book {n}</h1><p class="price_color">£{n}.00</p></body></html>'
 
 
+HTML = [("Content-Type", "text/html; charset=utf-8")]
+
+
 @pytest.fixture
 def bookstore(server: LoopbackServer) -> LoopbackServer:
     """A small paginated catalogue: list pages link to detail pages and to each other."""
-    html = [("Content-Type", "text/html; charset=utf-8")]
     for page in range(1, PAGES + 1):
-        server.route(f"/catalogue/page-{page}.html", _list_page(server, page), headers=html)
+        server.route(f"/catalogue/page-{page}.html", _list_page(page), headers=HTML)
     for n in range(1, PAGES * BOOKS_PER_PAGE + 1):
-        server.route(f"/book/{n}.html", _book_page(n), headers=html)
+        server.route(f"/book/{n}.html", _book_page(n), headers=HTML)
     return server
 
 
 class Books(Spider):
-    """The example from docs/design.md §4.1; the fixture pages use absolute links."""
+    """The example from docs/design.md §4.1."""
 
     name = "books"
 
@@ -90,6 +91,49 @@ def test_run_crawls_list_and_detail_pages(bookstore: LoopbackServer, tmp_path: P
     fetched = [request.path for request in bookstore.received]
     assert len(fetched) == len(set(fetched)), "every page is fetched exactly once"
     assert len(fetched) == PAGES + PAGES * BOOKS_PER_PAGE
+
+
+async def test_relative_links_resolve_against_the_final_url_after_a_redirect(
+    bookstore: LoopbackServer, tmp_path: Path
+) -> None:
+    bookstore.route("/start", status=302, headers=[("Location", FIRST_PAGE)])
+
+    class LocalBooks(Books):
+        start_urls = (bookstore.url("/start"),)
+
+    output = tmp_path / "books.jsonl"
+    async with asyncio.timeout(10):
+        await LocalBooks.crawl(output=output)
+
+    assert _sorted(_read_items(output)) == _sorted(EXPECTED_BOOKS)
+
+
+async def test_relative_links_honor_the_base_href(bookstore: LoopbackServer, tmp_path: Path) -> None:
+    bookstore.route("/mirror/index.html", _list_page(1, base="/catalogue/"), headers=HTML)
+
+    class LocalBooks(Books):
+        start_urls = (bookstore.url("/mirror/index.html"),)
+
+    output = tmp_path / "books.jsonl"
+    async with asyncio.timeout(10):
+        await LocalBooks.crawl(output=output)
+
+    assert _sorted(_read_items(output)) == _sorted(EXPECTED_BOOKS)
+    assert "/mirror/page-2.html" not in [request.path for request in bookstore.received]
+
+
+async def test_a_relative_url_in_start_is_an_error(bookstore: LoopbackServer, caplog: pytest.LogCaptureFixture) -> None:
+    class Relative(Books):
+        start_urls = (FIRST_PAGE,)
+
+    async with asyncio.timeout(10):
+        await Relative.crawl()
+
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert "start() of spider 'books' failed" in record.getMessage()
+    assert record.exc_info is not None
+    assert "is a relative URL" in str(record.exc_info[1])
+    assert bookstore.received == []
 
 
 async def test_crawl_runs_inside_an_event_loop(bookstore: LoopbackServer, tmp_path: Path) -> None:
