@@ -18,8 +18,9 @@ from pernix.events import (
     ResponseReceived,
     SpiderIdle,
 )
-from pernix.request import Request, resolve_relative_urls
+from pernix.request import Request
 from pernix.response import expect_response
+from pernix.spider_middleware import resolving_against
 
 if TYPE_CHECKING:
     from pernix.events import EventBus
@@ -196,19 +197,13 @@ def run_callbacks(spider: Spider) -> HandleResponse:
     Returns:
         A function that calls the Callback of a Response's Request, with the
         Request's `kwargs`, and yields its outputs. Requests constructed in the
-        Callback resolve relative URLs against that Response.
+        Callback, including while it is closed, resolve relative URLs against that
+        Response.
     """
 
-    async def run_callback(response: Response) -> AsyncGenerator[object]:
+    def run_callback(response: Response) -> AsyncGenerator[object]:
         callback = response.request.callback or spider.parse
-        async with aclosing(_outputs(callback, response)) as outputs:
-            while True:
-                try:
-                    with resolve_relative_urls(response.urljoin):
-                        output = await anext(outputs)
-                except StopAsyncIteration:
-                    return
-                yield output
+        return resolving_against(response, _outputs(callback, response))
 
     return run_callback
 

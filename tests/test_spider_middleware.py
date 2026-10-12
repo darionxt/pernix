@@ -184,6 +184,58 @@ async def test_closing_the_chain_closes_every_layer_and_the_callback() -> None:
     assert Cleanup.log == ["middleware cleaned up", "middleware cleaned up", "callback cleaned up", "chain closed"]
 
 
+class CleanupRequests(Spider):
+    built: ClassVar[list[str]] = []
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        try:
+            yield {"n": 1}
+            yield {"n": 2}
+        finally:
+            self.built.append(Request("callback-cleanup.html").url)
+
+
+class Mirror(SpiderMiddleware):
+    async def __call__(self, response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
+        try:
+            async for output in call_next(response.replace(url="https://mirror.example/list/")):
+                yield output
+        finally:
+            CleanupRequests.built.append(Request("mirror-cleanup.html").url)
+
+
+class Inner(SpiderMiddleware):
+    async def __call__(self, response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
+        try:
+            async for output in call_next(response):
+                yield output
+        finally:
+            CleanupRequests.built.append(Request("inner-cleanup.html").url)
+
+
+async def test_cleanup_after_an_early_stop_resolves_against_each_layers_response() -> None:
+    CleanupRequests.built.clear()
+    handle = build_spider_chain([Mirror(), Inner()], run_callbacks(CleanupRequests()))
+
+    async with aclosing(cast("AsyncGenerator[Any]", handle(_response()))) as outputs:
+        assert await anext(outputs) == {"n": 1}
+
+    assert CleanupRequests.built == [
+        "https://example.com/list/mirror-cleanup.html",
+        "https://mirror.example/list/inner-cleanup.html",
+        "https://mirror.example/list/callback-cleanup.html",
+    ]
+
+
+async def test_closing_a_callback_without_middleware_resolves_against_its_response() -> None:
+    CleanupRequests.built.clear()
+
+    async with aclosing(cast("AsyncGenerator[Any]", run_callbacks(CleanupRequests())(_response()))) as outputs:
+        assert await anext(outputs) == {"n": 1}
+
+    assert CleanupRequests.built == ["https://example.com/list/callback-cleanup.html"]
+
+
 async def test_function_spider_middleware() -> None:
     @spider_middleware
     async def only_requests(response: Response, call_next: HandleResponse) -> AsyncIterator[Any]:
