@@ -159,7 +159,7 @@ Request(
   - Encoding labels are mapped following the WHATWG Encoding Standard; for example, both `gb2312` and `gbk` are decoded as `gb18030`, and `iso-8859-1` as `windows-1252`. An explicit encoding or the default may also be a Python codec name.
   - The codec actually used is stored in `encoding`, and the step that chose it in `encoding_source`: `explicit`, `bom`, `header`, `document`, `utf-8`, `detected`, or `default`.
 - Selectors: `css()`, `xpath()`, `re()` / `re_first()` over the whole text, and `jmespath()`, whose results keep JSON values as they are. The document is parsed only on first call: XML media types as XML, JSON media types as JSON, and anything else as JSON if it is an object or array, as XML if it starts with an XML declaration, and as HTML otherwise. `json()` decodes the text with orjson and caches the decoded value.
-- Links: `urljoin()` resolves a URL against the Response's base URL (final URL, honoring the first `<base href>` of an HTML document), for example to store absolute links in Items. There are no `follow` helpers: Requests are always written out explicitly, and relative URLs are resolved automatically (see §4.3).
+- Links: `urljoin()` resolves a URL against the Response's base URL (final URL, honoring the first `<base href>` of an HTML document unless browsers would ignore it, such as a `data:` or `javascript:` base), for example to store absolute links in Items. There are no `follow` helpers: Requests are always written out explicitly, and relative URLs are resolved automatically (see §4.3).
 - Responses from the browser also carry `response.browser`: captured XHRs, screenshots, and action outputs; with `keep_page` enabled there is also `response.page`, see §4.7.
 
 ### 4.5 Callbacks and output semantics

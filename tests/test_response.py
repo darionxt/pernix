@@ -182,6 +182,13 @@ def test_urljoin_honors_the_first_base_href(base: str, expected: str) -> None:
     assert _response(html, content_type="text/html").urljoin("page-2.html") == expected
 
 
+@pytest.mark.parametrize("base", ["javascript:alert(1)", "data:text/html,x", "about:blank", "http://["])
+def test_urljoin_ignores_bases_browsers_ignore(base: str) -> None:
+    response = _response(f'<base href="{base}">', content_type="text/html")
+
+    assert response.urljoin("page-2.html") == "https://example.com/catalogue/page-2.html"
+
+
 def test_urljoin_ignores_base_elements_outside_html() -> None:
     response = _response('{"base": "<base href=\\"/x/\\">"}', content_type="application/json")
 

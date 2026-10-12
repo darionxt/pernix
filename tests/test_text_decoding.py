@@ -124,6 +124,21 @@ def test_meta_tags_inside_comments_are_ignored() -> None:
     assert (decoded.encoding, decoded.source) == ("gb18030", "detected")
 
 
+def test_meta_text_inside_attribute_values_is_not_a_declaration() -> None:
+    page = '<div data-example="<meta charset=windows-1252>">café</div>'
+
+    decoded = decode_text(page.encode())
+
+    assert decoded == text_decoding.DecodedText(page, "utf-8", "utf-8")
+
+
+def test_quoted_greater_than_signs_do_not_end_a_tag_early() -> None:
+    body = _gbk_page(head='<link title="a > b"><meta charset="gbk">')
+
+    assert decode_text(body).source == "document"
+    assert decode_text(_gbk_page(head='<link title="<meta charset=gbk>">')).source == "detected"
+
+
 def test_only_the_first_4096_bytes_are_scanned_for_a_meta() -> None:
     body = _page(CHINESE * 10, head=" " * 4096 + '<meta charset="gbk">').encode("gbk")
 
@@ -161,6 +176,14 @@ def test_a_truncated_last_character_does_not_fail_strict_decoding() -> None:
     assert decode_text(body, content_type="text/html; charset=utf-8").source == "header"
 
 
+def test_a_truncated_character_of_a_stateful_encoding_is_replaced() -> None:
+    body = "日本".encode("iso2022_jp")[:-4]  # b"\x1b$BF|K": cut inside 本, still in JIS mode
+
+    decoded = decode_text(body, content_type="text/plain; charset=iso-2022-jp")
+
+    assert (decoded.source, decoded.text) == ("header", "日\ufffd")
+
+
 def test_unknown_header_labels_are_ignored() -> None:
     decoded = decode_text(_page(CHINESE).encode(), content_type="text/html; charset=x-made-up")
 
@@ -174,7 +197,7 @@ def test_the_default_applies_when_detection_fails() -> None:
     decoded = decode_text(body)
 
     assert (decoded.encoding, decoded.source) == ("utf-8", "default")
-    assert "�" in decoded.text
+    assert "\ufffd" in decoded.text
     assert CHINESE in decoded.text
     assert decode_text(body, default_encoding="latin1").encoding == "cp1252"
 

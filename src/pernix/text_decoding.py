@@ -95,8 +95,15 @@ _BOMS = ((codecs.BOM_UTF8, "utf-8"), (codecs.BOM_UTF16_BE, "utf-16-be"), (codecs
 _PRESCAN_BYTES = 4096
 _CHARSET_PARAMETER = re.compile(r"""(?:^|[\s;])charset\s*=\s*["']?\s*([^\s;,"']+)""", re.IGNORECASE)
 _XML_DECLARATION = re.compile(r"""<\?xml\s[^>]*?encoding\s*=\s*["']\s*([^\s"']+)""")
-_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
-_META_TAG = re.compile(r"<meta[\s/]([^>]*)", re.IGNORECASE)
+_MARKUP = re.compile(
+    r"""
+    <!--.*?(?:-->|$)                        # a comment
+    | <([a-zA-Z][^\s/>]*)                   # a start tag and its name,
+      ((?:[^>"']|"[^"]*"|'[^']*')*)>?       # with its attributes, quoted values whole
+    | <[!/?][^>]*>?                         # a doctype, end tag, or processing instruction
+    """,
+    re.DOTALL | re.VERBOSE,
+)
 _ATTRIBUTE = re.compile(r"""([^\s/=>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']*)))?""")
 
 
@@ -161,7 +168,7 @@ def decode_text(
     """
     if encoding is not None:
         codec = codec_for(encoding)
-        return DecodedText(body.decode(codec, errors="replace").removeprefix("﻿"), codec, "explicit")
+        return DecodedText(body.decode(codec, errors="replace").removeprefix("\ufeff"), codec, "explicit")
     for bom, codec in _BOMS:
         if body.startswith(bom):
             return DecodedText(body[len(bom) :].decode(codec, errors="replace"), codec, "bom")
@@ -199,8 +206,10 @@ def _decode_strictly(body: bytes, codec: str) -> str | None:
         text = decoder.decode(body, final=False)
     except UnicodeDecodeError:
         return None
-    pending: bytes = decoder.getstate()[0]
-    return text + pending.decode(codec, errors="replace") if pending else text
+    # Finish with the same decoder, which keeps the state of stateful encodings
+    # such as ISO-2022-JP.
+    decoder.errors = "replace"
+    return text + decoder.decode(b"", final=True)
 
 
 def _header_codec(content_type: str | None) -> str | None:
@@ -214,8 +223,12 @@ def _document_codec(body: bytes) -> str | None:
     head = body[:_PRESCAN_BYTES].decode("latin-1")
     if head.startswith("<?xml") and (match := _XML_DECLARATION.match(head)) is not None:
         return _declared(match[1])
-    for tag in _META_TAG.finditer(_COMMENT.sub("", head)):
-        attributes = _attributes(tag[1])
+    # Scan markup item by item, as the HTML prescan does, so that "<meta" inside a
+    # comment or an attribute value is never taken for a tag.
+    for markup in _MARKUP.finditer(head):
+        if (markup[1] or "").lower() != "meta":
+            continue
+        attributes = _attributes(markup[2])
         label = attributes.get("charset")
         if label is None and attributes.get("http-equiv", "").strip().lower() == "content-type":
             match = _CHARSET_PARAMETER.search(attributes.get("content", ""))

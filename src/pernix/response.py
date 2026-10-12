@@ -9,7 +9,7 @@ from parsel import Selector, SelectorList
 
 from pernix.headers import Headers, HeadersInput
 from pernix.text_decoding import codec_for, decode_text
-from pernix.urls import join_url
+from pernix.urls import document_base, join_url
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -293,7 +293,8 @@ class Response:
     def urljoin(self, url: str) -> str:
         """Resolve a URL against this Response, as a browser would resolve a link in it.
 
-        The base is the final URL, or the first `<base href>` of an HTML document.
+        The base is the final URL, or the first `<base href>` of an HTML document
+        unless browsers would ignore it, as they do `data:` and `javascript:` bases.
         Requests constructed in a Callback do this to relative URLs automatically;
         use this method for links stored in Items.
 
@@ -306,7 +307,7 @@ class Response:
         base = self._base_url
         if base is None:
             href = self.selector.xpath("(//base[@href])[1]/@href").get() if self.selector.type == "html" else None
-            base = self.url if href is None else join_url(self.url, href)
+            base = document_base(self.url, href)
             object.__setattr__(self, "_base_url", base)
         return join_url(base, url)
 
