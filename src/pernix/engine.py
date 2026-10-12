@@ -191,19 +191,28 @@ class Engine:
 
     async def _work(self) -> None:
         while True:
-            leases = await self._frontier.claim(
-                self._worker_id, 1, self._lease_ttl, skip_slots=self._throttle.blocked()
-            )
-            if not leases:
-                await self._wait_for_work()
-                continue
-            await self._process(leases[0])
+            lease = await self._claim() or await self._wait_for_work()
+            if lease is not None:
+                await self._process(lease)
 
-    async def _wait_for_work(self) -> None:
-        """Wait until the Frontier changes or a blocked slot may start again."""
-        waits = [asyncio.create_task(self._frontier.wait()), asyncio.create_task(self._throttle.wait())]
+    async def _claim(self) -> Lease | None:
+        leases = await self._frontier.claim(self._worker_id, 1, self._lease_ttl, skip_slots=self._throttle.blocked())
+        return leases[0] if leases else None
+
+    async def _wait_for_work(self) -> Lease | None:
+        """Wait until the Frontier changes or a blocked slot may start again; return a Lease found meanwhile."""
+        loop = asyncio.get_running_loop()
+        # Started eagerly, both waits register for changes before the claim below, so a
+        # change made between an empty claim and the wait cannot go unnoticed.
+        waits = [
+            asyncio.Task(self._frontier.wait(), loop=loop, eager_start=True),
+            asyncio.Task(self._throttle.wait(), loop=loop, eager_start=True),
+        ]
         try:
-            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            lease = await self._claim()
+            if lease is None:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            return lease
         finally:
             for wait in waits:
                 wait.cancel()

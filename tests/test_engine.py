@@ -547,3 +547,14 @@ async def test_requests_claimed_for_a_cooling_domain_go_back_without_counting_an
     assert frontier.returns[0] == (1.0, False, "domain cooling down")
     assert [url for _, url in probe.started] == ["https://a.example/1"]
     assert throttle.stats.refused >= 1
+
+
+async def test_requests_added_while_workers_start_waiting_are_not_missed() -> None:
+    class Late(Links):
+        async def start(self) -> AsyncIterator[Request]:
+            await asyncio.sleep(0)  # the workers find nothing and start waiting meanwhile
+            yield Request(f"{SITE}/a")
+
+    _, items, _ = await _run(Late(), FakeSite({"/a": "<p>a</p>"}), concurrency=1)
+
+    assert items == [{"page": "a"}]

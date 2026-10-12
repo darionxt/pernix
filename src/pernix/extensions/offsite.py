@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from ada_url import URL, idna_to_ascii
+
 from pernix.events import RequestScheduled, Veto, on
 from pernix.extensions.extension import Extension
 
@@ -18,7 +20,7 @@ class OffsiteFilter(Extension):
     """Drops Requests to hosts outside the Spider's `allowed_domains`, at admission.
 
     A host is allowed if it is one of the domains or a subdomain of one; ports do not
-    matter. Dropped Requests are emitted as `RequestDropped` with the reason
+    matter, and internationalized names match in Unicode and in punycode alike. Dropped Requests are emitted as `RequestDropped` with the reason
     `"offsite"`, whatever their `dont_filter`. A Spider without `allowed_domains` is
     not filtered. Enabled by default in the `extensions` setting.
     """
@@ -47,10 +49,19 @@ class OffsiteFilter(Extension):
         """
         if not self._domains:
             return None
-        host = (urlsplit(event.request.url).hostname or "").rstrip(".")
+        host = _ascii_host(event.request.url)
         if any(host == domain or host.endswith(f".{domain}") for domain in self._domains):
             return None
         return Veto("offsite")
+
+
+def _ascii_host(url: str) -> str:
+    """The host of a URL as WHATWG rules serialize it, with internationalized names in punycode."""
+    try:
+        host = URL(url).hostname
+    except ValueError:
+        host = urlsplit(url).hostname or ""
+    return host.lower().rstrip(".")
 
 
 def _normalized(domains: Iterable[str]) -> tuple[str, ...]:
@@ -62,5 +73,5 @@ def _normalized(domains: Iterable[str]) -> tuple[str, ...]:
                 f"allowed_domains holds {domain!r}; write bare domains such as 'example.com', "
                 "without a scheme, port, or path"
             )
-        normalized.append(name)
+        normalized.append(idna_to_ascii(name).decode("ascii") or name)
     return tuple(normalized)

@@ -44,6 +44,19 @@ def test_allowed_domains_include_their_subdomains(url: str, admitted: bool) -> N
         assert veto.reason == "offsite"
 
 
+@pytest.mark.parametrize(
+    ("allowed", "url"),
+    [
+        ("例子.测试", "https://xn--fsqu00a.xn--0zwm56d/"),
+        ("例子.测试", "https://shop.例子.测试/"),
+        ("xn--fsqu00a.xn--0zwm56d", "https://例子.测试/a"),
+        ("XN--FSQU00A.xn--0zwm56d", "https://www.xn--fsqu00a.xn--0zwm56d/"),
+    ],
+)
+def test_internationalized_domains_match_in_unicode_and_punycode(allowed: str, url: str) -> None:
+    assert _filter(allowed).admit(events.RequestScheduled(Request(url))) is None
+
+
 def test_spiders_without_allowed_domains_are_not_filtered() -> None:
     assert _filter().admit(events.RequestScheduled(Request("https://anywhere.example/"))) is None
 
