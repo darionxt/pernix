@@ -1,6 +1,7 @@
 from pernix.settings.core_settings import (
     CORE_SECTIONS,
     CoreSettings,
+    DomainSettings,
     EventSettings,
     FingerprintSettings,
     FrontierSettings,
@@ -16,6 +17,7 @@ __all__ = [
     "CORE_SECTIONS",
     "ComponentMap",
     "CoreSettings",
+    "DomainSettings",
     "EventSettings",
     "FingerprintSettings",
     "FrontierSettings",

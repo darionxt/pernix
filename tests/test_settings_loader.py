@@ -7,6 +7,7 @@ import msgspec
 import pytest
 
 from pernix.errors import SettingsError
+from pernix.extensions import OffsiteFilter
 from pernix.fetchers import HTTPFetcher
 from pernix.settings import (
     ComponentMap,
@@ -569,7 +570,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
     assert settings.section(DomainSettings) == DomainSettings()
     assert dict(settings) == {
         "concurrency": 16,
-        "extensions": {},
+        "extensions": {OffsiteFilter: 100},
         "addons": (),
         "middlewares": {},
         "spider_middlewares": {},

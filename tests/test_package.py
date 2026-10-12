@@ -30,4 +30,4 @@ def test_events_are_importable_from_the_package() -> None:
     from pernix import Extension, events
 
     assert issubclass(events.SpiderClosed, events.Event)
-    assert Extension.__module__ == "pernix.extension"
+    assert Extension.__module__ == "pernix.extensions.extension"

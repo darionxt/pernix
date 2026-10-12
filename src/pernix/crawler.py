@@ -20,6 +20,7 @@ from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import (
     CoreSettings,
+    DomainSettings,
     EventSettings,
     FingerprintSettings,
     FrontierSettings,
@@ -28,6 +29,7 @@ from pernix.settings import (
     Settings,
     load_settings,
 )
+from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
     import os
@@ -209,6 +211,7 @@ class Crawler:
                 concurrency=concurrency,
                 lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
                 retry_policy=retry_policy,
+                throttle=Throttle(self.settings.section(DomainSettings)),
             )
             reason = "failed"
             try:
