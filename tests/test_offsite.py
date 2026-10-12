@@ -51,9 +51,13 @@ def test_allowed_domains_include_their_subdomains(url: str, admitted: bool) -> N
         ("例子.测试", "https://shop.例子.测试/"),
         ("xn--fsqu00a.xn--0zwm56d", "https://例子.测试/a"),
         ("XN--FSQU00A.xn--0zwm56d", "https://www.xn--fsqu00a.xn--0zwm56d/"),
+        ("127.1", "http://127.1/"),
+        ("127.1", "http://127.0.0.1:8080/"),
+        ("example.com\u3002", "https://example.com/"),
+        ("example.com", "https://example.com\u3002/"),
     ],
 )
-def test_internationalized_domains_match_in_unicode_and_punycode(allowed: str, url: str) -> None:
+def test_allowed_domains_and_hosts_are_normalized_alike(allowed: str, url: str) -> None:
     assert _filter(allowed).admit(events.RequestScheduled(Request(url))) is None
 
 

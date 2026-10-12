@@ -558,3 +558,29 @@ async def test_requests_added_while_workers_start_waiting_are_not_missed() -> No
     _, items, _ = await _run(Late(), FakeSite({"/a": "<p>a</p>"}), concurrency=1)
 
     assert items == [{"page": "a"}]
+
+
+async def test_a_lease_claimed_while_a_worker_stops_waiting_goes_back_if_cancelled() -> None:
+    task: asyncio.Task[Lease | None] | None = None
+
+    class CancelledAfterClaim(MemoryFrontier):
+        async def claim(self, *args: Any, **kwargs: Any) -> list[Lease]:
+            leases = await super().claim(*args, **kwargs)
+            assert task is not None
+            asyncio.get_running_loop().call_soon(task.cancel)  # lands while the waits are cleaned up
+            return leases
+
+    spider = Links()
+    frontier = CancelledAfterClaim()
+    await frontier.add([Request(f"{SITE}/a")])
+    engine = _engine(spider, FakeSite({}), frontier, Throttle(DomainSettings()))
+
+    task = asyncio.create_task(engine._wait_for_work())  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(asyncio.CancelledError):
+        async with asyncio.timeout(5):
+            await task
+
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased) == (1, 0)
+    [lease] = await MemoryFrontier.claim(frontier, "worker-1", 1, 30.0)
+    assert lease.attempt == 1

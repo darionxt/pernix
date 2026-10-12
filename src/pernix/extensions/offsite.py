@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from ada_url import URL, idna_to_ascii
+from ada_url import URL
 
 from pernix.events import RequestScheduled, Veto, on
 from pernix.extensions.extension import Extension
@@ -56,7 +56,7 @@ class OffsiteFilter(Extension):
 
 
 def _ascii_host(url: str) -> str:
-    """The host of a URL as WHATWG rules serialize it, with internationalized names in punycode."""
+    """The host of a URL as WHATWG rules serialize it, such as with names in punycode, without a final dot."""
     try:
         host = URL(url).hostname
     except ValueError:
@@ -73,5 +73,5 @@ def _normalized(domains: Iterable[str]) -> tuple[str, ...]:
                 f"allowed_domains holds {domain!r}; write bare domains such as 'example.com', "
                 "without a scheme, port, or path"
             )
-        normalized.append(idna_to_ascii(name).decode("ascii") or name)
+        normalized.append(_ascii_host(f"http://{name}/"))  # the same rules as for Request hosts
     return tuple(normalized)

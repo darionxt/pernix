@@ -208,15 +208,21 @@ class Engine:
             asyncio.Task(self._frontier.wait(), loop=loop, eager_start=True),
             asyncio.Task(self._throttle.wait(), loop=loop, eager_start=True),
         ]
+        lease: Lease | None = None
         try:
             lease = await self._claim()
             if lease is None:
                 await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
-            return lease
         finally:
             for wait in waits:
                 wait.cancel()
-            await asyncio.wait(waits)
+            try:
+                await asyncio.wait(waits)
+            except asyncio.CancelledError:
+                if lease is not None:  # claimed, but cancelled before it could be processed
+                    await self._return(lease)
+                raise
+        return lease
 
     async def _process(self, lease: Lease) -> None:
         renewal = asyncio.create_task(self._keep_leased(lease))
