@@ -92,3 +92,12 @@ def test_oversized_max_age_values_decide_without_failing() -> None:
     assert removed is not None
     assert removed.expired(NOW)
     assert merge_set_cookies({"b": "old"}, [f"a=1; Max-Age={huge}", f"b=2; Max-Age=-{huge}"], now=NOW) == {"a": "1"}
+
+
+@pytest.mark.parametrize(("max_age", "expired"), [("0" * 19, True), ("-0000", True), ("0005", False)])
+def test_leading_zeros_do_not_change_the_max_age(max_age: str, expired: bool) -> None:
+    cookie = parse_set_cookie(f"a=1; Max-Age={max_age}")
+
+    assert cookie is not None
+    assert cookie.expired(NOW) is expired
+    assert merge_set_cookies({"a": "old"}, [f"a=1; Max-Age={max_age}"], now=NOW) == ({} if expired else {"a": "1"})

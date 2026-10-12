@@ -141,7 +141,10 @@ def merge_set_cookies(
 
 def _bounded_seconds(text: str) -> int:
     """Convert a `Max-Age` value, clamping very long ones instead of building huge integers."""
-    if len(text.lstrip("-")) <= _MAX_AGE_DIGITS:
+    significant = text.lstrip("-").lstrip("0")
+    if not significant:
+        return 0
+    if len(significant) <= _MAX_AGE_DIGITS:
         return int(text)
     return -1 if text.startswith("-") else 10**_MAX_AGE_DIGITS
 
