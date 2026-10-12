@@ -73,3 +73,18 @@ async def test_a_failing_fingerprint_adds_nothing_of_the_batch() -> None:
 
     assert (await frontier.counts()).ready == 0
     assert await frontier.add([Request(URL + "good")]) == [True]
+
+
+async def test_a_failing_slot_function_adds_nothing_of_the_batch() -> None:
+    def slot_of(request: Request) -> str:
+        if request.url.endswith("bad"):
+            raise ValueError("no slot")
+        return "all"
+
+    frontier = MemoryFrontier(slot_of=slot_of)
+
+    with pytest.raises(ValueError, match="no slot"):
+        await frontier.add([Request(URL + "good"), Request(URL + "bad")])
+
+    assert (await frontier.counts()).ready == 0
+    assert await frontier.add([Request(URL + "good")]) == [True]

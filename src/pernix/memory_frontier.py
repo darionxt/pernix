@@ -74,16 +74,17 @@ class MemoryFrontier:
 
     async def add(self, requests: Sequence[Request]) -> list[bool]:
         """Deduplicate and store Requests; see `Frontier.add()`."""
-        # Compute every Fingerprint first, so a failing one leaves nothing half-added.
-        keys = [None if r.dont_filter else self._key(r) for r in requests]
+        # Compute every Fingerprint and slot first, so a failing one leaves nothing half-added.
+        prepared = [(None if r.dont_filter else self._key(r), self._slot_of(r)) for r in requests]
+        self._refresh()  # Requests that became ready before these queue ahead of them
         added: list[bool] = []
-        for request, key in zip(requests, keys, strict=True):
+        for request, (key, slot) in zip(requests, prepared, strict=True):
             if key is not None:
                 if key in self._seen:
                     added.append(False)
                     continue
                 self._seen.add(key)
-            item = _Item(str(next(self._ids)), request, self._slot_of(request))
+            item = _Item(str(next(self._ids)), request, slot)
             self._items[item.id] = item
             self._counts["ready"] += 1
             self._push_ready(item)
@@ -100,6 +101,7 @@ class MemoryFrontier:
             raise ValueError(f"limit must be at least 1, got {limit}")
         _check_ttl(ttl)
         now = self._refresh()
+        due = self._next_due()
         leases: list[Lease] = []
         skipped: list[tuple[int, int, str]] = []
         while self._ready and len(leases) < limit:
@@ -117,6 +119,8 @@ class MemoryFrontier:
             leases.append(Lease(item.id, item.token, item.attempts + 1, item.expires_at, item.slot, item.request))
         for entry in skipped:
             heapq.heappush(self._ready, entry)
+        if leases and (due is None or now + ttl < due):
+            self._notify()  # waiters wake up by the earliest deadline, which is now sooner
         return leases
 
     async def renew(self, lease: Lease, ttl: float) -> Lease | None:
@@ -181,9 +185,9 @@ class MemoryFrontier:
         """Wait for a change, or until the next delay or Lease is due; see `Frontier.wait()`."""
         changed = self._changed  # a change made by the refresh below sets this one
         now = self._refresh()
-        due = [entry[0] for entry in (self._delayed[:1] + self._expiries[:1])]
+        due = self._next_due()
         try:
-            async with asyncio.timeout(max(0.0, min(due) - now) if due else None):
+            async with asyncio.timeout(None if due is None else max(0.0, due - now)):
                 await changed.wait()
         except TimeoutError:
             pass
@@ -215,6 +219,11 @@ class MemoryFrontier:
         if changed:
             self._notify()
         return now
+
+    def _next_due(self) -> float | None:
+        """When the next delay passes or Lease expires, if any; stale entries may make it early."""
+        due = [entry[0] for entry in (self._delayed[:1] + self._expiries[:1])]
+        return min(due) if due else None
 
     def _leased(self, lease: Lease) -> _Item | None:
         """The item a Lease is valid for, or `None` for a stale Lease."""

@@ -231,6 +231,18 @@ class FrontierConformance:
         assert lease.attempt == 1
         assert (await frontier.counts()).delayed == 0
 
+    async def test_requests_due_after_a_delay_queue_ahead_of_later_arrivals(
+        self, frontier: Frontier, clock: FakeClock
+    ) -> None:
+        await frontier.add([_page(1)])
+        assert await frontier.nack(await self._claim_one(frontier), delay=10.0)
+        clock.advance(11.0)
+
+        await frontier.add([_page(2)])
+        leases = await frontier.claim("worker-1", 10, TTL)
+
+        assert [lease.request.url for lease in leases] == [f"{URL}1", f"{URL}2"]
+
     async def test_dead_requests_are_kept_and_never_handed_out(self, frontier: Frontier) -> None:
         await frontier.add([_page(1)])
         lease = await self._claim_one(frontier)
@@ -290,6 +302,20 @@ class FrontierConformance:
 
         async with asyncio.timeout(5):
             await waiting
+
+    async def test_wait_returns_once_a_lease_claimed_while_waiting_expires(
+        self, frontier: Frontier, clock: FakeClock
+    ) -> None:
+        await frontier.add([_page(1)])
+        waiting = asyncio.create_task(frontier.wait())
+        await asyncio.sleep(0)
+
+        await self._claim_one(frontier, ttl=0.05)
+        clock.advance(0.05)
+
+        async with asyncio.timeout(5):
+            await waiting
+        assert (await frontier.counts()).ready == 1
 
     async def test_close_keeps_the_requests(self, frontier: Frontier, clock: FakeClock) -> None:
         await frontier.add([_page(1), _page(2)])
