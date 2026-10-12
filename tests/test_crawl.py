@@ -11,7 +11,7 @@ import orjson
 import pytest
 
 from pernix import Request, Response, Spider, events
-from pernix.errors import SettingsError
+from pernix.errors import ComponentError, SettingsError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -433,3 +433,56 @@ async def test_dont_filter_bypasses_deduplication(server: LoopbackServer) -> Non
         await Repeat.crawl()
 
     assert [r.path for r in server.received].count("/again") == 2
+
+
+def _item_links(server: LoopbackServer, *hrefs: str) -> None:
+    links = "".join(f"<a href='{href}'>x</a>" for href in hrefs)
+    server.route("/", f"<html><body>{links}</body></html>", headers=HTML)
+    server.route("/item", "<p>item</p>", headers=HTML)
+
+
+class Idle(Spider):
+    start_urls = ()
+
+
+class Items(Spider):
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        for href in response.css("a::attr(href)").getall():
+            yield Request(href, callback=self.parse_item)
+
+    async def parse_item(self, response: Response) -> None:
+        pass
+
+
+@pytest.mark.parametrize(("settings", "fetches"), [({}, 1), ({"fingerprint.sort_query": False}, 2)])
+async def test_query_order_counts_only_when_sorting_is_off(
+    server: LoopbackServer, settings: dict[str, Any], fetches: int
+) -> None:
+    _item_links(server, "/item?a=1&b=2#top", "/item?b=2&a=1")
+
+    class Local(Items):
+        start_urls = (server.url("/"),)
+
+    async with asyncio.timeout(10):
+        await Local.crawl(settings=settings)
+
+    assert [request.path for request in server.received].count("/item") == fetches
+
+
+async def test_a_fingerprint_function_replaces_the_default(server: LoopbackServer) -> None:
+    _item_links(server, "/item?id=1", "/item?id=2")
+
+    class Local(Items):
+        start_urls = (server.url("/"),)
+
+    async with asyncio.timeout(10):
+        await Local.crawl(settings={"fingerprint.function": lambda request: request.url.partition("?")[0]})
+
+    assert [request.path for request in server.received].count("/item") == 1
+
+
+async def test_fingerprint_settings_are_checked_before_the_run() -> None:
+    with pytest.raises(SettingsError, match="the Cookie header cannot be declared"):
+        await Idle.crawl(settings={"fingerprint.headers": ["Accept-Language", "Cookie"]})
+    with pytest.raises(ComponentError, match=r"fingerprint\.function must be callable"):
+        await Idle.crawl(settings={"fingerprint.function": 42})
