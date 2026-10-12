@@ -26,6 +26,9 @@ class Spider:
     Attributes:
         name: Identifies the Spider in logs; defaults to the lower-cased class name.
         start_urls: URLs fetched with a GET when `start()` is not overridden.
+        allowed_domains: Domains, such as `"example.com"`, whose hosts and subdomains
+            Requests may go to; Requests elsewhere are dropped as offsite. Empty allows
+            every host.
         settings: Settings for this Spider, by dotted key; they override the project
             file and the environment, and are overridden by run arguments.
 
@@ -39,6 +42,7 @@ class Spider:
 
     name: ClassVar[str] = ""
     start_urls: ClassVar[Sequence[str]] = ()
+    allowed_domains: ClassVar[Sequence[str]] = ()
     settings: ClassVar[Mapping[str, Any]] = MappingProxyType({})
 
     def __init_subclass__(cls, **kwargs: Any) -> None:

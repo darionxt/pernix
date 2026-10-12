@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -13,12 +14,14 @@ from pernix.engine import Engine
 from pernix.errors import ConnectError, RetriesExhausted
 from pernix.frontiers import MemoryFrontier
 from pernix.retry_policy import DefaultRetryPolicy
-from pernix.settings import RetrySettings
+from pernix.settings import DomainSettings, RetrySettings
+from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
     from pernix.frontiers import Lease
+    from pernix.middlewares import Download
     from pernix.retry_policy import Decision, RetryPolicy
 
 SITE = "https://site.example"
@@ -412,3 +415,135 @@ async def test_a_run_cancelled_while_settling_returns_the_request_without_counti
     assert (counts.ready, counts.leased) == (1, 0)
     [lease] = await frontier.claim("worker-1", 1, 30.0)
     assert lease.attempt == 1
+
+
+# Throttling
+
+
+class Hosts(Spider):
+    """Starts with six pages on each of two hosts."""
+
+    async def start(self) -> AsyncIterator[Request]:
+        for n in range(6):
+            for host in ("a.example", "b.example"):
+                yield Request(f"https://{host}/{n}")
+
+    async def parse(self, response: Response) -> None:
+        pass
+
+
+class Probe:
+    """A download chain that records how many fetches run at once, per host and in all."""
+
+    def __init__(self, *, seconds: float = 0.02) -> None:
+        self.seconds = seconds
+        self.active: dict[str, int] = {}
+        self.most: dict[str, int] = {}
+        self.most_in_all = 0
+        self.started: list[tuple[float, str]] = []
+
+    async def __call__(self, request: Request) -> Response:
+        host = request.url.split("/")[2]
+        self.started.append((asyncio.get_running_loop().time(), request.url))
+        self.active[host] = self.active.get(host, 0) + 1
+        self.most[host] = max(self.most.get(host, 0), self.active[host])
+        self.most_in_all = max(self.most_in_all, sum(self.active.values()))
+        try:
+            await asyncio.sleep(self.seconds)
+        finally:
+            self.active[host] -= 1
+        return Response(url=request.url, status=200, headers=[], body=b"", request=request)
+
+
+def _engine(spider: Spider, download: Download, frontier: MemoryFrontier, throttle: Throttle, **kwargs: Any) -> Engine:
+    return Engine(
+        spider,
+        frontier=frontier,
+        download=download,
+        handle=run_callbacks(spider),
+        item_sink=lambda item: None,
+        events=events.EventBus(timeout=5),
+        retry_policy=DefaultRetryPolicy(RetrySettings(delay_scale=0)),
+        throttle=throttle,
+        **{"concurrency": 8, **kwargs},
+    )
+
+
+async def test_each_domain_is_limited_while_the_others_continue() -> None:
+    probe = Probe()
+    frontier = MemoryFrontier()
+
+    async with asyncio.timeout(10):
+        await _engine(Hosts(), probe, frontier, Throttle(DomainSettings(concurrency=2))).run()
+
+    assert probe.most == {"a.example": 2, "b.example": 2}
+    assert probe.most_in_all == 4
+    assert (await frontier.counts()).done == 12
+
+
+async def test_delays_space_one_domain_without_holding_back_the_others() -> None:
+    probe = Probe(seconds=0)
+
+    async with asyncio.timeout(10):
+        settings = DomainSettings(delay=0.05, delay_jitter=0.0)
+        await _engine(Hosts(), probe, MemoryFrontier(), Throttle(settings)).run()
+
+    for host in ("a.example", "b.example"):
+        starts = [at for at, url in probe.started if host in url]
+        assert all(later - earlier >= 0.045 for earlier, later in itertools.pairwise(starts))
+    assert probe.started[-1][0] - probe.started[0][0] < 0.5
+
+
+async def test_workers_skip_domains_that_must_wait() -> None:
+    class OneDomainFirst(Hosts):
+        async def start(self) -> AsyncIterator[Request]:
+            for host in ("a.example", "b.example"):
+                for n in range(6):
+                    yield Request(f"https://{host}/{n}")
+
+    probe = Probe(seconds=0)
+    engine = _engine(
+        OneDomainFirst(), probe, MemoryFrontier(), Throttle(DomainSettings(delay=0.1, delay_jitter=0.0)), concurrency=2
+    )
+
+    async with asyncio.timeout(10):
+        await engine.run()
+
+    first_a = min(at for at, url in probe.started if "a.example" in url)
+    first_b = min(at for at, url in probe.started if "b.example" in url)
+    assert first_b - first_a < 0.05, "b.example waited behind a.example's delays"
+
+
+async def test_requests_claimed_for_a_cooling_domain_go_back_without_counting_an_attempt() -> None:
+    class Racing(Throttle):
+        def blocked(self) -> frozenset[str]:
+            return frozenset()  # as if the cooldown started right after the claim
+
+    class Recording(MemoryFrontier):
+        def __init__(self) -> None:
+            super().__init__()
+            self.returns: list[tuple[float, bool, str]] = []
+
+        async def nack(self, lease: Lease, *, delay: float = 0.0, count_attempt: bool = True, reason: str = "") -> bool:
+            self.returns.append((round(delay, 1), count_attempt, reason))
+            return await super().nack(lease, delay=delay, count_attempt=count_attempt, reason=reason)
+
+    class One(Spider):
+        start_urls = ("https://a.example/1",)
+
+        async def parse(self, response: Response) -> None:
+            pass
+
+    throttle = Racing(DomainSettings())
+    throttle.observe("a.example", Response(
+        url="https://a.example/", status=429, headers=[("Retry-After", "1")], body=b"", request=Request("https://a.example/")
+    ))  # fmt: skip
+    frontier = Recording()
+    probe = Probe(seconds=0)
+
+    async with asyncio.timeout(10):
+        await _engine(One(), probe, frontier, throttle).run()
+
+    assert frontier.returns[0] == (1.0, False, "domain cooling down")
+    assert [url for _, url in probe.started] == ["https://a.example/1"]
+    assert throttle.stats.refused >= 1

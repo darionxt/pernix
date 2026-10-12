@@ -25,7 +25,8 @@ from pernix.events import (
 from pernix.request import Request
 from pernix.response import expect_response
 from pernix.retry_policy import Action, Decision, DefaultRetryPolicy
-from pernix.settings import RetrySettings
+from pernix.settings import DomainSettings, RetrySettings
+from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
     from pernix.events import EventBus
@@ -54,6 +55,7 @@ class _Again:
 
     delay: float
     reason: str
+    count_attempt: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,9 +71,11 @@ type _Settlement = _Done | _Again | _Dead
 class Engine:
     """Runs a fixed number of workers that claim Requests from the Frontier and process them.
 
-    Each worker claims one Request at a time under a Lease, renews the Lease while it
-    works, fetches the Request through the download chain, and handles the Response
-    through the spider chain, which ends in the Callback. Once the Callback's outputs
+    Each worker claims one Request at a time under a Lease, skipping the slots the
+    Throttle blocks, renews the Lease while it works, fetches the Request through the
+    download chain while holding its slot, and handles the Response through the
+    spider chain, which ends in the Callback. A Request whose slot is cooling down
+    goes back to the Frontier until the cooldown ends, without counting an attempt. Once the Callback's outputs
     have been added, the Lease is acknowledged. Because a Request stays leased until
     then, the Requests its Callback adds are always in the Frontier before it leaves.
 
@@ -110,6 +114,7 @@ class Engine:
         concurrency: int,
         lease_ttl: float = 60.0,
         retry_policy: RetryPolicy | None = None,
+        throttle: Throttle | None = None,
         worker_id: str | None = None,
     ) -> None:
         """Wire the Engine to its collaborators.
@@ -128,6 +133,8 @@ class Engine:
                 are renewed every third of it.
             retry_policy: Decides which attempts are retried; defaults to
                 `DefaultRetryPolicy` with the default `RetrySettings`.
+            throttle: Paces fetches per slot; defaults to the default
+                `DomainSettings`.
             worker_id: Identifies this Worker to the Frontier; defaults to the host
                 name and process id.
 
@@ -147,6 +154,7 @@ class Engine:
         self._concurrency = concurrency
         self._lease_ttl = lease_ttl
         self._retry_policy = retry_policy or DefaultRetryPolicy(RetrySettings())
+        self._throttle = throttle or Throttle(DomainSettings())
         self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
 
     async def run(self) -> None:
@@ -183,11 +191,23 @@ class Engine:
 
     async def _work(self) -> None:
         while True:
-            leases = await self._frontier.claim(self._worker_id, 1, self._lease_ttl)
+            leases = await self._frontier.claim(
+                self._worker_id, 1, self._lease_ttl, skip_slots=self._throttle.blocked()
+            )
             if not leases:
-                await self._frontier.wait()
+                await self._wait_for_work()
                 continue
             await self._process(leases[0])
+
+    async def _wait_for_work(self) -> None:
+        """Wait until the Frontier changes or a blocked slot may start again."""
+        waits = [asyncio.create_task(self._frontier.wait()), asyncio.create_task(self._throttle.wait())]
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for wait in waits:
+                wait.cancel()
+            await asyncio.wait(waits)
 
     async def _process(self, lease: Lease) -> None:
         renewal = asyncio.create_task(self._keep_leased(lease))
@@ -227,8 +247,8 @@ class Engine:
 
     async def _settle(self, lease: Lease, settlement: _Settlement) -> bool:
         match settlement:
-            case _Again(delay, reason):
-                return await self._frontier.nack(lease, delay=delay, reason=reason)
+            case _Again(delay, reason, count_attempt):
+                return await self._frontier.nack(lease, delay=delay, count_attempt=count_attempt, reason=reason)
             case _Dead(reason):
                 return await self._frontier.dead(lease, reason)
             case _Done():
@@ -237,8 +257,11 @@ class Engine:
     async def _attempt(self, lease: Lease) -> _Settlement:
         """Fetch a Request and run its Callback once; return how to settle its Lease."""
         request = lease.request
+        if not await self._throttle.acquire(lease.slot):
+            # The domain is cooling down: wait in the Frontier, not in a worker.
+            return _Again(self._throttle.cooldown_left(lease.slot), "domain cooling down", count_attempt=False)
         try:
-            response = expect_response(await self._download(request), f"the download chain for {request!r}")
+            response = await self._fetch(lease)
         except IgnoreRequest as exc:
             logger.debug("Ignored %r: %s", request, exc.reason)
             await self._events.emit(RequestIgnored(request, exc.reason))
@@ -262,6 +285,15 @@ class Engine:
             if decision.action is not Action.ACCEPT:
                 return await self._retry_or_give_up(lease, decision, cause=error)
         return await self._fail(request, error)
+
+    async def _fetch(self, lease: Lease) -> Response:
+        """Fetch through the download chain in the slot `acquire()` gave the Lease, then free the slot."""
+        try:
+            response = expect_response(await self._download(lease.request), f"the download chain for {lease.request!r}")
+            self._throttle.observe(lease.slot, response)
+            return response
+        finally:
+            self._throttle.release(lease.slot)
 
     def _decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
         """Ask the retry policy; a policy that raises keeps the outcome."""

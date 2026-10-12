@@ -7,7 +7,7 @@ import pytest
 
 from pernix import Response, Spider, events
 from pernix.crawler import Crawler
-from pernix.extension import Extension
+from pernix.extensions import Extension
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

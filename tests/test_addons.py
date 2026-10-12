@@ -11,7 +11,7 @@ from pernix.addons import Addon, AddonAPI, addon_settings, discover_addons, load
 from pernix.crawler import Crawler
 from pernix.errors import AddonError
 from pernix.events import EventBus
-from pernix.extension import Extension
+from pernix.extensions import Extension
 from pernix.settings import CORE_SECTIONS, Section, load_settings
 
 if TYPE_CHECKING:
@@ -171,7 +171,7 @@ def test_addon_settings_sit_below_the_project_file(tmp_path: Path) -> None:
 
     assert below_project["concurrency"] == 5
     assert alone["concurrency"] == 3
-    assert alone.components("extensions") == [Greeter]
+    assert Greeter in alone.components("extensions")
 
 
 async def test_enabled_addons_shape_the_run(

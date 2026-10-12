@@ -522,8 +522,8 @@ class SessionPool(Protocol):
 
 **Pacing**
 
-- Concurrency and delay (with jitter) are set per domain, `Retry-After` is honored, and on `429`/`503` the whole domain backs off together.
-- Concurrency slots are computed along two dimensions: "domain × Session".
+- Concurrency and delay (with jitter) are set per domain, `Retry-After` is honored, and a `429`/`503` with `Retry-After` makes the whole domain back off together (§6.3).
+- Concurrency slots are computed along two dimensions: "domain × Session" (from M1; the domain alone before Sessions exist).
 
 **Handling Blocked responses**
 
@@ -588,9 +588,14 @@ Engine integration:
 ### 6.3 Concurrency, rate limiting, and robots
 
 - **Concurrency**:
-  - Global default 16, per-domain default 8; browser pages are counted separately.
+  - Global default 16 (`concurrency`, the number of workers), per-domain default 8 (`domain.concurrency`); browser pages are counted separately.
+  - A domain is a host name, and each has its own slot (the Lease's `slot`). A fetch holds its slot from just before the download chain until the Response arrives; Callbacks hold none.
+  - Workers claim only Requests whose slot can start a fetch now: `claim(skip_slots=...)` skips slots that are full, cooling down, or waiting for their delay or rate, so one slow domain never holds back the others. Idle workers wake when the Frontier changes or a slot frees up.
   - Requests that are backing off go back to the Frontier to wait and do not occupy concurrency slots.
-- **Rate limiting**: the GCRA algorithm on a monotonic clock. In distributed mode a shared rate-limiting backend is used instead, and permit times follow the backend clock.
+- **Delay**: `domain.delay` seconds between the starts of two fetches from one domain, randomized within ± `domain.delay_jitter` (50 % by default).
+- **Rate limiting**: the GCRA algorithm on a monotonic clock, `domain.rate` fetches per second with bursts of `domain.burst`, off by default. In distributed mode a shared rate-limiting backend is used instead, and permit times follow the backend clock.
+- **Cooldown**: a `429` or `503` with `Retry-After` pauses its whole domain for that long, up to `domain.cooldown_max` (300 s), while other domains continue; the Request itself is retried under the retry policy (§6.4). A Request claimed for a domain that starts cooling down before its fetch goes back to the Frontier until the cooldown ends, without counting an attempt.
+- **Offsite**: `Spider.allowed_domains` (subdomains included) admits only Requests to those hosts. The built-in `OffsiteFilter` Extension, enabled by default, vetoes the others at admission, emitting `RequestDropped` with the reason `offsite`; `dont_filter` does not bypass it.
 - **robots.txt** (not obeyed by default, confirmed; enable with `robots.obey = true`). Behavior when enabled:
   - Cached per origin for 24 hours; concurrent Requests to the same origin fetch robots.txt only once.
   - Status code handling: 4xx means everything is allowed; 5xx or a network error means everything is disallowed, cached briefly and then retried.

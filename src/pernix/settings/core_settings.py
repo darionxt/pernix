@@ -10,6 +10,7 @@ from pernix.text_decoding import codec_for
 __all__ = [
     "CORE_SECTIONS",
     "CoreSettings",
+    "DomainSettings",
     "EventSettings",
     "FingerprintSettings",
     "FrontierSettings",
@@ -23,7 +24,8 @@ class CoreSettings(Section):
 
     Attributes:
         concurrency: The maximum number of Requests processed at once.
-        extensions: Extensions to run, as `{extension: order}`.
+        extensions: Extensions to run, as `{extension: order}`; the built-in
+            `OffsiteFilter` is enabled by default.
         addons: Addons to enable, in order, by entry point name, import path, class,
             or object.
         middlewares: Download Middleware, as `{middleware: order}`; lower orders are
@@ -35,7 +37,7 @@ class CoreSettings(Section):
     """
 
     concurrency: Annotated[int, msgspec.Meta(ge=1)] = 16
-    extensions: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
+    extensions: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.extensions.OffsiteFilter": 100})
     addons: tuple[Any, ...] = ()
     middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     spider_middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
@@ -53,6 +55,31 @@ class EventSettings(Section):
     __prefix__ = "events"
 
     timeout: Annotated[float, msgspec.Meta(gt=0)] = 30.0
+
+
+class DomainSettings(Section):
+    """Settings of how each domain is fetched: its own concurrency, spacing, and rate.
+
+    A domain is a host name; each has its own slot.
+
+    Attributes:
+        concurrency: Fetches in progress at once per domain.
+        delay: Seconds between the starts of two fetches from one domain.
+        delay_jitter: Randomizes each delay between `delay * (1 - delay_jitter)` and
+            `delay * (1 + delay_jitter)`; 0 keeps it exact.
+        rate: Fetches per second per domain, enforced with GCRA; `None` for no limit.
+        burst: Fetches a domain may start at once before `rate` applies.
+        cooldown_max: The longest a 429 or 503 with `Retry-After` pauses its domain.
+    """
+
+    __prefix__ = "domain"
+
+    concurrency: Annotated[int, msgspec.Meta(ge=1)] = 8
+    delay: Annotated[float, msgspec.Meta(ge=0)] = 0.0
+    delay_jitter: Annotated[float, msgspec.Meta(ge=0, le=1)] = 0.5
+    rate: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    burst: Annotated[int, msgspec.Meta(ge=1)] = 1
+    cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
 
 
 class ResponseSettings(Section):
@@ -149,5 +176,6 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FrontierSettings,
     FingerprintSettings,
     RetrySettings,
+    DomainSettings,
 )
 """The Sections every Crawler registers."""

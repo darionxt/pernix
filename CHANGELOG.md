@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Per-domain politeness (`pernix.throttle`): each host has a slot held only while fetching, limited by `domain.concurrency`, spaced by `domain.delay` with `domain.delay_jitter`, and optionally rate-limited with GCRA (`domain.rate`, `domain.burst`). Workers skip slots that must wait, so one domain never holds back the others. A 429 or 503 with `Retry-After` cools its whole domain down, up to `domain.cooldown_max`, and Requests claimed for a cooling domain go back to the Frontier without counting an attempt.
+- `Spider.allowed_domains`, enforced at admission by the built-in `OffsiteFilter` Extension, enabled by default: other hosts are dropped as `RequestDropped(reason="offsite")`.
 - Retries decided by a replaceable `RetryPolicy` after every attempt: the default retries statuses 408, 429, 500, 502, 503, 504, 522, and 524, `Timeout`, `ConnectError`, `ProxyError`, and `Retry(reason, delay=None)`, up to 3 times, waiting as `Retry-After` says (up to 300 s) or with full-jitter backoff (1 s base, 60 s cap). Retried Requests go back to the Frontier with a delay and emit `RequestRetried`. The `retry.*` settings configure it, including `retry.delay_scale` for tests.
 - Failure semantics: a Request whose retries ran out (`RetriesExhausted`), whose fetch failed in a way the policy keeps, or whose Callback raised is kept as a Dead Request, emits `RequestFailed`, and runs its errback, `errback(request, error)`, which may yield Requests and Items. Callback exceptions are not retried, and outputs yielded before them are kept. A cancelled Run returns Requests in flight to the Frontier without counting an attempt.
 - `FetchError` and its subclasses `Timeout`, `ConnectError`, `ProxyError`, `TLSError`, `TooManyRedirects`, and `DecodeError`, which the HTTP Fetcher raises instead of curl-cffi's exceptions, keeping libcurl's error code.
@@ -28,6 +30,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- `Extension` moved to `pernix.extensions`, next to the built-in Extensions; `from pernix import Extension` is unchanged.
 - `RequestFailed` is emitted once per Request that fails for good, not once per failed attempt; the Item Events have `response=None` for Items an errback yields.
 - The `Fetcher` protocol is `async def fetch(request)` plus `schemes`; Fetchers are opened and closed like other components and no longer check `render` or `fetcher` themselves.
 - Requests are independent: cookies no longer persist from one Request to another. Pass `cookies=` explicitly, or use a Session Pool once available (ADR 0011).

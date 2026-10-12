@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 from typing import TYPE_CHECKING, Any
 
 import orjson
 import pytest
 
-from loopback import Reply
+from loopback import ReceivedRequest, Reply
 from pernix import Request, Response, Spider, events
 from pernix.errors import ComponentError, SettingsError
 from pernix.retry_policy import Decision
@@ -510,7 +511,7 @@ async def test_retries_go_back_through_the_frontier(server: LoopbackServer, tmp_
 
     output = tmp_path / "items.jsonl"
     async with asyncio.timeout(10):
-        await Flaky.crawl(output=output, settings={"retry.delay_scale": 0})
+        await Flaky.crawl(output=output, settings={"retry.delay_scale": 0, "domain.cooldown_max": 0})
 
     assert _read_items(output) == [{"body": "ok"}]
     assert [request.path for request in server.received] == ["/flaky"] * 3
@@ -536,3 +537,42 @@ async def test_the_retry_policy_is_replaceable(server: LoopbackServer) -> None:
 
     with pytest.raises(ComponentError, match=r"retry\.policy must have decide"):
         await Down.crawl(settings={"retry.policy": object()})
+
+
+async def test_a_429_with_retry_after_pauses_only_its_domain(server: LoopbackServer) -> None:
+    fetched: list[tuple[float, str, str]] = []
+    limited_once: list[bool] = []
+
+    def record(request: ReceivedRequest) -> Reply:
+        host = (request.header("Host") or "").split(":")[0]
+        fetched.append((time.monotonic(), host, request.path))
+        if request.path == "/limited" and not limited_once:
+            limited_once.append(True)
+            return Reply(status=429, headers=[("Retry-After", "1")])
+        return Reply(body="ok")
+
+    paths = ["/limited", *(f"/more/{n}" for n in range(4)), *(f"/other/{n}" for n in range(4))]
+    for path in paths:
+        server.route(path, handler=record)
+    other_host = server.url("/").replace("127.0.0.1", "localhost")
+
+    class TwoDomains(Spider):
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(server.url("/limited"))
+            for n in range(4):
+                yield Request(server.url(f"/more/{n}"))
+                yield Request(f"{other_host}other/{n}")
+
+        async def parse(self, response: Response) -> None:
+            pass
+
+    async with asyncio.timeout(15):
+        await TwoDomains.crawl(settings={"concurrency": 2, "domain.concurrency": 1})
+
+    [limited_at] = [at for at, _, path in fetched if path == "/limited"][:1]
+    others = [at for at, host, _ in fetched if host == "localhost"]
+    paused = [at for at, host, path in fetched if host == "127.0.0.1" and path != "/limited"]
+    assert len(others) == 4
+    assert max(others) < limited_at + 0.9, "the other domain is not paused"
+    assert len(paused) == 4
+    assert min(paused) >= limited_at + 0.9, "the limited domain waits out Retry-After"

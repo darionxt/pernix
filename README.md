@@ -63,12 +63,16 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `concurrency` | `16` | Maximum number of Requests processed at once |
-| `extensions` | `{}` | Extensions to run, as `{extension: order}` |
+| `extensions` | `{OffsiteFilter: 100}` | Extensions to run, as `{extension: order}` |
 | `addons` | `()` | Addons to enable, by entry point name or import path |
 | `middlewares` | `{}` | Download Middleware, as `{middleware: order}`; lower orders are further out |
 | `spider_middlewares` | `{}` | Spider Middleware, as `{middleware: order}`; lower orders are further out |
 | `fetchers` | `{"http": HTTPFetcher}` | Fetchers by name; `Request(fetcher=name)` selects one |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
+| `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
+| `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |
+| `domain.rate` / `domain.burst` | `None` / `1` | Fetches per second per domain (GCRA), and how many may start at once |
+| `domain.cooldown_max` | `300.0` | The longest a 429 or 503 with `Retry-After` pauses its domain |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -98,6 +102,7 @@ src/pernix/
 ├── engine.py            worker loop: claim, fetch, run Callbacks, settle Leases
 ├── callbacks.py         runs Callbacks and errbacks, collects their outputs
 ├── retry_policy.py      retry decisions, backoff, Retry-After
+├── throttle.py          per-domain slots: concurrency, delay, rate, cooldowns
 ├── request.py           Request
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors, URL joining
@@ -109,13 +114,15 @@ src/pernix/
 ├── errors.py            exception hierarchy, control-flow exceptions
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse
-├── extension.py         Extension base class
 ├── addons.py            Addon loading, entry point discovery, setup API
 ├── feeds.py             Item output files
 ├── events/
 │   ├── event.py         Event base class, Dispatch, Veto
 │   ├── event_bus.py     EventBus, events.on()
 │   └── lifecycle_events.py core Events of a Run
+├── extensions/
+│   ├── extension.py     Extension base class
+│   └── offsite.py       OffsiteFilter: drops Requests outside allowed_domains
 ├── fetchers/
 │   ├── fetcher.py       Fetcher protocol
 │   ├── fetcher_dispatch.py picks the Fetcher of each Request
@@ -138,7 +145,7 @@ src/pernix/
 tests/                   one test module per source module, plus end-to-end crawls
 ```
 
-Pluggable component families with several implementations, such as Fetchers, Frontiers, and Middleware, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
+Pluggable component families with several implementations, such as Extensions, Fetchers, Frontiers, and Middleware, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
 
 ## Development
 
