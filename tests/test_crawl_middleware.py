@@ -10,16 +10,14 @@ import pytest
 from pernix import Extension, Request, Response, Spider, events
 from pernix.errors import ComponentError, IgnoreRequest, SettingsError
 from pernix.fetchers import HTTPFetcher
-from pernix.middleware import Middleware, middleware
-from pernix.spider_middleware import SpiderMiddleware
+from pernix.middlewares import Middleware, SpiderMiddleware, middleware
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from loopback import LoopbackServer
-    from pernix.middleware import Download
+    from pernix.middlewares import Download, HandleResponse
     from pernix.settings import Settings
-    from pernix.spider_middleware import HandleResponse
 
 HTML = [("Content-Type", "text/html; charset=utf-8")]
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 from pernix.fingerprint import request_fingerprint
-from pernix.frontier import FrontierCounts, Lease, host_slot
+from pernix.frontiers.frontier import FrontierCounts, Lease, host_slot
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Sequence

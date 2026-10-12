@@ -9,7 +9,7 @@ import pytest
 
 from pernix import IgnoreRequest, Request, Response, Spider, events
 from pernix.engine import Engine, run_callbacks
-from pernix.memory_frontier import MemoryFrontier
+from pernix.frontiers import MemoryFrontier
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping

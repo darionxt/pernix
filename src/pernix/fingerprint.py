@@ -2,9 +2,7 @@
 
 The default Fingerprint covers the method, the normalized URL, the body, and the
 headers declared for it, never cookies (ADR 0011), nor the Fetcher or the Session.
-URL normalization does three things only: serialize the URL by WHATWG rules, drop
-the fragment, and sort the query parameters stably by name. Percent-encoded bytes
-are kept as they are.
+URLs are compared after `pernix.urls.normalize_url()`.
 """
 
 from __future__ import annotations
@@ -13,14 +11,15 @@ import hashlib
 from typing import TYPE_CHECKING
 
 import orjson
-from ada_url import URL
+
+from pernix.urls import normalize_url
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from pernix.request import Request
 
-__all__ = ["FINGERPRINT_VERSION", "normalize_url", "request_fingerprint"]
+__all__ = ["FINGERPRINT_VERSION", "request_fingerprint"]
 
 FINGERPRINT_VERSION = 1
 """Changes whenever the default Fingerprint of some Request changes."""
@@ -57,25 +56,3 @@ def request_fingerprint(request: Request, *, headers: Iterable[str] = (), sort_q
         ]
     )
     return hashlib.blake2b(canonical, digest_size=16).hexdigest()
-
-
-def normalize_url(url: str, *, sort_query: bool = True) -> str:
-    """Normalize a URL for comparison.
-
-    Args:
-        url: An absolute URL.
-        sort_query: Sort the query parameters stably by name.
-
-    Returns:
-        The URL serialized by WHATWG rules, without its fragment, with sorted query
-        parameters; a URL WHATWG rules cannot parse is returned as it is.
-    """
-    try:
-        parsed = URL(url)
-    except ValueError:
-        return url
-    parsed.hash = ""
-    if sort_query and parsed.search:
-        parameters = parsed.search.removeprefix("?").split("&")
-        parsed.search = "&".join(sorted(parameters, key=lambda parameter: parameter.partition("=")[0]))
-    return parsed.href

@@ -20,17 +20,16 @@ from pernix.events import (
     ResponseReceived,
     SpiderIdle,
 )
+from pernix.middlewares import resolving_against
 from pernix.request import Request
 from pernix.response import expect_response
-from pernix.spider_middleware import resolving_against
 
 if TYPE_CHECKING:
     from pernix.events import EventBus
-    from pernix.frontier import Frontier, Lease
-    from pernix.middleware import Download
+    from pernix.frontiers import Frontier, Lease
+    from pernix.middlewares import Download, HandleResponse
     from pernix.response import Response
     from pernix.spider import Spider
-    from pernix.spider_middleware import HandleResponse
 
 __all__ = ["Engine", "ItemSink", "run_callbacks"]
 

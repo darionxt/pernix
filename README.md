@@ -88,25 +88,21 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
 ├── spider.py            Spider base class and run()/crawl() entry points
+├── crawler.py           assembles the components of one Run, builds components
+├── engine.py            worker loop: claim, fetch, run Callbacks, dispatch outputs
 ├── request.py           Request
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors, URL joining
-├── text_decoding.py     decoding bodies: encoding declarations, labels, detection
-├── urls.py              URL clean-up and joining
 ├── headers.py           Headers
 ├── cookies.py           applies Set-Cookie headers to cookies held by name
-├── crawler.py           assembles the components of one Run, builds components
+├── urls.py              URL clean-up, joining, and normalization
+├── text_decoding.py     decoding bodies: encoding declarations, labels, detection
+├── fingerprint.py       Fingerprints of Requests
+├── errors.py            exception hierarchy, control-flow exceptions
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse
 ├── extension.py         Extension base class
 ├── addons.py            Addon loading, entry point discovery, setup API
-├── errors.py            exception hierarchy, control-flow exceptions
-├── engine.py            worker loop: fetch, run Callbacks, dispatch outputs
-├── middleware.py        download Middleware, NodeMiddleware, the download chain
-├── spider_middleware.py spider Middleware and their chain
-├── frontier.py          Frontier protocol, Lease
-├── memory_frontier.py   in-memory Frontier
-├── fingerprint.py       Fingerprints and URL normalization
 ├── feeds.py             Item output files
 ├── events/
 │   ├── event.py         Event base class, Dispatch, Veto
@@ -116,17 +112,25 @@ src/pernix/
 │   ├── fetcher.py       Fetcher protocol
 │   ├── fetcher_dispatch.py picks the Fetcher of each Request
 │   └── http_fetcher.py  curl-cffi HTTP Fetcher
-├── testing/
-│   └── frontier.py      conformance suite for Frontier backends
-└── settings/
-    ├── loader.py        merges and validates the settings layers
-    ├── sources.py       project file and environment variables
-    ├── settings.py      Settings, the immutable result
-    ├── section.py       Section base class, ComponentMap
-    ├── core_settings.py settings of the crawl loop, events, and Responses
-    └── secret.py        Secret, a redacted value
+├── frontiers/
+│   ├── frontier.py      Frontier protocol, Lease
+│   └── memory_frontier.py in-memory Frontier
+├── middlewares/
+│   ├── middleware.py    download Middleware, NodeMiddleware, the download chain
+│   └── spider_middleware.py spider Middleware and their chain
+├── settings/
+│   ├── loader.py        merges and validates the settings layers
+│   ├── sources.py       project file and environment variables
+│   ├── settings.py      Settings, the immutable result
+│   ├── section.py       Section base class, ComponentMap, NamedComponents
+│   ├── core_settings.py the Sections every Crawler registers
+│   └── secret.py        Secret, a redacted value
+└── testing/
+    └── frontier.py      conformance suite for Frontier backends
 tests/                   one test module per source module, plus end-to-end crawls
 ```
+
+Pluggable component families with several implementations, such as Fetchers, Frontiers, and Middleware, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
 
 ## Development
 

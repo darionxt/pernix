@@ -8,12 +8,12 @@ import pytest
 from pernix import Request, Response, Spider
 from pernix.engine import run_callbacks
 from pernix.errors import ComponentError
-from pernix.spider_middleware import SpiderMiddleware, build_spider_chain, spider_middleware
+from pernix.middlewares import SpiderMiddleware, build_spider_chain, spider_middleware
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator
 
-    from pernix.spider_middleware import HandleResponse
+    from pernix.middlewares import HandleResponse
 
 URL = "https://example.com/list/index.html"
 
