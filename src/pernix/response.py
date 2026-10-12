@@ -24,7 +24,8 @@ class Response:
         body: The raw response body.
         request: The Request that produced this Response.
         cookies: Read-only cookies the client holds after the fetch, by name: those the
-            Request carried plus those set during the fetch, including on redirects.
+            Request carried (`cookies=` or a `Cookie` header) plus those set during the
+            fetch, including on redirects.
             Pass them on with `Request(url, cookies=response.cookies)`.
     """
 

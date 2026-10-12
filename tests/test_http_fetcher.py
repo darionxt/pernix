@@ -96,3 +96,12 @@ async def test_response_cookies_hold_everything_set_during_the_transfer(server: 
 
     assert dict(response.cookies) == {"lang": "en", "auth": "ok", "theme": "dark"}
     assert sorted(follow_up.text.split("; ")) == ["auth=ok", "lang=en", "theme=dark"]
+
+
+async def test_response_cookies_include_those_sent_in_a_cookie_header(server: LoopbackServer) -> None:
+    server.route("/", "ok", headers=[("Set-Cookie", "theme=dark")])
+
+    async with HTTPFetcher() as fetcher:
+        response = await fetcher.fetch(Request(server.url("/"), headers={"Cookie": "session=abc; lang=en"}))
+
+    assert dict(response.cookies) == {"session": "abc", "lang": "en", "theme": "dark"}

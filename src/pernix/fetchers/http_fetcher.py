@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 from curl_cffi.requests import AsyncSession
 
-from pernix.cookies import merge_set_cookies
+from pernix.cookies import merge_set_cookies, parse_cookie_header
 from pernix.headers import Headers
 from pernix.response import Response
 
@@ -85,5 +85,14 @@ class HTTPFetcher:
             headers=Headers((k, v) for k, v in result.headers.multi_items() if v is not None),
             body=result.content,
             request=request,
-            cookies=merge_set_cookies(request.cookies, set_cookies),
+            cookies=merge_set_cookies(_sent_cookies(request), set_cookies),
         )
+
+
+def _sent_cookies(request: Request) -> dict[str, str]:
+    """The cookies a Request carries, whether as `cookies=` or as `Cookie` headers."""
+    sent: dict[str, str] = {}
+    for header in request.headers.get_all("Cookie"):
+        sent.update(parse_cookie_header(header))
+    sent.update(request.cookies)
+    return sent
