@@ -5,6 +5,7 @@ from pernix.settings.core_settings import (
     FingerprintSettings,
     FrontierSettings,
     ResponseSettings,
+    RetrySettings,
 )
 from pernix.settings.loader import load_settings
 from pernix.settings.secret import Secret
@@ -20,6 +21,7 @@ __all__ = [
     "FrontierSettings",
     "NamedComponents",
     "ResponseSettings",
+    "RetrySettings",
     "Secret",
     "Section",
     "Settings",

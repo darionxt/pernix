@@ -7,20 +7,34 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pernix import IgnoreRequest, Request, Response, Spider, events
-from pernix.engine import Engine, run_callbacks
+from pernix import IgnoreRequest, Request, Response, Retry, Spider, events
+from pernix.callbacks import run_callbacks
+from pernix.engine import Engine
+from pernix.errors import ConnectError, RetriesExhausted
 from pernix.frontiers import MemoryFrontier
+from pernix.retry_policy import DefaultRetryPolicy
+from pernix.settings import RetrySettings
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
+    from pernix.frontiers import Lease
+    from pernix.retry_policy import Decision, RetryPolicy
+
 SITE = "https://site.example"
 
 
-class FakeSite:
-    """A download chain answering from a dict of pages; a missing page fails."""
+type Outcome = str | int | Exception
+"""A page body for a 200 Response, a status for an empty Response, or an exception to raise."""
 
-    def __init__(self, pages: dict[str, str]) -> None:
+
+class FakeSite:
+    """A download chain answering from a dict of pages; a missing page fails.
+
+    A page given as a list answers with its outcomes in turn, repeating the last.
+    """
+
+    def __init__(self, pages: dict[str, Outcome | list[Outcome]]) -> None:
         self.pages = pages
         self.fetched: list[str] = []
 
@@ -29,18 +43,33 @@ class FakeSite:
         self.fetched.append(path)
         if path == "/ignored":
             raise IgnoreRequest("not needed")
-        body = self.pages[path]
+        outcome = self.pages[path]
+        if isinstance(outcome, list):
+            outcome = outcome.pop(0) if len(outcome) > 1 else outcome[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        status, body = (outcome, "") if isinstance(outcome, int) else (200, outcome)
         return Response(
-            url=request.url, status=200, headers=[("Content-Type", "text/html")], body=body.encode(), request=request
+            url=request.url, status=status, headers=[("Content-Type", "text/html")], body=body.encode(), request=request
         )
 
 
 async def _run(
-    spider: Spider, site: FakeSite, *, concurrency: int = 4, lease_ttl: float = 60.0
-) -> tuple[MemoryFrontier, list[Mapping[str, Any]], events.EventBus]:
+    spider: Spider,
+    site: FakeSite,
+    *,
+    concurrency: int = 4,
+    lease_ttl: float = 60.0,
+    retry_policy: RetryPolicy | None = None,
+    record: tuple[type[events.Event], ...] = (),
+) -> tuple[MemoryFrontier, list[Mapping[str, Any]], list[events.Event]]:
+    """Run to the end, retrying at once by default; return the Frontier, the Items, and the recorded Events."""
     frontier = MemoryFrontier()
     items: list[Mapping[str, Any]] = []
+    recorded: list[events.Event] = []
     bus = events.EventBus(timeout=5)
+    for event_type in record:
+        bus.on(event_type, recorded.append)
     engine = Engine(
         spider,
         frontier=frontier,
@@ -50,10 +79,11 @@ async def _run(
         events=bus,
         concurrency=concurrency,
         lease_ttl=lease_ttl,
+        retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings(delay_scale=0)),
     )
     async with asyncio.timeout(10):
         await engine.run()
-    return frontier, items, bus
+    return frontier, items, recorded
 
 
 class Links(Spider):
@@ -167,3 +197,218 @@ def test_invalid_engine_settings_are_rejected(concurrency: int, lease_ttl: float
             concurrency=concurrency,
             lease_ttl=lease_ttl,
         )
+
+
+# Retries and failures
+
+
+class Recovering(Links):
+    """Follows links like Links; its errback yields an Item and a fallback Request."""
+
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(f"{SITE}/a", errback=self.failed)
+
+    async def failed(self, request: Request, error: Exception) -> AsyncIterator[Any]:
+        yield {"failed": request.url.removeprefix(SITE), "error": type(error).__name__}
+        yield Request("fallback")  # relative to the failed Request
+
+
+async def test_retried_statuses_are_fetched_again_until_one_succeeds() -> None:
+    site = FakeSite({"/a": [503, 429, "<p>a</p>"]})
+
+    frontier, items, recorded = await _run(Links(), site, record=(events.RequestRetried,))
+
+    assert site.fetched == ["/a", "/a", "/a"]
+    assert items == [{"page": "a"}]
+    assert [(event.attempt, event.reason) for event in recorded if isinstance(event, events.RequestRetried)] == [
+        (1, "HTTP 503"),
+        (2, "HTTP 429"),
+    ]
+    assert (await frontier.counts()).done == 1
+
+
+async def test_exhausted_retries_keep_a_dead_request_and_call_the_errback() -> None:
+    site = FakeSite({"/a": 503, "/fallback": "<p>fallback</p>"})
+
+    frontier, items, recorded = await _run(Recovering(), site, record=(events.RequestFailed, events.ItemScraped))
+
+    assert site.fetched == ["/a"] * 4 + ["/fallback"]
+    assert items == [{"failed": "/a", "error": "RetriesExhausted"}, {"page": "fallback"}]
+    [failed] = [event for event in recorded if isinstance(event, events.RequestFailed)]
+    assert isinstance(failed.error, RetriesExhausted)
+    assert failed.error.response is not None
+    assert (failed.error.reason, failed.error.response.status) == ("HTTP 503", 503)
+    assert next(event.response for event in recorded if isinstance(event, events.ItemScraped)) is None
+    counts = await frontier.counts()
+    assert (counts.dead, counts.done) == (1, 1)
+
+
+async def test_transport_errors_are_retried_and_become_the_cause() -> None:
+    site = FakeSite({"/a": ConnectError("refused", code=7), "/fallback": "<p>fallback</p>"})
+
+    _, items, recorded = await _run(Recovering(), site, record=(events.RequestFailed,))
+
+    assert site.fetched.count("/a") == 4
+    [failed] = recorded
+    assert isinstance(failed, events.RequestFailed)
+    assert isinstance(failed.error, RetriesExhausted)
+    assert isinstance(failed.error.__cause__, ConnectError)
+    assert items[0] == {"failed": "/a", "error": "RetriesExhausted"}
+
+
+async def test_errors_the_policy_keeps_fail_at_once() -> None:
+    site = FakeSite({"/a": ValueError("broken fetcher"), "/fallback": "<p>fallback</p>"})
+
+    frontier, items, _ = await _run(Recovering(), site)
+
+    assert site.fetched == ["/a", "/fallback"]
+    assert items[0] == {"failed": "/a", "error": "ValueError"}
+    assert (await frontier.counts()).dead == 1
+
+
+async def test_callback_errors_are_not_retried_and_keep_earlier_outputs() -> None:
+    class Fragile(Recovering):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            if response.url.endswith("/fallback"):
+                return
+            yield {"page": "a"}
+            raise ValueError("cannot parse")
+
+    site = FakeSite({"/a": "<p>a</p>", "/fallback": ""})
+
+    frontier, items, _ = await _run(Fragile(), site)
+
+    assert site.fetched == ["/a", "/fallback"]
+    assert items == [{"page": "a"}, {"failed": "/a", "error": "ValueError"}]
+    counts = await frontier.counts()
+    assert (counts.dead, counts.done) == (1, 1)
+
+
+async def test_callbacks_can_ask_for_a_retry() -> None:
+    class Patient(Links):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            if "not ready" in response.text:
+                raise Retry("page not ready")
+            async for output in super().parse(response):
+                yield output
+
+    site = FakeSite({"/a": ["<p>not ready</p>", "<p>a</p>"]})
+
+    frontier, items, recorded = await _run(Patient(), site, record=(events.RequestRetried,))
+
+    assert items == [{"page": "a"}]
+    assert [event.reason for event in recorded if isinstance(event, events.RequestRetried)] == ["page not ready"]
+    assert (await frontier.counts()).done == 1
+
+
+async def test_a_failing_retry_policy_keeps_the_outcome(caplog: pytest.LogCaptureFixture) -> None:
+    class Broken:
+        def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
+            raise RuntimeError("policy bug")
+
+    site = FakeSite({"/a": 503})
+
+    _, items, _ = await _run(Links(), site, retry_policy=Broken())
+
+    assert site.fetched == ["/a"]
+    assert items == [{"page": None}]
+    assert "The retry policy failed to judge" in caplog.text
+
+
+async def test_errback_failures_are_logged(caplog: pytest.LogCaptureFixture) -> None:
+    class Clumsy(Recovering):
+        async def failed(self, request: Request, error: Exception) -> AsyncIterator[Any]:
+            raise RuntimeError("errback bug")
+            yield
+
+    frontier, _, _ = await _run(Clumsy(), FakeSite({"/a": ValueError("broken")}))
+
+    assert "Clumsy.failed failed for <Request GET https://site.example/a>" in caplog.text
+    assert (await frontier.counts()).dead == 1
+
+
+async def test_a_cancelled_run_returns_requests_in_flight_without_counting_an_attempt() -> None:
+    started = asyncio.Event()
+
+    class Stuck(Links):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            started.set()
+            await asyncio.Event().wait()
+            yield
+
+    spider = Stuck()
+    frontier = MemoryFrontier()
+    retried: list[events.Event] = []
+    bus = events.EventBus(timeout=5)
+    bus.on(events.RequestRetried, retried.append)
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=FakeSite({"/a": "<p>a</p>"}),
+        handle=run_callbacks(spider),
+        item_sink=lambda item: None,
+        events=bus,
+        concurrency=2,
+    )
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await started.wait()
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased, counts.dead) == (1, 0, 0)
+    assert retried == []
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    assert lease.attempt == 1
+
+
+async def test_transport_errors_raised_by_a_callback_are_not_retried() -> None:
+    class Inline(Recovering):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            if response.url.endswith("/a"):
+                raise ConnectError("an inline fetch failed for good", code=7)
+            yield {"page": "fallback"}
+
+    site = FakeSite({"/a": "<p>a</p>", "/fallback": ""})
+
+    _, items, _ = await _run(Inline(), site)
+
+    assert site.fetched == ["/a", "/fallback"]
+    assert items == [{"failed": "/a", "error": "ConnectError"}, {"page": "fallback"}]
+
+
+async def test_a_run_cancelled_while_settling_returns_the_request_without_counting_an_attempt() -> None:
+    acking = asyncio.Event()
+
+    class StalledAcks(MemoryFrontier):
+        async def ack(self, lease: Lease) -> bool:
+            acking.set()
+            await asyncio.Event().wait()  # a backend that never answers
+            return True
+
+    spider = Links()
+    frontier = StalledAcks()
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=FakeSite({"/a": "<p>a</p>"}),
+        handle=run_callbacks(spider),
+        item_sink=lambda item: None,
+        events=events.EventBus(timeout=5),
+        concurrency=1,
+    )
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await acking.wait()
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased) == (1, 0)
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    assert lease.attempt == 1

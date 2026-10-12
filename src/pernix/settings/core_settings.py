@@ -14,6 +14,7 @@ __all__ = [
     "FingerprintSettings",
     "FrontierSettings",
     "ResponseSettings",
+    "RetrySettings",
 ]
 
 
@@ -113,11 +114,40 @@ class FingerprintSettings(Section):
             )
 
 
+class RetrySettings(Section):
+    """Settings of retries.
+
+    Attributes:
+        times: Retries after the first attempt; 0 turns retrying off.
+        statuses: Response status codes that are retried.
+        backoff_base: Seconds of the first backoff; each retry doubles it, and the
+            delay is chosen at random up to it (full jitter).
+        backoff_max: The most seconds a backoff can reach.
+        retry_after_max: The most seconds a `Retry-After` header can make a retry wait.
+        delay_scale: Multiplies every delay the default policy chooses; 0 retries at
+            once, as in tests.
+        policy: A replacement retry policy, an object with
+            `decide(request, outcome, attempt)`, as an object, a class building one,
+            or an import path; `None` for the default policy.
+    """
+
+    __prefix__ = "retry"
+
+    times: Annotated[int, msgspec.Meta(ge=0)] = 3
+    statuses: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504, 522, 524})
+    backoff_base: Annotated[float, msgspec.Meta(ge=0)] = 1.0
+    backoff_max: Annotated[float, msgspec.Meta(ge=0)] = 60.0
+    retry_after_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
+    delay_scale: Annotated[float, msgspec.Meta(ge=0)] = 1.0
+    policy: Any = None
+
+
 CORE_SECTIONS: tuple[type[Section], ...] = (
     CoreSettings,
     EventSettings,
     ResponseSettings,
     FrontierSettings,
     FingerprintSettings,
+    RetrySettings,
 )
 """The Sections every Crawler registers."""
