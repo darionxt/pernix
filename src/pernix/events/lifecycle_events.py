@@ -19,6 +19,7 @@ __all__ = [
     "RequestDropped",
     "RequestFailed",
     "RequestIgnored",
+    "RequestRetried",
     "RequestScheduled",
     "ResponseReceived",
     "SpiderClosed",
@@ -95,7 +96,11 @@ class RequestDropped(Event):
 
 @dataclass(frozen=True)
 class RequestFailed(Event):
-    """Fetching a Request, or its Callback, raised.
+    """A Request failed for good and is kept as a Dead Request; its errback runs next.
+
+    It failed because fetching it raised an exception the retry policy does not
+    retry, because its Callback raised, or because its retries ran out, in which case
+    `error` is a `RetriesExhausted`.
 
     Attributes:
         request: The Request.
@@ -104,6 +109,23 @@ class RequestFailed(Event):
 
     request: Request
     error: Exception
+
+
+@dataclass(frozen=True)
+class RequestRetried(Event):
+    """An attempt at a Request did not succeed, and the Request will be fetched again.
+
+    Attributes:
+        request: The Request.
+        attempt: The attempt that did not succeed, from 1.
+        delay: Seconds before the next attempt.
+        reason: Why, such as `"HTTP 503"`.
+    """
+
+    request: Request
+    attempt: int
+    delay: float
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -136,11 +158,11 @@ class ItemScraped(Event):
 
     Attributes:
         item: The Item.
-        response: The Response whose Callback produced it.
+        response: The Response whose Callback produced it; `None` for an errback's.
     """
 
     item: Any
-    response: Response
+    response: Response | None
 
 
 @dataclass(frozen=True)
@@ -149,12 +171,12 @@ class ItemDropped(Event):
 
     Attributes:
         item: The Item.
-        response: The Response whose Callback produced it.
+        response: The Response whose Callback produced it; `None` for an errback's.
         reason: Why it was dropped.
     """
 
     item: Any
-    response: Response
+    response: Response | None
     reason: str
 
 
@@ -164,12 +186,12 @@ class ItemError(Event):
 
     Attributes:
         item: The Item.
-        response: The Response whose Callback produced it.
+        response: The Response whose Callback produced it; `None` for an errback's.
         error: The exception.
     """
 
     item: Any
-    response: Response
+    response: Response | None
     error: Exception
 
 

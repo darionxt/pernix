@@ -49,7 +49,7 @@ flowchart LR
     Gate --> Frontier[(Frontier)]
     Frontier -->|claim with Lease| Worker[Engine worker]
     Worker --> Slot[Concurrency slot / rate limiting]
-    Slot --> DMW[Download Middleware onion\nrobots / Session / retry / custom]
+    Slot --> DMW[Download Middleware onion\nrobots / Session / custom]
     DMW --> Fetcher[Fetcher\nhttp / browser / custom]
     Fetcher --> DMW
     DMW --> SMW[Spider Middleware onion]
@@ -127,7 +127,7 @@ Request(
     headers=None,          # order-preserving, case-preserving, duplicate keys allowed
     body=None, json=None, data=None,
     callback=None,         # defaults to parse; must be a Spider method (referenced by name when persisted)
-    errback=None,
+    errback=None,          # a Spider method called as errback(request, error) when the Request fails for good
     kwargs=None,           # keyword arguments passed through to the Callback
     meta=None,             # user data; must be JSON-serializable
     priority=0,            # higher goes first; FIFO within the same priority
@@ -167,9 +167,10 @@ Request(
 - A Callback can be an `async def` async generator that yields `Request` objects or Items (None is ignored), or a plain `async def` that returns a single object, a list, or None.
 - **Output is streamed**: each yielded object is processed immediately. Requests go to the Frontier; Items go into a bounded queue, and when the queue is full the Callback is suspended (backpressure).
 - **When a Callback raises** (confirmed):
-  - The Request is marked as failed, the errback is called, and the failure is counted in stats. It is **not retried by default**, because parsing errors are usually deterministic.
+  - The Request is marked as failed: it is kept as a Dead Request, `RequestFailed` is emitted, and the errback is called. It is **not retried**, because parsing errors are usually deterministic; this holds for every exception a Callback raises, including a `FetchError` from an Inline Fetch that already exhausted its own retries.
   - Output yielded before the exception is kept.
-  - To retry, the user explicitly writes `raise Retry(reason)`; deciding whether a page is Blocked is covered in §5.4 and handled automatically by the framework.
+  - To retry, the user explicitly writes `raise Retry(reason, delay=None)`; the retry policy still decides whether a retry is left (§6.4). Deciding whether a page is Blocked is covered in §5.4 and handled automatically by the framework.
+- **Errbacks**: `errback(request, error)` runs once a Request fails for good, whether its fetch failed, its retries ran out (`error` is then `RetriesExhausted`, carrying the last `response` or the last exception as its cause), or its Callback raised. Like a Callback, it may yield Requests and Items; relative URLs resolve against the failed Request's URL. An errback that raises is logged.
 - Every Request must go through the Frontier; a Callback cannot bypass scheduling and hand a Request directly to a Fetcher. For cases that need the Response "right away", use the Inline Fetch in §4.6.
 
 ### 4.6 Inline Fetch (`await self.fetch`)
@@ -277,7 +278,8 @@ class DropEmpty(SpiderMiddleware):
 - Middleware are components like Extensions: services are injected, `events.on()` methods are subscribed, and they are opened and closed with the Run. The chains are built once at startup, and a Middleware that is not an async callable (download) or an async generator (spider) is rejected then, before anything is opened.
 - On a single chain, the order in the request direction and in the response direction is naturally symmetric, and exceptions propagate naturally along the chain; there is no asymmetry such as "exceptions raised in the response phase bypass exception handling". Only `Exception` is caught by the framework, so `CancelledError` always propagates.
 - A spider Middleware may pass another Response to `call_next`; exceptions raised by the Callback come out of its `async for`, so it can catch them. Requests constructed in a layer, or in the Callback, resolve relative URLs against the Response that layer, or the Callback, received. When a layer ends, even early, the inner layers and the Callback it started are closed with it.
-- Control flow is expressed with exceptions such as `IgnoreRequest`, `Retry`, and `DropItem`, which are not `PernixError`s. `IgnoreRequest` raised by download Middleware or a Fetcher drops the Request without counting it as failed and emits `RequestIgnored(reason)`; the handling of the others comes with retries and Pipelines.
+- Control flow is expressed with exceptions such as `IgnoreRequest`, `Retry`, and `DropItem`, which are not `PernixError`s. `IgnoreRequest` raised by download Middleware or a Fetcher drops the Request without counting it as failed and emits `RequestIgnored(reason)`; `Retry` asks the retry policy for another attempt (§6.4); `DropItem` comes with Pipelines.
+- Retries are not a Middleware: the Engine asks the retry policy after each attempt and returns the Request to the Frontier, so every Middleware runs again on each retry (§6.4).
 - A `NodeMiddleware` adapter is also provided, which wraps `process_request` / `process_response` / `process_exception`-style classes into the onion to make migrating existing code easier. The hooks may be plain or `async` methods:
   - `process_request(request)` returns `None` to continue inward, or a Response that skips the inner layers.
   - `process_response(request, response)` returns the Response or a replacement; it also sees Responses returned by the other two hooks.
@@ -326,10 +328,11 @@ Core Events:
 | `SpiderClosed(reason)` | observe, reverse | The Run ended: `finished`, `failed`, or `cancelled` |
 | `RequestScheduled` | gate (fail-open) | A Request is about to enter the Frontier |
 | `RequestDropped(reason)` | observe | A Request was vetoed, or was a duplicate |
-| `RequestFailed(error)` | observe | Fetching a Request, or its Callback, raised |
+| `RequestRetried(attempt, delay, reason)` | observe | An attempt did not succeed, and the Request goes back to the Frontier for another |
+| `RequestFailed(error)` | observe | A Request failed for good: an exception the retry policy keeps, its Callback raised, or its retries ran out (`RetriesExhausted`); its errback runs next |
 | `RequestIgnored(reason)` | observe | Download Middleware or a Fetcher raised `IgnoreRequest` |
 | `ResponseReceived` | observe | A Response was fetched, before its Callback runs |
-| `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed |
+| `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed; `response` is `None` for an errback's Items |
 | `StatsSnapshot` | observe | A periodic copy of the stats |
 
 Lifecycle: Extensions (the `extensions` setting) are built in order, subscribed, and opened, as async context managers or through `open()`. They are closed in reverse after `SpiderClosed`; `__aexit__` receives the exception that ended the Run, so a component can roll back, but cannot suppress it. Every close step runs even when earlier ones fail or are cancelled: failures are raised together as an `ExceptionGroup`, and a cancellation is re-raised after the last component is closed. If opening a component fails, the ones already open are closed in reverse. Once `SpiderOpened` has been dispatched, `SpiderClosed` always follows, even on cancellation.
@@ -419,7 +422,7 @@ A Fetcher is a component with `async def fetch(self, request) -> Response` and a
 **Timeouts and cancellation**
 
 - `timeout` maps to curl's connect/read timeouts; the overall deadline (including time spent waiting in line) is enforced by the framework with asyncio.
-- curl-cffi exceptions are mapped onto the framework's own exception hierarchy: `Timeout`, `ConnectError`, `ProxyError` (407 responses also fall under this), `TLSError`, `TooManyRedirects`, `DecodeError`; the original curl error code is preserved on the exception.
+- curl-cffi exceptions are mapped onto the framework's own exception hierarchy, `FetchError` and its subclasses `Timeout`, `ConnectError`, `ProxyError` (407 responses also fall under this), `TLSError`, `TooManyRedirects`, `DecodeError`; the original curl error code is kept in `code`, and the curl-cffi exception is the `__cause__`.
 
 **Concurrency**
 
@@ -595,17 +598,24 @@ Engine integration:
 
 ### 6.4 Retries
 
-Default policy:
+After every attempt that produced a Response, raised while fetching, or raised `Retry` in the Callback, the Engine asks the retry policy, `decide(request, outcome, attempt) -> Decision`, where `outcome` is the Response or the exception and `attempt` counts from 1. The Decision is one of:
 
-- At most 3 retries.
-- Retried status codes: 408, 429, 500, 502, 503, 504, 522, 524; connection, timeout, and proxy errors are also retried.
-- Backoff uses full jitter, with a 1 s base and a 60 s cap.
-- Both formats of `Retry-After` are parsed, with a maximum wait of 300 s.
+- `accept()`: the outcome stands; a Response goes to the spider chain, an exception fails the Request.
+- `retry(delay, reason)`: the Request is fetched again after the delay, and `RequestRetried` is emitted.
+- `give_up(reason)`: a retry was called for but none is left; the Request fails with `RetriesExhausted`.
+
+Default policy (`DefaultRetryPolicy`, configured by `retry.*`):
+
+- At most 3 retries (`retry.times`; 0 turns retrying off).
+- Retried status codes (`retry.statuses`): 408, 429, 500, 502, 503, 504, 522, 524. Retried exceptions: `Timeout`, `ConnectError`, `ProxyError`, and `Retry`; other `FetchError`s, such as `TLSError` or `TooManyRedirects`, would fail again.
+- The delay is the one `Retry` names; otherwise a `Retry-After` header's, in either format, up to 300 s (`retry.retry_after_max`); otherwise full-jitter backoff with a 1 s base (`retry.backoff_base`) doubling per retry, up to 60 s (`retry.backoff_max`). `retry.delay_scale` multiplies every delay; tests set it to 0.
+- `retry.policy` replaces the policy with any object that has `decide()`; a class gets `RetrySettings` injected. A policy that raises keeps the outcome.
 
 Rules:
 
-- For Requests that go through the Frontier, retries are implemented by re-adding them with `nack(delay)`; Inline Fetches are retried in place.
-- `CancelledError` is never caught.
+- For Requests that go through the Frontier, a retry returns the Request with `nack(delay)`, so it holds no concurrency slot while it waits, and every Middleware runs again; Inline Fetches are retried in place.
+- A Request whose retries ran out, or that failed in a way the policy keeps, is kept as a Dead Request, `RequestFailed` is emitted, and its errback runs.
+- `CancelledError` is never caught: when a Run is cancelled, Requests in flight are returned to the Frontier without counting an attempt, never retried.
 
 ### 6.5 Resuming and distributed crawling
 

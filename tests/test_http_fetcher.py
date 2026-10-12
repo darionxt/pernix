@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 from typing import TYPE_CHECKING
 
 import pytest
-from curl_cffi.requests.exceptions import Timeout
 
 from loopback import ReceivedRequest, Reply
 from pernix import Request
+from pernix.errors import ConnectError, FetchError, Timeout, TLSError, TooManyRedirects
 from pernix.fetchers import HTTPFetcher
 
 if TYPE_CHECKING:
@@ -132,3 +133,22 @@ async def test_responses_use_the_configured_default_encoding(server: LoopbackSer
         response = await fetcher.fetch(Request(server.url("/page")))
 
     assert (response.encoding, response.encoding_source) == ("gb18030", "default")
+
+
+async def test_transport_failures_become_fetch_errors_with_the_curl_code(server: LoopbackServer) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+    server.route("/loop", status=302, headers=[("Location", "/loop")])
+
+    async with HTTPFetcher() as fetcher:
+        with pytest.raises(ConnectError) as refused:
+            await fetcher.fetch(Request(f"http://127.0.0.1:{closed_port}/"))
+        with pytest.raises(TLSError):
+            await fetcher.fetch(Request(server.url("/").replace("http://", "https://")))
+        with pytest.raises(TooManyRedirects):
+            await fetcher.fetch(Request(server.url("/loop")))
+
+    assert refused.value.code == 7  # CURLE_COULDNT_CONNECT
+    assert isinstance(refused.value, FetchError)
+    assert refused.value.__cause__ is not None

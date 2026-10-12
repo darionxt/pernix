@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from curl_cffi import CurlHttpVersion
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests import exceptions as curl_errors
 
 from pernix.cookies import merge_set_cookies, parse_cookie_header
+from pernix.errors import ConnectError, DecodeError, FetchError, ProxyError, Timeout, TLSError, TooManyRedirects
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
 from pernix.settings import CoreSettings, ResponseSettings
@@ -26,6 +28,17 @@ _HTTP_VERSIONS: dict[int, str] = {
     CurlHttpVersion.V3: "HTTP/3",
 }
 """What libcurl reports as the HTTP version of a transfer, by name."""
+
+_ERROR_KINDS: tuple[tuple[type[curl_errors.RequestException], type[FetchError]], ...] = (
+    (curl_errors.ProxyError, ProxyError),
+    (curl_errors.SSLError, TLSError),  # before ConnectionError, its base
+    (curl_errors.Timeout, Timeout),  # before ConnectionError, a base of ConnectTimeout
+    (curl_errors.ConnectionError, ConnectError),
+    (curl_errors.IncompleteRead, ConnectError),
+    (curl_errors.TooManyRedirects, TooManyRedirects),
+    (curl_errors.ContentDecodingError, DecodeError),
+)
+"""curl-cffi errors and the FetchErrors they become, most specific first."""
 
 
 class HTTPFetcher:
@@ -91,24 +104,28 @@ class HTTPFetcher:
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
-            curl_cffi.requests.exceptions.RequestException: The transfer failed.
+            pernix.errors.FetchError: The transfer failed; a subclass names the kind of
+                failure, and `code` is libcurl's error code.
         """
         if self._session is None:
             raise RuntimeError("HTTPFetcher must be entered with 'async with' before fetching")
         options: dict[str, Any] = {}
         if request.timeout is not None:
             options["timeout"] = request.timeout
-        result = await self._session.request(
-            cast("HttpMethod", request.method),
-            request.url,
-            headers=request.headers.items(),
-            data=request.body,
-            cookies=dict(request.cookies),
-            discard_cookies=True,
-            proxy=request.proxy,
-            impersonate=cast("Any", request.impersonate),
-            **options,
-        )
+        try:
+            result = await self._session.request(
+                cast("HttpMethod", request.method),
+                request.url,
+                headers=request.headers.items(),
+                data=request.body,
+                cookies=dict(request.cookies),
+                discard_cookies=True,
+                proxy=request.proxy,
+                impersonate=cast("Any", request.impersonate),
+                **options,
+            )
+        except curl_errors.RequestException as exc:
+            raise _fetch_error(exc) from exc
         hops = [*result.history, result]
         set_cookies = [value for hop in hops for value in hop.headers.get_list("set-cookie") if value is not None]
         return Response(
@@ -125,6 +142,12 @@ class HTTPFetcher:
             http_version=_HTTP_VERSIONS.get(result.http_version),
             fetcher="http",
         )
+
+
+def _fetch_error(error: curl_errors.RequestException) -> FetchError:
+    """Map a curl-cffi error onto the FetchError of its kind, keeping libcurl's code."""
+    kind = next((kind for curl_kind, kind in _ERROR_KINDS if isinstance(error, curl_kind)), FetchError)
+    return kind(str(error), code=int(error.code))
 
 
 def _headers(response: curl_cffi.Response) -> Headers:

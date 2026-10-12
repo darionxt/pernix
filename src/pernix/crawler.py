@@ -6,9 +6,10 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, cast
 
 from pernix.addons import addon_settings, load_addons, setup_addon
+from pernix.callbacks import run_callbacks
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
-from pernix.engine import Engine, run_callbacks
+from pernix.engine import Engine
 from pernix.errors import ComponentError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.feeds import JsonLinesFeed
@@ -16,11 +17,13 @@ from pernix.fetchers import FetcherDispatch
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier
 from pernix.middlewares import build_download_chain, build_spider_chain
+from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import (
     CoreSettings,
     EventSettings,
     FingerprintSettings,
     FrontierSettings,
+    RetrySettings,
     Section,
     Settings,
     load_settings,
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
     from pernix.frontiers import Frontier
     from pernix.middlewares import Download, HandleResponse
     from pernix.request import Request
+    from pernix.retry_policy import RetryPolicy
     from pernix.spider import Spider
 
 __all__ = ["Crawler"]
@@ -129,11 +133,11 @@ class Crawler:
         """Run the Spider to completion.
 
         Addons register their subscribers. Then every component is built: Extensions,
-        Fetchers, download Middleware, spider Middleware, and the Fingerprint function,
-        and the chains are checked, before anything is opened. The components are
-        subscribed and opened in that order, `SpiderOpened` is emitted, the Engine runs
-        with an in-memory Frontier, `SpiderClosed` is emitted, and the components are
-        closed in reverse order.
+        Fetchers, download Middleware, spider Middleware, the Fingerprint function, and
+        the retry policy, and the chains are checked, before anything is opened. The
+        components are subscribed and opened in that order, `SpiderOpened` is emitted,
+        the Engine runs with an in-memory Frontier, `SpiderClosed` is emitted, and the
+        components are closed in reverse order.
 
         Raises:
             RuntimeError: This Crawler already ran.
@@ -153,12 +157,13 @@ class Crawler:
         download = build_download_chain(middlewares, FetcherDispatch(fetchers))
         handle = build_spider_chain(spider_middlewares, run_callbacks(self.spider))
         frontier = MemoryFrontier(fingerprint=self._fingerprint_function())
+        retry_policy = self._retry_policy()
         async with ComponentLifecycle() as lifecycle:
             for component in (*extensions, *fetchers.values(), *middlewares, *spider_middlewares):
                 self.events.subscribe_methods(component)
                 await lifecycle.open(component)
             try:
-                await self._run(frontier, download, handle)
+                await self._run(frontier, download, handle, retry_policy)
             finally:
                 await frontier.close()
 
@@ -180,7 +185,17 @@ class Crawler:
             raise ComponentError(f"fingerprint.function must be callable as function(request) -> str, got {function!r}")
         return cast("Callable[[Request], str]", function)
 
-    async def _run(self, frontier: Frontier, download: Download, handle: HandleResponse) -> None:
+    def _retry_policy(self) -> RetryPolicy:
+        """The `retry.policy` setting, or the default policy, built with injection."""
+        spec = self.settings.section(RetrySettings).policy
+        policy = self.build_component(DefaultRetryPolicy if spec is None else spec)
+        if not callable(getattr(policy, "decide", None)):
+            raise ComponentError(f"retry.policy must have decide(request, outcome, attempt), got {policy!r}")
+        return cast("RetryPolicy", policy)
+
+    async def _run(
+        self, frontier: Frontier, download: Download, handle: HandleResponse, retry_policy: RetryPolicy
+    ) -> None:
         concurrency = self.settings.section(CoreSettings).concurrency
         with ExitStack() as stack:
             item_sink = _discard if self._output is None else stack.enter_context(JsonLinesFeed(self._output)).write
@@ -193,6 +208,7 @@ class Crawler:
                 events=self.events,
                 concurrency=concurrency,
                 lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
+                retry_policy=retry_policy,
             )
             reason = "failed"
             try:

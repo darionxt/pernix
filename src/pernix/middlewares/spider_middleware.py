@@ -116,15 +116,16 @@ def build_spider_chain(middlewares: Sequence[object], handle: HandleResponse) ->
     return handle
 
 
-def resolving_against(response: Response, outputs: AsyncIterator[Any]) -> AsyncGenerator[Any]:
-    """Iterate outputs with relative URLs resolving against a Response.
+def resolving_against(urljoin: Callable[[str], str], outputs: AsyncIterator[Any]) -> AsyncGenerator[Any]:
+    """Iterate outputs with relative URLs resolving through `urljoin`.
 
     Each step, and the closing of `outputs` once iteration ends or is abandoned, runs
-    with Requests constructed in it resolving relative URLs against `response`.
+    with Requests constructed in it resolving relative URLs through `urljoin`.
 
     Args:
-        response: The Response the code producing `outputs` handles.
-        outputs: The outputs of a spider Middleware layer or a Callback.
+        urljoin: Resolves a relative URL, such as the `urljoin` of the Response the
+            code producing `outputs` handles.
+        outputs: The outputs of a spider Middleware layer, a Callback, or an errback.
 
     Returns:
         An async generator of the same outputs.
@@ -133,14 +134,14 @@ def resolving_against(response: Response, outputs: AsyncIterator[Any]) -> AsyncG
     async def resolving() -> AsyncGenerator[Any]:
         try:
             while True:
-                with resolve_relative_urls(response.urljoin):
+                with resolve_relative_urls(urljoin):
                     try:
                         output = await anext(outputs)
                     except StopAsyncIteration:
                         return
                 yield output
         finally:
-            with resolve_relative_urls(response.urljoin):
+            with resolve_relative_urls(urljoin):
                 await _aclose(outputs)
 
     return resolving()
@@ -149,7 +150,8 @@ def resolving_against(response: Response, outputs: AsyncIterator[Any]) -> AsyncG
 def _link(layer: Callable[[Response, HandleResponse], AsyncIterator[Any]], call_next: HandleResponse) -> HandleResponse:
     """Run `layer` with `call_next` as its inner chain.
 
-    The layer runs against the Response it received (see `resolving_against()`).
+    The layer resolves relative URLs against the Response it received (see
+    `resolving_against()`).
     When it ends, however it ends, the inner iterators it opened through `call_next`
     are closed too, so their cleanup runs before the chain is done rather than
     whenever they are garbage collected.
@@ -163,7 +165,7 @@ def _link(layer: Callable[[Response, HandleResponse], AsyncIterator[Any]], call_
             opened.append(inner)
             return inner
 
-        outputs = resolving_against(response, layer(response, tracked_call_next))
+        outputs = resolving_against(response.urljoin, layer(response, tracked_call_next))
         try:
             async for output in outputs:
                 yield output

@@ -74,6 +74,12 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
 | `fingerprint.sort_query` | `true` | Sort query parameters, so their order does not make a Request new |
 | `fingerprint.function` | `None` | A replacement Fingerprint function, `(request) -> str` |
+| `retry.times` | `3` | Retries after the first attempt; `0` turns retrying off |
+| `retry.statuses` | `[408, 429, 500, 502, 503, 504, 522, 524]` | Response status codes that are retried |
+| `retry.backoff_base` / `retry.backoff_max` | `1.0` / `60.0` | Full-jitter backoff: seconds of the first retry, doubling up to the maximum |
+| `retry.retry_after_max` | `300.0` | The longest wait a `Retry-After` header can set |
+| `retry.delay_scale` | `1.0` | Multiplies every retry delay; `0` retries at once, as in tests |
+| `retry.policy` | `None` | A replacement retry policy, an object with `decide(request, outcome, attempt)` |
 
 ## Documentation
 
@@ -89,7 +95,9 @@ src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
 ├── spider.py            Spider base class and run()/crawl() entry points
 ├── crawler.py           assembles the components of one Run, builds components
-├── engine.py            worker loop: claim, fetch, run Callbacks, dispatch outputs
+├── engine.py            worker loop: claim, fetch, run Callbacks, settle Leases
+├── callbacks.py         runs Callbacks and errbacks, collects their outputs
+├── retry_policy.py      retry decisions, backoff, Retry-After
 ├── request.py           Request
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors, URL joining

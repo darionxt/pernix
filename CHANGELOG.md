@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Retries decided by a replaceable `RetryPolicy` after every attempt: the default retries statuses 408, 429, 500, 502, 503, 504, 522, and 524, `Timeout`, `ConnectError`, `ProxyError`, and `Retry(reason, delay=None)`, up to 3 times, waiting as `Retry-After` says (up to 300 s) or with full-jitter backoff (1 s base, 60 s cap). Retried Requests go back to the Frontier with a delay and emit `RequestRetried`. The `retry.*` settings configure it, including `retry.delay_scale` for tests.
+- Failure semantics: a Request whose retries ran out (`RetriesExhausted`), whose fetch failed in a way the policy keeps, or whose Callback raised is kept as a Dead Request, emits `RequestFailed`, and runs its errback, `errback(request, error)`, which may yield Requests and Items. Callback exceptions are not retried, and outputs yielded before them are kept. A cancelled Run returns Requests in flight to the Frontier without counting an attempt.
+- `FetchError` and its subclasses `Timeout`, `ConnectError`, `ProxyError`, `TLSError`, `TooManyRedirects`, and `DecodeError`, which the HTTP Fetcher raises instead of curl-cffi's exceptions, keeping libcurl's error code.
 - The Frontier contract (ADR 0003): `add` deduplicating atomically, `claim` under token-carrying Leases with priorities, FIFO within a priority, and skippable slots, `renew`, `ack`, `nack` with delays, `dead`, `counts`, `wait`, and `close`, with every write conditional on the Lease. `MemoryFrontier` implements it, and `pernix.testing.frontier` ships the conformance suite for other backends.
 - Fingerprints: method, WHATWG-normalized URL without fragment and with sorted query, body digest, and declared headers, never cookies. `fingerprint.headers`, `fingerprint.sort_query`, and `fingerprint.function` configure them; `request_fingerprint()` is public.
 - The Engine claims Requests under Leases, renews them while it works, acknowledges them once the Callback's outputs are added, and keeps failed Requests as Dead Requests. `Spider.on_idle()` can add Requests when the Run is idle; the Run ends once it adds none. `frontier.lease_ttl` sets the Lease lifetime.
@@ -25,6 +28,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- `RequestFailed` is emitted once per Request that fails for good, not once per failed attempt; the Item Events have `response=None` for Items an errback yields.
 - The `Fetcher` protocol is `async def fetch(request)` plus `schemes`; Fetchers are opened and closed like other components and no longer check `render` or `fetcher` themselves.
 - Requests are independent: cookies no longer persist from one Request to another. Pass `cookies=` explicitly, or use a Session Pool once available (ADR 0011).
 - `Spider.run()` and `Spider.crawl()` take `settings={"concurrency": ...}` instead of a `concurrency` argument.

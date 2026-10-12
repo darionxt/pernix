@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import pytest
 
+from loopback import Reply
 from pernix import Request, Response, Spider, events
 from pernix.errors import ComponentError, SettingsError
+from pernix.retry_policy import Decision
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -186,7 +188,7 @@ async def test_fetch_error_is_logged_and_run_continues(
 
     output = tmp_path / "items.jsonl"
     async with asyncio.timeout(10):
-        await Mixed.crawl(output=output)
+        await Mixed.crawl(output=output, settings={"retry.times": 0})
 
     assert _read_items(output) == [{"body": "ok"}]
     assert any(f":{closed_port}/" in r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
@@ -258,12 +260,12 @@ async def test_item_storage_failure_ends_the_run(server: LoopbackServer, tmp_pat
         async def parse(self, response: Response) -> AsyncIterator[Any]:
             yield {"tags": {"a", "b"}}  # a set is not JSON-serializable
 
-    errors: list[tuple[Any, str, type[Exception]]] = []
+    errors: list[tuple[Any, str | None, type[Exception]]] = []
 
     class ItemErrors:
         @events.on(events.ItemError)
         def failed(self, event: events.ItemError) -> None:
-            errors.append((event.item, event.response.url, type(event.error)))
+            errors.append((event.item, event.response and event.response.url, type(event.error)))
 
     with pytest.RaisesGroup(TypeError):
         async with asyncio.timeout(10):
@@ -322,7 +324,12 @@ class Observer:
 
     @events.on(events.ItemScraped)
     def scraped(self, event: events.ItemScraped) -> None:
-        self.log.append(f"item {event.item['n']} from {event.response.url.rsplit('/', 1)[-1]}")
+        source = event.response.url.rsplit("/", 1)[-1] if event.response else "an errback"
+        self.log.append(f"item {event.item['n']} from {source}")
+
+    @events.on(events.RequestRetried)
+    def retried(self, event: events.RequestRetried) -> None:
+        self.log.append(f"retried {event.request.url.rsplit('/', 1)[-1]} {event.attempt} {event.reason.split(':')[0]}")
 
     @events.on(events.RequestFailed)
     def failed(self, event: events.RequestFailed) -> None:
@@ -352,7 +359,7 @@ async def test_the_engine_emits_request_response_and_item_events(server: Loopbac
             yield
 
     async with asyncio.timeout(10):
-        await Eventful.crawl(settings={"concurrency": 1, "extensions": {observer: 1}})
+        await Eventful.crawl(settings={"concurrency": 1, "extensions": {observer: 1}, "retry.delay_scale": 0})
 
     assert observer.log[:4] == [
         "received start",
@@ -362,8 +369,11 @@ async def test_the_engine_emits_request_response_and_item_events(server: Loopbac
     ]
     assert sorted(observer.log[4:]) == [
         "failed broken ValueError",
-        "failed unreachable ConnectionError",
+        "failed unreachable RetriesExhausted",
         "received broken",
+        "retried unreachable 1 ConnectError",
+        "retried unreachable 2 ConnectError",
+        "retried unreachable 3 ConnectError",
     ]
 
 
@@ -486,3 +496,43 @@ async def test_fingerprint_settings_are_checked_before_the_run() -> None:
         await Idle.crawl(settings={"fingerprint.headers": ["Accept-Language", "Cookie"]})
     with pytest.raises(ComponentError, match=r"fingerprint\.function must be callable"):
         await Idle.crawl(settings={"fingerprint.function": 42})
+
+
+async def test_retries_go_back_through_the_frontier(server: LoopbackServer, tmp_path: Path) -> None:
+    replies = [Reply(status=503, headers=[("Retry-After", "120")]), Reply(status=500), Reply(body="<p>ok</p>")]
+    server.route("/flaky", handler=lambda request: replies.pop(0))
+
+    class Flaky(Spider):
+        start_urls = (server.url("/flaky"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"body": response.css("p::text").get()}
+
+    output = tmp_path / "items.jsonl"
+    async with asyncio.timeout(10):
+        await Flaky.crawl(output=output, settings={"retry.delay_scale": 0})
+
+    assert _read_items(output) == [{"body": "ok"}]
+    assert [request.path for request in server.received] == ["/flaky"] * 3
+
+
+class NoRetries:
+    def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
+        return Decision.accept()
+
+
+async def test_the_retry_policy_is_replaceable(server: LoopbackServer) -> None:
+    server.route("/down", status=503)
+
+    class Down(Spider):
+        start_urls = (server.url("/down"),)
+
+        async def parse(self, response: Response) -> None:
+            pass
+
+    async with asyncio.timeout(10):
+        await Down.crawl(settings={"retry.policy": NoRetries})
+    assert len(server.received) == 1
+
+    with pytest.raises(ComponentError, match=r"retry\.policy must have decide"):
+        await Down.crawl(settings={"retry.policy": object()})

@@ -12,4 +12,4 @@ The cost is that users used to node-style hooks need to adapt, so a `NodeMiddlew
 
 ## Consequences
 
-Middlewares inside the retry Middleware run again on every retry; order registrations accordingly.
+Retries are decided by the Engine's retry policy rather than by a Middleware, and a retried Request goes back through the Frontier, so every Middleware runs again on each retry. A Middleware that calls `call_next` more than once retries in place; the Middleware inside it run again each time, so order registrations accordingly.
