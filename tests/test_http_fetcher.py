@@ -9,7 +9,7 @@ import pytest
 
 from loopback import ReceivedRequest, Reply
 from pernix import Request
-from pernix.errors import ConnectError, FetchError, Timeout, TLSError, TooManyRedirects
+from pernix.errors import ConnectError, DecodeError, FetchError, Timeout, TLSError, TooManyRedirects
 from pernix.fetchers import HTTPFetcher
 
 if TYPE_CHECKING:
@@ -152,3 +152,13 @@ async def test_transport_failures_become_fetch_errors_with_the_curl_code(server:
     assert refused.value.code == 7  # CURLE_COULDNT_CONNECT
     assert isinstance(refused.value, FetchError)
     assert refused.value.__cause__ is not None
+
+
+async def test_bodies_that_fail_to_decompress_raise_decode_error(server: LoopbackServer) -> None:
+    server.route("/bad", b"not gzip at all", headers=[("Content-Encoding", "gzip")])
+
+    async with HTTPFetcher() as fetcher:
+        with pytest.raises(DecodeError) as error:
+            await fetcher.fetch(Request(server.url("/bad")))
+
+    assert error.value.code == 61  # CURLE_BAD_CONTENT_ENCODING

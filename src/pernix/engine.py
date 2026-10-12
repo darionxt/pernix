@@ -193,13 +193,16 @@ class Engine:
         renewal = asyncio.create_task(self._keep_leased(lease))
         try:
             settlement = await self._attempt(lease)
+            renewal.cancel()  # before settling, so a renewal never races the settlement
+            settled = await self._settle(lease, settlement)
         except asyncio.CancelledError:
+            # Until settled, the Request goes back; once settled, this write is stale and changes nothing.
             await self._return(lease)
             raise
         finally:
             renewal.cancel()
             await asyncio.wait([renewal])
-        if not await self._settle(lease, settlement):
+        if not settled:
             logger.warning("The Lease on %r expired before it was settled; it may be processed again", lease.request)
 
     async def _keep_leased(self, lease: Lease) -> None:

@@ -18,6 +18,7 @@ from pernix.settings import RetrySettings
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
+    from pernix.frontiers import Lease
     from pernix.retry_policy import Decision, RetryPolicy
 
 SITE = "https://site.example"
@@ -377,3 +378,37 @@ async def test_transport_errors_raised_by_a_callback_are_not_retried() -> None:
 
     assert site.fetched == ["/a", "/fallback"]
     assert items == [{"failed": "/a", "error": "ConnectError"}, {"page": "fallback"}]
+
+
+async def test_a_run_cancelled_while_settling_returns_the_request_without_counting_an_attempt() -> None:
+    acking = asyncio.Event()
+
+    class StalledAcks(MemoryFrontier):
+        async def ack(self, lease: Lease) -> bool:
+            acking.set()
+            await asyncio.Event().wait()  # a backend that never answers
+            return True
+
+    spider = Links()
+    frontier = StalledAcks()
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=FakeSite({"/a": "<p>a</p>"}),
+        handle=run_callbacks(spider),
+        item_sink=lambda item: None,
+        events=events.EventBus(timeout=5),
+        concurrency=1,
+    )
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await acking.wait()
+
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased) == (1, 0)
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    assert lease.attempt == 1

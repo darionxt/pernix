@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
-from curl_cffi import CurlHttpVersion
+from curl_cffi import CurlECode, CurlHttpVersion
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests import exceptions as curl_errors
 
@@ -36,9 +36,11 @@ _ERROR_KINDS: tuple[tuple[type[curl_errors.RequestException], type[FetchError]],
     (curl_errors.ConnectionError, ConnectError),
     (curl_errors.IncompleteRead, ConnectError),
     (curl_errors.TooManyRedirects, TooManyRedirects),
-    (curl_errors.ContentDecodingError, DecodeError),
 )
 """curl-cffi errors and the FetchErrors they become, most specific first."""
+
+_ERROR_CODES: dict[int, type[FetchError]] = {CurlECode.BAD_CONTENT_ENCODING: DecodeError}
+"""libcurl error codes that curl-cffi raises with a generic class, and the FetchErrors they become."""
 
 
 class HTTPFetcher:
@@ -146,8 +148,11 @@ class HTTPFetcher:
 
 def _fetch_error(error: curl_errors.RequestException) -> FetchError:
     """Map a curl-cffi error onto the FetchError of its kind, keeping libcurl's code."""
-    kind = next((kind for curl_kind, kind in _ERROR_KINDS if isinstance(error, curl_kind)), FetchError)
-    return kind(str(error), code=int(error.code))
+    code = int(error.code)
+    kind = _ERROR_CODES.get(code) or next(
+        (kind for curl_kind, kind in _ERROR_KINDS if isinstance(error, curl_kind)), FetchError
+    )
+    return kind(str(error), code=code)
 
 
 def _headers(response: curl_cffi.Response) -> Headers:
