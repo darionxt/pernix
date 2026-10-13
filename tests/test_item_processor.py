@@ -254,6 +254,25 @@ async def test_items_wait_behind_a_batch_being_processed() -> None:
     assert recorder.log == [("scraped", {"n": 1}), ("scraped", {"n": 2})]
 
 
+async def test_items_waiting_behind_a_batch_are_bounded() -> None:
+    class Rare(Rows):
+        batch_size = 100
+        accepts = staticmethod(lambda item: item["n"] == 0)
+
+    rows = Rare()
+    processor, recorder = _processor([rows], queue_size=1)
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        for n in range(301):
+            await processor.put({"n": n}, CTX)
+        await asyncio.sleep(0.05)
+        assert rows.batches == [[0]]  # processed small, long before the batch timeout
+        assert len(recorder.log) >= 299  # only what waits behind the batch is not delivered yet
+        await processor.join()
+
+    assert [entry[1]["n"] for entry in recorder.log] == list(range(301))
+
+
 async def test_a_feed_failure_after_a_batch_is_reported_once(tmp_path: Path) -> None:
     feed = Feed(tmp_path / "items.jsonl")
     feed.open()

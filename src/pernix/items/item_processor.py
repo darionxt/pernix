@@ -74,7 +74,9 @@ class ItemProcessor:
     batch Pipeline collects Items and processes them when its batch is full, inside
     the worker that filled it, when its timeout passes, and in `join()`; the batch
     then continues on its way. An Item a batch Pipeline does not accept waits behind
-    the Items pending there, so with one worker no Item overtakes another.
+    the Items pending there, so with one worker no Item overtakes another; once as
+    many of them wait there as the queue holds, the pending batch is processed, even
+    if smaller, so that waiting stays bounded.
 
     Each Item a Pipeline failed on then goes, as a `FailedItem`, through the failure
     Pipelines in order, each passing it on to the next or stopping it with `None`. A
@@ -219,13 +221,14 @@ class ItemProcessor:
 
     async def _batch(self, index: int, entry: _Entry, *, accepted: bool) -> None:
         batch = self._batches[index]
-        batch.entries.append((entry, accepted))
-        if not accepted:
-            return  # it leaves with the Items ahead of it
-        batch.accepted += 1
-        if batch.accepted >= (self._stages[index].batch_size or 1):
+        batch.entries.append((entry, accepted))  # an Item not accepted leaves with the Items ahead of it
+        batch.accepted += accepted
+        full = batch.accepted >= (self._stages[index].batch_size or 1)
+        # The Items passing by may wait here only as long as the queue they came from is.
+        crowded = len(batch.entries) - batch.accepted >= self._queue.maxsize
+        if full or crowded:
             await self._flush(index)
-        elif batch.accepted == 1 and self._tasks is not None:
+        elif accepted and batch.accepted == 1 and self._tasks is not None:
             batch.timer = self._tasks.create_task(self._flush_later(index))
 
     async def _flush_later(self, index: int) -> None:
