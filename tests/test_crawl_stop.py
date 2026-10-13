@@ -376,3 +376,30 @@ async def test_context_set_by_components_while_opening_lasts_until_they_close(pa
     assert result.reason == "finished"
     assert result.stats["items.scraped"] == 1
     assert TENANT.get("none") == "none"
+
+
+class StopsWhileOpening:
+    """A component that force-stops the Run while it opens, without suspending."""
+
+    def __init__(self, crawler: Crawler) -> None:
+        self.crawler = crawler
+
+    async def open(self) -> None:
+        self.crawler.stop("force")
+
+
+async def test_a_force_stop_while_opening_ends_the_run_even_if_opening_never_suspends(
+    pages: LoopbackServer,
+) -> None:
+    calls: list[str] = []
+    extensions = {StopsWhileOpening: 100, Recorded("after", calls): 200}
+    crawler = _crawler(_spider(pages, asyncio.Event(), asyncio.Event()), {"extensions": extensions})
+    seen = _opened_and_closed(crawler)
+
+    async with asyncio.timeout(10):
+        result = await crawler.crawl()
+
+    assert result.reason == "forced"
+    assert calls == ["open after", "close after"]
+    assert seen == []
+    assert pages.received == []

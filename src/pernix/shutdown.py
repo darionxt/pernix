@@ -108,7 +108,8 @@ class Shutdown:
             stage: The stage, such as opening the components.
 
         Returns:
-            Whether a Force Stop cancelled it, or kept it from starting.
+            Whether a Force Stop was requested before it ended: it was cancelled,
+            kept from starting, or ended before the cancellation could reach it.
 
         Raises:
             asyncio.CancelledError: The caller was cancelled.
@@ -127,7 +128,7 @@ class Shutdown:
             raise
         finally:
             self._stage = None
-        return False
+        return self.forced  # requested during a stage that never suspended afterwards
 
     def end(self) -> None:
         """Stop carrying out stop requests; later requests do nothing."""

@@ -77,6 +77,15 @@ async def test_a_stage_after_a_force_stop_does_not_start() -> None:
     assert started == []
 
 
+async def test_a_force_stop_requested_by_a_stage_that_does_not_suspend_counts() -> None:
+    shutdown, _, _ = _shutdown()
+
+    async def stage() -> None:
+        shutdown.request("force")  # as a component opening could, then open the rest at once
+
+    assert await shutdown.run_stage(stage()) is True
+
+
 async def test_a_stage_runs_in_the_calling_task() -> None:
     shutdown, _, _ = _shutdown()
     tasks: list[asyncio.Task[object] | None] = []
