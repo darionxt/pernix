@@ -32,12 +32,15 @@ class RunLog:
     and delivers it: to the Run's own output, as text or JSON lines, or to the
     handlers of the root logger when the application configured logging (see
     `LogSettings.output`). Meanwhile the `pernix` logger does not propagate, so no
-    record is delivered twice, and takes the level of `log.level` when Pernix writes
-    the output; both are restored once the last open RunLog of the process closes.
-    The root logger is never changed.
+    record is delivered twice. When Pernix writes the output, the queue handler takes
+    only records at `log.level` or above, and the `pernix` logger gets the lowest
+    level the open Runs need; both are restored once the last open RunLog of the
+    process closes. The root logger is never changed.
 
     Closing waits up to `drain_timeout` for the queued records to be written; records
     a blocked output still holds are then abandoned, with the daemon writer thread.
+    Pernix's own output takes no lock that `logging.shutdown()` waits for, so a
+    blocked output does not keep the process from exiting.
 
     Example:
         >>> async with RunLog(settings.section(LogSettings), RunContext("r1", "books")):
@@ -68,7 +71,7 @@ class RunLog:
         self._drain_timeout = drain_timeout
         self._records: queue.Queue[logging.LogRecord] = queue.Queue(settings.queue_size)
         self.handler = RunQueueHandler(self._records, run, owns_unattributed=lambda: _PERNIX.first_open() is self)
-        self._output: logging.Handler | None = None
+        self._output: _StreamOutput | None = None
         self._writer: threading.Thread | None = None
 
     @property
@@ -92,6 +95,8 @@ class RunLog:
         if self._writer is not None:
             raise RuntimeError("a RunLog opens only once")
         self._output = _own_output(self._settings)
+        if self.level is not None:
+            self.handler.setLevel(self.level)
         self._writer = threading.Thread(target=self._write, name=f"pernix-log-{self._run.run_id[:8]}", daemon=True)
         self._writer.start()
         _PERNIX.attach(self)
@@ -122,7 +127,7 @@ class RunLog:
                 if self._output is None:
                     logging.getLogger().handle(record)
                 else:
-                    self._output.handle(record)
+                    self._output.write(record)
             except Exception:
                 self.handler.handleError(record)
 
@@ -134,8 +139,23 @@ class RunLog:
         if record.stack_info:
             record.stack_info = redact(record.stack_info)
         for name, value in record_extras(record).items():
-            if isinstance(value, str):
-                record.__dict__[name] = redact(value)
+            record.__dict__[name] = self._redactor.redact_value(value)
+
+
+class _StreamOutput:
+    """Writes formatted records to a stream; only the writer thread calls it.
+
+    Unlike a `logging.StreamHandler`, it holds no lock that `logging.shutdown()`
+    would wait for at exit while a blocked write keeps it.
+    """
+
+    def __init__(self, stream: IO[str], formatter: logging.Formatter) -> None:
+        self._stream = stream
+        self._formatter = formatter
+
+    def write(self, record: logging.LogRecord) -> None:
+        self._stream.write(self._formatter.format(record) + "\n")
+        self._stream.flush()
 
 
 class _SharedLogger:
@@ -180,17 +200,15 @@ class _SharedLogger:
 _PERNIX = _SharedLogger(logging.getLogger("pernix"))
 
 
-def _own_output(settings: LogSettings) -> logging.Handler | None:
-    """The handler that writes the Run's output, or `None` to hand records to the root handlers."""
+def _own_output(settings: LogSettings) -> _StreamOutput | None:
+    """Where Pernix writes the Run's output, or `None` to hand records to the root handlers."""
     output = settings.output
     if output == "auto":
         output = "root" if logging.getLogger().handlers else "stderr"
     if output == "root":
         return None
     stream = sys.stdout if output == "stdout" else sys.stderr
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(JsonFormatter() if _writes_json(settings.format, stream) else TextFormatter())
-    return handler
+    return _StreamOutput(stream, JsonFormatter() if _writes_json(settings.format, stream) else TextFormatter())
 
 
 def _writes_json(log_format: str, stream: IO[str]) -> bool:

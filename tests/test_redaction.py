@@ -87,3 +87,24 @@ def test_secrets_are_found_inside_the_settings_values() -> None:
     ]
 
     assert revealed_secrets(values) == {"a", "b", "c", "d", "e"}
+
+
+def test_strings_inside_values_are_masked_in_copies() -> None:
+    redactor = Redactor(secrets=["sk-live-123"])
+    stats = {
+        "proxy.last": "http://alice:s3cret@proxy:8080",
+        "sk-live-123": 1,
+        "nested": [{"key": ("sk-live-123", 2)}, {"sk-live-123"}, frozenset({"plain"})],
+        "count": 3,
+    }
+
+    redacted = redactor.redact_value(stats)
+
+    assert redacted == {
+        "proxy.last": "http://***@proxy:8080",
+        "***": 1,
+        "nested": [{"key": ("***", 2)}, {"***"}, frozenset({"plain"})],
+        "count": 3,
+    }
+    assert stats["proxy.last"] == "http://alice:s3cret@proxy:8080"  # the original is unchanged
+    assert redactor.redact_value(42) == 42

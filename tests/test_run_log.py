@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import subprocess
 import sys
+import textwrap
 import threading
+from typing import Literal
 
 import orjson
 import pytest
@@ -98,6 +101,89 @@ async def test_exceptions_are_rendered_before_queueing_and_redacted(monkeypatch:
 
     [line] = [orjson.loads(line) for line in stream.getvalue().splitlines()]
     assert line["exception"].endswith("ConnectionError: proxy http://***@proxy:8080 refused")
+
+
+async def test_strings_inside_extra_fields_are_redacted_without_changing_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    json_stream, text_stream = io.StringIO(), io.StringIO()
+    stats = {"api.proxy": "http://alice:s3cret@proxy:8080", "api.keys": ["sk-live-123"], "items.scraped": 2}
+
+    outputs: list[tuple[io.StringIO, Literal["json", "text"]]] = [(json_stream, "json"), (text_stream, "text")]
+    for stream, log_format in outputs:
+        monkeypatch.setattr(sys, "stderr", stream)
+        async with RunLog(LogSettings(output="stderr", format=log_format), RUN, secrets=["sk-live-123"]):
+            with run_context(RUN):
+                log.info("Run finished", extra={"stats": stats, "final": True})
+
+    [line] = [orjson.loads(line) for line in json_stream.getvalue().splitlines()]
+    assert line["stats"] == {"api.proxy": "http://***@proxy:8080", "api.keys": ["***"], "items.scraped": 2}
+    assert text_stream.getvalue().endswith(
+        "Run finished\n  api.proxy: http://***@proxy:8080\n  api.keys: ['***']\n  items.scraped: 2\n"
+    )
+    assert stats["api.proxy"] == "http://alice:s3cret@proxy:8080"  # e.g. a snapshot Stats Sinks also receive
+
+
+def test_a_blocked_output_does_not_keep_the_process_from_exiting() -> None:
+    script = textwrap.dedent("""
+        import asyncio, io, logging, sys, threading
+        from pernix.logs import RunContext, RunLog, run_context
+        from pernix.settings import LogSettings
+
+        class Blocked(io.StringIO):
+            def write(self, s):
+                threading.Event().wait()
+                return 0
+
+        async def main():
+            sys.stderr = Blocked()
+            run = RunContext("r", "s")
+            async with RunLog(LogSettings(output="stderr"), run, drain_timeout=0.1):
+                with run_context(run):
+                    logging.getLogger("pernix.x").warning("never written")
+            print("closed")
+
+        asyncio.run(main())
+    """)
+
+    finished = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=False)  # noqa: S603
+
+    assert (finished.returncode, finished.stdout) == (0, "closed\n")
+
+
+async def test_each_run_writes_only_records_at_its_own_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    verbose_run, quiet_run = RunContext("a", "verbose"), RunContext("b", "quiet")
+    verbose_stream, quiet_stream = io.StringIO(), io.StringIO()
+    verbose = RunLog(LogSettings(output="stderr", format="text", level="DEBUG"), verbose_run)
+    quiet = RunLog(LogSettings(output="stderr", format="text", level="ERROR"), quiet_run)
+    monkeypatch.setattr(sys, "stderr", verbose_stream)
+    verbose.open()
+    monkeypatch.setattr(sys, "stderr", quiet_stream)
+    quiet.open()
+    try:
+        for run in (verbose_run, quiet_run):
+            with run_context(run):
+                log.debug("debug")
+                log.error("error")
+    finally:
+        await verbose.close()
+        await quiet.close()
+
+    assert _messages(verbose_stream) == ["debug", "error"]
+    assert _messages(quiet_stream) == ["error"]
+    assert (quiet.counts.error, quiet.counts.warning) == (1, 0)
+
+
+async def test_child_logger_levels_do_not_lower_the_run_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stream)
+    chatty = logging.getLogger("pernix.tests.chatty")
+    monkeypatch.setattr(chatty, "level", logging.DEBUG)
+
+    async with RunLog(LogSettings(output="stderr", format="text", level="INFO"), RUN):
+        with run_context(RUN):
+            chatty.debug("debug")
+            chatty.info("info")
+
+    assert _messages(stream) == ["info"]
 
 
 async def test_records_go_to_the_root_handlers_when_the_application_configured_logging(

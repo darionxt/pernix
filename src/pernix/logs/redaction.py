@@ -111,6 +111,35 @@ class Redactor:
         text = self._assignments.sub(rf"\g<1>{MASK}", text)
         return self._headers.sub(rf"\g<1>{MASK}", text)
 
+    def redact_value(self, value: object) -> object:
+        """Return `value` with the strings in it masked, including inside containers.
+
+        Mappings, lists, tuples, sets, and frozensets are copied with their string
+        keys and items masked; `value` itself is never changed. Other values are
+        returned as they are.
+
+        Args:
+            value: A value such as an extra field of a log record.
+
+        Returns:
+            The masked string, a masked copy of the container, or `value`.
+        """
+        if isinstance(value, str):
+            return self.redact(value)
+        if isinstance(value, Mapping):
+            entries = cast("Mapping[object, object]", value)
+            return {self.redact_value(key): self.redact_value(item) for key, item in entries.items()}
+        if not isinstance(value, list | tuple | set | frozenset):
+            return value
+        items = [self.redact_value(item) for item in cast("Iterable[object]", value)]
+        if isinstance(value, tuple):
+            return tuple(items)
+        if isinstance(value, frozenset):
+            return frozenset(items)
+        if isinstance(value, set):
+            return set(items)
+        return items
+
 
 def revealed_secrets(values: Iterable[object]) -> frozenset[str]:
     """Collect the values of the `Secret`s in some values, including inside containers.
