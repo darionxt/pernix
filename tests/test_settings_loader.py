@@ -575,6 +575,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "middlewares": {},
         "spider_middlewares": {},
         "fetchers": {"http": HTTPFetcher},
+        "run_id": None,
         "domain.delay": 0.0,
         "domain.verify": True,
         "domain.codes": [],

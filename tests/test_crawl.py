@@ -134,8 +134,7 @@ async def test_a_relative_url_in_start_is_an_error(bookstore: LoopbackServer, ca
 
     [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert "start() of spider 'books' failed" in record.getMessage()
-    assert record.exc_info is not None
-    assert "is a relative URL" in str(record.exc_info[1])
+    assert "is a relative URL" in (record.exc_text or "")  # queued records carry the traceback as text
     assert bookstore.received == []
 
 

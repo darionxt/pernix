@@ -5,8 +5,10 @@ from pernix.settings.core_settings import (
     EventSettings,
     FingerprintSettings,
     FrontierSettings,
+    LogSettings,
     ResponseSettings,
     RetrySettings,
+    StatsSettings,
 )
 from pernix.settings.loader import load_settings
 from pernix.settings.secret import Secret
@@ -21,11 +23,13 @@ __all__ = [
     "EventSettings",
     "FingerprintSettings",
     "FrontierSettings",
+    "LogSettings",
     "NamedComponents",
     "ResponseSettings",
     "RetrySettings",
     "Secret",
     "Section",
     "Settings",
+    "StatsSettings",
     "load_settings",
 ]

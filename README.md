@@ -68,6 +68,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `middlewares` | `{}` | Download Middleware, as `{middleware: order}`; lower orders are further out |
 | `spider_middlewares` | `{}` | Spider Middleware, as `{middleware: order}`; lower orders are further out |
 | `fetchers` | `{"http": HTTPFetcher}` | Fetchers by name; `Request(fetcher=name)` selects one |
+| `run_id` | `None` | Identifies the Run in logs and stats; `None` generates one |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
 | `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |
@@ -84,6 +85,19 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `retry.retry_after_max` | `300.0` | The longest wait a `Retry-After` header can set |
 | `retry.delay_scale` | `1.0` | Multiplies every retry delay; `0` retries at once, as in tests |
 | `retry.policy` | `None` | A replacement retry policy, an object with `decide(request, outcome, attempt)` |
+| `log.output` | `"auto"` | `"stderr"`, `"stdout"`, or `"root"` (the application's handlers); `"auto"` is `"root"` if logging is configured, else `"stderr"` |
+| `log.format` | `"auto"` | `"text"`, `"json"` (JSON lines), or `"auto"`: text on a terminal, JSON lines otherwise |
+| `log.level` | `"INFO"` | The lowest level Pernix writes |
+| `log.queue_size` | `10000` | Records waiting to be written at most; more are dropped and counted |
+| `log.redact` | `()` | Names whose values are masked in logs, besides the built-in ones |
+| `stats.interval` | `60.0` | Seconds between stats snapshots; `0` keeps only the final one |
+| `stats.sinks` | `{}` | Stats Sinks, as `{sink: order}`, that receive every snapshot |
+
+## Logs and stats
+
+Pernix logs on the `pernix.*` loggers; `self.logger` in a Spider is `pernix.spiders.<name>`. During a Run, records are queued and written by a background thread, so a slow log output never stalls the crawl. If your application configured logging, the records go to its handlers; otherwise Pernix writes them to stderr, as text on a terminal and as JSON lines otherwise. Every record carries the `run_id`, the `spider`, and the `request_id` of the Request being processed, and credentials, cookies, tokens, and `Secret` settings are masked.
+
+The stats of a Run, such as `downloads.by_status.200` or `items.scraped`, are in `crawler.stats` (`self.stats` in a Spider, where you can add your own). They are logged every minute and summarized at the end, and Stats Sinks registered with `stats.sinks` receive every snapshot. See [`docs/design.md`](docs/design.md) §8 for the keys.
 
 ## Documentation
 
@@ -116,6 +130,12 @@ src/pernix/
 ├── component_lifecycle.py opens components in order, closes them in reverse
 ├── addons.py            Addon loading, entry point discovery, setup API
 ├── feeds.py             Item output files
+├── logs/
+│   ├── log_context.py   run and Request context carried in contextvars
+│   ├── queue_handler.py queues the records of a Run without blocking
+│   ├── run_log.py       RunLog: the writer thread and the output of a Run
+│   ├── log_formats.py   text and JSON-lines formatters
+│   └── redaction.py     masks credentials, tokens, and secrets in log text
 ├── events/
 │   ├── event.py         Event base class, Dispatch, Veto
 │   ├── event_bus.py     EventBus, events.on()
@@ -133,6 +153,12 @@ src/pernix/
 ├── middlewares/
 │   ├── middleware.py    download Middleware, NodeMiddleware, the download chain
 │   └── spider_middleware.py spider Middleware and their chain
+├── stats/
+│   ├── stats.py         Stats, the counters and values of a Run
+│   ├── core_stats.py    counts Requests, downloads, Responses, and Items
+│   ├── stats_reporter.py periodic and final snapshots, the summary
+│   ├── loop_lag.py      samples the event loop lag
+│   └── stats_sink.py    StatsSink protocol
 ├── settings/
 │   ├── loader.py        merges and validates the settings layers
 │   ├── sources.py       project file and environment variables

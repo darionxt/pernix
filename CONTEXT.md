@@ -143,3 +143,13 @@ _Avoid_: plugin
 **Platform**:
 The external system that manages projects and starts and stops Runs. Pernix only exposes observation and control interfaces to it.
 _Avoid_: scheduler
+
+### Observability
+
+**Stats**:
+Named counters and values describing a Run, such as Responses per status code. Each Worker keeps them in memory and reports them as snapshots.
+_Avoid_: metrics
+
+**Stats Sink**:
+A component that receives every stats snapshot of a Run to report it elsewhere, such as to the Platform.
+_Avoid_: stats exporter

@@ -22,6 +22,7 @@ from pernix.events import (
     ResponseReceived,
     SpiderIdle,
 )
+from pernix.logs import request_context
 from pernix.request import Request
 from pernix.response import expect_response
 from pernix.retry_policy import Action, Decision, DefaultRetryPolicy
@@ -99,7 +100,8 @@ class Engine:
     stored as `ItemError`.
 
     Requests constructed in the spider chain resolve relative URLs against the
-    Response handled by the layer, or the Callback, that constructs them.
+    Response handled by the layer, or the Callback, that constructs them. While a
+    Request is processed, its Frontier id is the `request_id` of the records logged.
     """
 
     def __init__(
@@ -193,7 +195,8 @@ class Engine:
         while True:
             lease = await self._claim() or await self._wait_for_work()
             if lease is not None:
-                await self._process(lease)
+                with request_context(lease.id):  # records logged for the Request, its Callback's included
+                    await self._process(lease)
 
     async def _claim(self) -> Lease | None:
         leases = await self._frontier.claim(self._worker_id, 1, self._lease_ttl, skip_slots=self._throttle.blocked())

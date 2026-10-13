@@ -116,7 +116,7 @@ class Search(Spider):
 ```
 
 - One Crawler corresponds to one Spider object. Settings live on the Crawler object and no module-level global variable is modified, so one process can run multiple Spiders in parallel.
-- `self.logger`, `self.crawler`, and `self.stats` are available at runtime.
+- `self.crawler` (set once a Crawler is created for the Spider), `self.stats` (the Run's stats), and `self.logger` (the `pernix.spiders.<name>` logger) are available at runtime.
 
 ### 4.3 Request
 
@@ -333,7 +333,7 @@ Core Events:
 | `RequestIgnored(reason)` | observe | Download Middleware or a Fetcher raised `IgnoreRequest` |
 | `ResponseReceived` | observe | A Response was fetched, before its Callback runs |
 | `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed; `response` is `None` for an errback's Items |
-| `StatsSnapshot` | observe | A periodic copy of the stats |
+| `StatsSnapshot(stats, final)` | observe | A copy of the stats: every `stats.interval`, and a final one after `SpiderClosed` |
 
 Lifecycle: Extensions (the `extensions` setting) are built in order, subscribed, and opened, as async context managers or through `open()`. They are closed in reverse after `SpiderClosed`; `__aexit__` receives the exception that ended the Run, so a component can roll back, but cannot suppress it. Every close step runs even when earlier ones fail or are cancelled: failures are raised together as an `ExceptionGroup`, and a cancellation is re-raised after the last component is closed. If opening a component fails, the ones already open are closed in reverse. Once `SpiderOpened` has been dispatched, `SpiderClosed` always follows, even on cancellation.
 
@@ -385,7 +385,7 @@ Rules:
 - Settings are declared as typed **Sections**: a key prefix plus fields with defaults and optional constraints. `settings.section(RetrySettings)` returns the validated values.
 - Components (Middleware, Pipelines, Extensions) are registered as `{component: order}`, lowest order first. A later layer adds or overrides entries, and `None` (`false` in TOML and JSON) disables one. Fetchers are registered by name instead, as `{name: component}`, merged name by name. A component can be given as a class, an object, or an import path.
 - A component registers its own Sections by annotating `__init__` parameters with them (which also injects them) or by listing them in `settings_sections`; their keys are validated together with the core keys. Sections of a disabled component stay registered, so its settings can remain in the project file.
-- Construction: an object is used as is; a class with `from_crawler(crawler)` is built through it. Otherwise, `__init__` parameters annotated with exactly `Crawler`, `Settings`, `EventBus`, or a registered Section are injected, and other parameters keep their defaults. These types may be imported only under `TYPE_CHECKING`. There is no global service locator.
+- Construction: an object is used as is; a class with `from_crawler(crawler)` is built through it. Otherwise, `__init__` parameters annotated with exactly `Crawler`, `Settings`, `EventBus`, `Stats`, or a registered Section are injected, and other parameters keep their defaults. These types may be imported only under `TYPE_CHECKING`. There is no global service locator.
 - Secret settings use the `Secret` type and are automatically redacted in reprs, logs, and stats.
 
 ### 4.12 Running and the CLI
@@ -672,16 +672,40 @@ Rules:
 
 ## 8. Observability and the Platform interface
 
-**Run identification**: every Run has a `run_id` (generated automatically or passed in from outside). All logs, Events, and stats carry the `run_id` and `spider`.
+**Run identification**: every Run has a `run_id`: the `run_id` setting, which a Platform passes for example as `PERNIX_RUN_ID`, or else a generated one (32 hexadecimal digits). It is `crawler.run_id`; log records carry it with the `spider` name, and stats as `run.id` and `run.spider`.
 
 **Logging**
 
-- Uses the standard library logging `pernix.*` logger hierarchy and does not modify the root logger.
-- Human-readable format in a terminal; outside a terminal, or when explicitly configured, JSON lines are written to stdout for the Platform to collect.
-- Log writes go through a bounded queue and do not block the event loop; when the queue is full, messages are dropped and counted.
-- Request context (`run_id`, `request_id`) is injected automatically through contextvars.
+- Uses the standard library logging `pernix.*` logger hierarchy and does not modify the root logger. `Spider.logger` is `pernix.spiders.<name>`.
+- During a Run, a bounded queue handler on the `pernix` logger takes each record without blocking, and a writer thread delivers it, so a slow or blocked output never stalls the event loop. When the queue is full (`log.queue_size`, 10 000 records), records are dropped and counted. When the Run ends, Pernix waits up to 5 s for the queued records. Meanwhile the `pernix` logger does not propagate, so no record is delivered twice; it is restored afterwards.
+- Before a record is queued, its message is merged with its arguments, its exception is rendered as text (`exc_text`), and its context is attached from contextvars: `run_id`, `spider`, and `request_id`, the Frontier's id of the Request being processed, which stays the same across retries and is `None` outside a Request.
+- Output (`log.output`): by default, if the application configured logging (the root logger has handlers), records go to the root logger's handlers, still from the writer thread; otherwise Pernix writes them to stderr itself. `"stderr"`, `"stdout"`, and `"root"` force a choice. Logs go to stderr by default so that stdout stays free for data.
+- Format (`log.format`): human-readable text on a terminal, and JSON lines otherwise, or as configured. A JSON line holds `time` (UTC), `level`, `logger`, `message`, `run_id`, `spider`, `request_id`, `exception` and `stack` when present, and the record's extra fields. `log.level` (INFO) applies when Pernix writes the output; the root handlers use the application's levels.
+- Redaction, in the writer thread, of messages, exception texts, and the strings in extra fields, such as the stats of a snapshot (copies are masked; the originals are unchanged): credentials in URLs (`http://user:pass@proxy` becomes `http://***@proxy`); the values of sensitive names as query parameters, form fields, quoted pairs, and header lines, such as `Cookie`, `Set-Cookie`, `Authorization`, `Proxy-Authorization`, `token`, `access_token`, `api_key`, `password`, `secret`, `signature`, and `sessionid`, plus the names in `log.redact`; and the values of `Secret` settings wherever they occur.
 
-**Stats**: stats snapshot Events are emitted periodically, and a summary is output at the end. `StatsSink` is pluggable, so the Platform can implement its own reporting.
+**Stats**
+
+- `crawler.stats` (also `Spider.stats`, and injected into components annotated with `Stats`) holds the Run's stats in memory: `inc(key, count=1)`, `set(key, value)`, `max(key, value)`, `get(key, default=None)`, and `snapshot()`. Values are ints, floats, or strings. The stats stay readable after the Run.
+- Keys are dot-separated; Pernix names its segments in snake_case, keeps the spelling of labels such as status codes, reasons, and error types, and never makes one of its keys the prefix of another, so a snapshot can be nested by its dots. Breakdowns use a `_by_<dimension>` segment. Pernix reserves the prefixes below; Spiders and components use their own.
+
+| Key | Meaning |
+| --- | --- |
+| `run.id`, `run.spider`, `run.started_at`, `run.finished_at`, `run.elapsed`, `run.reason` | The Run; times in UTC ISO 8601, `elapsed` in seconds, `reason` as in `SpiderClosed` |
+| `requests.enqueued` | Requests that entered the Frontier |
+| `requests.dropped`, `requests.dropped_by_reason.<reason>` | Requests vetoed or dropped as duplicates, such as `duplicate` and `offsite` |
+| `requests.retried`, `requests.ignored` | Attempts retried; Requests ignored |
+| `requests.failed`, `requests.failed_by_error.<ErrorType>` | Requests that failed for good |
+| `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards, and their body bytes |
+| `downloads.errors`, `downloads.errors_by_type.<ErrorType>` | Exceptions fetching raised, other than `IgnoreRequest` and `Retry` |
+| `responses.received` | Responses handed to Callbacks |
+| `items.scraped`, `items.dropped`, `items.errors` | Items stored, dropped, or failed |
+| `frontier.ready`, `frontier.delayed`, `frontier.leased`, `frontier.done`, `frontier.dead` | The Frontier at the snapshot |
+| `throttle.waits`, `throttle.wait_seconds`, `throttle.cooldowns`, `throttle.refused` | Waiting for per-domain slots, and cooldowns |
+| `loop.lag_avg`, `loop.lag_max` | Event loop lag in seconds, sampled every second |
+| `log.warning`, `log.error`, `log.critical`, `log.dropped` | Records logged per level, and records dropped from the full queue |
+
+- Every `stats.interval` (60 s; 0 turns it off), a `StatsSnapshot` Event is emitted and an INFO line logged, such as "Fetched 120 responses (60/min), scraped 340 items (170/min)", with the stats in its `stats` field. After `SpiderClosed` and before the components are closed, the final snapshot (`final=True`) is emitted and logged as the Run's summary; text output lists every stat.
+- **Stats Sinks** (`stats.sinks`, as `{sink: order}`) report snapshots elsewhere, such as to the Platform. A sink has `push(snapshot)`, sync or async, which is subscribed to `StatsSnapshot`, so a sink that fails or times out does not affect the Run. Sinks are built and opened like Extensions, before them, and receive the final snapshot before they are closed.
 
 **Control**
 

@@ -144,7 +144,7 @@ def _injected_arguments(
             reason = f" (its annotation {parameter.annotation!r} cannot be resolved at runtime)" if unresolved else ""
             raise ComponentError(
                 f"cannot build {component.__qualname__}: no service can be injected for the required "
-                f"parameter {name!r}{reason}. Annotate it with Crawler, Settings, EventBus, or a settings "
+                f"parameter {name!r}{reason}. Annotate it with Crawler, Settings, EventBus, Stats, or a settings "
                 "Section, give it a default, or define a from_crawler() classmethod."
             )
     return arguments
