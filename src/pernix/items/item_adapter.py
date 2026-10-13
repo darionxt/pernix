@@ -103,7 +103,7 @@ def _plain(value: object) -> object:
         return {field.name: _plain(getattr(value, field.name)) for field in dataclasses.fields(value)}
     if _is_pydantic_model(value):
         model: Any = value
-        return cast("dict[str, Any]", model.model_dump())
+        return _plain(model.model_dump())
     if _is_attrs_instance(value):
         attr: Any = sys.modules["attr"]
         return {field.name: _plain(getattr(value, field.name)) for field in attr.fields(type(value))}

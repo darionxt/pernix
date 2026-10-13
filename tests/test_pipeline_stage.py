@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 import pytest
 
 from pernix import DropItem, ItemContext, Pipeline, Request, Retry
-from pernix.errors import ComponentError, RetriesExhausted
+from pernix.errors import ComponentError, FeedError, RetriesExhausted
 from pernix.items import PipelineStage
 
 CTX = ItemContext(Request("https://example.com/"), None)
@@ -62,6 +62,19 @@ async def test_other_errors_and_drops_are_never_retried(error: Exception) -> Non
     stage, retries = _stage(pipeline)
 
     with pytest.raises(type(error)):
+        await stage.process({"a": 1}, CTX)
+
+    assert (pipeline.calls, retries) == (1, [])
+
+
+async def test_feed_errors_are_never_retried() -> None:
+    class Retries(Flaky):
+        retry_on: ClassVar[tuple[type[Exception], ...]] = (Exception,)
+
+    pipeline = Retries([FeedError("disk full")])
+    stage, retries = _stage(pipeline)
+
+    with pytest.raises(FeedError, match="disk full"):
         await stage.process({"a": 1}, CTX)
 
     assert (pipeline.calls, retries) == (1, [])

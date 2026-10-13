@@ -340,6 +340,35 @@ async def test_feeds_are_finished_when_the_run_fails(server: LoopbackServer, tmp
     assert _names(tmp_path) == ["bad.jsonl", "good.json"]
 
 
+@pytest.mark.parametrize(
+    ("settings", "output", "problem"),
+    [
+        (
+            {"feeds": {"{dir}/{{name}}.jsonl": {"accepts": [Book]}}},
+            "{dir}/idle.jsonl",
+            r"feeds\[.*\] and output both write",
+        ),
+        ({"feeds": {"{dir}/idle.jsonl": {}}}, "{dir}/idle.jsonl", r"feeds\[.*\] and output both write"),
+        ({"feeds": {"{dir}/a.jsonl": {}, "{dir}/./a.jsonl": {}}}, None, r"feeds\[.*\] and feeds\[.*\] both write"),
+        ({"items.failed_output": "{dir}/idle.jsonl"}, "{dir}/sub/../idle.jsonl", "output and items.failed_output both"),
+    ],
+)
+async def test_two_outputs_may_not_write_the_same_file(
+    tmp_path: Path, settings: dict[str, Any], output: str | None, problem: str
+) -> None:
+    class Idle(Spider):
+        pass
+
+    def filled(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {filled(key): filled(item) for key, item in value.items()}
+        return value.format(dir=tmp_path) if isinstance(value, str) else value
+
+    with pytest.raises(SettingsError, match=problem):
+        await Idle.crawl(settings=filled(settings), output=filled(output))
+    assert _names(tmp_path) == []
+
+
 async def test_invalid_pipelines_and_outputs_fail_before_the_run(tmp_path: Path) -> None:
     class Idle(Spider):
         pass

@@ -43,6 +43,7 @@ from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from pathlib import Path
 
     from pernix.frontiers import Frontier
     from pernix.request import Request
@@ -266,18 +267,35 @@ class Crawler:
         return StatsReporter(self.stats, self.events, self._run_context, interval=interval, gauges=gauges)
 
     def _build_feeds(self) -> list[Feed]:
-        """The Feeds of the `feeds` setting, and the one `output` names."""
-        configured = dict(self.settings.section(FeedSettings).feeds)
+        """The Feeds of the `feeds` setting and the one `output` names, each writing its own file.
+
+        Raises:
+            pernix.errors.SettingsError: A Feed is invalid, or two Feeds, or a Feed
+                and `items.failed_output`, would write the same file.
+        """
+        feed_settings = self.settings.section(FeedSettings).feeds
+        configured = [(f"feeds[{template!r}]", template, options) for template, options in feed_settings.items()]
         if self._output is not None:
-            configured[os.fspath(self._output)] = FeedOptions()
-        return [self._feed(template, options) for template, options in configured.items()]
+            configured.append(("output", os.fspath(self._output), FeedOptions()))
+        feeds = [self._feed(template, options) for _, template, options in configured]
+        destinations = [(label, feed.path) for (label, _, _), feed in zip(configured, feeds, strict=True)]
+        failed_output = self.settings.section(ItemSettings).failed_output
+        if failed_output is not None:
+            destinations.append(("items.failed_output", self._feed_path(failed_output)))
+        _check_distinct(destinations)
+        return feeds
 
     def _feed(self, template: str, options: FeedOptions) -> Feed:
-        path = render_path(template, name=self.spider.name, run_id=self.run_id, started=self.started_at)
         try:
-            return Feed(path, options)
-        except (TypeError, ValueError, ComponentError, KeyError, IndexError) as exc:
+            return Feed(self._feed_path(template), options)
+        except (TypeError, ValueError, ComponentError) as exc:
             raise SettingsError([f"feed {template!r}: {exc}"]) from exc
+
+    def _feed_path(self, template: str) -> Path:
+        try:
+            return render_path(template, name=self.spider.name, run_id=self.run_id, started=self.started_at)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise SettingsError([f"feed {template!r}: invalid path template: {exc!r}"]) from exc
 
     def _item_processor(
         self, pipelines: Sequence[object], failed_pipelines: Sequence[object], feeds: Sequence[Feed]
@@ -358,3 +376,17 @@ class Crawler:
             except KeyError:
                 return None
         return None
+
+
+def _check_distinct(destinations: Sequence[tuple[str, Path]]) -> None:
+    """Fail when two outputs would write the same file, as the last one closed would replace the others."""
+    seen: dict[Path, str] = {}
+    problems: list[str] = []
+    for label, path in destinations:
+        key = path.resolve()
+        if key in seen:
+            problems.append(f"{seen[key]} and {label} both write {path}")
+        else:
+            seen[key] = label
+    if problems:
+        raise SettingsError(problems)

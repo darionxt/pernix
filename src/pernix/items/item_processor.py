@@ -33,9 +33,34 @@ class _Entry:
 
 @dataclass(slots=True)
 class _Batch:
-    entries: list[_Entry] = field(default_factory=list[_Entry])
+    """The Items waiting at a batch Pipeline, in arrival order.
+
+    Each entry says whether the Pipeline accepted the Item; the others only wait
+    there so as not to overtake the Items ahead of them.
+    """
+
+    entries: list[tuple[_Entry, bool]] = field(default_factory=list[tuple[_Entry, bool]])
+    accepted: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     timer: asyncio.Task[None] | None = None
+
+    @property
+    def busy(self) -> bool:
+        """Whether Items are waiting here or being processed."""
+        return bool(self.entries) or self.lock.locked()
+
+    def take(self, size: int) -> list[tuple[_Entry, bool]]:
+        """Remove the waiting entries up to, not including, the accepted one past `size`."""
+        taken, cut = 0, len(self.entries)
+        for position, (_, accepted) in enumerate(self.entries):
+            if accepted:
+                if taken == size:
+                    cut = position
+                    break
+                taken += 1
+        chunk, self.entries = self.entries[:cut], self.entries[cut:]
+        self.accepted -= taken
+        return chunk
 
 
 class ItemProcessor:
@@ -48,7 +73,8 @@ class ItemProcessor:
     and one a Pipeline fails on as `ItemError`; either way it goes no further. A
     batch Pipeline collects Items and processes them when its batch is full, inside
     the worker that filled it, when its timeout passes, and in `join()`; the batch
-    then continues on its way.
+    then continues on its way. An Item a batch Pipeline does not accept waits behind
+    the Items pending there, so with one worker no Item overtakes another.
 
     Each Item a Pipeline failed on then goes, as a `FailedItem`, through the failure
     Pipelines in order, each passing it on to the next or stopping it with `None`. A
@@ -161,16 +187,14 @@ class ItemProcessor:
     async def _advance(self, entry: _Entry, start: int) -> None:
         """Take an Item through the Pipelines from `start` on, then deliver it."""
         for index in range(start, len(self._stages)):
-            stage = self._stages[index]
+            stage, batch = self._stages[index], self._batches.get(index)
+            result: Any = None
             try:
-                if not stage.wants(entry.item):
-                    continue
-                if index in self._batches:
-                    await self._batch(index, entry)
-                    return
-                result = await stage.process(entry.item, entry.ctx)
-                if result is not None and not is_item(result):
-                    raise TypeError(f"process() returned {result!r}, which is not an Item")
+                wanted = stage.wants(entry.item)
+                if wanted and batch is None:
+                    result = await stage.process(entry.item, entry.ctx)
+                    if result is not None and not is_item(result):
+                        raise TypeError(f"process() returned {result!r}, which is not an Item")
             except DropItem as exc:
                 await self._drop(entry, exc.reason or f"dropped by {stage.name}")
                 return
@@ -180,18 +204,28 @@ class ItemProcessor:
             except Exception as exc:
                 await self._fail(entry, stage, exc)
                 return
+            if batch is not None:
+                if wanted or batch.busy:  # outside the handlers above: a flush reports its own errors
+                    await self._batch(index, entry, accepted=wanted)
+                    return
+                continue
+            if not wanted:
+                continue
             if result is None:
                 await self._drop(entry, f"{stage.name} returned None")
                 return
             entry.item = result
         await self._deliver(entry)
 
-    async def _batch(self, index: int, entry: _Entry) -> None:
+    async def _batch(self, index: int, entry: _Entry, *, accepted: bool) -> None:
         batch = self._batches[index]
-        batch.entries.append(entry)
-        if len(batch.entries) >= (self._stages[index].batch_size or 1):
+        batch.entries.append((entry, accepted))
+        if not accepted:
+            return  # it leaves with the Items ahead of it
+        batch.accepted += 1
+        if batch.accepted >= (self._stages[index].batch_size or 1):
             await self._flush(index)
-        elif len(batch.entries) == 1 and self._tasks is not None:
+        elif batch.accepted == 1 and self._tasks is not None:
             batch.timer = self._tasks.create_task(self._flush_later(index))
 
     async def _flush_later(self, index: int) -> None:
@@ -199,31 +233,32 @@ class ItemProcessor:
         await self._flush(index)
 
     async def _flush(self, index: int) -> None:
-        """Process the pending Items of a batch Pipeline, a batch at a time, and pass them on."""
+        """Process the pending Items of a batch Pipeline, a batch at a time, and pass them on in order."""
         stage, batch = self._stages[index], self._batches[index]
         async with batch.lock:
             if batch.timer is not None and batch.timer is not asyncio.current_task():
                 batch.timer.cancel()
             batch.timer = None
-            size = stage.batch_size or 1
             while batch.entries:
-                entries, batch.entries = batch.entries[:size], batch.entries[size:]
-                try:
-                    await stage.process_batch([entry.item for entry in entries], [entry.ctx for entry in entries])
-                except DropItem as exc:
-                    for entry in entries:
-                        await self._drop(entry, exc.reason or f"dropped by {stage.name}")
-                    continue
-                except FeedError as exc:
-                    for entry in entries:
-                        await self._events.emit(ItemError(entry.item, entry.ctx.response, exc))
-                    raise
-                except Exception as exc:
-                    for entry in entries:
-                        await self._fail(entry, stage, exc)
-                    continue
-                for entry in entries:
-                    await self._advance(entry, index + 1)
+                chunk = batch.take(stage.batch_size or 1)
+                members = [entry for entry, accepted in chunk if accepted]
+                failure: Exception | None = None
+                if members:
+                    try:
+                        await stage.process_batch([entry.item for entry in members], [entry.ctx for entry in members])
+                    except FeedError as exc:
+                        for entry in members:
+                            await self._events.emit(ItemError(entry.item, entry.ctx.response, exc))
+                        raise
+                    except Exception as exc:
+                        failure = exc
+                for entry, accepted in chunk:
+                    if not accepted or failure is None:
+                        await self._advance(entry, index + 1)
+                    elif isinstance(failure, DropItem):
+                        await self._drop(entry, failure.reason or f"dropped by {stage.name}")
+                    else:
+                        await self._fail(entry, stage, failure)
 
     async def _deliver(self, entry: _Entry) -> None:
         for feed in self._feeds:

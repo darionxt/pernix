@@ -6,7 +6,7 @@ import logging
 import random
 from typing import TYPE_CHECKING, Any, cast
 
-from pernix.errors import ComponentError, DropItem, RetriesExhausted, Retry
+from pernix.errors import ComponentError, DropItem, FeedError, RetriesExhausted, Retry
 from pernix.items.item_adapter import item_matcher
 from pernix.items.pipeline import Pipeline
 from pernix.retry_policy import full_jitter
@@ -90,10 +90,11 @@ class PipelineStage:
         return self._wants(item)
 
     async def process(self, item: Any, ctx: ItemContext) -> Any:
-        """Call `process()`, retrying as configured.
+        """Call `process()`, retrying as configured; `DropItem` and `FeedError` are never retried.
 
         Raises:
             DropItem: The Pipeline dropped the Item.
+            FeedError: The Pipeline failed to write to a Feed.
             RetriesExhausted: A retryable error persisted through every retry.
             Exception: The Pipeline raised an error that is not retried.
         """
@@ -101,10 +102,11 @@ class PipelineStage:
         return await self._retrying(lambda: method(item, ctx))
 
     async def process_batch(self, items: list[Any], contexts: list[ItemContext]) -> None:
-        """Call `process_batch()`, retrying as configured.
+        """Call `process_batch()`, retrying as configured; `DropItem` and `FeedError` are never retried.
 
         Raises:
             DropItem: The Pipeline dropped the batch.
+            FeedError: The Pipeline failed to write to a Feed.
             RetriesExhausted: A retryable error persisted through every retry.
             Exception: The Pipeline raised an error that is not retried.
         """
@@ -116,7 +118,7 @@ class PipelineStage:
         while True:
             try:
                 return await self._call(call)
-            except DropItem:
+            except (DropItem, FeedError):  # never retried: a drop is final, and a Feed failure ends the Run
                 raise
             except Exception as exc:
                 delay = self._retry_delay(exc, attempt)

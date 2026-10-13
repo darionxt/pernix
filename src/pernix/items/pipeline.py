@@ -64,7 +64,7 @@ class Pipeline:
     its own timeout, and once the retries run out, the error is `RetriesExhausted`.
     Only the Pipeline's own call is repeated, so it should write idempotently, such as
     by upserting. Meanwhile the Items wait, and Callbacks are suspended once the Item
-    queue fills.
+    queue fills. `DropItem` and `FeedError` are never retried.
 
     An Item a Pipeline failed on goes, as a `FailedItem`, through the failure
     Pipelines of the `failed_pipelines` setting, which are Pipelines too, without batch

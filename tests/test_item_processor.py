@@ -202,6 +202,105 @@ async def test_a_failed_batch_drops_or_fails_each_of_its_items(fail_on: int, out
     ]
 
 
+class OddRows(Rows):
+    accepts = staticmethod(lambda item: item["n"] % 2 == 1)
+
+
+async def test_items_a_batch_pipeline_does_not_accept_keep_their_place() -> None:
+    rows = OddRows()
+
+    log = await _process([rows, Tag("after")], [{"n": n} for n in range(1, 6)])
+
+    assert rows.batches == [[1, 3], [5]]
+    assert log == [("scraped", {"n": n, "tags": ["after"]}) for n in range(1, 6)]
+
+
+async def test_items_keep_their_place_behind_a_failed_batch() -> None:
+    class Failing(OddRows):
+        async def process_batch(self, items: list[Any], contexts: list[ItemContext]) -> None:
+            raise ValueError("bad batch")
+
+    log = await _process([Failing()], [{"n": n} for n in (1, 2, 3, 4)])
+
+    assert log == [
+        ("error", {"n": 1}, "ValueError"),
+        ("scraped", {"n": 2}),
+        ("error", {"n": 3}, "ValueError"),
+        ("scraped", {"n": 4}),
+    ]
+
+
+async def test_items_wait_behind_a_batch_being_processed() -> None:
+    release = asyncio.Event()
+
+    class Slow(OddRows):
+        batch_size = 100
+        batch_timeout = 0.01
+
+        async def process_batch(self, items: list[Any], contexts: list[ItemContext]) -> None:
+            await release.wait()
+
+    processor, recorder = _processor([Slow()])
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        await processor.put({"n": 1}, CTX)
+        await asyncio.sleep(0.05)  # the timeout starts processing 1, which waits
+        await processor.put({"n": 2}, CTX)
+        await asyncio.sleep(0.05)
+        assert recorder.log == []  # 2 does not overtake 1
+        release.set()
+        await processor.join()
+
+    assert recorder.log == [("scraped", {"n": 1}), ("scraped", {"n": 2})]
+
+
+async def test_a_feed_failure_after_a_batch_is_reported_once(tmp_path: Path) -> None:
+    feed = Feed(tmp_path / "items.jsonl")
+    feed.open()
+    processor, recorder = _processor([Rows()], feeds=[feed])
+    try:
+        with pytest.RaisesGroup(FeedError):
+            async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+                processor.start(tasks)
+                await processor.put({"n": 1, "raw": b"\x00"}, CTX)
+                await processor.put({"n": 2}, CTX)  # fills the batch; 1 then fails to be written
+                await processor.join()
+    finally:
+        feed.close()
+
+    assert recorder.log == [("error", {"n": 1, "raw": b"\x00"}, "FeedError")]
+
+
+async def test_a_feed_error_in_a_pipeline_is_never_retried_and_ends_the_processing(tmp_path: Path) -> None:
+    class Writer(Pipeline):
+        retry_times = 3
+        retry_on: ClassVar[tuple[type[Exception], ...]] = (Exception,)
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.feed = Feed(tmp_path / "rows.jsonl")
+
+        async def process(self, item: Any, ctx: ItemContext) -> Any:
+            self.calls += 1
+            self.feed.write(item)
+            return item
+
+    writer = Writer()
+    writer.feed.open()
+    processor, recorder = _processor([writer])
+    try:
+        with pytest.RaisesGroup(FeedError):
+            async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+                processor.start(tasks)
+                await processor.put({"raw": b"\x00"}, CTX)
+                await processor.join()
+    finally:
+        writer.feed.close()
+
+    assert writer.calls == 1
+    assert recorder.log == [("error", {"raw": b"\x00"}, "FeedError")]
+
+
 async def test_batches_of_one_pipeline_never_overlap() -> None:
     class Slow(Pipeline):
         batch_size = 2

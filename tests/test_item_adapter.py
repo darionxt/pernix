@@ -46,6 +46,11 @@ class BookModel(pydantic.BaseModel):
     author: Author
 
 
+class TaggedModel(pydantic.BaseModel):
+    tags: set[str]
+    shelves: frozenset[int]
+
+
 @attrs.define
 class BookAttrs:
     title: str
@@ -71,6 +76,7 @@ class BookAttrs:
             BookModel(Title="Dune", published=WHEN, author=Author("Herbert")),
             {"title": "Dune", "published": WHEN, "author": {"name": "Herbert"}},
         ),
+        (TaggedModel(tags={"sf"}, shelves=frozenset({2})), {"tags": ["sf"], "shelves": [2]}),
         (
             BookAttrs("Dune", Author("Herbert"), {"nested": BookStruct("x", 1, Author("y"))}),
             {
@@ -80,7 +86,7 @@ class BookAttrs:
             },
         ),
     ],
-    ids=["dict", "mapping-proxy", "ordered-dict", "dataclass", "msgspec", "pydantic", "attrs"],
+    ids=["dict", "mapping-proxy", "ordered-dict", "dataclass", "msgspec", "pydantic", "pydantic-sets", "attrs"],
 )
 def test_every_item_type_becomes_a_plain_dict(item: object, expected: dict[str, Any]) -> None:
     assert is_item(item)
