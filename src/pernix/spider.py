@@ -1,19 +1,22 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from pernix.crawler import Crawler
 from pernix.request import Request
+from pernix.runner import run_spider
+from pernix.spider_arguments import check_argument_names
 
 if TYPE_CHECKING:
     import os
     from collections.abc import AsyncIterator, Mapping, Sequence
 
+    from pernix.items import ItemStream
     from pernix.request import CallbackResult
     from pernix.response import Response
+    from pernix.run_result import RunResult
     from pernix.stats import Stats
 
 __all__ = ["Spider"]
@@ -24,6 +27,11 @@ class Spider:
 
     Subclasses set `start_urls` or override `start()`, and implement `parse()` and any
     other Callbacks as async generators that yield Requests and Items.
+
+    A Spider takes arguments through the keyword parameters of its `__init__`. Each
+    Run creates a new Spider object with them, converting strings, such as those from
+    a command line, to the annotated types; `__init__` may raise `ValueError` to
+    reject them. `settings` and `output` cannot name an argument.
 
     Attributes:
         name: Identifies the Spider in logs; defaults to the lower-cased class name.
@@ -55,6 +63,7 @@ class Spider:
         super().__init_subclass__(**kwargs)
         if not cls.name:
             cls.name = cls.__name__.lower()
+        check_argument_names(cls)
 
     @property
     def crawler(self) -> Crawler:
@@ -130,44 +139,103 @@ class Spider:
         raise NotImplementedError(f"{type(self).__name__}.parse() is not implemented")
 
     @classmethod
-    async def crawl(
-        cls,
-        *,
-        output: str | os.PathLike[str] | None = None,
-        settings: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Run this Spider inside an existing event loop.
-
-        Args:
-            output: A Feed for the Items besides the `feeds` setting, such as
-                `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
-            settings: Settings for this Run, by dotted key; they take precedence over
-                every other layer.
-
-        Raises:
-            pernix.errors.SettingsError: The settings are invalid; nothing has been
-                fetched or written yet.
-            pernix.errors.AddonError: An enabled Addon cannot be loaded.
-        """
-        await Crawler.from_spider(cls, settings=settings, output=output).crawl()
-
-    @classmethod
     def run(
         cls,
         *,
-        output: str | os.PathLike[str] | None = None,
         settings: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Run this Spider to completion in a new event loop.
+        output: str | os.PathLike[str] | None = None,
+        **args: Any,
+    ) -> RunResult:
+        """Run this Spider to completion in a new event loop, as the main program.
+
+        SIGINT or SIGTERM drains the Run, and a second one force-stops it. When the
+        Run does not complete, the process exits: with 1 when it failed, with 2 for a
+        configuration error, such as invalid settings or Spider arguments, and with
+        130 when a signal stopped it. Use `crawl()` to handle errors in code.
 
         Args:
-            output: A Feed for the Items besides the `feeds` setting, such as
-                `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
             settings: Settings for this Run, by dotted key; they take precedence over
                 every other layer.
+            output: A Feed for the Items besides the `feeds` setting, such as
+                `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
+            **args: The Spider arguments.
+
+        Returns:
+            How the Run ended, when it finished or code stopped it.
+
+        Raises:
+            SystemExit: The Run failed, was misconfigured, or was stopped by a signal.
+
+        Example:
+            >>> if __name__ == "__main__":
+            ...     Books.run(output="books.jsonl", settings={"concurrency": 32})
+        """
+        return run_spider(cls, args=args, settings=settings, output=output)
+
+    @classmethod
+    async def crawl(
+        cls,
+        *,
+        settings: Mapping[str, Any] | None = None,
+        output: str | os.PathLike[str] | None = None,
+        **args: Any,
+    ) -> RunResult:
+        """Run this Spider inside an existing event loop.
+
+        Signals are left to the application; cancelling the task stops the Run like
+        a Force Stop, and raises `CancelledError`. For more control, such as calling
+        `stop()`, create a `pernix.crawler.Crawler` with `Crawler.from_spider()`.
+
+        Args:
+            settings: Settings for this Run, by dotted key; they take precedence over
+                every other layer.
+            output: A Feed for the Items besides the `feeds` setting, such as
+                `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
+            **args: The Spider arguments.
+
+        Returns:
+            How the Run ended.
 
         Raises:
             pernix.errors.SettingsError: The settings are invalid; nothing has been
                 fetched or written yet.
+            pernix.errors.SpiderArgumentError: The Spider arguments are invalid.
+            pernix.errors.AddonError: An enabled Addon cannot be loaded.
         """
-        asyncio.run(cls.crawl(output=output, settings=settings))
+        return await Crawler.from_spider(cls, args=args, settings=settings, output=output).crawl()
+
+    @classmethod
+    def stream(
+        cls,
+        *,
+        settings: Mapping[str, Any] | None = None,
+        output: str | os.PathLike[str] | None = None,
+        **args: Any,
+    ) -> ItemStream:
+        """Run this Spider inside an existing event loop, streaming the Items that pass every Pipeline.
+
+        The Run starts with the first iteration. The stream holds one Item at a time,
+        so a slow consumer slows the Run down. Leaving early force-stops the Run; an
+        `async with` block waits until it has stopped. If the Run fails, the error is
+        raised after the Items already received.
+
+        Args:
+            settings: Settings for this Run, by dotted key; they take precedence over
+                every other layer.
+            output: A Feed for the Items besides the `feeds` setting.
+            **args: The Spider arguments.
+
+        Returns:
+            The Items, as an async iterator and an async context manager.
+
+        Raises:
+            pernix.errors.SettingsError: The settings are invalid.
+            pernix.errors.SpiderArgumentError: The Spider arguments are invalid.
+            pernix.errors.AddonError: An enabled Addon cannot be loaded.
+
+        Example:
+            >>> async with Books.stream(keyword="dune") as items:
+            ...     async for item in items:
+            ...         print(item["title"])
+        """
+        return Crawler.from_spider(cls, args=args, settings=settings, output=output).stream()

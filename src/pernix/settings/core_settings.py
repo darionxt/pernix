@@ -26,6 +26,7 @@ __all__ = [
     "LogSettings",
     "ResponseSettings",
     "RetrySettings",
+    "ShutdownSettings",
     "StatsSettings",
 ]
 
@@ -334,6 +335,24 @@ class StatsSettings(Section):
     sinks: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
 
 
+class ShutdownSettings(Section):
+    """Settings of stopping a Run.
+
+    Attributes:
+        grace: Seconds a Drain may take to finish the Requests in flight and the
+            queued Items before it turns into a Force Stop.
+        close_timeout: Seconds each component may take to close after a Force Stop
+            or a cancellation; 0 sets no limit. A sync `close()` cannot be cancelled,
+            so it is never limited. Closing after a Run that finished or drained is
+            never limited.
+    """
+
+    __prefix__ = "shutdown"
+
+    grace: Annotated[float, msgspec.Meta(ge=0)] = 20.0
+    close_timeout: Annotated[float, msgspec.Meta(ge=0)] = 5.0
+
+
 CORE_SECTIONS: tuple[type[Section], ...] = (
     CoreSettings,
     EventSettings,
@@ -346,5 +365,6 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FeedSettings,
     LogSettings,
     StatsSettings,
+    ShutdownSettings,
 )
 """The Sections every Crawler registers."""

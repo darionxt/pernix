@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Spider arguments declared by the keyword parameters of `__init__` and passed as keyword arguments of `run()`, `crawl()`, and `stream()`, or as `Crawler.from_spider(args=...)`. Strings are converted to the annotated types as environment variables are, including JSON for containers, dataclasses, and Structs; problems, and a `ValueError` from `__init__`, are reported together as `SpiderArgumentError`. `settings` and `output` cannot name an argument.
+- `Spider.stream()` and `Crawler.stream()`: an `ItemStream` of the Items that pass every Pipeline, holding one at a time so that a slow consumer pauses the Callbacks; leaving it early force-stops the Run.
+- `crawler.stop(mode)`: a Drain (`"drain"`) stops claiming and finishes the work in flight within `shutdown.grace` (20 s), then turns into a Force Stop; a Force Stop (`"force"`) cancels the Requests in flight, returning them to the Frontier without counting an attempt, discards the Items not processed yet as `items.discarded`, and limits each component's close to `shutdown.close_timeout` (5 s). Stopping covers the opening and the closing of the components too. `ComponentLifecycle.limit_closing()` limits closing while it runs.
+- `run()` as a program: the first SIGINT or SIGTERM drains the Run and the second force-stops it; the process exits with 1 when the Run failed, 2 for a configuration error, and 130 when a signal stopped it (`pernix.runner.ExitCode`).
+- `RunResult(run_id, reason, stats)`, returned by `run()` and `crawl()`.
 - Items of any common type: dicts and other mappings, dataclasses, msgspec `Struct`s, pydantic v2 models, and attrs objects, recognized by `pernix.items.is_item()` without importing pydantic or attrs, and converted for export by `item_to_dict()`.
 - Item Pipelines registered with `pipelines`: `process(item, ctx)` returns the Item or `None` to drop it, or raises `DropItem`; `accepts` takes types or a function; batch mode with `batch_size`, `batch_timeout`, and `process_batch(items, contexts)`; retries with `retry_times` and `retry_on` (or `Retry`) and full-jitter backoff, counted as `items.retried`. `ItemContext` gives the Request and Response of an Item. Pipeline errors emit `ItemError` and drop the Item without fetching the Request again. Each call is limited by `items.timeout` (60 s) or the Pipeline's `timeout`.
 - Failure Pipelines (`failed_pipelines`) that receive each `FailedItem(item, pipeline, error)`, with the built-in `FailedItemsFile` writing them to `items.failed_output`; Items a failure Pipeline loses are counted as `items.failures_lost`.
@@ -43,6 +48,12 @@ All notable changes to this project are documented here. The format follows [Kee
 - Project scaffolding: uv packaging, ruff, pyright, pytest, CI on Python 3.13 and 3.14, Apache-2.0 license.
 
 ### Changed
+
+- `SpiderClosed.reason` and the `run.reason` stat gain `drained` and `forced`.
+- An error that ends a Run is logged before it is raised, with its traceback unless it is a configuration error.
+- A string that is not valid JSON for a container setting is reported as `invalid JSON`.
+- From Python 3.14 on, the annotations of component and Spider `__init__` methods may name types defined later or imported only for type checking.
+- The per-Request processing of the Engine moved to `pernix.request_processor.RequestProcessor`.
 
 - `output=` writes jsonl, csv, or json by the file extension, as a Feed; other extensions are rejected. `pernix.feeds.JsonLinesFeed` is replaced by `Feed`.
 - `ItemScraped` is emitted once an Item passed every Pipeline and was written to the Feeds, apart from its Callback. In Feed output, sets become lists, `Decimal`s strings, and values JSON cannot represent, such as `bytes`, fail the Run with `FeedError`.

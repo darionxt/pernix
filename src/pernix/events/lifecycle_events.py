@@ -57,7 +57,9 @@ class SpiderClosed(Event):
 
     Attributes:
         spider: The Spider that was run.
-        reason: `"finished"`, `"failed"`, or `"cancelled"`.
+        reason: `"finished"` when the Run ended on its own, `"drained"` after a
+            Drain, `"forced"` after a Force Stop, `"failed"` when an error ended it,
+            and `"cancelled"` when its task was cancelled.
     """
 
     reverse: ClassVar[bool] = True

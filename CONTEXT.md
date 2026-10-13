@@ -10,6 +10,10 @@ An asyncio-based Python crawling framework. HTTP and the browser are peer ways o
 The user-written crawling logic: where to start, how to parse a Response, and what to produce.
 _Avoid_: crawler script, Crawler
 
+**Spider Argument**:
+A value given to one Run of a Spider, such as a search keyword, declared by a parameter of the Spider's `__init__`. Strings from a command line or the Platform are converted to the declared type.
+_Avoid_: spider parameter, run argument (settings for a Run are not Spider Arguments)
+
 **Request**:
 An immutable description of one fetch, including which Callback receives the result.
 _Avoid_: task, job, BrowserRequest
@@ -101,7 +105,11 @@ Stop claiming new Requests, finish the in-flight ones, then end.
 _Avoid_: graceful stop
 
 **Force Stop**:
-Cancel in-flight Requests, return them to the Frontier, then end.
+Cancel in-flight Requests, return them to the Frontier, discard the Items not processed yet, then end.
+_Avoid_: kill
+
+**Grace Period**:
+How long a Drain may take before it turns into a Force Stop.
 
 **Pause**:
 Stop claiming new Requests while the Worker stays alive.

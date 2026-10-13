@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from pernix.response import Response
 
 __all__ = [
+    "CONFIGURATION_ERRORS",
     "AddonError",
     "ComponentError",
     "ConnectError",
@@ -20,6 +21,7 @@ __all__ = [
     "Retry",
     "SerializationError",
     "SettingsError",
+    "SpiderArgumentError",
     "TLSError",
     "Timeout",
     "TooManyRedirects",
@@ -47,12 +49,33 @@ class SettingsError(PernixError, ValueError):
         super().__init__("Invalid settings:\n" + "\n".join(f"  - {problem}" for problem in problems))
 
 
+class SpiderArgumentError(PernixError, ValueError):
+    """The Spider arguments are invalid: missing, unknown, of the wrong type, or rejected by the Spider.
+
+    Attributes:
+        problems: One human-readable line per problem found.
+    """
+
+    def __init__(self, problems: list[str]) -> None:
+        """Create the error from every problem found.
+
+        Args:
+            problems: One human-readable line per problem.
+        """
+        self.problems = problems
+        super().__init__("Invalid Spider arguments:\n" + "\n".join(f"  - {problem}" for problem in problems))
+
+
 class ComponentError(PernixError):
     """A component could not be loaded or constructed."""
 
 
 class AddonError(PernixError):
     """An Addon cannot be loaded, is incompatible, or misused its setup API."""
+
+
+CONFIGURATION_ERRORS: tuple[type[PernixError], ...] = (SettingsError, SpiderArgumentError, ComponentError, AddonError)
+"""The errors that mean a Run is misconfigured; `Spider.run()` exits with 2 for them."""
 
 
 class SerializationError(PernixError):

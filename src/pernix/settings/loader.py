@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePath
-from types import MappingProxyType, UnionType
-from typing import Annotated, Any, TypeAliasType, Union, cast, get_args, get_origin
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, cast
 
 import msgspec
 import orjson
@@ -13,18 +13,14 @@ from msgspec import structs
 
 from pernix.components import init_type_hints, resolve_component
 from pernix.errors import ComponentError, SettingsError
+from pernix.settings.conversion import convert_value
 from pernix.settings.core_settings import CORE_SECTIONS
-from pernix.settings.secret import Secret
 from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.settings.settings import Settings
 from pernix.settings.sources import find_project_file, read_environment
 from pernix.settings.suggestions import did_you_mean
 
 __all__ = ["load_settings"]
-
-_CONTAINERS: tuple[object, ...] = (dict, list, tuple, set, frozenset, Mapping, Sequence)
-_FROM_STRING: tuple[type, ...] = (Secret, PurePath)
-"""Types without native msgspec support that settings may give as a string."""
 
 
 def load_settings(
@@ -158,8 +154,8 @@ class _Loader:
                 values[key] = raw
             else:
                 try:
-                    values[key] = _convert(raw, known.type, lenient=merged.lenient[key])
-                except (msgspec.ValidationError, orjson.JSONDecodeError) as exc:
+                    values[key] = convert_value(raw, known.type, lenient=merged.lenient[key])
+                except msgspec.ValidationError as exc:
                     problems.append(f"{key}: {exc} (from {merged.origins[key]})")
         if problems:
             raise SettingsError(problems)
@@ -298,7 +294,7 @@ class _Loader:
             default = info.default if info.default_factory is msgspec.NODEFAULT else info.default_factory()
             if info.type not in (ComponentMap, NamedComponents):
                 try:
-                    default = _convert(default, info.type, lenient=False)
+                    default = convert_value(default, info.type, lenient=False)
                 except msgspec.ValidationError as exc:
                     self._schema_problems.append(
                         f"settings section {section.__qualname__}: the default of {info.name!r} is invalid: {exc}"
@@ -338,34 +334,3 @@ def _sections_of(component: object, known_sections: Mapping[str, type]) -> list[
         hints = init_type_hints(component, known_types=known_sections)
         sections += [hint for hint in hints.values() if isinstance(hint, type) and issubclass(hint, Section)]
     return sections
-
-
-def _convert(value: object, target: Any, *, lenient: bool) -> Any:
-    if lenient and isinstance(value, str) and _is_container(target):
-        value = orjson.loads(value)
-    return msgspec.convert(value, target, strict=not lenient, dec_hook=_decode_custom)
-
-
-def _decode_custom(target: object, value: object) -> object:
-    """Validate a value whose declared type msgspec does not handle natively.
-
-    An instance of the declared type is kept as is. A string is converted only for the
-    types in `_FROM_STRING`; other types are never built from arbitrary input.
-    """
-    if isinstance(target, type):
-        if isinstance(value, target):
-            return value
-        if isinstance(value, str) and issubclass(target, _FROM_STRING):
-            return target(value)
-    raise TypeError(f"Expected `{getattr(target, '__name__', target)}`, got `{type(value).__name__}`")
-
-
-def _is_container(target: Any) -> bool:
-    if isinstance(target, TypeAliasType):
-        return _is_container(target.__value__)
-    origin = get_origin(target)
-    if origin is Annotated:
-        return _is_container(get_args(target)[0])
-    if origin in (Union, UnionType):
-        return any(_is_container(member) for member in get_args(target))
-    return (origin or target) in _CONTAINERS

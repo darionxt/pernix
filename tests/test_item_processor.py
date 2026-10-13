@@ -527,3 +527,101 @@ async def test_pipeline_retries_are_counted() -> None:
 def test_queue_size_and_concurrency_must_be_positive() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         ItemProcessor([], [], events.EventBus(), Stats(), queue_size=0)
+
+
+async def test_the_outlet_receives_the_items_that_pass_before_they_are_reported(tmp_path: Path) -> None:
+    feed = Feed(tmp_path / "items.jsonl")
+    bus = events.EventBus(timeout=5)
+    recorder = Recorder(bus)
+
+    async def outlet(item: Any) -> None:
+        recorder.log.append(("outlet", item))
+
+    processor = ItemProcessor([Tag("a"), Drop()], [feed], bus, Stats(), outlet=outlet)
+    feed.open()
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        for n in (1, 6):
+            await processor.put({"n": n}, CTX)
+        await processor.join()
+    feed.close()
+
+    passed = {"n": 6, "tags": ["a"]}
+    assert recorder.log == [
+        ("dropped", {"n": 1, "tags": ["a"]}, "Drop returned None"),
+        ("outlet", passed),
+        ("scraped", passed),
+    ]
+    assert (tmp_path / "items.jsonl").read_text() == '{"n":6,"tags":["a"]}\n'
+
+
+async def test_a_waiting_outlet_holds_the_items_behind() -> None:
+    gate = asyncio.Event()
+    taken: list[Any] = []
+
+    async def outlet(item: Any) -> None:
+        await gate.wait()
+        taken.append(item)
+
+    processor = ItemProcessor([], [], events.EventBus(timeout=5), Stats(), outlet=outlet, queue_size=1)
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        await processor.put({"n": 1}, CTX)
+        await processor.put({"n": 2}, CTX)  # the worker holds 1, the queue holds 2
+        third = asyncio.create_task(processor.put({"n": 3}, CTX))
+        await asyncio.sleep(0.01)
+        assert (taken, third.done()) == ([], False)
+        gate.set()
+        await third
+        await processor.join()
+
+    assert taken == [{"n": 1}, {"n": 2}, {"n": 3}]
+
+
+async def test_items_not_processed_when_the_processing_is_cancelled_are_discarded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    started = asyncio.Event()
+
+    class Stuck(Pipeline):
+        async def process(self, item: Any, ctx: ItemContext) -> Any:
+            if item["n"] == 2:
+                started.set()
+                await asyncio.Event().wait()
+            return item
+
+    stats = Stats()
+    processor, recorder = _processor([Stuck()], stats=stats)
+
+    async def process() -> None:
+        async with asyncio.TaskGroup() as tasks:
+            processor.start(tasks)
+            for n in (1, 2, 3, 4):
+                await processor.put({"n": n}, CTX)
+            await processor.join()
+
+    work = asyncio.create_task(process())
+    async with asyncio.timeout(5):
+        await started.wait()
+        await asyncio.sleep(0)  # 3 and 4 are queued behind 2
+        work.cancel()
+        await asyncio.wait([work])
+
+    assert recorder.log == [("scraped", {"n": 1})]
+    assert processor.discard() == 3
+    assert processor.discard() == 0
+    assert stats.get("items.discarded") == 3
+    assert "Discarded 3 Items the Run stopped before they were processed" in caplog.text
+
+
+async def test_nothing_is_discarded_after_a_complete_processing() -> None:
+    stats = Stats()
+    processor, _ = _processor([Drop()], stats=stats)
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        for n in (1, 2, 3):
+            await processor.put({"n": n}, CTX)
+        await processor.join()
+
+    assert processor.discard() == 0
+    assert stats.get("items.discarded") is None

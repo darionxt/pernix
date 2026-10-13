@@ -114,6 +114,7 @@ async def test_core_stats_count_requests_responses_and_items(server: LoopbackSer
         "items.errors": 0,
         "items.retried": 0,
         "items.failures_lost": 0,
+        "items.discarded": 0,
     }
     assert (stats["frontier.done"], stats["frontier.ready"], stats["frontier.dead"]) == (4, 0, 0)
     assert (stats["run.id"], stats["run.spider"], stats["run.reason"]) == (crawler.run_id, "site", "finished")

@@ -9,6 +9,7 @@ from pernix.items import FailedItem, ItemContext, Pipeline
 from pernix.middlewares import Middleware, NodeMiddleware, SpiderMiddleware, middleware, spider_middleware
 from pernix.request import Request
 from pernix.response import Response
+from pernix.run_result import RunResult
 from pernix.spider import Spider
 
 __version__ = _version("pernix")
@@ -26,6 +27,7 @@ __all__ = [
     "Request",
     "Response",
     "Retry",
+    "RunResult",
     "Spider",
     "SpiderMiddleware",
     "__version__",
