@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Logging on the `pernix.*` loggers through a bounded, non-blocking queue and a writer thread per Run (`pernix.logs.RunLog`): records go to the application's root handlers when logging is configured, and otherwise to stderr as text on a terminal or JSON lines elsewhere (`log.output`, `log.format`, `log.level`). A full queue drops records and counts them (`log.queue_size`). Records carry `run_id`, `spider`, and `request_id` from contextvars, and URL credentials, cookies, tokens, other sensitive names (`log.redact`), and `Secret` settings are masked. The root logger is never modified.
+- Stats: `crawler.stats` with `inc`, `set`, `max`, `get`, and `snapshot`, under stable keys for Requests, downloads by status and error type, Responses, Items, the Frontier, the Throttle, event loop lag, and log counts. A `StatsSnapshot` Event and an INFO line every `stats.interval`, a final snapshot and summary after `SpiderClosed`, and `StatsSink`s registered with `stats.sinks`. Components can be injected with `Stats`.
+- The `run_id` setting identifies a Run; `crawler.run_id` is generated when it is not set.
+- `Spider.crawler`, `Spider.stats`, and `Spider.logger` (`pernix.spiders.<name>`).
+
 - Per-domain politeness (`pernix.throttle`): each host has a slot held only while fetching, limited by `domain.concurrency`, spaced by `domain.delay` with `domain.delay_jitter`, and optionally rate-limited with GCRA (`domain.rate`, `domain.burst`). Workers skip slots that must wait, so one domain never holds back the others. A 429 or 503 with `Retry-After` cools its whole domain down, up to `domain.cooldown_max`, and Requests claimed for a cooling domain go back to the Frontier without counting an attempt.
 - `Spider.allowed_domains`, enforced at admission by the built-in `OffsiteFilter` Extension, enabled by default: other hosts are dropped as `RequestDropped(reason="offsite")`.
 - Retries decided by a replaceable `RetryPolicy` after every attempt: the default retries statuses 408, 429, 500, 502, 503, 504, 522, and 524, `Timeout`, `ConnectError`, `ProxyError`, and `Retry(reason, delay=None)`, up to 3 times, waiting as `Retry-After` says (up to 300 s) or with full-jitter backoff (1 s base, 60 s cap). Retried Requests go back to the Frontier with a delay and emit `RequestRetried`. The `retry.*` settings configure it, including `retry.delay_scale` for tests.
@@ -29,6 +34,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - Project scaffolding: uv packaging, ruff, pyright, pytest, CI on Python 3.13 and 3.14, Apache-2.0 license.
 
 ### Changed
+
+- `StatsSnapshot` gains `final`, true for the snapshot taken at the end of a Run.
+- During a Run, the `pernix` logger does not propagate: its records reach the root handlers from the writer thread, with the message already formatted and the exception rendered in `exc_text` instead of `exc_info`.
+- A Spider object can belong to one Crawler only.
 
 - `Extension` moved to `pernix.extensions`, next to the built-in Extensions; `from pernix import Extension` is unchanged.
 - `RequestFailed` is emitted once per Request that fails for good, not once per failed attempt; the Item Events have `response=None` for Items an errback yields.

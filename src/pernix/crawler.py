@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import uuid
 from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, cast
 
@@ -11,11 +12,12 @@ from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
 from pernix.engine import Engine
 from pernix.errors import ComponentError
-from pernix.events import EventBus, SpiderClosed, SpiderOpened
+from pernix.events import EventBus, SpiderClosed, SpiderOpened, StatsSnapshot
 from pernix.feeds import JsonLinesFeed
 from pernix.fetchers import FetcherDispatch
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier
+from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import (
@@ -24,11 +26,14 @@ from pernix.settings import (
     EventSettings,
     FingerprintSettings,
     FrontierSettings,
+    LogSettings,
     RetrySettings,
     Section,
     Settings,
+    StatsSettings,
     load_settings,
 )
+from pernix.stats import CoreStats, Stats, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
@@ -36,10 +41,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from pernix.frontiers import Frontier
-    from pernix.middlewares import Download, HandleResponse
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
     from pernix.spider import Spider
+    from pernix.stats import Gauge, StatsSink
 
 __all__ = ["Crawler"]
 
@@ -48,9 +53,11 @@ class Crawler:
     """Assembles the components for one Run of a Spider and runs it.
 
     Attributes:
-        spider: The Spider being run.
+        spider: The Spider being run; the Crawler binds itself as its `crawler`.
         settings: The validated, immutable settings of this Run.
         events: The event bus of this Run.
+        run_id: Identifies the Run: the `run_id` setting, or a generated one.
+        stats: The stats of this Run; they stay readable after it ends.
     """
 
     def __init__(
@@ -68,10 +75,17 @@ class Crawler:
             settings: Settings created by `pernix.settings.load_settings()`.
             output: A JSON-lines file for the Items; `None` discards them.
             addons: Loaded Addons whose `setup()` runs before the Run starts.
+
+        Raises:
+            RuntimeError: The Spider object is bound to another Crawler.
         """
         self.spider = spider
         self.settings = settings
         self.events = EventBus(timeout=settings.section(EventSettings).timeout)
+        self.run_id = settings.section(CoreSettings).run_id or uuid.uuid4().hex
+        self.stats = Stats()
+        spider.crawler = self
+        self._run_context = RunContext(self.run_id, spider.name)
         self._output = output
         self._addons = tuple(addons)
         self._started = False
@@ -118,7 +132,8 @@ class Crawler:
 
         Objects are used as is; classes are built through `from_crawler(crawler)` if
         they define it, and otherwise get their `__init__` parameters annotated with
-        exactly `Crawler`, `Settings`, `EventBus`, or a registered Section injected.
+        exactly `Crawler`, `Settings`, `EventBus`, `Stats`, or a registered Section
+        injected.
 
         Args:
             spec: A class, an object, or an import path.
@@ -134,12 +149,14 @@ class Crawler:
     async def crawl(self) -> None:
         """Run the Spider to completion.
 
-        Addons register their subscribers. Then every component is built: Extensions,
-        Fetchers, download Middleware, spider Middleware, the Fingerprint function, and
-        the retry policy, and the chains are checked, before anything is opened. The
-        components are subscribed and opened in that order, `SpiderOpened` is emitted,
-        the Engine runs with an in-memory Frontier, `SpiderClosed` is emitted, and the
-        components are closed in reverse order.
+        The `pernix.*` log records of the Run are delivered through a `RunLog`, and
+        carry its `run_id`. Addons register their subscribers. Then every component
+        is built: Stats Sinks, Extensions, Fetchers, download Middleware, spider
+        Middleware, the Fingerprint function, and the retry policy, and the chains are
+        checked, before anything is opened. The components are subscribed and opened
+        in that order, `SpiderOpened` is emitted, the Engine runs with an in-memory
+        Frontier while the stats are reported, `SpiderClosed` is emitted, the final
+        stats snapshot is taken, and the components are closed in reverse order.
 
         Raises:
             RuntimeError: This Crawler already ran.
@@ -150,28 +167,75 @@ class Crawler:
         if self._started:
             raise RuntimeError("a Crawler runs only once; create a new one for another Run")
         self._started = True
+        secrets = revealed_secrets(self.settings.values())
+        with run_context(self._run_context):
+            async with RunLog(self.settings.section(LogSettings), self._run_context, secrets=secrets) as run_log:
+                await self._crawl(run_log)
+
+    async def _crawl(self, run_log: RunLog) -> None:
         for addon in self._addons:
             setup_addon(addon, events=self.events, settings=self.settings)
+        sinks = self._build_sinks()
         extensions = self._build_all("extensions")
         fetchers = self._build_named("fetchers")
         middlewares = self._build_all("middlewares")
         spider_middlewares = self._build_all("spider_middlewares")
-        download = build_download_chain(middlewares, FetcherDispatch(fetchers))
+        core_stats = CoreStats(self.stats)
+        download = core_stats.count_downloads(build_download_chain(middlewares, FetcherDispatch(fetchers)))
         handle = build_spider_chain(spider_middlewares, run_callbacks(self.spider))
         frontier = MemoryFrontier(fingerprint=self._fingerprint_function())
         retry_policy = self._retry_policy()
+        throttle = Throttle(self.settings.section(DomainSettings))
+        reporter = self._reporter(frontier, throttle, run_log)
+        self.events.subscribe_methods(core_stats)
+        for sink in sinks:
+            self.events.on(StatsSnapshot, sink.push)
         async with ComponentLifecycle() as lifecycle:
-            for component in (*extensions, *fetchers.values(), *middlewares, *spider_middlewares):
+            for component in (*sinks, *extensions, *fetchers.values(), *middlewares, *spider_middlewares):
                 self.events.subscribe_methods(component)
                 await lifecycle.open(component)
             try:
-                await self._run(frontier, download, handle, retry_policy)
+                with ExitStack() as stack:
+                    item_sink = (
+                        _discard if self._output is None else stack.enter_context(JsonLinesFeed(self._output)).write
+                    )
+                    engine = Engine(
+                        self.spider,
+                        frontier=frontier,
+                        download=download,
+                        handle=handle,
+                        item_sink=item_sink,
+                        events=self.events,
+                        concurrency=self.settings.section(CoreSettings).concurrency,
+                        lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
+                        retry_policy=retry_policy,
+                        throttle=throttle,
+                    )
+                    await self._run(engine, reporter)
             finally:
                 await frontier.close()
 
     def _build_all(self, key: str) -> list[object]:
         """Build the enabled components of a `{component: order}` setting, in order."""
         return [self.build_component(spec) for spec in self.settings.components(key)]
+
+    def _build_sinks(self) -> list[StatsSink]:
+        """Build the enabled Stats Sinks, checking that each can receive snapshots."""
+        sinks = self._build_all("stats.sinks")
+        for sink in sinks:
+            if not callable(getattr(sink, "push", None)):
+                raise ComponentError(f"stats.sinks: {sink!r} must have push(snapshot)")
+        return cast("list[StatsSink]", sinks)
+
+    def _reporter(self, frontier: Frontier, throttle: Throttle, run_log: RunLog) -> StatsReporter:
+        """The reporter of this Run's stats, reading the Frontier, the Throttle, and the log counts."""
+        gauges: dict[str, Gauge] = {
+            "frontier": frontier.counts,
+            "throttle": lambda: throttle.stats,
+            "log": lambda: run_log.counts,
+        }
+        interval = self.settings.section(StatsSettings).interval
+        return StatsReporter(self.stats, self.events, self._run_context, interval=interval, gauges=gauges)
 
     def _build_named(self, key: str) -> dict[str, object]:
         """Build the enabled components of a `{name: component}` setting."""
@@ -195,25 +259,10 @@ class Crawler:
             raise ComponentError(f"retry.policy must have decide(request, outcome, attempt), got {policy!r}")
         return cast("RetryPolicy", policy)
 
-    async def _run(
-        self, frontier: Frontier, download: Download, handle: HandleResponse, retry_policy: RetryPolicy
-    ) -> None:
-        concurrency = self.settings.section(CoreSettings).concurrency
-        with ExitStack() as stack:
-            item_sink = _discard if self._output is None else stack.enter_context(JsonLinesFeed(self._output)).write
-            engine = Engine(
-                self.spider,
-                frontier=frontier,
-                download=download,
-                handle=handle,
-                item_sink=item_sink,
-                events=self.events,
-                concurrency=concurrency,
-                lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
-                retry_policy=retry_policy,
-                throttle=Throttle(self.settings.section(DomainSettings)),
-            )
-            reason = "failed"
+    async def _run(self, engine: Engine, reporter: StatsReporter) -> None:
+        reason = "failed"
+        reporter.start()
+        try:
             try:
                 await self.events.emit(SpiderOpened(self.spider))
                 await engine.run()
@@ -223,10 +272,12 @@ class Crawler:
                 raise
             finally:
                 await self.events.emit(SpiderClosed(self.spider, reason))
+        finally:
+            await reporter.finish(reason)
 
     def _service_types(self) -> dict[str, type]:
         sections = {section.__name__: section for section in self.settings.sections()}
-        return {**sections, "Crawler": Crawler, "Settings": Settings, "EventBus": EventBus}
+        return {**sections, "Crawler": Crawler, "Settings": Settings, "EventBus": EventBus, "Stats": Stats}
 
     def _provide(self, service_type: type) -> object | None:
         # Match annotations exactly: isinstance() would fail on Any and on Protocols
@@ -237,6 +288,8 @@ class Crawler:
             return self.settings
         if service_type is EventBus:
             return self.events
+        if service_type is Stats:
+            return self.stats
         if issubclass(service_type, Section):
             try:
                 return self.settings.section(service_type)

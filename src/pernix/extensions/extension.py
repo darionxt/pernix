@@ -7,7 +7,7 @@ class Extension:
     """Base class for components that subscribe to Events and have their own lifecycle.
 
     Register Extensions with the `extensions` setting. The Crawler builds each one
-    (injecting `Crawler`, `Settings`, `EventBus`, or Sections into annotated
+    (injecting `Crawler`, `Settings`, `EventBus`, `Stats`, or Sections into annotated
     `__init__` parameters), subscribes its methods marked with `events.on()`, and
     calls `open()` before the Run and `close()` after it, in reverse order.
 

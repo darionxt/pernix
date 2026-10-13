@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+import logging
+from typing import Annotated, Any, Literal
 
 import msgspec
 
@@ -14,8 +15,10 @@ __all__ = [
     "EventSettings",
     "FingerprintSettings",
     "FrontierSettings",
+    "LogSettings",
     "ResponseSettings",
     "RetrySettings",
+    "StatsSettings",
 ]
 
 
@@ -34,6 +37,8 @@ class CoreSettings(Section):
             are further out.
         fetchers: Fetchers by name, as `{name: fetcher}`; `Request(fetcher=name)`
             selects one by that name.
+        run_id: Identifies the Run in logs, Events, and stats; `None` generates one.
+            A Platform passes its own, for example as `PERNIX_RUN_ID`.
     """
 
     concurrency: Annotated[int, msgspec.Meta(ge=1)] = 16
@@ -42,6 +47,7 @@ class CoreSettings(Section):
     middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     spider_middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     fetchers: NamedComponents = msgspec.field(default_factory=lambda: {"http": "pernix.fetchers.HTTPFetcher"})
+    run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None
 
 
 class EventSettings(Section):
@@ -169,6 +175,55 @@ class RetrySettings(Section):
     policy: Any = None
 
 
+class LogSettings(Section):
+    """Settings of the log output of a Run.
+
+    Attributes:
+        output: Where the `pernix.*` records go: `"stderr"` or `"stdout"`, written by
+            Pernix; `"root"`, handed to the handlers of the root logger as the
+            application configured them; or `"auto"`, which is `"root"` when the root
+            logger has handlers and `"stderr"` otherwise.
+        format: `"text"` for human-readable lines, `"json"` for JSON lines, or
+            `"auto"`, which is text on a terminal and JSON lines otherwise. Applies
+            when Pernix writes the output.
+        level: The lowest level written, such as `"INFO"` or `"debug"`. Applies when
+            Pernix writes the output; the root handlers use the application's levels.
+        queue_size: Records waiting to be written at most; further records are
+            dropped and counted.
+        redact: Names whose values are masked in log output besides the built-in
+            ones, such as a query parameter, a header, or a JSON key.
+    """
+
+    __prefix__ = "log"
+
+    output: Literal["auto", "stderr", "stdout", "root"] = "auto"
+    format: Literal["auto", "text", "json"] = "auto"
+    level: str = "INFO"
+    queue_size: Annotated[int, msgspec.Meta(ge=1)] = 10_000
+    redact: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.level.upper() not in logging.getLevelNamesMapping():
+            raise ValueError(
+                f"{self.key('level')}: unknown level {self.level!r}, use DEBUG, INFO, WARNING, ERROR, or CRITICAL"
+            )
+
+
+class StatsSettings(Section):
+    """Settings of the stats of a Run.
+
+    Attributes:
+        interval: Seconds between two stats snapshots; 0 turns periodic snapshots
+            off. The final snapshot is always taken.
+        sinks: Stats Sinks that receive every snapshot, as `{sink: order}`.
+    """
+
+    __prefix__ = "stats"
+
+    interval: Annotated[float, msgspec.Meta(ge=0)] = 60.0
+    sinks: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
+
+
 CORE_SECTIONS: tuple[type[Section], ...] = (
     CoreSettings,
     EventSettings,
@@ -177,5 +232,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FingerprintSettings,
     RetrySettings,
     DomainSettings,
+    LogSettings,
+    StatsSettings,
 )
 """The Sections every Crawler registers."""

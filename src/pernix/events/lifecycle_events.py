@@ -197,10 +197,14 @@ class ItemError(Event):
 
 @dataclass(frozen=True)
 class StatsSnapshot(Event):
-    """A periodic copy of the Run's stats.
+    """A copy of the Run's stats, taken every `stats.interval` and once at the end.
+
+    Stats Sinks receive every snapshot (see `pernix.stats.StatsSink`).
 
     Attributes:
-        stats: Stat name to value.
+        stats: Stat name to value, sorted by name.
+        final: Whether this is the final snapshot, taken after `SpiderClosed`.
     """
 
     stats: Mapping[str, Any]
+    final: bool = False
