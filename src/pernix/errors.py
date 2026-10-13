@@ -11,6 +11,7 @@ __all__ = [
     "ConnectError",
     "DecodeError",
     "DropItem",
+    "FeedError",
     "FetchError",
     "IgnoreRequest",
     "PernixError",
@@ -56,6 +57,14 @@ class AddonError(PernixError):
 
 class SerializationError(PernixError):
     """A Request cannot be persisted, or a persisted Request cannot be restored."""
+
+
+class FeedError(PernixError):
+    """An Item could not be written to a Feed; it ends the Run, so that no Item is lost silently.
+
+    The original exception, such as a `TypeError` for a value JSON cannot represent or
+    an `OSError`, is the `__cause__`.
+    """
 
 
 class FetchError(PernixError):
@@ -175,7 +184,8 @@ class Retry(_ControlFlow):
 
 
 class DropItem(_ControlFlow):
-    """Discard the Item being processed, from a Pipeline.
+    """Discard the Item being processed, from a Pipeline, or a whole batch in batch mode.
 
-    Pipelines are not implemented yet; until they are, this is an ordinary exception.
+    The Item goes no further and `ItemDropped` is emitted with the reason; it is never
+    retried.
     """

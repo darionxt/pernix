@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Items of any common type: dicts and other mappings, dataclasses, msgspec `Struct`s, pydantic v2 models, and attrs objects, recognized by `pernix.items.is_item()` without importing pydantic or attrs, and converted for export by `item_to_dict()`.
+- Item Pipelines registered with `pipelines`: `process(item, ctx)` returns the Item or `None` to drop it, or raises `DropItem`; `accepts` takes types or a function; batch mode with `batch_size`, `batch_timeout`, and `process_batch(items, contexts)`; retries with `retry_times` and `retry_on` (or `Retry`) and full-jitter backoff, counted as `items.retried`. `ItemContext` gives the Request and Response of an Item. Pipeline errors emit `ItemError` and drop the Item without fetching the Request again. Each call is limited by `items.timeout` (60 s) or the Pipeline's `timeout`.
+- Failure Pipelines (`failed_pipelines`) that receive each `FailedItem(item, pipeline, error)`, with the built-in `FailedItemsFile` writing them to `items.failed_output`; Items a failure Pipeline loses are counted as `items.failures_lost`.
+- A bounded Item queue between Callbacks and Pipelines (`items.queue_size`) that suspends Callbacks when full, processed `items.concurrency` at a time; queued Items and pending batches are processed before `SpiderClosed`.
+- Feeds in jsonl, csv, and json (a streamed array), configured with `output=` and `feeds = {path_template: {format, fields, accepts, encoding}}`. Path templates take `{name}`, `{run_id}`, and `{time}`. Files appear atomically when the Run ends, also when it fails.
+- `full_jitter()` in `pernix.retry_policy`, shared by Request and Pipeline retries.
+- `FeedError`, raised when an Item cannot be written to a Feed; it ends the Run.
+- `Crawler.started_at`, the start of the Run that Feed paths use for `{time}`.
+
 - Logging on the `pernix.*` loggers through a bounded, non-blocking queue and a writer thread per Run (`pernix.logs.RunLog`): records go to the application's root handlers when logging is configured, and otherwise to stderr as text on a terminal or JSON lines elsewhere (`log.output`, `log.format`, `log.level`). A full queue drops records and counts them (`log.queue_size`). Records carry `run_id`, `spider`, and `request_id` from contextvars, and URL credentials, cookies, tokens, other sensitive names (`log.redact`), and `Secret` settings are masked. The root logger is never modified.
 - Stats: `crawler.stats` with `inc`, `set`, `max`, `get`, and `snapshot`, under stable keys for Requests, downloads by status and error type, Responses, Items, the Frontier, the Throttle, event loop lag, and log counts. A `StatsSnapshot` Event and an INFO line every `stats.interval`, a final snapshot and summary after `SpiderClosed`, and `StatsSink`s registered with `stats.sinks`. Components can be injected with `Stats`.
 - The `run_id` setting identifies a Run; `crawler.run_id` is generated when it is not set.
@@ -34,6 +43,10 @@ All notable changes to this project are documented here. The format follows [Kee
 - Project scaffolding: uv packaging, ruff, pyright, pytest, CI on Python 3.13 and 3.14, Apache-2.0 license.
 
 ### Changed
+
+- `output=` writes jsonl, csv, or json by the file extension, as a Feed; other extensions are rejected. `pernix.feeds.JsonLinesFeed` is replaced by `Feed`.
+- `ItemScraped` is emitted once an Item passed every Pipeline and was written to the Feeds, apart from its Callback. In Feed output, sets become lists, `Decimal`s strings, and values JSON cannot represent, such as `bytes`, fail the Run with `FeedError`.
+- The Engine takes `put_item(item, ctx)`, an awaitable handoff, instead of `item_sink`.
 
 - `StatsSnapshot` gains `final`, true for the snapshot taken at the end of a Run.
 - During a Run, the `pernix` logger does not propagate: its records reach the root handlers from the writer thread, with the message already formatted and the exception rendered in `exc_text` instead of `exc_info`.

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import codecs
 import logging
+import string
+from pathlib import PurePath
 from typing import Annotated, Any, Literal
 
 import msgspec
@@ -10,11 +13,16 @@ from pernix.text_decoding import codec_for
 
 __all__ = [
     "CORE_SECTIONS",
+    "FEED_FORMATS",
+    "PATH_FIELDS",
     "CoreSettings",
     "DomainSettings",
     "EventSettings",
+    "FeedOptions",
+    "FeedSettings",
     "FingerprintSettings",
     "FrontierSettings",
+    "ItemSettings",
     "LogSettings",
     "ResponseSettings",
     "RetrySettings",
@@ -37,6 +45,10 @@ class CoreSettings(Section):
             are further out.
         fetchers: Fetchers by name, as `{name: fetcher}`; `Request(fetcher=name)`
             selects one by that name.
+        pipelines: Item Pipelines, as `{pipeline: order}`; lower orders run first.
+        failed_pipelines: Pipelines that receive each `FailedItem`, the Items a
+            Pipeline failed on, as `{pipeline: order}`. The built-in
+            `FailedItemsFile`, enabled by default, writes them to `items.failed_output`.
         run_id: Identifies the Run in logs, Events, and stats; `None` generates one.
             A Platform passes its own, for example as `PERNIX_RUN_ID`.
     """
@@ -47,6 +59,8 @@ class CoreSettings(Section):
     middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     spider_middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     fetchers: NamedComponents = msgspec.field(default_factory=lambda: {"http": "pernix.fetchers.HTTPFetcher"})
+    pipelines: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
+    failed_pipelines: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.items.FailedItemsFile": 100})
     run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None
 
 
@@ -175,6 +189,102 @@ class RetrySettings(Section):
     policy: Any = None
 
 
+class ItemSettings(Section):
+    """Settings of how Items reach the Pipelines.
+
+    Attributes:
+        queue_size: Items waiting for the Pipelines at most; a Callback that
+            produces another one waits until there is room.
+        concurrency: Items processed at once. With 1, Items reach the Feeds in the
+            order they were produced.
+        timeout: Seconds one call of a Pipeline, `process()` for an Item or
+            `process_batch()` for a batch, may take before it is cancelled and fails
+            with `TimeoutError`; 0 for no limit. A Pipeline's own `timeout` overrides
+            it. Only async calls can be cancelled.
+        failed_output: A JSON-lines file, a path template as for Feeds, where the
+            built-in `FailedItemsFile` writes every Item a Pipeline failed on, with
+            the Pipeline and the error; `None` keeps no such file.
+    """
+
+    __prefix__ = "items"
+
+    queue_size: Annotated[int, msgspec.Meta(ge=1)] = 1000
+    concurrency: Annotated[int, msgspec.Meta(ge=1)] = 1
+    timeout: Annotated[float, msgspec.Meta(ge=0)] = 60.0
+    failed_output: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.failed_output is not None:
+            _check_path_template(self.key("failed_output"), self.failed_output)
+
+
+FEED_FORMATS: dict[str, Literal["jsonl", "csv", "json"]] = {
+    ".jsonl": "jsonl",
+    ".ndjson": "jsonl",
+    ".jl": "jsonl",
+    ".csv": "csv",
+    ".json": "json",
+}
+"""The Feed format each file extension implies."""
+
+PATH_FIELDS = frozenset({"name", "run_id", "time"})
+"""The placeholders of Feed path templates."""
+
+
+class FeedOptions(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """How one Feed writes its file.
+
+    Attributes:
+        format: `"jsonl"`, `"csv"`, or `"json"`; `None` infers it from the file
+            extension (see `FEED_FORMATS`).
+        fields: The fields to write, in order; `None` writes every field. For csv
+            they are the columns, which otherwise come from the first Item.
+        accepts: Item types, as classes or import paths, or a function
+            `(item) -> bool`, that the Feed writes; `None` writes every Item.
+        encoding: The text encoding of the file.
+    """
+
+    format: Literal["jsonl", "csv", "json"] | None = None
+    fields: tuple[str, ...] | None = None
+    accepts: Any = None
+    encoding: str = "utf-8"
+
+
+class FeedSettings(Section):
+    """Settings of the files Items are written to.
+
+    Attributes:
+        feeds: Feeds by path template, as `{path: options}`. A path may contain
+            `{name}` (the Spider), `{run_id}`, and `{time}` (when the Run started,
+            in UTC, such as `20261013T080405Z`).
+    """
+
+    feeds: dict[str, FeedOptions] = msgspec.field(default_factory=dict[str, FeedOptions])
+
+    def __post_init__(self) -> None:
+        for path, options in self.feeds.items():
+            key = f"{self.key('feeds')}[{path!r}]"
+            _check_path_template(key, path)
+            if options.format is None and PurePath(path).suffix.lower() not in FEED_FORMATS:
+                raise ValueError(
+                    f"{key}: cannot infer the format from the extension; set format to jsonl, csv, or json"
+                )
+            try:
+                codecs.lookup(options.encoding)
+            except LookupError:
+                raise ValueError(f"{key}: unknown encoding {options.encoding!r}") from None
+
+
+def _check_path_template(key: str, path: str) -> None:
+    try:
+        fields = {field for _, field, _, _ in string.Formatter().parse(path) if field is not None}
+    except ValueError as exc:
+        raise ValueError(f"{key}: invalid path template {path!r}: {exc}") from None
+    unknown = fields - PATH_FIELDS
+    if unknown:
+        raise ValueError(f"{key}: unknown placeholders {sorted(unknown)}; use {{name}}, {{run_id}}, or {{time}}")
+
+
 class LogSettings(Section):
     """Settings of the log output of a Run.
 
@@ -232,6 +342,8 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FingerprintSettings,
     RetrySettings,
     DomainSettings,
+    ItemSettings,
+    FeedSettings,
     LogSettings,
     StatsSettings,
 )

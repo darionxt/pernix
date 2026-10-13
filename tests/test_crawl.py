@@ -13,7 +13,7 @@ import pytest
 
 from loopback import ReceivedRequest, Reply
 from pernix import Request, Response, Spider, events
-from pernix.errors import ComponentError, SettingsError
+from pernix.errors import ComponentError, FeedError, SettingsError
 from pernix.retry_policy import Decision
 
 if TYPE_CHECKING:
@@ -258,7 +258,7 @@ async def test_item_storage_failure_ends_the_run(server: LoopbackServer, tmp_pat
         start_urls = (server.url("/"),)
 
         async def parse(self, response: Response) -> AsyncIterator[Any]:
-            yield {"tags": {"a", "b"}}  # a set is not JSON-serializable
+            yield {"raw": b"\x00"}  # bytes have no JSON form
 
     errors: list[tuple[Any, str | None, type[Exception]]] = []
 
@@ -267,11 +267,11 @@ async def test_item_storage_failure_ends_the_run(server: LoopbackServer, tmp_pat
         def failed(self, event: events.ItemError) -> None:
             errors.append((event.item, event.response and event.response.url, type(event.error)))
 
-    with pytest.RaisesGroup(TypeError):
+    with pytest.RaisesGroup(FeedError):
         async with asyncio.timeout(10):
             await Unserializable.crawl(output=tmp_path / "items.jsonl", settings={"extensions": {ItemErrors(): 1}})
 
-    assert errors == [({"tags": {"a", "b"}}, server.url("/"), TypeError)]
+    assert errors == [({"raw": b"\x00"}, server.url("/"), FeedError)]
 
 
 async def test_missing_parse_is_logged_and_run_continues(
@@ -361,13 +361,10 @@ async def test_the_engine_emits_request_response_and_item_events(server: Loopbac
     async with asyncio.timeout(10):
         await Eventful.crawl(settings={"concurrency": 1, "extensions": {observer: 1}, "retry.delay_scale": 0})
 
-    assert observer.log[:4] == [
-        "received start",
-        "item 1 from start",
-        "dropped offsite offsite",
-        "dropped start duplicate",
-    ]
-    assert sorted(observer.log[4:]) == [
+    assert "item 1 from start" in observer.log  # Items are processed apart from the Callback
+    request_log = [line for line in observer.log if not line.startswith("item")]
+    assert request_log[:3] == ["received start", "dropped offsite offsite", "dropped start duplicate"]
+    assert sorted(request_log[3:]) == [
         "failed broken ValueError",
         "failed unreachable RetriesExhausted",
         "received broken",
@@ -395,13 +392,13 @@ async def test_a_self_cancelled_item_error_subscriber_does_not_hide_the_storage_
 
         async def parse(self, response: Response) -> AsyncIterator[Any]:
             yield Request(server.url("/next"), callback=self.parse_next)
-            yield {"tags": {"a"}}
+            yield {"raw": b"\x00"}
 
         async def parse_next(self, response: Response) -> AsyncIterator[Any]:
             yield {"ok": True}
 
     settings = {"concurrency": 1, "extensions": {CancelsItself(): 1}}
-    with pytest.RaisesGroup(TypeError):
+    with pytest.RaisesGroup(FeedError):
         async with asyncio.timeout(10):
             await Unserializable.crawl(output=tmp_path / "items.jsonl", settings=settings)
 

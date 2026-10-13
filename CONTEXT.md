@@ -123,7 +123,11 @@ An onion-style layer wrapped around fetching (download Middleware) or around a C
 _Avoid_: hook, interceptor
 
 **Pipeline**:
-The ordered chain an Item passes through for validation, cleaning, and storage.
+A component that checks, cleans, or stores Items; Items pass through the Pipelines in order.
+
+**Failed Item**:
+An Item a Pipeline failed on, handed with the error to the failure Pipelines, for example to be written to a file and processed again later.
+_Avoid_: dead letter (except for a destination such as a queue)
 
 **Feed**:
 Built-in file output, such as jsonl or csv.

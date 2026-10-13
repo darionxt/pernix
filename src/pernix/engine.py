@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import socket
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any
 from pernix.callbacks import iterate_and_close, run_errback
 from pernix.errors import IgnoreRequest, RetriesExhausted, Retry
 from pernix.events import (
-    ItemError,
-    ItemScraped,
     RequestDropped,
     RequestFailed,
     RequestIgnored,
@@ -22,6 +20,7 @@ from pernix.events import (
     ResponseReceived,
     SpiderIdle,
 )
+from pernix.items import ItemContext, is_item
 from pernix.logs import request_context
 from pernix.request import Request
 from pernix.response import expect_response
@@ -37,12 +36,12 @@ if TYPE_CHECKING:
     from pernix.retry_policy import RetryPolicy
     from pernix.spider import Spider
 
-__all__ = ["Engine", "ItemSink"]
+__all__ = ["Engine", "PutItem"]
 
 logger = logging.getLogger(__name__)
 
-type ItemSink = Callable[[Mapping[str, Any]], None]
-"""Receives each Item a Callback produces."""
+type PutItem = Callable[[Any, ItemContext], Awaitable[None]]
+"""Takes each Item a Callback or an errback produces; waiting in it suspends the producer."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +78,8 @@ class Engine:
     goes back to the Frontier until the cooldown ends, without counting an attempt. Once the Callback's outputs
     have been added, the Lease is acknowledged. Because a Request stays leased until
     then, the Requests its Callback adds are always in the Frontier before it leaves.
+    Items, recognized with `pernix.items.is_item()`, are handed to `put_item`, which
+    may make the Callback wait.
 
     After every attempt that produced a Response, raised while fetching, or raised
     `Retry` in the Callback, the retry policy decides. A retried Request goes back to
@@ -89,15 +90,14 @@ class Engine:
     runs. Outputs a Callback yielded before raising are kept. `IgnoreRequest` raised
     while fetching is emitted as `RequestIgnored` and counts as done. If the Run is
     cancelled, Requests in flight are returned to the Frontier without counting an
-    attempt. An exception raised while storing an Item ends the Run.
+    attempt.
 
     The Run is idle once `start()` is exhausted and nothing is ready, delayed, or
     leased. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the Run ends when
     it adds no Request. Every Request passes the `RequestScheduled` gate before
     entering the Frontier; a vetoed or duplicate Request is emitted as
     `RequestDropped`. Each Response handed to the spider chain is emitted as
-    `ResponseReceived`, each stored Item as `ItemScraped`, and an Item that fails to be
-    stored as `ItemError`.
+    `ResponseReceived`.
 
     Requests constructed in the spider chain resolve relative URLs against the
     Response handled by the layer, or the Callback, that constructs them. While a
@@ -111,7 +111,7 @@ class Engine:
         frontier: Frontier,
         download: Download,
         handle: HandleResponse,
-        item_sink: ItemSink,
+        put_item: PutItem,
         events: EventBus,
         concurrency: int,
         lease_ttl: float = 60.0,
@@ -127,8 +127,9 @@ class Engine:
             download: Fetches a Request through the download Middleware and a Fetcher.
             handle: Runs the spider Middleware and the Callback for a Response,
                 yielding the outputs; it ends in `pernix.callbacks.run_callbacks()`.
-            item_sink: Receives every Item the Callbacks produce.
-            events: Where Request, Response, and Item Events are emitted.
+            put_item: Takes every Item the Callbacks and errbacks produce, with
+                where it came from.
+            events: Where Request and Response Events are emitted.
             concurrency: The number of workers, which is also the maximum number of
                 Requests processed at once.
             lease_ttl: Seconds a claimed Request stays leased without renewal; Leases
@@ -151,7 +152,7 @@ class Engine:
         self._frontier = frontier
         self._download = download
         self._handle = handle
-        self._item_sink = item_sink
+        self._put_item = put_item
         self._events = events
         self._concurrency = concurrency
         self._lease_ttl = lease_ttl
@@ -160,11 +161,7 @@ class Engine:
         self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
 
     async def run(self) -> None:
-        """Run until the Run is idle and `Spider.on_idle()` adds no more Requests.
-
-        Raises:
-            ExceptionGroup: Storing an Item failed; it holds the original exception.
-        """
+        """Run until the Run is idle and `Spider.on_idle()` adds no more Requests."""
         async with asyncio.TaskGroup() as tasks:
             workers = [tasks.create_task(self._work()) for _ in range(self._concurrency)]
             await self._schedule_all(self._spider.start(), "start()")
@@ -394,13 +391,8 @@ class Engine:
                 pass
             case Request():
                 await self._schedule(output)
-            case Mapping():
-                try:
-                    self._item_sink(output)  # pyright: ignore[reportUnknownArgumentType]
-                except Exception as exc:
-                    await self._events.emit(ItemError(output, response, exc))
-                    raise
-                await self._events.emit(ItemScraped(output, response))
+            case _ if is_item(output):
+                await self._put_item(output, ItemContext(request, response))
             case _:
                 logger.warning("Ignoring unsupported output %r produced for %r", output, request)
 

@@ -9,6 +9,7 @@ import pytest
 from pernix.errors import SettingsError
 from pernix.extensions import OffsiteFilter
 from pernix.fetchers import HTTPFetcher
+from pernix.items import FailedItemsFile
 from pernix.settings import (
     ComponentMap,
     CoreSettings,
@@ -575,6 +576,8 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "middlewares": {},
         "spider_middlewares": {},
         "fetchers": {"http": HTTPFetcher},
+        "pipelines": {},
+        "failed_pipelines": {FailedItemsFile: 100},
         "run_id": None,
         "domain.delay": 0.0,
         "domain.verify": True,

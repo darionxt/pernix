@@ -154,10 +154,10 @@ class ResponseReceived(Event):
 
 @dataclass(frozen=True)
 class ItemScraped(Event):
-    """An Item was stored.
+    """An Item passed every Pipeline and was written to the Feeds that accept it.
 
     Attributes:
-        item: The Item.
+        item: The Item, as the last Pipeline passed it on.
         response: The Response whose Callback produced it; `None` for an errback's.
     """
 
@@ -167,7 +167,7 @@ class ItemScraped(Event):
 
 @dataclass(frozen=True)
 class ItemDropped(Event):
-    """A Pipeline dropped an Item.
+    """A Pipeline dropped an Item, by returning `None` or raising `DropItem`.
 
     Attributes:
         item: The Item.
@@ -182,12 +182,12 @@ class ItemDropped(Event):
 
 @dataclass(frozen=True)
 class ItemError(Event):
-    """Processing or storing an Item raised.
+    """A Pipeline failed on an Item, which was dropped, or a Feed failed to write it, which ends the Run.
 
     Attributes:
         item: The Item.
         response: The Response whose Callback produced it; `None` for an errback's.
-        error: The exception.
+        error: The exception; `RetriesExhausted` once a Pipeline's retries ran out.
     """
 
     item: Any

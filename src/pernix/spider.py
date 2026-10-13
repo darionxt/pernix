@@ -139,7 +139,8 @@ class Spider:
         """Run this Spider inside an existing event loop.
 
         Args:
-            output: A JSON-lines file for the Items; `None` discards them.
+            output: A Feed for the Items besides the `feeds` setting, such as
+                `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
             settings: Settings for this Run, by dotted key; they take precedence over
                 every other layer.
 
@@ -160,7 +161,8 @@ class Spider:
         """Run this Spider to completion in a new event loop.
 
         Args:
-            output: A JSON-lines file for the Items; `None` discards them.
+            output: A Feed for the Items besides the `feeds` setting, such as
+                `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
             settings: Settings for this Run, by dotted key; they take precedence over
                 every other layer.
 
