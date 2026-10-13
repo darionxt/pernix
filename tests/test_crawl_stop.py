@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+import contextvars
+from typing import TYPE_CHECKING, Any, Self
 
 import orjson
 import pytest
@@ -342,3 +343,36 @@ async def test_a_drain_whose_closing_outlasts_the_grace_period_limits_it(pages: 
 
     assert [str(error) for error in raised.value.exceptions] == ["closing took longer than 0.05 s"]
     assert crawler.stats.get("run.reason") == "drained"
+
+
+TENANT: contextvars.ContextVar[str] = contextvars.ContextVar("tenant")
+
+
+class TenantScope:
+    """A component that sets a context variable for the Run and resets it after."""
+
+    def __init__(self) -> None:
+        self.token: contextvars.Token[str] | None = None
+
+    async def __aenter__(self) -> Self:
+        self.token = TENANT.set("acme")
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        assert self.token is not None
+        TENANT.reset(self.token)
+
+
+async def test_context_set_by_components_while_opening_lasts_until_they_close(pages: LoopbackServer) -> None:
+    class Tenanted(Spider):
+        start_urls = (pages.url("/1"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"tenant": TENANT.get("none")}
+
+    async with asyncio.timeout(10):
+        result = await _crawler(Tenanted, {"extensions": {TenantScope(): 100}}).crawl()
+
+    assert result.reason == "finished"
+    assert result.stats["items.scraped"] == 1
+    assert TENANT.get("none") == "none"

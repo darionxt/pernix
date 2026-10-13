@@ -49,7 +49,7 @@ class Shutdown:
         self._close_timeout = close_timeout
         self._lifecycle: ComponentLifecycle | None = None
         self._engine: Engine | None = None
-        self._stage: asyncio.Task[None] | None = None
+        self._stage: asyncio.Timeout | None = None
         self._timer: asyncio.TimerHandle | None = None
         self._active = False
         self._ended = False
@@ -98,27 +98,31 @@ class Shutdown:
             engine.drain()
 
     async def run_stage(self, stage: Coroutine[Any, Any, None]) -> bool:
-        """Run a stage of the Run in a task that a Force Stop cancels.
+        """Run a stage of the Run under a scope that a Force Stop cancels.
+
+        The stage runs in the calling task, so the context variables a component
+        sets while it opens are still set while the Run goes on and when it closes.
+        After a Force Stop, a stage does not start.
 
         Args:
             stage: The stage, such as opening the components.
 
         Returns:
-            Whether a Force Stop cancelled it.
+            Whether a Force Stop cancelled it, or kept it from starting.
 
         Raises:
-            asyncio.CancelledError: The caller was cancelled, or the stage was
-                cancelled otherwise.
+            asyncio.CancelledError: The caller was cancelled.
         """
-        task = asyncio.create_task(stage)
-        self._stage = task
         if self.forced:
-            task.cancel()
+            stage.close()
+            return True
+        scope = asyncio.timeout(None)
+        self._stage = scope
         try:
-            await task
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if self.forced and task.cancelled() and current is not None and not current.cancelling():
+            async with scope:
+                await stage
+        except TimeoutError:
+            if scope.expired():
                 return True
             raise
         finally:
@@ -142,8 +146,9 @@ class Shutdown:
         if self._timer is not None:
             self._timer.cancel()
         logger.warning("Stopping the Run now: cancelling the work in flight")
-        if self._stage is not None:
-            self._stage.cancel()
+        stage = self._stage
+        if stage is not None and not stage.expired():
+            stage.reschedule(asyncio.get_running_loop().time())
         if self._lifecycle is not None:
             self._lifecycle.limit_closing(self._close_timeout)
 

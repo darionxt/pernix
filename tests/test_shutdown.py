@@ -64,11 +64,38 @@ async def test_a_force_stop_cancels_the_stage_in_progress_and_limits_closing() -
     assert shutdown.mode == "force"
 
 
-async def test_a_stage_after_a_force_stop_is_cancelled_at_once() -> None:
+async def test_a_stage_after_a_force_stop_does_not_start() -> None:
     shutdown, _, _ = _shutdown()
+    started: list[str] = []
+
+    async def stage() -> None:
+        started.append("stage")
+
     shutdown.request("force")
 
-    assert await shutdown.run_stage(_forever()) is True
+    assert await shutdown.run_stage(stage()) is True
+    assert started == []
+
+
+async def test_a_stage_runs_in_the_calling_task() -> None:
+    shutdown, _, _ = _shutdown()
+    tasks: list[asyncio.Task[object] | None] = []
+
+    async def stage() -> None:
+        tasks.append(asyncio.current_task())
+
+    assert await shutdown.run_stage(stage()) is False
+    assert tasks == [asyncio.current_task()]
+
+
+async def test_a_timeout_raised_by_the_stage_itself_is_kept() -> None:
+    shutdown, _, _ = _shutdown()
+
+    async def stage() -> None:
+        raise TimeoutError("the database did not answer")
+
+    with pytest.raises(TimeoutError, match="the database did not answer"):
+        await shutdown.run_stage(stage())
 
 
 async def test_a_stage_that_completes_was_not_forced() -> None:

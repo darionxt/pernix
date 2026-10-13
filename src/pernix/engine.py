@@ -130,11 +130,12 @@ class Engine:
             await asyncio.wait([feeding, draining], return_when=asyncio.FIRST_COMPLETED)
             if feeding.done():
                 feeding.result()  # a cancellation from start() or on_idle() is not an ending
+            if self._draining.is_set():  # the feeding may have stopped for the Drain, with work in flight
+                feeding.cancel()  # the workers finish the Requests in flight, then return
+            else:
                 draining.cancel()
                 for worker in workers:  # all of them are waiting for work that will never come
                     worker.cancel()
-            else:
-                feeding.cancel()  # the workers finish the Requests in flight, then return
 
     def drain(self) -> None:
         """Stop claiming Requests and scheduling those of `start()` and `on_idle()`.
@@ -166,6 +167,8 @@ class Engine:
                     try:
                         request = await anext(pending)
                     except StopAsyncIteration:
+                        break
+                    if self._draining.is_set():  # requested while the producer ran
                         break
                     added += await self._schedule(request)
         except Exception:

@@ -734,3 +734,35 @@ async def test_a_cancellation_raised_by_start_is_not_taken_for_its_end() -> None
     with pytest.raises(asyncio.CancelledError):
         async with asyncio.timeout(5):
             await engine.run()
+
+
+async def test_a_drain_from_start_still_finishes_the_requests_in_flight() -> None:
+    handling, release = asyncio.Event(), asyncio.Event()
+    engine: Engine | None = None
+
+    class DrainsItself(Spider):
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(f"{SITE}/a")
+            await handling.wait()
+            assert engine is not None
+            engine.drain()  # as self.crawler.stop() would
+            yield Request(f"{SITE}/b")
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            handling.set()
+            await release.wait()
+            yield {"page": response.url.removeprefix(SITE)}
+
+    frontier, items = MemoryFrontier(), list[Any]()
+    site = FakeSite({"/a": "", "/b": ""})
+    engine = _gated_engine(DrainsItself(), site, frontier, _collect(items))
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await handling.wait()
+        await asyncio.sleep(0.01)  # the feeding has ended for the Drain
+        release.set()
+        await run
+
+    assert items == [{"page": "/a"}]
+    counts = await frontier.counts()
+    assert (counts.done, counts.ready) == (1, 0)
