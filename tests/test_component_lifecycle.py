@@ -259,3 +259,28 @@ async def test_a_timeout_raised_by_the_component_itself_is_kept() -> None:
         await lifecycle.aclose()
 
     assert [str(error) for error in raised.value.exceptions] == ["the server did not answer"]
+
+
+async def test_closing_can_be_limited_while_a_step_runs() -> None:
+    entered = asyncio.Event()
+
+    class Stuck(SlowClose):
+        async def close(self) -> None:
+            entered.set()
+            await super().close()
+
+    recorder = Recorder()
+    lifecycle = ComponentLifecycle()
+    await lifecycle.open(SlowClose(recorder, "later", 60))
+    await lifecycle.open(Stuck(recorder, "stuck", 60))
+
+    closing = asyncio.create_task(lifecycle.aclose())
+    async with asyncio.timeout(5):
+        await entered.wait()
+        lifecycle.limit_closing(0.05)
+        lifecycle.limit_closing(None)  # changes nothing
+        with pytest.raises(ExceptionGroup) as raised:
+            await closing
+
+    assert recorder.calls == ["close stuck", "close later"]
+    assert [str(error) for error in raised.value.exceptions] == ["closing took longer than 0.05 s"] * 2

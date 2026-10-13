@@ -28,8 +28,8 @@ class ComponentLifecycle:
     Every close step runs even when earlier ones fail or are cancelled: close failures
     are raised together as an `ExceptionGroup`, and a cancellation is re-raised once
     every component has been closed. A component whose opening failed is not closed.
-    Setting `close_timeout` limits each close step; one that takes longer is cancelled
-    and fails with `TimeoutError`.
+    Setting `close_timeout`, or calling `limit_closing()`, limits each close step;
+    one that takes longer is cancelled and fails with `TimeoutError`.
 
     Attributes:
         close_timeout: Seconds each close step may take; `None`, the default, sets no
@@ -45,6 +45,7 @@ class ComponentLifecycle:
     def __init__(self) -> None:
         """Create a lifecycle with no open components."""
         self._closers: list[tuple[object, _Closer]] = []
+        self._closing: asyncio.Timeout | None = None
         self.close_timeout: float | None = None
 
     async def open(self, component: object) -> None:
@@ -98,19 +99,37 @@ class ComponentLifecycle:
         if errors:
             raise ExceptionGroup("closing components failed", errors)
 
-    async def _close(self, closer: _Closer, error: BaseException | None) -> None:
-        timeout = self.close_timeout
+    def limit_closing(self, timeout: float | None) -> None:
+        """Limit each close step to `timeout` seconds, the one running included.
+
+        A step running already gets `timeout` seconds from now, unless it has less
+        left. `None` changes nothing.
+
+        Args:
+            timeout: Seconds per close step.
+        """
         if timeout is None:
-            await _resolve(closer(error))
             return
-        scope = asyncio.timeout(timeout)
+        self.close_timeout = timeout
+        scope = self._closing
+        if scope is not None:
+            deadline = asyncio.get_running_loop().time() + timeout
+            current = scope.when()
+            if current is None or current > deadline:
+                scope.reschedule(deadline)
+
+    async def _close(self, closer: _Closer, error: BaseException | None) -> None:
+        scope = asyncio.timeout(self.close_timeout)  # without a limit, one can be set while it runs
+        self._closing = scope
         try:
             async with scope:
                 await _resolve(closer(error))
         except TimeoutError:
             if scope.expired():
-                raise TimeoutError(f"closing took longer than {timeout} s") from None
+                raise TimeoutError(f"closing took longer than {self.close_timeout} s") from None
             raise
+        finally:
+            self._closing = None
 
     async def __aenter__(self) -> Self:
         return self

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
+    from pernix.component_lifecycle import ComponentLifecycle
     from pernix.engine import Engine
 
 __all__ = ["Shutdown", "StopMode"]
@@ -18,12 +21,14 @@ _MODES = ("drain", "force")
 
 
 class Shutdown:
-    """Carries out the stop requests of one Run.
+    """Carries out the stop requests of one Run, from opening its components to closing them.
 
-    A Drain makes the Engine stop claiming Requests and starts the grace period; once
-    it is over, the Drain turns into a Force Stop. A Force Stop cancels the Run's
-    work: the Requests in flight and the Item processing. A request made before the
-    work starts takes effect when it does; one made after it ends does nothing. A
+    Between `begin()` and `end()`, a Drain makes the Engine stop claiming Requests
+    and starts the grace period; once it is over, the Drain turns into a Force Stop.
+    A Force Stop cancels the stage of the Run in progress, opening the components or
+    doing the work, if run with `run_stage()`, and limits each step of closing the
+    components to `close_timeout` seconds, the step in progress included. A request
+    made before `begin()` takes effect then; one made after `end()` does nothing. A
     Drain requested during a Force Stop changes nothing, and a Force Stop requested
     during a Drain escalates it.
 
@@ -31,17 +36,22 @@ class Shutdown:
         mode: The stop requested so far, if any.
     """
 
-    def __init__(self, *, grace: float) -> None:
+    def __init__(self, *, grace: float, close_timeout: float | None) -> None:
         """Configure the stopping.
 
         Args:
             grace: Seconds a Drain may take before it turns into a Force Stop.
+            close_timeout: Seconds each component may take to close after a Force
+                Stop; `None` sets no limit.
         """
         self.mode: StopMode | None = None
         self._grace = grace
+        self._close_timeout = close_timeout
+        self._lifecycle: ComponentLifecycle | None = None
         self._engine: Engine | None = None
-        self._work: asyncio.Task[None] | None = None
+        self._stage: asyncio.Task[None] | None = None
         self._timer: asyncio.TimerHandle | None = None
+        self._active = False
         self._ended = False
 
     @property
@@ -63,37 +73,79 @@ class Shutdown:
         if self._ended or self.mode == mode or self.forced:
             return
         self.mode = mode
-        self._apply()
+        if self._active:
+            self._apply()
 
-    def start(self, engine: Engine, work: asyncio.Task[None]) -> None:
-        """Begin watching the work of the Run, applying any stop requested before.
+    def begin(self, lifecycle: ComponentLifecycle) -> None:
+        """Start carrying out stop requests, applying any made before.
 
         Args:
-            engine: The Engine to drain.
-            work: The task doing the Run's work, to cancel on a Force Stop.
+            lifecycle: Opens and closes the components of the Run.
         """
-        self._engine, self._work = engine, work
-        self._apply()
+        self._lifecycle = lifecycle
+        self._active = True
+        if self.mode is not None:
+            self._apply()
+
+    def attach(self, engine: Engine) -> None:
+        """Drain this Engine on a Drain, including one requested before.
+
+        Args:
+            engine: The Engine of the Run.
+        """
+        self._engine = engine
+        if self.mode == "drain":
+            engine.drain()
+
+    async def run_stage(self, stage: Coroutine[Any, Any, None]) -> bool:
+        """Run a stage of the Run in a task that a Force Stop cancels.
+
+        Args:
+            stage: The stage, such as opening the components.
+
+        Returns:
+            Whether a Force Stop cancelled it.
+
+        Raises:
+            asyncio.CancelledError: The caller was cancelled, or the stage was
+                cancelled otherwise.
+        """
+        task = asyncio.create_task(stage)
+        self._stage = task
+        if self.forced:
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if self.forced and task.cancelled() and current is not None and not current.cancelling():
+                return True
+            raise
+        finally:
+            self._stage = None
+        return False
 
     def end(self) -> None:
-        """Stop watching the Run; later requests do nothing."""
+        """Stop carrying out stop requests; later requests do nothing."""
+        self._active = False
         self._ended = True
         if self._timer is not None:
             self._timer.cancel()
 
     def _apply(self) -> None:
-        engine, work = self._engine, self._work
-        if engine is None or work is None or self.mode is None:
-            return
         if self.mode == "drain":
             logger.info("Draining the Run: finishing the work in flight within %s s", self._grace)
-            engine.drain()
+            if self._engine is not None:
+                self._engine.drain()
             self._timer = asyncio.get_running_loop().call_later(self._grace, self._grace_over)
             return
         if self._timer is not None:
             self._timer.cancel()
         logger.warning("Stopping the Run now: cancelling the work in flight")
-        work.cancel()
+        if self._stage is not None:
+            self._stage.cancel()
+        if self._lifecycle is not None:
+            self._lifecycle.limit_closing(self._close_timeout)
 
     def _grace_over(self) -> None:
         logger.warning("The Drain took longer than shutdown.grace (%s s)", self._grace)

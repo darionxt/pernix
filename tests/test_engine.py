@@ -675,13 +675,62 @@ async def test_a_drain_stops_scheduling_the_requests_of_start_and_wakes_idle_wor
     assert site.fetched == ["/a"]
 
 
-async def test_an_engine_drained_before_it_runs_fetches_nothing() -> None:
+async def test_an_engine_drained_before_it_runs_schedules_and_fetches_nothing() -> None:
+    started: list[str] = []
+
+    class Seeds(Links):
+        async def start(self) -> AsyncIterator[Request]:
+            started.append("start")
+            for path in ("/a", "/b", "/c"):
+                yield Request(f"{SITE}{path}")
+
     site = FakeSite({"/a": "<p>a</p>"})
     frontier = MemoryFrontier()
-    engine = _gated_engine(Links(), site, frontier, _discard, concurrency=2)
+    engine = _gated_engine(Seeds(), site, frontier, _discard, concurrency=2)
 
     engine.drain()
     async with asyncio.timeout(5):
         await engine.run()
 
-    assert site.fetched == []
+    assert (site.fetched, started) == ([], [])
+    assert (await frontier.counts()).unfinished == 0
+
+
+async def test_a_drain_when_the_run_goes_idle_skips_on_idle() -> None:
+    idled: list[str] = []
+
+    class Idle(Links):
+        async def on_idle(self) -> AsyncIterator[Request]:
+            idled.append("on_idle")
+            yield Request(f"{SITE}/more")
+
+    spider = Idle()
+    bus = events.EventBus(timeout=5)
+    engine = Engine(
+        spider,
+        frontier=MemoryFrontier(),
+        download=FakeSite({"/a": "<p>a</p>"}),
+        handle=run_callbacks(spider),
+        put_item=_discard,
+        events=bus,
+        concurrency=1,
+    )
+    bus.on(events.SpiderIdle, lambda _event: engine.drain())
+
+    async with asyncio.timeout(5):
+        await engine.run()
+
+    assert idled == []
+
+
+async def test_a_cancellation_raised_by_start_is_not_taken_for_its_end() -> None:
+    class Cancelled(Links):
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(f"{SITE}/a")
+            raise asyncio.CancelledError  # as awaiting a cancelled seed source would
+
+    engine = _gated_engine(Cancelled(), FakeSite({"/a": "<p>a</p>"}), MemoryFrontier(), _discard)
+
+    with pytest.raises(asyncio.CancelledError):
+        async with asyncio.timeout(5):
+            await engine.run()

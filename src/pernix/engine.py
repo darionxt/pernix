@@ -129,6 +129,7 @@ class Engine:
             draining = tasks.create_task(self._draining.wait())
             await asyncio.wait([feeding, draining], return_when=asyncio.FIRST_COMPLETED)
             if feeding.done():
+                feeding.result()  # a cancellation from start() or on_idle() is not an ending
                 draining.cancel()
                 for worker in workers:  # all of them are waiting for work that will never come
                     worker.cancel()
@@ -144,20 +145,28 @@ class Engine:
         self._draining.set()
 
     async def _feed(self) -> None:
-        """Schedule the Requests of `start()`, then those of `on_idle()` whenever the Run is idle, until it adds none."""
+        """Schedule the Requests of `start()`, then those of `on_idle()` whenever the Run is idle, until it adds none.
+
+        Scheduling into the Frontier need not suspend, so the Drain is checked before
+        each step rather than left to cancelling this task.
+        """
         await self._schedule_all(self._spider.start(), "start()")
-        while True:
+        while not self._draining.is_set():
             await self._until_idle()
             await self._events.emit(SpiderIdle(self._spider))
-            if not await self._schedule_all(self._spider.on_idle(), "on_idle()"):
+            if self._draining.is_set() or not await self._schedule_all(self._spider.on_idle(), "on_idle()"):
                 return
 
     async def _schedule_all(self, requests: AsyncIterator[Request], source: str) -> int:
-        """Schedule the Requests a Spider method yields; return how many were added."""
+        """Schedule the Requests a Spider method yields, until a Drain; return how many were added."""
         added = 0
         try:
             async with aclosing(iterate_and_close(requests)) as pending:
-                async for request in pending:
+                while not self._draining.is_set():
+                    try:
+                        request = await anext(pending)
+                    except StopAsyncIteration:
+                        break
                     added += await self._schedule(request)
         except Exception:
             logger.exception("%s of spider %r failed", source, self._spider.name)

@@ -109,7 +109,9 @@ class Crawler:
         self._output = output
         self._addons = tuple(addons)
         self._started = False
-        self._shutdown = Shutdown(grace=settings.section(ShutdownSettings).grace)
+        shutdown = settings.section(ShutdownSettings)
+        self._close_timeout = shutdown.close_timeout or None
+        self._shutdown = Shutdown(grace=shutdown.grace, close_timeout=self._close_timeout)
         self._outlet: Callable[[Any], Awaitable[None]] | None = None
 
     @classmethod
@@ -185,7 +187,9 @@ class Crawler:
         Frontier without counting an attempt, discards the Items not processed yet,
         counting them as `items.discarded`, and closes the components, each within
         `shutdown.close_timeout` seconds. The Feeds are closed either way, keeping
-        the Items written.
+        the Items written. A Force Stop while the components open cancels the
+        opening and ends the Run before it starts, closing the components already
+        open; one while they close limits the close in progress too.
 
         It may be called from a Callback, a component, or another task, and before
         the Run starts. A Force Stop requested during a Drain escalates it; anything
@@ -293,28 +297,41 @@ class Crawler:
             *pipelines,
             *failed_pipelines,
         )
-        async with ComponentLifecycle() as lifecycle:
-            for component in components:
-                self.events.subscribe_methods(component)
-                await lifecycle.open(component)
-            for feed in feeds:
-                await lifecycle.open(feed)
-            try:
-                engine = Engine(
-                    self.spider,
-                    frontier=frontier,
-                    download=download,
-                    handle=handle,
-                    put_item=items.put,
-                    events=self.events,
-                    concurrency=self.settings.section(CoreSettings).concurrency,
-                    lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
-                    retry_policy=retry_policy,
-                    throttle=throttle,
-                )
-                return await self._run(engine, items, reporter, lifecycle)
-            finally:
-                await frontier.close()
+        engine = Engine(
+            self.spider,
+            frontier=frontier,
+            download=download,
+            handle=handle,
+            put_item=items.put,
+            events=self.events,
+            concurrency=self.settings.section(CoreSettings).concurrency,
+            lease_ttl=self.settings.section(FrontierSettings).lease_ttl,
+            retry_policy=retry_policy,
+            throttle=throttle,
+        )
+        self._shutdown.attach(engine)
+        try:
+            async with ComponentLifecycle() as lifecycle:
+                self._shutdown.begin(lifecycle)
+                try:
+                    if await self._shutdown.run_stage(self._open(lifecycle, components, feeds)):
+                        return RunResult(self.run_id, "forced", self.stats.snapshot())
+                    return await self._run(engine, items, reporter)
+                except asyncio.CancelledError:
+                    lifecycle.limit_closing(self._close_timeout)
+                    raise
+                finally:
+                    await frontier.close()
+        finally:
+            self._shutdown.end()
+
+    async def _open(self, lifecycle: ComponentLifecycle, components: Sequence[object], feeds: Sequence[Feed]) -> None:
+        """Subscribe and open the components, then open the Feeds."""
+        for component in components:
+            self.events.subscribe_methods(component)
+            await lifecycle.open(component)
+        for feed in feeds:
+            await lifecycle.open(feed)
 
     def _build_all(self, key: str) -> list[object]:
         """Build the enabled components of a `{component: order}` setting, in order."""
@@ -409,9 +426,7 @@ class Crawler:
             raise ComponentError(f"retry.policy must have decide(request, outcome, attempt), got {policy!r}")
         return cast("RetryPolicy", policy)
 
-    async def _run(
-        self, engine: Engine, items: ItemProcessor, reporter: StatsReporter, lifecycle: ComponentLifecycle
-    ) -> RunResult:
+    async def _run(self, engine: Engine, items: ItemProcessor, reporter: StatsReporter) -> RunResult:
         reason = "failed"
         reporter.start()
         try:
@@ -422,8 +437,6 @@ class Crawler:
                 reason = "cancelled"
                 raise
             finally:
-                if reason in ("forced", "cancelled"):
-                    lifecycle.close_timeout = self.settings.section(ShutdownSettings).close_timeout or None
                 await self.events.emit(SpiderClosed(self.spider, reason))
         finally:
             snapshot = await reporter.finish(reason)
@@ -431,16 +444,9 @@ class Crawler:
 
     async def _work(self, engine: Engine, items: ItemProcessor) -> str:
         """Fetch and process the Items until done, or until stopped; return how the work ended."""
-        work = asyncio.create_task(self._fetch_and_process(engine, items))
-        self._shutdown.start(engine, work)
         try:
-            await work
-        except asyncio.CancelledError:
-            task = asyncio.current_task()
-            if not (self._shutdown.forced and work.cancelled() and task is not None and not task.cancelling()):
-                raise
+            await self._shutdown.run_stage(self._fetch_and_process(engine, items))
         finally:
-            self._shutdown.end()
             items.discard()
         return _REASONS[self._shutdown.mode]
 

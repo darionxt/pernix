@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
     from loopback import LoopbackServer
     from pernix.items import ItemContext
+    from pernix.shutdown import StopMode
 
 
 def _lines(path: Path) -> list[Any]:
@@ -238,3 +239,106 @@ def test_stop_modes_are_checked(pages: LoopbackServer) -> None:
 
     with pytest.raises(ValueError, match="the stop mode must be 'drain' or 'force'"):
         crawler.stop("pause")  # pyright: ignore[reportArgumentType]
+
+
+class Recorded:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name, self.calls = name, calls
+
+    async def open(self) -> None:
+        self.calls.append(f"open {self.name}")
+
+    async def close(self) -> None:
+        self.calls.append(f"close {self.name}")
+
+
+class StuckOpening(Recorded):
+    def __init__(self, name: str, calls: list[str], entered: asyncio.Event) -> None:
+        super().__init__(name, calls)
+        self.entered = entered
+
+    async def open(self) -> None:
+        await super().open()
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+class StuckClosing(Recorded):
+    def __init__(self, name: str, calls: list[str], entered: asyncio.Event) -> None:
+        super().__init__(name, calls)
+        self.entered = entered
+
+    async def close(self) -> None:
+        await super().close()
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+def _opened_and_closed(crawler: Crawler) -> list[str]:
+    seen: list[str] = []
+    crawler.events.on(events.SpiderOpened, lambda _event: seen.append("opened"))
+    crawler.events.on(events.SpiderClosed, lambda event: seen.append(event.reason))
+    return seen
+
+
+@pytest.mark.parametrize(("mode", "settings"), [("force", {}), ("drain", {"shutdown.grace": 0.05})])
+async def test_a_stop_interrupts_components_that_are_opening(
+    pages: LoopbackServer, mode: StopMode, settings: dict[str, Any]
+) -> None:
+    calls: list[str] = []
+    entered = asyncio.Event()
+    extensions = {Recorded("first", calls): 100, StuckOpening("stuck", calls, entered): 200}
+    crawler = _crawler(_spider(pages, asyncio.Event(), asyncio.Event()), {"extensions": extensions, **settings})
+    seen = _opened_and_closed(crawler)
+
+    run = asyncio.create_task(crawler.crawl())
+    async with asyncio.timeout(10):
+        await entered.wait()
+        crawler.stop(mode)
+        result = await run
+
+    assert result.reason == "forced"
+    assert calls == ["open first", "open stuck", "close first"]  # what failed to open is not closed
+    assert seen == []  # the Run never started
+    assert pages.received == []
+
+
+async def test_a_force_stop_while_closing_limits_the_close_in_progress(pages: LoopbackServer) -> None:
+    calls: list[str] = []
+    entered, gate = asyncio.Event(), asyncio.Event()
+    gate.set()
+    crawler = _crawler(
+        _spider(pages, asyncio.Event(), gate),
+        {"extensions": {StuckClosing("stuck", calls, entered): 100}, "shutdown.close_timeout": 0.05},
+    )
+
+    run = asyncio.create_task(crawler.crawl())
+    async with asyncio.timeout(10):
+        await entered.wait()
+        crawler.stop("force")
+        with pytest.raises(ExceptionGroup) as raised:
+            await run
+
+    assert [str(error) for error in raised.value.exceptions] == ["closing took longer than 0.05 s"]
+    assert crawler.stats.get("run.reason") == "finished"  # the work had ended on its own
+
+
+async def test_a_drain_whose_closing_outlasts_the_grace_period_limits_it(pages: LoopbackServer) -> None:
+    calls: list[str] = []
+    entered = asyncio.Event()
+    crawler = _crawler(
+        _spider(pages, asyncio.Event(), asyncio.Event()),
+        {
+            "extensions": {StuckClosing("stuck", calls, entered): 100},
+            "shutdown.grace": 0.1,
+            "shutdown.close_timeout": 0.05,
+        },
+    )
+
+    crawler.stop()
+    with pytest.raises(ExceptionGroup) as raised:
+        async with asyncio.timeout(10):
+            await crawler.crawl()
+
+    assert [str(error) for error in raised.value.exceptions] == ["closing took longer than 0.05 s"]
+    assert crawler.stats.get("run.reason") == "drained"
