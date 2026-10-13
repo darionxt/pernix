@@ -13,7 +13,7 @@ from pernix.items.pipeline_stage import PipelineStage
 
 if TYPE_CHECKING:
     import random
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from pernix.events import EventBus
     from pernix.feeds import Feed
@@ -85,6 +85,9 @@ class ItemProcessor:
 
     A `FeedError`, from a Feed or from any Pipeline, is emitted as `ItemError` and
     fails the task that raised it, so the Run fails rather than lose Items silently.
+
+    When the processing is cancelled before `join()` is done, as by a Force Stop, the
+    Items still queued or in process are lost; `discard()` counts them.
     """
 
     def __init__(
@@ -95,6 +98,7 @@ class ItemProcessor:
         stats: Stats,
         *,
         failed_pipelines: Sequence[object] = (),
+        outlet: Callable[[Any], Awaitable[None]] | None = None,
         queue_size: int = 1000,
         concurrency: int = 1,
         timeout: float = 0.0,
@@ -107,9 +111,12 @@ class ItemProcessor:
             pipelines: The Pipelines, in order.
             feeds: The Feeds every Item that passes the Pipelines may go to.
             events: Where Item Events are emitted.
-            stats: Counts Pipeline retries as `items.retried`, and failed Items the
-                failure Pipelines lost as `items.failures_lost`.
+            stats: Counts Pipeline retries as `items.retried`, failed Items the
+                failure Pipelines lost as `items.failures_lost`, and discarded Items
+                as `items.discarded`.
             failed_pipelines: The failure Pipelines, in order.
+            outlet: Receives every Item that passes the Pipelines, after the Feeds;
+                waiting in it holds the Items behind.
             queue_size: Items waiting at most before `put()` waits.
             concurrency: Items processed at once.
             timeout: Seconds a Pipeline call may take unless the Pipeline sets its
@@ -138,11 +145,13 @@ class ItemProcessor:
         self._failure_stages = [stage(pipeline, batches=False) for pipeline in failed_pipelines]
         self._batches = {index: _Batch() for index, stage in enumerate(self._stages) if stage.batch_size}
         self._feeds = tuple(feeds)
+        self._outlet = outlet
         self._events = events
         self._stats = stats
         self._queue: asyncio.Queue[_Entry] = asyncio.Queue(queue_size)
         self._concurrency = concurrency
         self._tasks: asyncio.TaskGroup | None = None
+        self._unsettled = 0
 
     async def put(self, item: Any, ctx: ItemContext) -> None:
         """Queue an Item, waiting while the queue is full.
@@ -152,6 +161,7 @@ class ItemProcessor:
             ctx: Where it came from.
         """
         await self._queue.put(_Entry(item, ctx))
+        self._unsettled += 1
 
     def start(self, tasks: asyncio.TaskGroup) -> None:
         """Start the workers, and later the batch timers, in a task group.
@@ -174,6 +184,21 @@ class ItemProcessor:
             if batch.timer is not None:
                 batch.timer.cancel()
         self._queue.shutdown()
+
+    def discard(self) -> int:
+        """Count the Items that were queued or in process when the processing was cancelled.
+
+        They are counted as `items.discarded` and logged as a warning; counting again
+        finds none.
+
+        Returns:
+            How many Items were discarded.
+        """
+        count, self._unsettled = self._unsettled, 0
+        if count:
+            self._stats.inc("items.discarded", count)
+            logger.warning("Discarded %d Items the Run stopped before they were processed", count)
+        return count
 
     async def _work(self) -> None:
         while True:
@@ -273,13 +298,18 @@ class ItemProcessor:
                 logger.error("%s; the Run stops", exc)
                 await self._events.emit(ItemError(entry.item, entry.ctx.response, exc))
                 raise
+        if self._outlet is not None:
+            await self._outlet(entry.item)
+        self._unsettled -= 1
         await self._events.emit(ItemScraped(entry.item, entry.ctx.response))
 
     async def _drop(self, entry: _Entry, reason: str) -> None:
+        self._unsettled -= 1
         logger.debug("Dropped an Item from %r: %s", entry.ctx.request, reason)
         await self._events.emit(ItemDropped(entry.item, entry.ctx.response, reason))
 
     async def _fail(self, entry: _Entry, stage: PipelineStage, error: Exception) -> None:
+        self._unsettled -= 1
         logger.error("Pipeline %s failed on an Item from %r", stage.name, entry.ctx.request, exc_info=error)
         await self._events.emit(ItemError(entry.item, entry.ctx.response, error))
         await self._record_failure(FailedItem(entry.item, stage.name, error), entry.ctx)

@@ -215,3 +215,47 @@ async def test_cancellation_during_cleanup_still_closes_every_component() -> Non
     with pytest.raises(asyncio.CancelledError):
         await task
     assert recorder.calls == ["open a", "slow close started", "close a"]
+
+
+class SlowClose:
+    def __init__(self, recorder: Recorder, name: str, seconds: float) -> None:
+        self.recorder, self.name, self.seconds = recorder, name, seconds
+
+    async def close(self) -> None:
+        self.recorder.calls.append(f"close {self.name}")
+        await asyncio.sleep(self.seconds)
+        self.recorder.calls.append(f"closed {self.name}")
+
+
+async def test_a_close_timeout_limits_each_close_step() -> None:
+    recorder = Recorder()
+    lifecycle = ComponentLifecycle()
+    await lifecycle.open(AsyncComponent("first", recorder))
+    await lifecycle.open(SlowClose(recorder, "stuck", 60))
+    await lifecycle.open(SlowClose(recorder, "quick", 0))
+    lifecycle.close_timeout = 0.05
+
+    with pytest.raises(ExceptionGroup) as raised:
+        async with asyncio.timeout(5):
+            await lifecycle.aclose()
+
+    assert recorder.calls == ["open first", "close quick", "closed quick", "close stuck", "close first"]
+    [error] = raised.value.exceptions
+    assert isinstance(error, TimeoutError)
+    assert str(error) == "closing took longer than 0.05 s"
+    assert any("SlowClose" in note for note in error.__notes__)
+
+
+async def test_a_timeout_raised_by_the_component_itself_is_kept() -> None:
+    class Failing:
+        async def close(self) -> None:
+            raise TimeoutError("the server did not answer")
+
+    lifecycle = ComponentLifecycle()
+    await lifecycle.open(Failing())
+    lifecycle.close_timeout = 5
+
+    with pytest.raises(ExceptionGroup) as raised:
+        await lifecycle.aclose()
+
+    assert [str(error) for error in raised.value.exceptions] == ["the server did not answer"]

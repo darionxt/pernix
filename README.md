@@ -35,11 +35,44 @@ if __name__ == "__main__":
     Titles.run(output="titles.jsonl")
 ```
 
-Each Callback is an async generator that yields Requests to follow and Items to store: dicts, dataclasses, msgspec Structs, pydantic models, or attrs objects. `output=` writes them to a `.jsonl`, `.csv`, or `.json` file. A Request constructed in a Callback resolves a relative URL against the Response being handled, after redirects and honoring `<base href>`. `run()` blocks until every Request has been fetched; `await Titles.crawl(...)` does the same inside an existing event loop.
+Each Callback is an async generator that yields Requests to follow and Items to store: dicts, dataclasses, msgspec Structs, pydantic models, or attrs objects. `output=` writes them to a `.jsonl`, `.csv`, or `.json` file. A Request constructed in a Callback resolves a relative URL against the Response being handled, after redirects and honoring `<base href>`. `run()` blocks until every Request has been fetched.
+
+## Running and stopping
+
+```python
+class Search(Spider):
+    def __init__(self, keyword: str, max_pages: int = 10):  # Spider arguments
+        self.keyword = keyword
+        self.max_pages = max_pages
+
+    async def start(self):
+        yield Request(f"https://example.com/search?q={self.keyword}")
+
+
+result = Search.run(keyword="dune", max_pages="3", output="results.jsonl")  # as a program
+result = await Search.crawl(keyword="dune")  # inside an existing event loop
+
+async with Search.stream(keyword="dune") as items:  # the Items that pass every Pipeline
+    async for item in items:
+        ...
+```
+
+Keyword arguments other than `settings=` and `output=` are Spider arguments, declared by the parameters of `__init__`. Strings, as from a command line, are converted to the annotated types: `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; `__init__` may raise `ValueError` to reject a value. `run()` and `crawl()` return a `RunResult` with the `run_id`, the `reason` the Run ended, and the final stats. `stream()` holds one Item at a time, so a slow consumer pauses the Callbacks; leaving the loop early stops the Run.
+
+`crawler.stop()` drains a Run: no new Request is claimed, and the Requests in flight and the queued Items are finished within `shutdown.grace`. `crawler.stop("force")` cancels the Requests in flight and returns them to the Frontier, and discards the Items not processed yet; the Feeds are still completed. `run()` drains on the first SIGINT or SIGTERM and force-stops on the second, and ends the process with an exit code when the Run does not complete:
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The Run finished, or code stopped it |
+| `1` | An error ended the Run; it is logged with its traceback |
+| `2` | Invalid settings, Spider arguments, or components; nothing was fetched |
+| `130` | A signal stopped the Run |
+
+`crawl()` and `stream()` raise errors instead, and leave signals to your application. See [`docs/design.md`](docs/design.md) §4.12 and §6.6.
 
 ## Configuration
 
-Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, and the `settings=` argument of `run()` / `crawl()`.
+Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, and the `settings=` argument of `run()`, `crawl()`, and `stream()`.
 
 ```python
 class Titles(Spider):
@@ -99,6 +132,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
 | `items.failed_output` | `None` | The JSON-lines file where `FailedItemsFile` writes failed Items, with the error |
+| `shutdown.grace` | `20.0` | Seconds a Drain may take before it turns into a Force Stop |
+| `shutdown.close_timeout` | `5.0` | Seconds each component may take to close after a Force Stop; `0` for no limit |
 
 ## Items, Pipelines, and Feeds
 
@@ -149,9 +184,15 @@ The stats of a Run, such as `downloads.by_status.200` or `items.scraped`, are in
 ```
 src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
-├── spider.py            Spider base class and run()/crawl() entry points
+├── spider.py            Spider base class and the run()/crawl()/stream() entry points
+├── spider_arguments.py  checks and converts Spider arguments
 ├── crawler.py           assembles the components of one Run, builds components
-├── engine.py            worker loop: claim, fetch, run Callbacks, settle Leases
+├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
+├── request_processor.py one attempt at a Request: fetch, retry decision, Callbacks
+├── shutdown.py          Drain, its grace period, and Force Stop
+├── runner.py            run() as a program: exit codes
+├── stop_signals.py      SIGINT and SIGTERM stop a Run
+├── run_result.py        RunResult, how a Run ended
 ├── callbacks.py         runs Callbacks and errbacks, collects their outputs
 ├── retry_policy.py      retry decisions, backoff, Retry-After
 ├── throttle.py          per-domain slots: concurrency, delay, rate, cooldowns
@@ -172,7 +213,8 @@ src/pernix/
 │   ├── pipeline.py      Pipeline base class, ItemContext
 │   ├── pipeline_stage.py one Pipeline's filter, options, timeouts, and retries
 │   ├── failed_items_file.py FailedItemsFile: writes failed Items to a file
-│   └── item_processor.py the Item queue, Pipelines, batches, and Feed delivery
+│   ├── item_processor.py the Item queue, Pipelines, batches, and Feed delivery
+│   └── item_stream.py   ItemStream, the Items of a streamed Run
 ├── feeds/
 │   ├── feed.py          Feed: one output file, finished atomically; path templates
 │   └── feed_formats.py  jsonl, csv, and json layouts
@@ -211,6 +253,7 @@ src/pernix/
 │   ├── settings.py      Settings, the immutable result
 │   ├── section.py       Section base class, ComponentMap, NamedComponents
 │   ├── core_settings.py the Sections every Crawler registers
+│   ├── conversion.py    validates values, converting strings from the environment
 │   └── secret.py        Secret, a redacted value
 └── testing/
     └── frontier.py      conformance suite for Frontier backends

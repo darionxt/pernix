@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import sys
 import typing
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,15 @@ def resolve_component(spec: object) -> object:
     return load_object(spec) if isinstance(spec, str) else spec
 
 
+def _annotations(function: object) -> dict[str, Any]:
+    """Read the annotations of a function; from Python 3.14 on, names not defined yet stay forward references."""
+    if sys.version_info >= (3, 14):
+        import annotationlib  # new in 3.14
+
+        return dict(annotationlib.get_annotations(function, format=annotationlib.Format.FORWARDREF))
+    return dict(getattr(function, "__annotations__", {}))
+
+
 def init_type_hints(component: type, *, known_types: Mapping[str, type] | None = None) -> dict[str, Any]:
     """Resolve the annotations of a class's `__init__`, parameter by parameter.
 
@@ -75,7 +85,7 @@ def init_type_hints(component: type, *, known_types: Mapping[str, type] | None =
         Parameter name to resolved annotation.
     """
     function = component.__init__
-    annotations: dict[str, Any] = dict(getattr(function, "__annotations__", {}))
+    annotations = _annotations(function)
     # The module's own names win; known types only fill in names it lacks at runtime.
     namespace: dict[str, Any] = {**(known_types or {}), **getattr(function, "__globals__", {})}
     hints: dict[str, Any] = {}

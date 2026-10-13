@@ -11,6 +11,7 @@ from pernix.settings.core_settings import (
     LogSettings,
     ResponseSettings,
     RetrySettings,
+    ShutdownSettings,
     StatsSettings,
 )
 from pernix.settings.loader import load_settings
@@ -36,6 +37,7 @@ __all__ = [
     "Secret",
     "Section",
     "Settings",
+    "ShutdownSettings",
     "StatsSettings",
     "load_settings",
 ]

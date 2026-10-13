@@ -21,6 +21,7 @@ def test_package_exports_public_api() -> None:
         "Request",
         "Response",
         "Retry",
+        "RunResult",
         "Spider",
         "SpiderMiddleware",
         "__version__",

@@ -103,7 +103,7 @@ class Search(Spider):
     settings = {...}                     # Spider-level settings, see §4.11
 
     def __init__(self, keyword: str, max_pages: int = 10):
-        # Run arguments: both CLI -a keyword=xx and Platform-supplied arguments are converted and validated by type annotation
+        # Spider arguments: both CLI -a keyword=xx and Platform-supplied arguments are converted and validated by type annotation
         self.keyword = keyword
         self.max_pages = max_pages
 
@@ -116,6 +116,7 @@ class Search(Spider):
 ```
 
 - One Crawler corresponds to one Spider object. Settings live on the Crawler object and no module-level global variable is modified, so one process can run multiple Spiders in parallel.
+- **Spider arguments** are the keyword parameters of `__init__`, given by name. A string is converted to the annotated type the way environment variables are (§4.11): `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; any other value must already have that type, and an unannotated parameter takes it as is. `**kwargs` accepts arguments no parameter names. Missing, unknown (with a suggestion), and invalid arguments are reported together as `SpiderArgumentError`, as is a `ValueError` raised by `__init__`, so a Spider can check its arguments further. `settings` and `output` are reserved for the entry points (§4.12), and a required positional-only parameter is rejected when the class is defined.
 - `self.crawler` (set once a Crawler is created for the Spider), `self.stats` (the Run's stats), and `self.logger` (the `pernix.spiders.<name>` logger) are available at runtime.
 
 ### 4.3 Request
@@ -362,7 +363,7 @@ Core Events:
 | --- | --- | --- |
 | `SpiderOpened` | observe | Components are open; nothing has been fetched yet |
 | `SpiderIdle` | observe | Nothing is ready, delayed, or leased, and `start()` is exhausted; `Spider.on_idle()` runs next |
-| `SpiderClosed(reason)` | observe, reverse | The Run ended: `finished`, `failed`, or `cancelled` |
+| `SpiderClosed(reason)` | observe, reverse | The Run ended: `finished` on its own, `drained` after a Drain, `forced` after a Force Stop (§6.6), `failed` by an error, or `cancelled` from outside |
 | `RequestScheduled` | gate (fail-open) | A Request is about to enter the Frontier |
 | `RequestDropped(reason)` | observe | A Request was vetoed, or was a duplicate |
 | `RequestRetried(attempt, delay, reason)` | observe | An attempt did not succeed, and the Request goes back to the Frontier for another |
@@ -390,7 +391,7 @@ Layers, from lowest to highest precedence:
 3. Project file (`pernix.toml`, or `[tool.pernix]` in `pyproject.toml`), found by walking up from the working directory; the nearest `pyproject.toml` ends the search
 4. Environment variables `PERNIX_*`
 5. `Spider.settings`
-6. `run()` arguments or CLI arguments
+6. The `settings=` argument of `run()`, `crawl()`, and `stream()`, or CLI arguments
 
 ```python
 class Books(Spider):
@@ -428,13 +429,19 @@ Rules:
 ### 4.12 Running and the CLI
 
 ```python
-Books.run(output="books.jsonl", settings={"concurrency": 32})  # synchronous entry point, suited to scripts
-await Books.crawl(keyword="x")                        # run inside an existing event loop; keyword arguments are Spider arguments
-async for item in Books.stream(keyword="x"):          # bounded streaming consumption, suited to embedding in other applications
-    ...
+result = Books.run(output="books.jsonl", settings={"concurrency": 32})  # synchronous entry point, the main program of a script
+result = await Books.crawl(keyword="x")               # run inside an existing event loop; keyword arguments are Spider arguments
+async with Books.stream(keyword="x") as items:        # bounded streaming consumption, suited to embedding in other applications
+    async for item in items:
+        ...
 ```
 
-Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (see §4.2); settings for the Run are passed in `settings=`.
+Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (see §4.2); settings for the Run are passed in `settings=`, and an extra Feed in `output=`. The `run_id` is the `run_id` setting, so it can come from `settings=`, from `PERNIX_RUN_ID`, or from the CLI; otherwise one is generated.
+
+- `run()` and `crawl()` return a `RunResult(run_id, reason, stats)`, where `reason` is `finished`, `drained`, or `forced`, and `stats` is the final snapshot.
+- `run()` behaves as a program: it creates its own event loop, installs the stop signals (§6.6) in the main thread, and ends the process when the Run does not complete. A configuration error (invalid settings, Spider arguments, or components, all found before anything is opened) is written to stderr, or logged by the Run, without a traceback, and exits with 2; a failed Run is logged with its traceback and exits with 1; a Run stopped by a signal exits with 130, whether it drained or was forced. A Run that finished, or that code stopped, returns.
+- `crawl()` and `stream()` are library calls: errors are raised, signals are left to the application, and cancelling the task stops the Run like a Force Stop (`cancelled`). For finer control, `Crawler.from_spider(Books, args=..., settings=...)` gives the Crawler, with `crawl()`, `stream()`, and `stop()`.
+- `stream()` yields the Items that pass every Pipeline, the same ones the Feeds receive, holding one at a time. A slow consumer therefore pauses the Item processing, then the Callbacks once the Item queue is full, and so the fetching. The Run starts with the first iteration; if it fails, the error is raised after the Items already received. Leaving early (`break`, an exception, leaving `async with`) force-stops the Run: `async with` or `aclose()` waits for it to stop, while an abandoned stream stops once it is garbage-collected.
 
 | Command | Purpose |
 | --- | --- |
@@ -680,10 +687,13 @@ Rules:
 | --- | --- |
 | `drain` | Stop claiming new Requests and finish the in-flight ones within a grace period |
 | `force` | Cancel in-flight Requests, return them to the Frontier (not counted as failures), and close components |
-| `pause` / `resume` | Stop or resume claiming; the process stays alive |
+| `pause` / `resume` | Stop or resume claiming; the process stays alive (planned, with the Platform's control sources) |
 
-- The first SIGINT/SIGTERM triggers a Drain, and the second triggers a Force Stop.
-- Each stage of shutdown is fault-tolerant on its own, and multiple exceptions are aggregated into an ExceptionGroup and reported together.
+- `crawler.stop(mode="drain")` requests a stop; it returns at once, and can be called from a Callback, a component, or another task, even before the Run starts. A Force Stop requested during a Drain escalates it; any other repeated request, and any request after the Run, does nothing.
+- **Drain**: the workers stop claiming, and the iteration of `start()` stops; `on_idle()` is not called. The Requests in flight are finished, and the Requests their Callbacks yield still enter the Frontier, where a later Run can resume them. The queued Items are processed. All of it must end within `shutdown.grace` (20 s); then the Drain turns into a Force Stop. The Run ends as `drained`.
+- **Force Stop**: the Requests in flight are cancelled and returned with `nack(count_attempt=False)`. The Item processing is cancelled too: the Items queued or in process are discarded, counted as `items.discarded`, and logged as a warning. The components are then closed as usual, but each within `shutdown.close_timeout` (5 s), so a stuck close cannot hold the process; a sync `close()` cannot be cancelled. The Feeds are completed, keeping the Items written. The Run ends as `forced`. A cancelled Run is closed the same way.
+- Signals, in `run()` and the CLI: the first SIGINT/SIGTERM triggers a Drain, and the second triggers a Force Stop. Any further one gets Python's default handling (`KeyboardInterrupt`, or termination), an escape hatch when sync code blocks the event loop. The defaults of 20 s and 5 s together stay below the usual 30 s a container platform waits before killing a process.
+- Each stage of shutdown is fault-tolerant on its own, and multiple exceptions are aggregated into an ExceptionGroup and reported together; a close that times out is one of them.
 
 ## 7. Built-in components
 
@@ -735,7 +745,7 @@ Rules:
 | `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards, and their body bytes |
 | `downloads.errors`, `downloads.errors_by_type.<ErrorType>` | Exceptions fetching raised, other than `IgnoreRequest` and `Retry` |
 | `responses.received` | Responses handed to Callbacks |
-| `items.scraped`, `items.dropped`, `items.errors`, `items.retried`, `items.failures_lost` | Items stored, dropped, or failed; Pipeline calls retried; failed Items a failure Pipeline lost |
+| `items.scraped`, `items.dropped`, `items.errors`, `items.retried`, `items.failures_lost`, `items.discarded` | Items stored, dropped, or failed; Pipeline calls retried; failed Items a failure Pipeline lost; Items a stopped Run never processed |
 | `frontier.ready`, `frontier.delayed`, `frontier.leased`, `frontier.done`, `frontier.dead` | The Frontier at the snapshot |
 | `throttle.waits`, `throttle.wait_seconds`, `throttle.cooldowns`, `throttle.refused` | Waiting for per-domain slots, and cooldowns |
 | `loop.lag_avg`, `loop.lag_max` | Event loop lag in seconds, sampled every second |
@@ -746,12 +756,12 @@ Rules:
 
 **Control**
 
-- Control through OS signals is supported; within a program, `crawler.pause()`, `resume()`, and `stop(mode)` can be called.
+- Control through OS signals is supported (§6.6); within a program, `crawler.stop(mode)` can be called, and `pause()` and `resume()` are planned.
 - Pluggable `ControlSource`: for example, reading pause/drain/stop commands from a Redis key. The framework only reads the control state and responds to it; writing it is done by the Platform.
 
 **Outcome**
 
-- The process exit code distinguishes the following cases: completed normally, error, configuration error, interrupted.
+- The process exit code distinguishes the following cases (§4.12): completed normally (0), error (1), configuration error (2), interrupted by a signal (130).
 - A final outcome file can optionally be written.
 
 ## 9. Testing support (`pernix.testing`)

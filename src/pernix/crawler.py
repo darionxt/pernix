@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import functools
+import logging
 import os
 import uuid
 from typing import TYPE_CHECKING, Any, cast
@@ -12,16 +13,17 @@ from pernix.callbacks import run_callbacks
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
 from pernix.engine import Engine
-from pernix.errors import ComponentError, SettingsError
+from pernix.errors import CONFIGURATION_ERRORS, ComponentError, SettingsError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened, StatsSnapshot
 from pernix.feeds import Feed, render_path
 from pernix.fetchers import FetcherDispatch
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier
-from pernix.items import ItemProcessor
+from pernix.items import ItemProcessor, ItemStream
 from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.retry_policy import DefaultRetryPolicy
+from pernix.run_result import RunResult
 from pernix.settings import (
     CoreSettings,
     DomainSettings,
@@ -35,23 +37,31 @@ from pernix.settings import (
     RetrySettings,
     Section,
     Settings,
+    ShutdownSettings,
     StatsSettings,
     load_settings,
 )
+from pernix.shutdown import Shutdown
+from pernix.spider_arguments import create_spider
 from pernix.stats import CoreStats, Stats, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
     from pathlib import Path
 
     from pernix.frontiers import Frontier
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
+    from pernix.shutdown import StopMode
     from pernix.spider import Spider
     from pernix.stats import Gauge, StatsSink
 
 __all__ = ["Crawler"]
+
+logger = logging.getLogger(__name__)
+
+_REASONS: dict[StopMode | None, str] = {None: "finished", "drain": "drained", "force": "forced"}
 
 
 class Crawler:
@@ -99,24 +109,30 @@ class Crawler:
         self._output = output
         self._addons = tuple(addons)
         self._started = False
+        self._shutdown = Shutdown(grace=settings.section(ShutdownSettings).grace)
+        self._outlet: Callable[[Any], Awaitable[None]] | None = None
 
     @classmethod
     def from_spider(
         cls,
         spider_type: type[Spider],
         *,
+        args: Mapping[str, object] | None = None,
         settings: Mapping[str, Any] | None = None,
         output: str | os.PathLike[str] | None = None,
     ) -> Crawler:
-        """Load the settings, including enabled Addons, and create a Crawler.
+        """Load the settings, including enabled Addons, create the Spider, and create a Crawler.
 
         The `addons` setting is read first, ignoring keys that only the Addons'
         components declare; the settings are then loaded again with each Addon's
-        layer.
+        layer. The Spider is created with its arguments, converted as
+        `pernix.spider_arguments.spider_arguments()` describes.
 
         Args:
             spider_type: The Spider class; a new object is created for the Run.
-            settings: Run arguments, the highest settings layer.
+            args: The Spider arguments, by name; strings are converted to the
+                annotated types.
+            settings: Settings for this Run, the highest settings layer.
             output: A Feed for the Items besides the `feeds` setting, such as
                 `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
 
@@ -126,6 +142,7 @@ class Crawler:
         Raises:
             pernix.errors.SettingsError: The settings are invalid.
             pernix.errors.AddonError: An enabled Addon cannot be loaded.
+            pernix.errors.SpiderArgumentError: The Spider arguments are invalid.
         """
         enabled = load_settings(
             sections=(CoreSettings,), spider_settings=spider_type.settings, overrides=settings, ignore_unknown=True
@@ -136,7 +153,7 @@ class Crawler:
             spider_settings=spider_type.settings,
             overrides=settings,
         )
-        return cls(spider_type(), settings=final, output=output, addons=addons)
+        return cls(create_spider(spider_type, args or {}), settings=final, output=output, addons=addons)
 
     def build_component(self, spec: object) -> object:
         """Construct a component for this Run.
@@ -157,7 +174,49 @@ class Crawler:
         """
         return build_component(spec, crawler=self, provide=self._provide, known_types=self._service_types())
 
-    async def crawl(self) -> None:
+    def stop(self, mode: StopMode = "drain") -> None:
+        """Ask the Run to stop; it returns at once.
+
+        A Drain (`"drain"`) stops claiming new Requests and scheduling those of
+        `start()` and `on_idle()`, and finishes the Requests in flight and the queued
+        Items within `shutdown.grace` seconds; after that, it turns into a Force Stop.
+        The Requests the Callbacks yield meanwhile still enter the Frontier. A Force
+        Stop (`"force"`) cancels the Requests in flight and returns them to the
+        Frontier without counting an attempt, discards the Items not processed yet,
+        counting them as `items.discarded`, and closes the components, each within
+        `shutdown.close_timeout` seconds. The Feeds are closed either way, keeping
+        the Items written.
+
+        It may be called from a Callback, a component, or another task, and before
+        the Run starts. A Force Stop requested during a Drain escalates it; anything
+        else requested again, and anything requested after the Run, does nothing.
+
+        Args:
+            mode: `"drain"` or `"force"`.
+
+        Raises:
+            ValueError: `mode` is neither.
+        """
+        self._shutdown.request(mode)
+
+    def stream(self) -> ItemStream:
+        """Run the Spider while streaming the Items that pass every Pipeline.
+
+        The Run starts with the first iteration; see `pernix.items.ItemStream`.
+
+        Returns:
+            The Items, as an async iterator and an async context manager.
+
+        Raises:
+            RuntimeError: This Crawler already ran or streams already.
+        """
+        if self._started or self._outlet is not None:
+            raise RuntimeError("a Crawler runs only once; create a new one for another Run")
+        channel: asyncio.Queue[Any] = asyncio.Queue(1)
+        self._outlet = channel.put
+        return ItemStream(self.crawl, self.stop, channel)
+
+    async def crawl(self) -> RunResult:
         """Run the Spider to completion.
 
         The `pernix.*` log records of the Run are delivered through a `RunLog`, and
@@ -171,7 +230,13 @@ class Crawler:
         Feeds and the stats are reported; once it is done, the queued Items and the
         pending batches are processed. Then `SpiderClosed` is emitted, the final stats
         snapshot is taken, and the components are closed in reverse order, which
-        finishes the Feed files.
+        finishes the Feed files. `stop()` ends the Run early.
+
+        An error that ends the Run is logged, with its traceback unless it is a
+        configuration error, and raised.
+
+        Returns:
+            How the Run ended.
 
         Raises:
             RuntimeError: This Crawler already ran.
@@ -188,9 +253,16 @@ class Crawler:
         secrets = revealed_secrets(self.settings.values())
         with run_context(self._run_context):
             async with RunLog(self.settings.section(LogSettings), self._run_context, secrets=secrets) as run_log:
-                await self._crawl(run_log)
+                try:
+                    return await self._crawl(run_log)
+                except CONFIGURATION_ERRORS as exc:
+                    logger.error("%s", exc)
+                    raise
+                except Exception as exc:
+                    logger.error("The Run failed", exc_info=exc)
+                    raise
 
-    async def _crawl(self, run_log: RunLog) -> None:
+    async def _crawl(self, run_log: RunLog) -> RunResult:
         for addon in self._addons:
             setup_addon(addon, events=self.events, settings=self.settings)
         sinks = self._build_sinks()
@@ -240,7 +312,7 @@ class Crawler:
                     retry_policy=retry_policy,
                     throttle=throttle,
                 )
-                await self._run(engine, items, reporter)
+                return await self._run(engine, items, reporter, lifecycle)
             finally:
                 await frontier.close()
 
@@ -308,6 +380,7 @@ class Crawler:
             self.events,
             self.stats,
             failed_pipelines=failed_pipelines,
+            outlet=self._outlet,
             queue_size=options.queue_size,
             concurrency=options.concurrency,
             timeout=options.timeout,
@@ -336,24 +409,47 @@ class Crawler:
             raise ComponentError(f"retry.policy must have decide(request, outcome, attempt), got {policy!r}")
         return cast("RetryPolicy", policy)
 
-    async def _run(self, engine: Engine, items: ItemProcessor, reporter: StatsReporter) -> None:
+    async def _run(
+        self, engine: Engine, items: ItemProcessor, reporter: StatsReporter, lifecycle: ComponentLifecycle
+    ) -> RunResult:
         reason = "failed"
         reporter.start()
         try:
             try:
                 await self.events.emit(SpiderOpened(self.spider))
-                async with asyncio.TaskGroup() as tasks:
-                    items.start(tasks)
-                    await engine.run()
-                    await items.join()
-                reason = "finished"
+                reason = await self._work(engine, items)
             except asyncio.CancelledError:
                 reason = "cancelled"
                 raise
             finally:
+                if reason in ("forced", "cancelled"):
+                    lifecycle.close_timeout = self.settings.section(ShutdownSettings).close_timeout or None
                 await self.events.emit(SpiderClosed(self.spider, reason))
         finally:
-            await reporter.finish(reason)
+            snapshot = await reporter.finish(reason)
+        return RunResult(self.run_id, reason, snapshot)
+
+    async def _work(self, engine: Engine, items: ItemProcessor) -> str:
+        """Fetch and process the Items until done, or until stopped; return how the work ended."""
+        work = asyncio.create_task(self._fetch_and_process(engine, items))
+        self._shutdown.start(engine, work)
+        try:
+            await work
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if not (self._shutdown.forced and work.cancelled() and task is not None and not task.cancelling()):
+                raise
+        finally:
+            self._shutdown.end()
+            items.discard()
+        return _REASONS[self._shutdown.mode]
+
+    @staticmethod
+    async def _fetch_and_process(engine: Engine, items: ItemProcessor) -> None:
+        async with asyncio.TaskGroup() as tasks:
+            items.start(tasks)
+            await engine.run()
+            await items.join()
 
     def _service_types(self) -> dict[str, type]:
         sections = {section.__name__: section for section in self.settings.sections()}

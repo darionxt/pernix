@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import asyncio
+import enum
+import sys
+from typing import TYPE_CHECKING, Any
+
+from pernix.crawler import Crawler
+from pernix.errors import CONFIGURATION_ERRORS
+from pernix.stop_signals import StopSignals
+
+if TYPE_CHECKING:
+    import os
+    from collections.abc import Mapping
+
+    from pernix.run_result import RunResult
+    from pernix.spider import Spider
+
+__all__ = ["ExitCode", "run_spider"]
+
+
+class ExitCode(enum.IntEnum):
+    """The exit status of a program that runs a Spider."""
+
+    COMPLETED = 0
+    """The Run finished, or code stopped it."""
+    FAILED = 1
+    """An error ended the Run."""
+    CONFIGURATION_ERROR = 2
+    """The settings, the Spider arguments, or a component are invalid."""
+    INTERRUPTED = 130
+    """A signal stopped the Run."""
+
+
+def run_spider(
+    spider_type: type[Spider],
+    *,
+    args: Mapping[str, object] | None = None,
+    settings: Mapping[str, Any] | None = None,
+    output: str | os.PathLike[str] | None = None,
+) -> RunResult:
+    """Run a Spider to completion in a new event loop, as the main program of a process.
+
+    SIGINT and SIGTERM stop the Run, as `pernix.stop_signals.StopSignals` describes.
+    A Run that does not complete ends the process with its `ExitCode`: a
+    configuration error is written to stderr, or logged by the Run, without a
+    traceback; a failure is logged with one.
+
+    Args:
+        spider_type: The Spider class.
+        args: The Spider arguments, by name.
+        settings: Settings for this Run.
+        output: A Feed for the Items besides the `feeds` setting.
+
+    Returns:
+        How the Run ended, when it finished or code stopped it.
+
+    Raises:
+        SystemExit: The Run failed, was misconfigured, or was stopped by a signal.
+    """
+    try:
+        crawler = Crawler.from_spider(spider_type, args=args, settings=settings, output=output)
+    except CONFIGURATION_ERRORS as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        raise SystemExit(ExitCode.CONFIGURATION_ERROR) from None
+    try:
+        result, interrupted = asyncio.run(_crawl(crawler))
+    except CONFIGURATION_ERRORS:  # the Run logged it
+        raise SystemExit(ExitCode.CONFIGURATION_ERROR) from None
+    except Exception:  # the Run logged it
+        raise SystemExit(ExitCode.FAILED) from None
+    if interrupted:
+        raise SystemExit(ExitCode.INTERRUPTED)
+    return result
+
+
+async def _crawl(crawler: Crawler) -> tuple[RunResult, bool]:
+    with StopSignals(crawler) as signals:
+        result = await crawler.crawl()
+    return result, signals.received > 0

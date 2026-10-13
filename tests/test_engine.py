@@ -601,3 +601,87 @@ async def test_a_lease_claimed_while_a_worker_stops_waiting_goes_back_if_cancell
     assert (counts.ready, counts.leased) == (1, 0)
     [lease] = await MemoryFrontier.claim(frontier, "worker-1", 1, 30.0)
     assert lease.attempt == 1
+
+
+def _gated_engine(spider: Spider, site: FakeSite, frontier: MemoryFrontier, put_item: PutItem, **kwargs: Any) -> Engine:
+    return Engine(
+        spider,
+        frontier=frontier,
+        download=site,
+        handle=run_callbacks(spider),
+        put_item=put_item,
+        events=events.EventBus(timeout=5),
+        **{"concurrency": 1, **kwargs},
+    )
+
+
+async def test_a_drain_finishes_the_requests_in_flight_and_claims_no_more() -> None:
+    handling, release = asyncio.Event(), asyncio.Event()
+
+    class Gated(Spider):
+        async def start(self) -> AsyncIterator[Request]:
+            for path in ("/a", "/b", "/c"):
+                yield Request(f"{SITE}{path}")
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            handling.set()
+            await release.wait()
+            yield {"page": response.url.removeprefix(SITE)}
+            yield Request(f"{SITE}/next")
+
+    spider, frontier, items = Gated(), MemoryFrontier(), list[Any]()
+    site = FakeSite({"/a": "", "/b": "", "/c": ""})
+    engine = _gated_engine(spider, site, frontier, _collect(items))
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await handling.wait()
+        engine.drain()
+        engine.drain()
+        release.set()
+        await run
+
+    assert site.fetched == ["/a"]
+    assert items == [{"page": "/a"}]
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased, counts.done) == (3, 0, 1)  # /b, /c, and /next are kept for later
+
+
+async def test_a_drain_stops_scheduling_the_requests_of_start_and_wakes_idle_workers() -> None:
+    put = asyncio.Event()
+    closed = asyncio.Event()
+
+    class Endless(Links):
+        async def start(self) -> AsyncIterator[Request]:
+            try:
+                yield Request(f"{SITE}/a")
+                await asyncio.Event().wait()  # a source that never ends
+                yield Request(f"{SITE}/never")
+            finally:
+                closed.set()
+
+    async def put_item(_item: Any, _ctx: ItemContext) -> None:
+        put.set()
+
+    site = FakeSite({"/a": "<p>a</p>"})
+    engine = _gated_engine(Endless(), site, MemoryFrontier(), put_item, concurrency=3)
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await put.wait()
+        await asyncio.sleep(0.01)  # the workers are idle now
+        engine.drain()
+        await run
+
+    assert closed.is_set()
+    assert site.fetched == ["/a"]
+
+
+async def test_an_engine_drained_before_it_runs_fetches_nothing() -> None:
+    site = FakeSite({"/a": "<p>a</p>"})
+    frontier = MemoryFrontier()
+    engine = _gated_engine(Links(), site, frontier, _discard, concurrency=2)
+
+    engine.drain()
+    async with asyncio.timeout(5):
+        await engine.run()
+
+    assert site.fetched == []

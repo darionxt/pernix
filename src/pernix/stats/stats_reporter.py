@@ -78,11 +78,14 @@ class StatsReporter:
         if self._interval:
             self._tasks.append(asyncio.create_task(self._periodically()))
 
-    async def finish(self, reason: str) -> None:
+    async def finish(self, reason: str) -> dict[str, int | float | str]:
         """Stop the periodic snapshots and take the final one.
 
         Args:
-            reason: How the Run ended: `"finished"`, `"failed"`, or `"cancelled"`.
+            reason: How the Run ended, as in `SpiderClosed`.
+
+        Returns:
+            The final snapshot.
         """
         for task in self._tasks:
             task.cancel()
@@ -101,6 +104,7 @@ class StatsReporter:
             snapshot.get("requests.failed", 0),
             extra={"stats": snapshot, "final": True},
         )
+        return snapshot
 
     async def _periodically(self) -> None:
         while True:

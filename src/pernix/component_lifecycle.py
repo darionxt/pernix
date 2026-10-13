@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from typing import TYPE_CHECKING, Self
@@ -27,6 +28,12 @@ class ComponentLifecycle:
     Every close step runs even when earlier ones fail or are cancelled: close failures
     are raised together as an `ExceptionGroup`, and a cancellation is re-raised once
     every component has been closed. A component whose opening failed is not closed.
+    Setting `close_timeout` limits each close step; one that takes longer is cancelled
+    and fails with `TimeoutError`.
+
+    Attributes:
+        close_timeout: Seconds each close step may take; `None`, the default, sets no
+            limit. A sync `close()` cannot be cancelled, so it is never limited.
 
     Example:
         >>> async with ComponentLifecycle() as lifecycle:
@@ -38,6 +45,7 @@ class ComponentLifecycle:
     def __init__(self) -> None:
         """Create a lifecycle with no open components."""
         self._closers: list[tuple[object, _Closer]] = []
+        self.close_timeout: float | None = None
 
     async def open(self, component: object) -> None:
         """Open a component and remember how to close it.
@@ -76,7 +84,7 @@ class ComponentLifecycle:
         while self._closers:
             component, closer = self._closers.pop()
             try:
-                await _resolve(closer(error))
+                await self._close(closer, error)
             except Exception as exc:
                 exc.add_note(f"while closing {component!r}")
                 errors.append(exc)
@@ -89,6 +97,20 @@ class ComponentLifecycle:
             raise interruption
         if errors:
             raise ExceptionGroup("closing components failed", errors)
+
+    async def _close(self, closer: _Closer, error: BaseException | None) -> None:
+        timeout = self.close_timeout
+        if timeout is None:
+            await _resolve(closer(error))
+            return
+        scope = asyncio.timeout(timeout)
+        try:
+            async with scope:
+                await _resolve(closer(error))
+        except TimeoutError:
+            if scope.expired():
+                raise TimeoutError(f"closing took longer than {timeout} s") from None
+            raise
 
     async def __aenter__(self) -> Self:
         return self
