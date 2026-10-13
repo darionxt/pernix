@@ -6,10 +6,15 @@ from typing import cast
 
 from pernix.settings import Secret
 
-__all__ = ["HEADER_NAMES", "MASK", "SENSITIVE_NAMES", "Redactor", "revealed_secrets"]
+__all__ = ["ELIDED", "HEADER_NAMES", "MASK", "SENSITIVE_NAMES", "Redactor", "revealed_secrets"]
 
 MASK = "***"
 """Replaces every masked value."""
+
+ELIDED = "..."
+"""Replaces a container that `Redactor.redact_value()` does not descend into."""
+
+_MAX_DEPTH = 100
 
 HEADER_NAMES = frozenset(
     {
@@ -115,8 +120,9 @@ class Redactor:
         """Return `value` with the strings in it masked, including inside containers.
 
         Mappings, lists, tuples, sets, and frozensets are copied with their string
-        keys and items masked; `value` itself is never changed. Other values are
-        returned as they are.
+        keys and items masked; `value` itself is never changed. A container inside
+        itself, or nested deeper than 100 levels, is replaced by `"..."`. Other values
+        are returned as they are.
 
         Args:
             value: A value such as an extra field of a log record.
@@ -124,14 +130,21 @@ class Redactor:
         Returns:
             The masked string, a masked copy of the container, or `value`.
         """
+        return self._redact_value(value, ())
+
+    def _redact_value(self, value: object, enclosing: tuple[int, ...]) -> object:
         if isinstance(value, str):
             return self.redact(value)
+        identity = id(value)
+        if not isinstance(value, Mapping | list | tuple | set | frozenset):
+            return value
+        if identity in enclosing or len(enclosing) >= _MAX_DEPTH:
+            return ELIDED
+        inside = (*enclosing, identity)
         if isinstance(value, Mapping):
             entries = cast("Mapping[object, object]", value)
-            return {self.redact_value(key): self.redact_value(item) for key, item in entries.items()}
-        if not isinstance(value, list | tuple | set | frozenset):
-            return value
-        items = [self.redact_value(item) for item in cast("Iterable[object]", value)]
+            return {self._redact_value(key, inside): self._redact_value(item, inside) for key, item in entries.items()}
+        items = [self._redact_value(item, inside) for item in cast("Iterable[object]", value)]
         if isinstance(value, tuple):
             return tuple(items)
         if isinstance(value, frozenset):

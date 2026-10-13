@@ -122,6 +122,20 @@ async def test_strings_inside_extra_fields_are_redacted_without_changing_them(mo
     assert stats["api.proxy"] == "http://alice:s3cret@proxy:8080"  # e.g. a snapshot Stats Sinks also receive
 
 
+async def test_records_with_cyclic_extra_fields_are_still_written(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stream)
+    cyclic: dict[str, object] = {"token": "abc"}
+    cyclic["self"] = cyclic
+
+    async with RunLog(LogSettings(output="stderr", format="json"), RUN):
+        with run_context(RUN):
+            log.warning("cyclic", extra={"state": cyclic})
+
+    [line] = [orjson.loads(line) for line in stream.getvalue().splitlines()]
+    assert (line["message"], line["state"]) == ("cyclic", {"token": "abc", "self": "..."})
+
+
 def test_a_blocked_output_does_not_keep_the_process_from_exiting() -> None:
     script = textwrap.dedent("""
         import asyncio, io, logging, sys, threading

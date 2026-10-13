@@ -108,3 +108,19 @@ def test_strings_inside_values_are_masked_in_copies() -> None:
     }
     assert stats["proxy.last"] == "http://alice:s3cret@proxy:8080"  # the original is unchanged
     assert redactor.redact_value(42) == 42
+
+
+def test_containers_inside_themselves_or_too_deep_are_elided() -> None:
+    cyclic: dict[str, object] = {"url": "https://api.example/?token=abc"}
+    cyclic["self"] = cyclic
+    looped: list[object] = ["sk"]
+    looped.append(looped)
+    deep: list[object] = ["leaf"]
+    for _ in range(500):
+        deep = [deep]
+
+    assert Redactor().redact_value(cyclic) == {"url": "https://api.example/?token=***", "self": "..."}
+    assert Redactor().redact_value(looped) == ["sk", "..."]
+    masked = {"url": "https://api.example/?token=***", "self": "..."}
+    assert Redactor().redact_value({"a": cyclic, "b": cyclic}) == {"a": masked, "b": masked}  # shared, not cyclic
+    assert "leaf" not in repr(Redactor().redact_value(deep))
