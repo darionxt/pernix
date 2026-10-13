@@ -20,7 +20,9 @@ from pernix.throttle import Throttle
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
+    from pernix.engine import PutItem
     from pernix.frontiers import Lease
+    from pernix.items import ItemContext
     from pernix.middlewares import Download
     from pernix.retry_policy import Decision, RetryPolicy
 
@@ -57,6 +59,19 @@ class FakeSite:
         )
 
 
+def _collect(items: list[Any], contexts: list[ItemContext] | None = None) -> PutItem:
+    async def put(item: Any, ctx: ItemContext) -> None:
+        items.append(item)
+        if contexts is not None:
+            contexts.append(ctx)
+
+    return put
+
+
+async def _discard(_item: Any, _ctx: ItemContext) -> None:
+    pass
+
+
 async def _run(
     spider: Spider,
     site: FakeSite,
@@ -65,6 +80,7 @@ async def _run(
     lease_ttl: float = 60.0,
     retry_policy: RetryPolicy | None = None,
     record: tuple[type[events.Event], ...] = (),
+    contexts: list[ItemContext] | None = None,
 ) -> tuple[MemoryFrontier, list[Mapping[str, Any]], list[events.Event]]:
     """Run to the end, retrying at once by default; return the Frontier, the Items, and the recorded Events."""
     frontier = MemoryFrontier()
@@ -78,7 +94,7 @@ async def _run(
         frontier=frontier,
         download=site,
         handle=run_callbacks(spider),
-        item_sink=items.append,
+        put_item=_collect(items, contexts),
         events=bus,
         concurrency=concurrency,
         lease_ttl=lease_ttl,
@@ -148,7 +164,7 @@ async def test_on_idle_runs_until_it_adds_nothing_new() -> None:
     bus = events.EventBus(timeout=5)
     bus.on(events.SpiderIdle, lambda event: idle.append(event.spider.name))
     engine = Engine(
-        spider, frontier=frontier, download=site, handle=run_callbacks(spider), item_sink=items.append, events=bus,
+        spider, frontier=frontier, download=site, handle=run_callbacks(spider), put_item=_collect(items), events=bus,
         concurrency=2,
     )  # fmt: skip
     async with asyncio.timeout(10):
@@ -195,7 +211,7 @@ def test_invalid_engine_settings_are_rejected(concurrency: int, lease_ttl: float
             frontier=MemoryFrontier(),
             download=FakeSite({}),
             handle=run_callbacks(spider),
-            item_sink=lambda item: None,
+            put_item=_discard,
             events=events.EventBus(),
             concurrency=concurrency,
             lease_ttl=lease_ttl,
@@ -233,7 +249,8 @@ async def test_retried_statuses_are_fetched_again_until_one_succeeds() -> None:
 async def test_exhausted_retries_keep_a_dead_request_and_call_the_errback() -> None:
     site = FakeSite({"/a": 503, "/fallback": "<p>fallback</p>"})
 
-    frontier, items, recorded = await _run(Recovering(), site, record=(events.RequestFailed, events.ItemScraped))
+    contexts: list[ItemContext] = []
+    frontier, items, recorded = await _run(Recovering(), site, record=(events.RequestFailed,), contexts=contexts)
 
     assert site.fetched == ["/a"] * 4 + ["/fallback"]
     assert items == [{"failed": "/a", "error": "RetriesExhausted"}, {"page": "fallback"}]
@@ -241,7 +258,7 @@ async def test_exhausted_retries_keep_a_dead_request_and_call_the_errback() -> N
     assert isinstance(failed.error, RetriesExhausted)
     assert failed.error.response is not None
     assert (failed.error.reason, failed.error.response.status) == ("HTTP 503", 503)
-    assert next(event.response for event in recorded if isinstance(event, events.ItemScraped)) is None
+    assert (contexts[0].request.url, contexts[0].response) == (f"{SITE}/a", None)  # the errback's Item
     counts = await frontier.counts()
     assert (counts.dead, counts.done) == (1, 1)
 
@@ -349,7 +366,7 @@ async def test_a_cancelled_run_returns_requests_in_flight_without_counting_an_at
         frontier=frontier,
         download=FakeSite({"/a": "<p>a</p>"}),
         handle=run_callbacks(spider),
-        item_sink=lambda item: None,
+        put_item=_discard,
         events=bus,
         concurrency=2,
     )
@@ -399,7 +416,7 @@ async def test_a_run_cancelled_while_settling_returns_the_request_without_counti
         frontier=frontier,
         download=FakeSite({"/a": "<p>a</p>"}),
         handle=run_callbacks(spider),
-        item_sink=lambda item: None,
+        put_item=_discard,
         events=events.EventBus(timeout=5),
         concurrency=1,
     )
@@ -461,7 +478,7 @@ def _engine(spider: Spider, download: Download, frontier: MemoryFrontier, thrott
         frontier=frontier,
         download=download,
         handle=run_callbacks(spider),
-        item_sink=lambda item: None,
+        put_item=_discard,
         events=events.EventBus(timeout=5),
         retry_policy=DefaultRetryPolicy(RetrySettings(delay_scale=0)),
         throttle=throttle,

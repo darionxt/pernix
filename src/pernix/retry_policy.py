@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.settings import RetrySettings
 
-__all__ = ["Action", "Decision", "DefaultRetryPolicy", "RetryPolicy", "retry_after_seconds"]
+__all__ = ["Action", "Decision", "DefaultRetryPolicy", "RetryPolicy", "full_jitter", "retry_after_seconds"]
 
 _RETRIED_ERRORS = (Timeout, ConnectError, ProxyError)
 _MAX_DOUBLINGS = 64
@@ -168,8 +168,23 @@ class DefaultRetryPolicy:
             seconds = retry_after_seconds(outcome.headers.get("Retry-After"), now=self._now())
             if seconds is not None:
                 return min(seconds, self._settings.retry_after_max)
-        ceiling = self._settings.backoff_base * 2.0 ** min(attempt - 1, _MAX_DOUBLINGS)
-        return self._rng.uniform(0.0, min(self._settings.backoff_max, ceiling))
+        return full_jitter(attempt, base=self._settings.backoff_base, cap=self._settings.backoff_max, rng=self._rng)
+
+
+def full_jitter(attempt: int, *, base: float, cap: float, rng: random.Random) -> float:
+    """Choose a backoff at random, up to `base` doubled per earlier attempt, and at most `cap`.
+
+    Args:
+        attempt: The attempt that failed, from 1.
+        base: Seconds of the first backoff.
+        cap: The most seconds a backoff can reach.
+        rng: The source of jitter.
+
+    Returns:
+        Seconds to wait before the next attempt.
+    """
+    ceiling = base * 2.0 ** min(attempt - 1, _MAX_DOUBLINGS)
+    return rng.uniform(0.0, min(cap, ceiling))
 
 
 def retry_after_seconds(value: str | None, *, now: dt.datetime) -> float | None:

@@ -39,6 +39,8 @@ _COUNTERS = (
     "items.scraped",
     "items.dropped",
     "items.errors",
+    "items.retried",
+    "items.failures_lost",
 )
 
 _UNSAFE_LABEL = re.compile(r"[^\w-]+")
@@ -65,6 +67,8 @@ class CoreStats:
       other than `IgnoreRequest` and `Retry`.
     - `responses.received`: Responses handed to Callbacks.
     - `items.scraped`, `items.dropped`, `items.errors`: Items stored, dropped, or failed.
+    - `items.retried`, `items.failures_lost`: Pipeline calls retried, and failed Items a
+      failure Pipeline lost; the ItemProcessor counts them.
     """
 
     def __init__(self, stats: Stats) -> None:

@@ -11,10 +11,13 @@ def test_package_exports_public_api() -> None:
     assert set(pernix.__all__) == {
         "DropItem",
         "Extension",
+        "FailedItem",
         "Headers",
         "IgnoreRequest",
+        "ItemContext",
         "Middleware",
         "NodeMiddleware",
+        "Pipeline",
         "Request",
         "Response",
         "Retry",

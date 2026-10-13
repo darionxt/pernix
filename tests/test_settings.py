@@ -42,6 +42,8 @@ def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
         "middlewares",
         "spider_middlewares",
         "fetchers",
+        "pipelines",
+        "failed_pipelines",
         "run_id",
         "test.plugins",
     }

@@ -35,7 +35,7 @@ if __name__ == "__main__":
     Titles.run(output="titles.jsonl")
 ```
 
-Each Callback is an async generator that yields Requests to follow and Items (dicts) to store. A Request constructed in a Callback resolves a relative URL against the Response being handled, after redirects and honoring `<base href>`. `run()` blocks until every Request has been fetched; `await Titles.crawl(...)` does the same inside an existing event loop.
+Each Callback is an async generator that yields Requests to follow and Items to store: dicts, dataclasses, msgspec Structs, pydantic models, or attrs objects. `output=` writes them to a `.jsonl`, `.csv`, or `.json` file. A Request constructed in a Callback resolves a relative URL against the Response being handled, after redirects and honoring `<base href>`. `run()` blocks until every Request has been fetched; `await Titles.crawl(...)` does the same inside an existing event loop.
 
 ## Configuration
 
@@ -68,6 +68,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `middlewares` | `{}` | Download Middleware, as `{middleware: order}`; lower orders are further out |
 | `spider_middlewares` | `{}` | Spider Middleware, as `{middleware: order}`; lower orders are further out |
 | `fetchers` | `{"http": HTTPFetcher}` | Fetchers by name; `Request(fetcher=name)` selects one |
+| `pipelines` | `{}` | Item Pipelines, as `{pipeline: order}`; lower orders run first |
+| `failed_pipelines` | `{FailedItemsFile: 100}` | Pipelines that receive the Items a Pipeline failed on, as `FailedItem`s |
+| `feeds` | `{}` | Files Items are written to, as `{path_template: options}` |
 | `run_id` | `None` | Identifies the Run in logs and stats; `None` generates one |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
@@ -92,6 +95,41 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `log.redact` | `()` | Names whose values are masked in logs, besides the built-in ones |
 | `stats.interval` | `60.0` | Seconds between stats snapshots; `0` keeps only the final one |
 | `stats.sinks` | `{}` | Stats Sinks, as `{sink: order}`, that receive every snapshot |
+| `items.queue_size` | `1000` | Items waiting for the Pipelines at most; a Callback producing more waits |
+| `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
+| `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
+| `items.failed_output` | `None` | The JSON-lines file where `FailedItemsFile` writes failed Items, with the error |
+
+## Items, Pipelines, and Feeds
+
+```python
+from pernix import DropItem, Pipeline
+
+
+class Clean(Pipeline):
+    async def process(self, item, ctx):
+        if not item["title"]:
+            raise DropItem("empty title")  # returning None drops the Item too
+        return item
+
+
+class SaveRows(Pipeline):
+    accepts = (Book,)  # only these Item types; or a function (item) -> bool
+    batch_size = 500  # process_batch() receives up to 500 Items at once
+    retry_times = 3  # retry on OSError and TimeoutError, with backoff
+    timeout = 300  # seconds per call, instead of items.timeout
+
+    async def process_batch(self, items, contexts): ...
+
+
+class Books(Spider):
+    settings = {
+        "pipelines": {Clean: 100, SaveRows: 200},
+        "feeds": {"out/{name}-{time}.csv": {"fields": ["title", "price"]}},
+    }
+```
+
+Pipelines run in order on each Item, apart from the Callbacks: when they fall behind, the Item queue fills and Callbacks wait. A Pipeline error or timeout drops the Item (emitted as `ItemError`) and never fetches the Request again; the Item then goes, as a `FailedItem`, through the `failed_pipelines`, such as the built-in `FailedItemsFile` that writes to `items.failed_output`. Feeds write the Items that pass every Pipeline; each file is written under a temporary name and moved into place when the Run ends, so it appears complete or not at all. See [`docs/design.md`](docs/design.md) §4.8.
 
 ## Logs and stats
 
@@ -129,7 +167,15 @@ src/pernix/
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse
 ├── addons.py            Addon loading, entry point discovery, setup API
-├── feeds.py             Item output files
+├── items/
+│   ├── item_adapter.py  which outputs are Items, and their conversion to dicts
+│   ├── pipeline.py      Pipeline base class, ItemContext
+│   ├── pipeline_stage.py one Pipeline's filter, options, timeouts, and retries
+│   ├── failed_items_file.py FailedItemsFile: writes failed Items to a file
+│   └── item_processor.py the Item queue, Pipelines, batches, and Feed delivery
+├── feeds/
+│   ├── feed.py          Feed: one output file, finished atomically; path templates
+│   └── feed_formats.py  jsonl, csv, and json layouts
 ├── logs/
 │   ├── log_context.py   run and Request context carried in contextvars
 │   ├── queue_handler.py queues the records of a Run without blocking
@@ -171,7 +217,7 @@ src/pernix/
 tests/                   one test module per source module, plus end-to-end crawls
 ```
 
-Pluggable component families with several implementations, such as Extensions, Fetchers, Frontiers, and Middleware, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
+Pluggable component families with several implementations, such as Extensions, Feeds, Fetchers, Frontiers, Middleware, and Pipelines, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
 
 ## Development
 

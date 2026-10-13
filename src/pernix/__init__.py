@@ -5,6 +5,7 @@ from importlib.metadata import version as _version
 from pernix.errors import DropItem, IgnoreRequest, Retry
 from pernix.extensions import Extension
 from pernix.headers import Headers
+from pernix.items import FailedItem, ItemContext, Pipeline
 from pernix.middlewares import Middleware, NodeMiddleware, SpiderMiddleware, middleware, spider_middleware
 from pernix.request import Request
 from pernix.response import Response
@@ -15,10 +16,13 @@ __version__ = _version("pernix")
 __all__ = [
     "DropItem",
     "Extension",
+    "FailedItem",
     "Headers",
     "IgnoreRequest",
+    "ItemContext",
     "Middleware",
     "NodeMiddleware",
+    "Pipeline",
     "Request",
     "Response",
     "Retry",

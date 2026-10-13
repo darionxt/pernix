@@ -221,29 +221,66 @@ Other conventions:
 
 ### 4.8 Items and Pipelines
 
-- The framework **does not build its own Item/Field system**. dict, dataclass, pydantic, msgspec, and attrs objects can all be Items; an adapter layer converts them to dicts uniformly before export. For validation, use pydantic or msgspec models directly.
+- The framework **does not build its own Item/Field system**. dicts and other mappings, dataclasses, msgspec `Struct`s, pydantic models, and attrs objects can all be Items; `Request` and `Response` are not. pydantic and attrs are only consulted when the application imported them. `pernix.items.item_to_dict()` converts any Item to a plain dict for export, nested Items included; msgspec honors `rename`, and pydantic uses field names. For validation, use pydantic or msgspec models directly.
+- To store different kinds of Items apart, such as in different tables, give each kind its own type and route by type. dicts can be routed by content, with an `accepts` function.
 
 ```python
-from pernix import Pipeline, DropItem
+from pernix import DropItem, ItemContext, Pipeline
 
 class Clean(Pipeline):
-    async def process(self, item, ctx):
+    async def process(self, item, ctx: ItemContext):   # sync works too
         if not item["title"]:
             raise DropItem("empty title")      # returning None also drops the Item
-        return item
+        return item                            # or a new object, passed on to the next Pipeline
 
-class SaveMySQL(Pipeline):
-    accepts = (Book,)                          # optional: only handle Items of these types
+class SaveRows(Pipeline):
+    accepts = (Book,)                          # optional: only these types; or a function (item) -> bool
     batch_size = 500                           # optional: enable batch mode
-    async def open(self, crawler): ...
-    async def process_batch(self, items, ctx): ...
-    async def close(self): ...
+    batch_timeout = 1.0                        # a batch waits at most this long after its first Item
+    retry_times = 3                            # optional: retry this Pipeline's call on transient errors
+    retry_on = (ConnectionError, TimeoutError) # which errors are retried; raising Retry also retries
+    timeout = 300                              # optional: seconds per call, instead of items.timeout
+    def __init__(self, settings: DbSettings) -> None: ...   # dependencies are injected
+    async def open(self) -> None: ...
+    async def process_batch(self, items, contexts) -> None: ...
+    async def close(self) -> None: ...
 ```
 
-- Pipelines run in order. `open` / `close` are managed by the framework: if startup fails, the components already opened are closed in reverse order.
-- File output (Feeds) is built in: `-o books.jsonl` or `settings["feeds"]`, supporting jsonl, csv, and json.
+- Pipelines are registered with `pipelines = {pipeline: order}` and run in order; `open()` / `close()` follow the component lifecycle, as for Extensions. `ItemContext` holds the `request` and the `response` an Item came from (`None` for an errback's Items).
+- Callbacks hand Items to a bounded queue (`items.queue_size`, 1000); when it is full, the Callback is suspended until there is room (backpressure). `items.concurrency` (1) Items are processed at once; with 1, Items reach the Feeds in the order they were produced, as an Item a batch Pipeline does not accept waits behind the Items pending there.
+- Outcomes: an Item that passes every Pipeline is written to the Feeds that accept it and emitted as `ItemScraped`. Returning `None` or raising `DropItem` emits `ItemDropped`. Any other exception emits `ItemError` and drops the Item; the Request is never fetched again for it.
+- Failed Items: each Item a Pipeline failed on (retries exhausted included, drops not) goes, as a `FailedItem(item, pipeline, error)`, through the failure Pipelines of `failed_pipelines = {pipeline: order}`, which are Pipelines without batch mode: each passes the `FailedItem` on, or stops it with `None`. The built-in `FailedItemsFile`, registered by default, writes each one with the Pipeline, the error, and the URL to the JSON-lines file of `items.failed_output`, so it can be processed again later; without that setting it does nothing. A failure Pipeline that fails loses the failed Item: it is logged and counted as `items.failures_lost`, unless it is a `FeedError`, which ends the Run.
+
+```python
+class DeadLetters(Pipeline):
+    retry_times = 3
+    async def process(self, item: FailedItem, ctx: ItemContext):
+        await self.producer.send(topic, item.item, error=str(item.error))
+        return item                            # on to the next failure Pipeline
+
+settings = {"failed_pipelines": {DeadLetters: 200}}   # next to the built-in FailedItemsFile (100)
+```
+- Batch mode: `process_batch(items, contexts)` runs when the batch is full (in the worker that filled it, so a slow batch applies backpressure), when `batch_timeout` passes, when as many Items it does not accept wait behind it as the Item queue holds, and when the Run ends. The Items then pass on unchanged; `DropItem` drops the whole batch, and another exception fails each of its Items. Batches of one Pipeline never overlap.
+- Timeouts: one call of a Pipeline, `process()` for an Item or `process_batch()` for a batch, may take `items.timeout` seconds (60 by default; 0 for no limit), or the Pipeline's own `timeout`. Then it is cancelled and fails with `TimeoutError`, so a hanging database call cannot stall the crawl. Only async calls can be cancelled; blocking work belongs in async code or `asyncio.to_thread`.
+- Retries: a Pipeline with `retry_times` retries its own call (one Item, or a whole batch) when it raises one of `retry_on` (by default `OSError` and `TimeoutError`, timeouts included) or `Retry`, with full-jitter backoff from 1 s up to 60 s, scaled by `retry.delay_scale`; each attempt has its own timeout. Meanwhile the Items wait, so an unavailable database slows the crawl down instead of losing data. Once the retries run out, the error is `RetriesExhausted`; without retries, the error is kept as it is. `DropItem` and `FeedError` are never retried. `items.retried` counts the retries.
+- Delivery semantics: in M0, a Request's Lease is acknowledged once its Items are queued. With the in-memory Frontier nothing survives a crash anyway. With persistent Frontiers (M2), acknowledgment will wait until the Request's Items are processed, making delivery at-least-once: output may be produced again after crash recovery, so Pipelines should write idempotently, such as by upserting on a business key. The framework does not promise exactly-once.
+- When the Run ends, the queued Items and the pending batches are processed before `SpiderClosed`. A cancelled Run abandons the queued Items.
 - Four writer Pipelines are built in, for MySQL, PostgreSQL, MongoDB, and Kafka, and are installed as optional extras (confirmed); the database ones support batch writes and upserts by business key.
-- Delivery semantics are at-least-once: output may be produced again after crash recovery. The framework provides helpers for upserting by business key and does not promise exactly-once.
+
+**Feeds** write Items to files: `output=` / `-o books.jsonl`, and the `feeds` setting.
+
+```python
+settings = {"feeds": {
+    "out/{name}-{time}.jsonl": {},
+    "books.csv": {"fields": ["title", "price"], "accepts": [Book]},
+}}
+Books.run(output="books.json")   # adds {"books.json": {}}
+```
+
+- Formats: jsonl (orjson), csv, and json (an array streamed one Item per line), chosen with `format` or by the extension (`.jsonl`, `.ndjson`, `.jl`, `.csv`, `.json`). `fields` selects and orders the fields; for csv they are the columns, which otherwise come from the first Item. `accepts` restricts a Feed to some Items, like a Pipeline's. `encoding` defaults to UTF-8.
+- Paths are templates with `{name}` (the Spider), `{run_id}`, and `{time}` (when the Run started, in UTC, such as `20261013T080405Z`). Unknown placeholders, unknown extensions, and two outputs that would write the same file (Feeds, `output=`, or `items.failed_output`) fail at startup. Missing directories are created.
+- Files are written to a hidden temporary file next to the target and renamed over it when the Feed closes, also when the Run fails, so a file appears complete or not at all, and an existing file is replaced.
+- Values JSON cannot represent, such as `bytes`, fail the write; `Decimal`s are written as strings, sets as lists. In csv, `None` is an empty cell, booleans and containers are JSON, and dates are ISO 8601. A Feed that fails to write raises `FeedError`, which emits `ItemError` and ends the Run, rather than lose Items silently.
 
 ### 4.9 Middleware
 
@@ -332,7 +369,7 @@ Core Events:
 | `RequestFailed(error)` | observe | A Request failed for good: an exception the retry policy keeps, its Callback raised, or its retries ran out (`RetriesExhausted`); its errback runs next |
 | `RequestIgnored(reason)` | observe | Download Middleware or a Fetcher raised `IgnoreRequest` |
 | `ResponseReceived` | observe | A Response was fetched, before its Callback runs |
-| `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item was stored, dropped, or failed; `response` is `None` for an errback's Items |
+| `ItemScraped` / `ItemDropped` / `ItemError` | observe | An Item passed the Pipelines and was written to the Feeds, was dropped, or failed; `response` is `None` for an errback's Items |
 | `StatsSnapshot(stats, final)` | observe | A copy of the stats: every `stats.interval`, and a final one after `SpiderClosed` |
 
 Lifecycle: Extensions (the `extensions` setting) are built in order, subscribed, and opened, as async context managers or through `open()`. They are closed in reverse after `SpiderClosed`; `__aexit__` receives the exception that ended the Run, so a component can roll back, but cannot suppress it. Every close step runs even when earlier ones fail or are cancelled: failures are raised together as an `ExceptionGroup`, and a cancellation is re-raised after the last component is closed. If opening a component fails, the ones already open are closed in reverse. Once `SpiderOpened` has been dispatched, `SpiderClosed` always follows, even on cancellation.
@@ -698,7 +735,7 @@ Rules:
 | `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards, and their body bytes |
 | `downloads.errors`, `downloads.errors_by_type.<ErrorType>` | Exceptions fetching raised, other than `IgnoreRequest` and `Retry` |
 | `responses.received` | Responses handed to Callbacks |
-| `items.scraped`, `items.dropped`, `items.errors` | Items stored, dropped, or failed |
+| `items.scraped`, `items.dropped`, `items.errors`, `items.retried`, `items.failures_lost` | Items stored, dropped, or failed; Pipeline calls retried; failed Items a failure Pipeline lost |
 | `frontier.ready`, `frontier.delayed`, `frontier.leased`, `frontier.done`, `frontier.dead` | The Frontier at the snapshot |
 | `throttle.waits`, `throttle.wait_seconds`, `throttle.cooldowns`, `throttle.refused` | Waiting for per-domain slots, and cooldowns |
 | `loop.lag_avg`, `loop.lag_max` | Event loop lag in seconds, sampled every second |
