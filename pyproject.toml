@@ -28,6 +28,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.scripts]
+pernix = "pernix.cli:main"
+
 [project.urls]
 Repository = "https://github.com/darionxt/pernix"
 

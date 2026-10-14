@@ -61,6 +61,7 @@ class Crawler:
         started_at: When the Run started, in UTC; until then, when the Crawler was
             created. Feed paths fill in `{time}` with it.
         stats: The stats of this Run; they stay readable after it ends.
+        addons: The loaded Addons, whose `setup()` runs before the Run starts.
     """
 
     def __init__(
@@ -93,7 +94,7 @@ class Crawler:
         spider.crawler = self
         self._run_context = RunContext(self.run_id, spider.name)
         self._output = output
-        self._addons = tuple(addons)
+        self.addons = tuple(addons)
         self._started = False
         shutdown = settings.section(ShutdownSettings)
         self._close_timeout = shutdown.close_timeout or None
@@ -107,6 +108,7 @@ class Crawler:
         *,
         args: Mapping[str, object] | None = None,
         settings: Mapping[str, Any] | None = None,
+        command_line: Mapping[str, str] | None = None,
         output: str | os.PathLike[str] | None = None,
     ) -> Crawler:
         """Load the settings, including enabled Addons, create the Spider, and create a Crawler.
@@ -120,7 +122,9 @@ class Crawler:
             spider_type: The Spider class; a new object is created for the Run.
             args: The Spider arguments, by name; strings are converted to the
                 annotated types.
-            settings: Settings for this Run, the highest settings layer.
+            settings: Settings for this Run, above every layer but the command line.
+            command_line: Settings given as text on the command line, parsed like
+                environment variables; the highest layer.
             output: A Feed for the Items besides the `feeds` setting, such as
                 `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
 
@@ -133,13 +137,18 @@ class Crawler:
             pernix.errors.SpiderArgumentError: The Spider arguments are invalid.
         """
         enabled = load_settings(
-            sections=(CoreSettings,), spider_settings=spider_type.settings, overrides=settings, ignore_unknown=True
+            sections=(CoreSettings,),
+            spider_settings=spider_type.settings,
+            overrides=settings,
+            command_line=command_line,
+            ignore_unknown=True,
         )
         addons = load_addons(enabled.section(CoreSettings).addons)
         final = load_settings(
             addon_layers=[addon_settings(addon) for addon in addons],
             spider_settings=spider_type.settings,
             overrides=settings,
+            command_line=command_line,
         )
         return cls(create_spider(spider_type, args or {}), settings=final, output=output, addons=addons)
 
@@ -251,7 +260,7 @@ class Crawler:
                     raise
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
-        run = RunAssembly.build(self, run_log, addons=self._addons, output=self._output, outlet=self._outlet)
+        run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet)
         self._shutdown.attach(run.engine)
         try:
             async with ComponentLifecycle() as lifecycle:

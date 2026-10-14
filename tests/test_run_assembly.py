@@ -79,3 +79,19 @@ def test_the_output_and_the_outlet_reach_the_item_processing(tmp_path: Path) -> 
 
     assert [feed.path for feed in run.feeds] == [tmp_path / "books.csv"]
     assert run.items._outlet is outlet  # pyright: ignore[reportPrivateUsage]
+
+
+def test_independent_problems_are_reported_together(tmp_path: Path) -> None:
+    path = str(tmp_path / "books.jsonl")
+
+    with pytest.raises(SettingsError) as raised:
+        _build({"middlewares": {object(): 10}, "retry.policy": object(), "feeds": {path: {}}}, output=path)
+
+    problems = raised.value.problems
+    assert len(problems) == 3
+    assert any("is not an async callable" in problem for problem in problems)
+    assert any(problem.startswith("retry.policy must have decide") for problem in problems)
+    assert any("and output both write" in problem for problem in problems)
+    cause = raised.value.__cause__
+    assert isinstance(cause, ExceptionGroup)
+    assert [type(error) for error in cause.exceptions] == [ComponentError, SettingsError, ComponentError]

@@ -70,9 +70,22 @@ Keyword arguments other than `settings=` and `output=` are Spider arguments, dec
 
 `crawl()` and `stream()` raise errors instead, and leave signals to your application. See [`docs/design.md`](docs/design.md) §4.12 and §6.6.
 
+## Command line
+
+```bash
+pernix run books.py -a keyword=dune -s concurrency=4 -o books.jsonl   # Books.run() from the command line
+pernix run myproject.spiders.books:Books                            # an import path, a Spider chosen by name
+pernix fetch https://example.com/ > page.html                        # headers to stderr, the body to stdout
+pernix fetch https://example.com/ --json                             # one JSON object, errors included
+pernix shell https://example.com/                                    # `await fetch(...)`, `response.css(...)`
+pernix check books.py                                                # validate settings and components
+```
+
+`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `fetch` exits with 0 for any Response and 1 when fetching failed. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings, without retries; `--fetcher` picks a registered Fetcher. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+
 ## Configuration
 
-Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, and the `settings=` argument of `run()`, `crawl()`, and `stream()`.
+Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, the `settings=` argument of `run()`, `crawl()`, and `stream()`, and `-s` on the command line.
 
 ```python
 class Titles(Spider):
@@ -187,11 +200,12 @@ src/pernix/
 ├── spider.py            Spider base class and the run()/crawl()/stream() entry points
 ├── spider_arguments.py  checks and converts Spider arguments
 ├── crawler.py           Crawler: runs one Run, builds components with injection, stops it
-├── run_assembly.py      which components a Run has, built and wired before opening
+├── run_assembly.py      which components a Run has, built and wired before opening; the download chain
 ├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
 ├── request_processor.py one attempt at a Request: fetch, retry decision, Callbacks
 ├── shutdown.py          Drain, its grace period, and Force Stop
 ├── runner.py            run() as a program: exit codes
+├── __main__.py          python -m pernix
 ├── stop_signals.py      SIGINT and SIGTERM stop a Run
 ├── run_result.py        RunResult, how a Run ended
 ├── callbacks.py         runs Callbacks and errbacks, collects their outputs
@@ -209,6 +223,16 @@ src/pernix/
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse
 ├── addons.py            Addon loading, entry point discovery, setup API
+├── cli/
+│   ├── __init__.py      the pernix command: main()
+│   ├── run_command.py   pernix run
+│   ├── fetch_command.py pernix fetch, and its JSON output
+│   ├── shell_command.py pernix shell
+│   ├── check_command.py pernix check
+│   ├── spider_loader.py finds a Spider in a file or an import path
+│   ├── downloader.py    fetches single Requests outside a Run
+│   ├── console.py       the interactive console with top-level await
+│   └── options.py       -s and -a, and the Crawler of a command
 ├── items/
 │   ├── item_adapter.py  which outputs are Items, and their conversion to dicts
 │   ├── pipeline.py      Pipeline base class, ItemContext
