@@ -32,6 +32,12 @@ def _isolate_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name)
 
 
+@pytest.fixture(autouse=True)
+def _restore_import_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo what tests, such as those running the command line, add to `sys.path`."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+
 @pytest.fixture
 def server() -> Iterator[LoopbackServer]:
     with LoopbackServer() as srv:
@@ -39,9 +45,8 @@ def server() -> Iterator[LoopbackServer]:
 
 
 @pytest.fixture
-def write_spider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str, str], Path]]:
+def write_spider(tmp_path: Path) -> Iterator[Callable[[str, str], Path]]:
     """Write a module of Spiders to the temporary directory; the imports it causes are undone afterwards."""
-    monkeypatch.setattr(sys, "path", list(sys.path))
     names: list[str] = []
 
     def write(name: str, source: str) -> Path:

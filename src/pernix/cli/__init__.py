@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from importlib.metadata import version
 from typing import TYPE_CHECKING
@@ -23,7 +24,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Results go to stdout, and messages and logs to stderr. A configuration error,
     such as an invalid setting or a Spider that cannot be found, is printed without
-    a traceback and exits with 2, as do invalid command-line options.
+    a traceback and exits with 2, as do invalid command-line options. As with
+    `python -m`, the working directory comes first on `sys.path`, so the modules of
+    the project, such as its Spiders and components, can be imported.
 
     Args:
         argv: The arguments after the program name; defaults to `sys.argv[1:]`.
@@ -32,6 +35,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         The exit status.
     """
     args = _parser().parse_args(argv)
+    if "" not in sys.path and os.getcwd() not in sys.path:
+        sys.path.insert(0, os.getcwd())
     try:
         return args.handler(args)
     except (UsageError, *CONFIGURATION_ERRORS) as exc:

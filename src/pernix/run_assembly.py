@@ -3,12 +3,12 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from pernix.addons import setup_addon
 from pernix.callbacks import run_callbacks
 from pernix.engine import Engine
-from pernix.errors import ComponentError, SettingsError
+from pernix.errors import CONFIGURATION_ERRORS, ComponentError, SettingsError
 from pernix.events import StatsSnapshot
 from pernix.feeds import Feed, render_path
 from pernix.fetchers import FetcherDispatch
@@ -115,22 +115,22 @@ class RunAssembly:
         crawler: Crawler,
         run_log: RunLog,
         *,
-        addons: Sequence[object] = (),
         output: str | os.PathLike[str] | None = None,
         outlet: Callable[[Any], Awaitable[None]] | None = None,
     ) -> RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
-        Addons register their subscribers first. Then the components are built with
-        `crawler.build_component()`: Stats Sinks, Extensions, Fetchers, download
-        Middleware, spider Middleware, Pipelines, failure Pipelines, Feeds, the
-        Fingerprint function, and the retry policy; the download and spider chains
-        are checked. The core stats and the Stats Sinks are subscribed.
+        The Crawler's Addons register their subscribers first. Then the components
+        are built with `crawler.build_component()`: Stats Sinks, Extensions, Fetchers,
+        download Middleware, spider Middleware, Pipelines, failure Pipelines, Feeds,
+        the Fingerprint function, and the retry policy; the download and spider
+        chains and the Pipelines are checked. Steps that do not depend on each other
+        all run, so their problems are reported together. The core stats and the
+        Stats Sinks are subscribed.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
             run_log: The log of the Run, whose counts are reported in the stats.
-            addons: Loaded Addons whose `setup()` runs first.
             output: A Feed for the Items besides the `feeds` setting.
             outlet: Receives every Item that passes the Pipelines, after the Feeds.
 
@@ -140,35 +140,57 @@ class RunAssembly:
         Raises:
             pernix.errors.ComponentError: A component cannot be built, or does not fit
                 its role.
-            pernix.errors.SettingsError: Two Fetchers claim the same URL scheme, or a
-                Feed is invalid.
+            pernix.errors.SettingsError: Two Fetchers claim the same URL scheme, a Feed
+                is invalid, or several problems were found; it lists them all.
+            pernix.errors.AddonError: An Addon's `setup()` failed.
         """
         settings, events = crawler.settings, crawler.events
-        for addon in addons:
-            setup_addon(addon, events=events, settings=settings)
-        sinks = _build_sinks(crawler)
-        extensions = _build_all(crawler, "extensions")
-        downloading = DownloadAssembly.build(crawler)
-        spider_middlewares = _build_all(crawler, "spider_middlewares")
-        pipelines = _build_all(crawler, "pipelines")
-        failed_pipelines = _build_all(crawler, "failed_pipelines")
-        feeds = _build_feeds(crawler, output)
-        items = _item_processor(crawler, pipelines, failed_pipelines, feeds, outlet)
+        problems = _Problems()
+        for addon in crawler.addons:
+            problems.attempt(setup_addon, addon, events=events, settings=settings)
+        sinks = problems.attempt(_build_sinks, crawler)
+        extensions = problems.attempt(_build_all, crawler, "extensions")
+        downloading = problems.attempt(DownloadAssembly.build, crawler)
+        spider_middlewares = problems.attempt(_build_all, crawler, "spider_middlewares")
+        pipelines = problems.attempt(_build_all, crawler, "pipelines")
+        failed_pipelines = problems.attempt(_build_all, crawler, "failed_pipelines")
+        feeds = problems.attempt(_build_feeds, crawler, output)
+        fingerprint = problems.attempt(_fingerprint_function, crawler)
+        retry_policy = problems.attempt(_retry_policy, crawler)
+        handle = None
+        if spider_middlewares is not None:
+            handle = problems.attempt(build_spider_chain, spider_middlewares, run_callbacks(crawler.spider))
+        items = None
+        if pipelines is not None and failed_pipelines is not None and feeds is not None:
+            items = problems.attempt(_item_processor, crawler, pipelines, failed_pipelines, feeds, outlet)
+        if (
+            problems.found
+            or sinks is None
+            or extensions is None
+            or downloading is None
+            or spider_middlewares is None
+            or pipelines is None
+            or failed_pipelines is None
+            or feeds is None
+            or fingerprint is None
+            or retry_policy is None
+            or handle is None
+            or items is None
+        ):
+            problems.raise_them()
         core_stats = CoreStats(crawler.stats)
-        download = core_stats.count_downloads(downloading.download)
-        handle = build_spider_chain(spider_middlewares, run_callbacks(crawler.spider))
-        frontier = MemoryFrontier(fingerprint=_fingerprint_function(crawler))
+        frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
         engine = Engine(
             crawler.spider,
             frontier=frontier,
-            download=download,
+            download=core_stats.count_downloads(downloading.download),
             handle=handle,
             put_item=items.put,
             events=events,
             concurrency=settings.section(CoreSettings).concurrency,
             lease_ttl=settings.section(FrontierSettings).lease_ttl,
-            retry_policy=_retry_policy(crawler),
+            retry_policy=retry_policy,
             throttle=throttle,
         )
         events.subscribe_methods(core_stats)
@@ -190,6 +212,33 @@ class RunAssembly:
             engine=engine,
             reporter=_reporter(crawler, frontier, throttle, run_log),
         )
+
+
+class _Problems:
+    """Collects the configuration errors of independent build steps, to report them together."""
+
+    def __init__(self) -> None:
+        self._errors: list[Exception] = []
+
+    @property
+    def found(self) -> bool:
+        """Whether a step failed."""
+        return bool(self._errors)
+
+    def attempt[**P, T](self, step: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> T | None:
+        """Run a step; on a configuration error, keep it and return `None`."""
+        try:
+            return step(*args, **kwargs)
+        except CONFIGURATION_ERRORS as exc:
+            self._errors.append(exc)
+            return None
+
+    def raise_them(self) -> NoReturn:
+        """Raise the one error found, or a `SettingsError` listing them all, caused by an `ExceptionGroup` of them."""
+        if len(self._errors) == 1:
+            raise self._errors[0]
+        problems = [problem for error in self._errors for problem in getattr(error, "problems", [str(error)])]
+        raise SettingsError(problems) from ExceptionGroup("configuration errors", self._errors)
 
 
 def _build_all(crawler: Crawler, key: str) -> list[object]:

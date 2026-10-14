@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -80,3 +82,15 @@ def test_a_failed_first_fetch_still_opens_the_shell(
     out, err = capsys.readouterr()
     assert "open None" in out
     assert "Error: fetching http://127.0.0.1:9/ failed: ConnectError" in err
+
+
+def test_exits_and_interrupts_raised_by_awaited_code_reach_the_console() -> None:
+    lines = "import asyncio\nawait asyncio.sleep(0); raise KeyboardInterrupt\nprint('alive')\nawait asyncio.sleep(0); exit()\nprint('never')\n"
+    process = subprocess.run(  # this interpreter, running the command under test
+        [sys.executable, "-m", "pernix", "shell"], input=lines, capture_output=True, text=True, timeout=30, check=False
+    )
+
+    assert process.returncode == 0, process.stderr
+    assert "KeyboardInterrupt" in process.stderr
+    assert "alive" in process.stdout
+    assert "never" not in process.stdout

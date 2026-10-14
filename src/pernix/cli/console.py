@@ -33,11 +33,15 @@ class LoopThread:
             Its result.
 
         Raises:
-            KeyboardInterrupt: Interrupted while waiting; the coroutine is cancelled.
+            KeyboardInterrupt: Interrupted while waiting, and the coroutine is
+                cancelled; or the coroutine raised it.
+            SystemExit: The coroutine raised it, such as by calling `exit()`.
         """
-        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        future = asyncio.run_coroutine_threadsafe(_carry_exits(coroutine), self.loop)
         try:
             return future.result()
+        except _Exit as carried:
+            raise carried.exception from None
         except KeyboardInterrupt:
             future.cancel()
             raise
@@ -47,6 +51,21 @@ class LoopThread:
         self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join()
         self.loop.close()
+
+
+class _Exit(Exception):
+    """Carries `SystemExit` or `KeyboardInterrupt` out of the loop, which they would otherwise stop."""
+
+    def __init__(self, exception: BaseException) -> None:
+        super().__init__(exception)
+        self.exception = exception
+
+
+async def _carry_exits[T](coroutine: Coroutine[Any, Any, T]) -> T:
+    try:
+        return await coroutine
+    except (SystemExit, KeyboardInterrupt) as exc:
+        raise _Exit(exc) from None
 
 
 class AsyncConsole(code.InteractiveConsole):

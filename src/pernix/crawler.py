@@ -61,6 +61,7 @@ class Crawler:
         started_at: When the Run started, in UTC; until then, when the Crawler was
             created. Feed paths fill in `{time}` with it.
         stats: The stats of this Run; they stay readable after it ends.
+        addons: The loaded Addons, whose `setup()` runs before the Run starts.
     """
 
     def __init__(
@@ -93,7 +94,7 @@ class Crawler:
         spider.crawler = self
         self._run_context = RunContext(self.run_id, spider.name)
         self._output = output
-        self._addons = tuple(addons)
+        self.addons = tuple(addons)
         self._started = False
         shutdown = settings.section(ShutdownSettings)
         self._close_timeout = shutdown.close_timeout or None
@@ -259,7 +260,7 @@ class Crawler:
                     raise
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
-        run = RunAssembly.build(self, run_log, addons=self._addons, output=self._output, outlet=self._outlet)
+        run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet)
         self._shutdown.attach(run.engine)
         try:
             async with ComponentLifecycle() as lifecycle:
