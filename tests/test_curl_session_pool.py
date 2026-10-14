@@ -35,6 +35,11 @@ async def _use(pool: CurlSessionPool, profile: str) -> FakeSession:
         return cast("FakeSession", session)
 
 
+async def _retired() -> None:
+    """Let the sessions the pool retired finish closing, in their own tasks."""
+    await asyncio.sleep(0.01)
+
+
 async def test_each_profile_has_its_own_session_reused_across_uses() -> None:
     pool = FakePool()
 
@@ -51,6 +56,7 @@ async def test_the_least_recently_used_session_goes_first_once_the_pool_is_full(
     await _use(pool, "a")
 
     c = await _use(pool, "c")
+    await _retired()
 
     assert (a.closed, b.closed, c.closed) == (False, True, False)
 
@@ -70,6 +76,7 @@ async def test_idle_sessions_are_closed_when_the_pool_is_next_used() -> None:
     await asyncio.sleep(0.02)
 
     await _use(pool, "b")
+    await _retired()
 
     assert idle.closed
 
@@ -89,6 +96,7 @@ async def test_an_idle_session_is_replaced_rather_than_reused() -> None:
     await asyncio.sleep(0.02)
 
     new = await _use(pool, "a")
+    await _retired()
 
     assert new is not old
     assert old.closed
@@ -105,6 +113,22 @@ async def test_sessions_being_closed_are_never_handed_out() -> None:
             return cast("FakeSession", session).closed
 
     closed_while_in_use = await asyncio.gather(take("c"), take("b"), take("a"))
+    await _retired()
 
     assert closed_while_in_use == [False, False, False]
     assert (a.closed, b.closed) == (True, True)
+
+
+async def test_sessions_being_retired_still_close_when_the_task_retiring_them_is_cancelled() -> None:
+    pool = FakePool(size=8, idle=0.01)
+    await _use(pool, "a")
+    await _use(pool, "b")
+    await asyncio.sleep(0.02)  # both are idle now
+    taking = asyncio.create_task(_use(pool, "c"))
+    await asyncio.sleep(0)  # it retires both, which start closing
+
+    taking.cancel()
+    await asyncio.wait([taking])
+    await pool.close()
+
+    assert [session.closed for session in pool.created] == [True, True, True]

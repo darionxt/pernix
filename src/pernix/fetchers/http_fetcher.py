@@ -19,7 +19,7 @@ from pernix.errors import (
     TLSError,
     TooManyRedirects,
 )
-from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool
+from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.http_settings import HTTPSettings, check_profile
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
@@ -27,7 +27,7 @@ from pernix.response import Redirect, Response
 from pernix.settings import CoreSettings, ResponseSettings, Section
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
@@ -176,13 +176,12 @@ class HTTPFetcher:
         limit = self._settings.max_body_size or None
         started = time.monotonic()
         async with pool.session(profile) as session, self._deadline(request):
-            result = await self._send(session, request, profile)
-            too_large = _limit_ingress(result, limit)
+            result, transfer = await self._send(session, request, profile, limit)
             try:
                 _check_declared_size(result, request, limit)
                 chunks: list[bytes] = []
                 size = 0
-                async for chunk in _chunks(result, request, limit, too_large):
+                async for chunk in _chunks(result, request, transfer):
                     size += len(chunk)
                     if limit is not None and size > limit:
                         raise ResponseTooLarge(f"the body of {request.url} exceeds {limit} bytes")
@@ -216,12 +215,11 @@ class HTTPFetcher:
         started = time.monotonic()
         async with pool.session(profile) as session:
             async with self._deadline(request):
-                result = await self._send(session, request, profile)
-            too_large = _limit_ingress(result, limit)
+                result, transfer = await self._send(session, request, profile, limit)
             try:
                 _check_declared_size(result, request, limit)
                 response = self._response(request, result, b"", elapsed=time.monotonic() - started)
-                yield StreamedResponse(response, lambda: _chunks(result, request, limit, too_large), max_bytes=limit)
+                yield StreamedResponse(response, lambda: _chunks(result, request, transfer), max_bytes=limit)
             finally:
                 await _discard(result)
 
@@ -244,7 +242,9 @@ class HTTPFetcher:
                 raise Timeout(f"fetching {request.url} took longer than http.deadline ({deadline} s)") from None
             raise
 
-    async def _send(self, session: CurlSession, request: Request, profile: str) -> curl_cffi.Response:
+    async def _send(
+        self, session: CurlSession, request: Request, profile: str, limit: int | None
+    ) -> tuple[curl_cffi.Response, Transfer]:
         """Send a Request and wait for its response headers, following redirects.
 
         Waiting for the headers is limited precisely with asyncio; once they arrived,
@@ -254,7 +254,7 @@ class HTTPFetcher:
         scope = asyncio.timeout(timeout)
         try:
             async with scope:
-                result = await self._request(session, request, profile, timeout)
+                result, transfer = await self._request(session, request, profile, timeout, limit)
         except TimeoutError:
             if scope.expired():
                 raise Timeout(f"{request.url} did not respond within {timeout} s") from None
@@ -262,14 +262,13 @@ class HTTPFetcher:
         if result.status_code == 407 and request.proxy is not None:
             await _discard(result)
             raise ProxyError(f"the proxy refused {request.url}: 407 Proxy Authentication Required")
-        return result
+        return result, transfer
 
     async def _request(
-        self, session: CurlSession, request: Request, profile: str, curl_timeout: float
-    ) -> curl_cffi.Response:
-        """Start a streamed transfer and wait for its headers; stop the transfer if cancelled meanwhile."""
+        self, session: CurlSession, request: Request, profile: str, curl_timeout: float, limit: int | None
+    ) -> tuple[curl_cffi.Response, Transfer]:
         try:
-            return await session.request(
+            return await session.start(
                 cast("HttpMethod", request.method),
                 request.url,
                 headers=request.headers.items(),
@@ -281,13 +280,10 @@ class HTTPFetcher:
                 timeout=curl_timeout,
                 max_redirects=self._settings.max_redirects,
                 http_version=_http_version(request.url),
-                stream=True,
+                body_limit=limit,
             )
         except CurlError as exc:
             raise _fetch_error(exc) from exc
-        except asyncio.CancelledError:
-            session.abort_pending()  # curl-cffi would let the transfer run on, holding its handle
-            raise
 
     def _response(self, request: Request, result: curl_cffi.Response, body: bytes, *, elapsed: float) -> Response:
         hops = [*result.history, result]
@@ -311,49 +307,16 @@ class HTTPFetcher:
         )
 
 
-async def _chunks(
-    result: curl_cffi.Response, request: Request, limit: int | None, too_large: Callable[[], bool]
-) -> AsyncIterator[bytes]:
+async def _chunks(result: curl_cffi.Response, request: Request, transfer: Transfer) -> AsyncIterator[bytes]:
     """Read a streamed body, as FetchErrors."""
     content = cast("AsyncIterator[bytes]", result.aiter_content())  # pyright: ignore[reportUnknownMemberType]  # untyped
     try:
         async for chunk in content:
             yield chunk
     except CurlError as exc:
-        if too_large():
-            raise ResponseTooLarge(f"the body of {request.url} exceeds {limit} bytes") from exc
+        if transfer.exceeded:
+            raise ResponseTooLarge(f"the body of {request.url} exceeds {transfer.limit} bytes") from exc
         raise _fetch_error(exc) from exc
-
-
-def _limit_ingress(result: curl_cffi.Response, limit: int | None) -> Callable[[], bool]:
-    """Count a streamed body as curl delivers it, stopping the transfer once it exceeds the limit.
-
-    curl-cffi queues every chunk without bound, however slowly they are read, so the
-    limit is checked where its write callback queues them. Past the limit, its
-    `quit_now` event makes curl end the transfer.
-
-    Returns:
-        Tells whether the limit stopped the transfer.
-    """
-    exceeded = False
-    if limit is None:
-        return lambda: exceeded
-    queue = cast("asyncio.Queue[object]", result.queue)  # pyright: ignore[reportUnknownMemberType]  # untyped
-    quit_now = cast("asyncio.Event", result.quit_now)
-    put = queue.put_nowait
-    received = 0
-
-    def counted(item: object) -> None:
-        nonlocal received, exceeded
-        if isinstance(item, bytes):
-            received += len(item)
-            if received > limit and not exceeded:
-                exceeded = True
-                quit_now.set()
-        put(item)
-
-    setattr(queue, "put_nowait", counted)  # noqa: B010  # what curl-cffi's write callback calls
-    return lambda: exceeded
 
 
 async def _discard(result: curl_cffi.Response) -> None:

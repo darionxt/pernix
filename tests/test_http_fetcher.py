@@ -305,14 +305,19 @@ async def test_redirects_are_followed_up_to_the_limit(server: LoopbackServer) ->
 
 async def test_bodies_over_the_limit_stop_the_transfer(server: LoopbackServer) -> None:
     server.route("/big", b"x" * 2000)
-    unsized = [(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"y" * 3000, 0.0)]
+    unsized = [(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"y" * 500, 0.0), (b"y" * 2500, 0.1)]
+    declared = [(b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n" + b"y" * 100, 0.0), (b"y" * 4900, 3.0)]
 
-    with ScriptedServer(unsized) as undeclared:
+    with ScriptedServer(unsized) as undeclared, ScriptedServer(declared) as announced:
         async with HTTPFetcher(HTTPSettings(max_body_size=1000)) as limited:
-            with pytest.raises(ResponseTooLarge, match=r"has 2000 bytes, more than 1000"):
+            with pytest.raises(ResponseTooLarge, match=r"the body of .*/big exceeds 1000 bytes"):
                 await limited.fetch(Request(server.url("/big")))
             with pytest.raises(ResponseTooLarge, match=r"exceeds 1000 bytes"):
                 await limited.fetch(Request(undeclared.url))
+            started = time.monotonic()
+            with pytest.raises(ResponseTooLarge, match=r"has 5000 bytes, more than 1000"):
+                await limited.fetch(Request(announced.url))  # before the rest of the body arrives
+            assert time.monotonic() - started < 2
         async with HTTPFetcher(HTTPSettings(max_body_size=0)) as unlimited:
             assert len((await unlimited.fetch(Request(server.url("/big")))).body) == 2000
 
@@ -367,6 +372,44 @@ async def test_the_byte_limit_stops_a_transfer_nobody_reads() -> None:
     assert huge.completed == [False]  # curl stopped receiving at the limit
 
 
+async def test_cancelling_a_request_waiting_for_a_handle_leaves_other_transfers_alone(
+    server: LoopbackServer,
+) -> None:
+    server.route("/fast", "fast")
+    trickle = [(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\na", 0.0), *[(b"a", 0.05)] * 19]
+
+    with ScriptedServer(trickle) as trickling:
+        async with HTTPFetcher(max_clients=1) as fetcher, fetcher.stream(Request(trickling.url)) as outer:
+            waiting = asyncio.create_task(fetcher.fetch(Request(server.url("/fast"))))  # no handle is free
+            await asyncio.sleep(0.1)
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+            body = b"".join([chunk async for chunk in outer.iter_bytes()])
+
+    assert body == b"a" * 20
+
+
+async def test_the_byte_limit_counts_what_arrives_with_the_headers() -> None:
+    # The burst arrives in one read with the headers; the tail alone stays under the limit.
+    burst = [(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"z" * (48 * 1024), 0.0), (b"z" * 8 * 1024, 0.5)]
+
+    with ScriptedServer(burst) as bursting:
+        async with HTTPFetcher() as fetcher:
+
+            async def read_late() -> None:
+                async with fetcher.stream(Request(bursting.url), max_bytes=32 * 1024) as streamed:
+                    await asyncio.sleep(1)  # nothing reads meanwhile: only the burst counts
+                    async for _ in streamed.iter_bytes():
+                        pass
+
+            with pytest.raises(ResponseTooLarge, match="exceeds 32768 bytes"):
+                await read_late()
+        assert await asyncio.to_thread(bursting.answered.wait, 5)
+
+    assert bursting.completed == [False]  # curl stopped within the burst, before the rest was sent
+
+
 async def test_bodyless_responses_may_declare_any_length(server: LoopbackServer) -> None:
     server.route("/big", b"x" * 2000, method="HEAD")
     server.route("/cached", status=304, headers=[("Content-Length", "5000")])
@@ -399,15 +442,15 @@ async def test_streamed_bodies_are_read_as_they_arrive_or_saved(server: Loopback
 
 async def test_streamed_bodies_respect_the_byte_limit(server: LoopbackServer) -> None:
     server.route("/file", b"x" * 2000)
-    unsized = [(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"y" * 3000, 0.0)]
+    unsized = [(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + b"y" * 500, 0.0), (b"y" * 2500, 0.1)]
 
     with ScriptedServer(unsized) as undeclared:
         async with HTTPFetcher() as fetcher:
-            with pytest.raises(ResponseTooLarge, match="has 2000 bytes"):
+            with pytest.raises(ResponseTooLarge, match="exceeds 1000 bytes"):  # with the first chunk
                 async with fetcher.stream(Request(server.url("/file")), max_bytes=1000):
                     pass
             async with fetcher.stream(Request(undeclared.url), max_bytes=1000) as streamed:
-                with pytest.raises(ResponseTooLarge, match="exceeds 1000 bytes"):
+                with pytest.raises(ResponseTooLarge, match="exceeds 1000 bytes"):  # while it is read
                     async for _ in streamed.iter_bytes():
                         pass
             async with fetcher.stream(Request(server.url("/file")), max_bytes=0) as streamed:

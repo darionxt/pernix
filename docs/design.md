@@ -473,7 +473,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 **curl session pool**
 
-- Underlying curl sessions are grouped and reused by `(Session, Profile)` (by Profile alone until Sessions exist), created on first use inside the running event loop, and evicted by LRU beyond `http.pool_size` (8) plus an idle timeout of `http.pool_idle` (300 s); a session in use is never closed, and one idle too long is replaced rather than reused. A single underlying curl session never mixes different Profiles, so connections are never shared between Profiles.
+- Underlying curl sessions are grouped and reused by `(Session, Profile)` (by Profile alone until Sessions exist), created on first use inside the running event loop, and evicted by LRU beyond `http.pool_size` (8) plus an idle timeout of `http.pool_idle` (300 s); a session in use is never closed, one idle too long is replaced rather than reused, and retired sessions close in tasks of their own, which closing the Fetcher waits for. A single underlying curl session never mixes different Profiles, so connections are never shared between Profiles.
 - impersonate is set explicitly on every Request, so a reused connection handle never carries over the previous Request's Profile. The Profile is `http.impersonate`, or `Request(impersonate=...)`; both must name a pinned target (§5.4).
 - Cleartext `http://` Requests use HTTP/1.1, as browsers never upgrade those to HTTP/2; HTTPS negotiates as the Profile does.
 
@@ -493,7 +493,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 - Request headers preserve order and case, and support duplicate keys; they follow the Profile's own headers.
 - Response headers are read with all multiple values preserved. A body decoded from gzip, deflate, br, or zstd loses `Content-Encoding` and `Content-Length`, which describe the encoded body; a `HEAD` Response keeps them.
 - Redirects are followed up to `http.max_redirects` (20, as browsers do), and recorded in `Response.history`.
-- A body larger than `http.max_body_size` (100 MiB; 0 for no limit) fails with `ResponseTooLarge`: at once when `Content-Length` declares it, unless the response has no body (`HEAD`, 1xx, 204, 304), otherwise as soon as curl receives more, however slowly the body is read.
+- A body larger than `http.max_body_size` (100 MiB; 0 for no limit) fails with `ResponseTooLarge`: at once when `Content-Length` declares it, unless the response has no body (`HEAD`, 1xx, 204, 304), otherwise as soon as curl receives more, counted from the first byte in curl's write callback, however slowly the body is read.
 - Streaming downloads: `async with fetcher.stream(request, max_bytes=...) as streamed:` gives a `StreamedResponse` whose `response` holds everything but the body, read once with `iter_bytes()` or written to a file with `save(path)`. `http.deadline` then limits only the wait for the headers. Until reading pauses curl, a slow reader buffers up to `max_bytes` in memory. How a Callback reaches it, and that backpressure, come with Inline Fetch (§4.6).
 
 **Delegated to the framework**
