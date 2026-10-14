@@ -160,11 +160,15 @@ class ScriptedServer:
 
     After reading the request head, it sends each `(data, pause)` step after sleeping
     `pause` seconds, then closes the connection. Tests use it for what an HTTP server
-    library will not do: stall, trickle, or leave out `Content-Length`.
+    library will not do: stall, trickle, or leave out `Content-Length`. `completed`
+    records, for each connection answered, whether every step was sent before the
+    client went away, and `answered` is set after each.
     """
 
     def __init__(self, steps: list[tuple[bytes, float]]) -> None:
         self._steps = steps
+        self.completed: list[bool] = []
+        self.answered = threading.Event()
         self._socket = socket.create_server(("127.0.0.1", 0))
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
@@ -196,9 +200,14 @@ class ScriptedServer:
                 if not chunk:
                     return
                 head += chunk
+            completed = False
             try:
                 for data, pause in self._steps:
                     time.sleep(pause)
                     connection.sendall(data)
+                completed = True
             except OSError:
                 pass  # the client gave up
+            finally:
+                self.completed.append(completed)
+                self.answered.set()

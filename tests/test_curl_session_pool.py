@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 from pernix.fetchers.curl_session_pool import CurlSessionPool
 
 if TYPE_CHECKING:
-    from curl_cffi.requests import AsyncSession
+    from pernix.fetchers.curl_session_pool import CurlSession
 
 
 class FakeSession:
@@ -15,6 +15,7 @@ class FakeSession:
         self.closed = False
 
     async def close(self) -> None:
+        await asyncio.sleep(0)  # as closing a real session does, other tasks run meanwhile
         self.closed = True
 
 
@@ -23,10 +24,10 @@ class FakePool(CurlSessionPool):
         super().__init__(size=size, idle=idle, max_clients=4)
         self.created: list[FakeSession] = []
 
-    def _new_session(self, profile: str) -> AsyncSession:
+    def _new_session(self, profile: str) -> CurlSession:
         session = FakeSession(profile)
         self.created.append(session)
-        return cast("AsyncSession", session)
+        return cast("CurlSession", session)
 
 
 async def _use(pool: CurlSessionPool, profile: str) -> FakeSession:
@@ -80,3 +81,30 @@ async def test_closing_the_pool_closes_every_session() -> None:
     await pool.close()
 
     assert all(session.closed for session in sessions)
+
+
+async def test_an_idle_session_is_replaced_rather_than_reused() -> None:
+    pool = FakePool(size=8, idle=0.01)
+    old = await _use(pool, "a")
+    await asyncio.sleep(0.02)
+
+    new = await _use(pool, "a")
+
+    assert new is not old
+    assert old.closed
+
+
+async def test_sessions_being_closed_are_never_handed_out() -> None:
+    pool = FakePool(size=8, idle=0.01)
+    a, b = await _use(pool, "a"), await _use(pool, "b")
+    await asyncio.sleep(0.02)  # both are idle now
+
+    async def take(profile: str) -> bool:
+        async with pool.session(profile) as session:
+            await asyncio.sleep(0.01)
+            return cast("FakeSession", session).closed
+
+    closed_while_in_use = await asyncio.gather(take("c"), take("b"), take("a"))
+
+    assert closed_while_in_use == [False, False, False]
+    assert (a.closed, b.closed) == (True, True)

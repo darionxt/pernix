@@ -328,9 +328,9 @@ async def test_a_407_from_a_proxy_is_a_proxy_error(server: LoopbackServer) -> No
     assert response.status == 407
 
 
-async def test_cancelled_fetches_leave_the_connections_usable(server: LoopbackServer) -> None:
+async def test_cancelled_fetches_stop_their_transfers_and_free_the_handle(server: LoopbackServer) -> None:
     def slow(_request: ReceivedRequest) -> Reply:
-        time.sleep(1)
+        time.sleep(3)
         return Reply(body="late")
 
     server.route("/slow", handler=slow)
@@ -345,8 +345,38 @@ async def test_cancelled_fetches_leave_the_connections_usable(server: LoopbackSe
                 fetching.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await fetching
-                async with asyncio.timeout(5):
+                async with asyncio.timeout(1):  # the one handle is free again at once
                     assert (await fetcher.fetch(Request(server.url("/fast")))).text == "fast"
+            with pytest.raises(Timeout):
+                await fetcher.fetch(Request(server.url("/slow"), timeout=0.2))
+            async with asyncio.timeout(1):
+                assert (await fetcher.fetch(Request(server.url("/fast")))).text == "fast"
+
+
+async def test_the_byte_limit_stops_a_transfer_nobody_reads() -> None:
+    script = [(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", 0.0), (b"z" * (8 * 1024 * 1024), 0.0)]
+
+    with ScriptedServer(script) as huge:
+        async with HTTPFetcher() as fetcher, fetcher.stream(Request(huge.url), max_bytes=64 * 1024) as streamed:
+            await asyncio.sleep(0.5)  # a slow consumer: curl goes on receiving meanwhile
+            with pytest.raises(ResponseTooLarge, match="exceeds 65536 bytes"):
+                async for _ in streamed.iter_bytes():
+                    pass
+        assert await asyncio.to_thread(huge.answered.wait, 5)
+
+    assert huge.completed == [False]  # curl stopped receiving at the limit
+
+
+async def test_bodyless_responses_may_declare_any_length(server: LoopbackServer) -> None:
+    server.route("/big", b"x" * 2000, method="HEAD")
+    server.route("/cached", status=304, headers=[("Content-Length", "5000")])
+
+    async with HTTPFetcher(HTTPSettings(max_body_size=1000)) as fetcher:
+        head = await fetcher.fetch(Request(server.url("/big"), method="HEAD"))
+        cached = await fetcher.fetch(Request(server.url("/cached")))
+
+    assert (head.status, head.headers.get("Content-Length"), head.body) == (200, "2000", b"")
+    assert (cached.status, cached.body) == (304, b"")
 
 
 async def test_streamed_bodies_are_read_as_they_arrive_or_saved(server: LoopbackServer, tmp_path: Path) -> None:
