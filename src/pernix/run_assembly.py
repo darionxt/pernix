@@ -39,11 +39,49 @@ if TYPE_CHECKING:
     from pernix.crawler import Crawler
     from pernix.frontiers import Frontier
     from pernix.logs import RunLog
+    from pernix.middlewares import Download
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
     from pernix.stats import Gauge, StatsSink
 
-__all__ = ["RunAssembly"]
+__all__ = ["DownloadAssembly", "RunAssembly"]
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadAssembly:
+    """The Fetchers and download Middleware of the settings, and the download chain through them.
+
+    A Run fetches through it, and so do single fetches outside a Run, such as those
+    of `pernix fetch`.
+
+    Attributes:
+        components: The components to subscribe and open, in order: the Fetchers,
+            then the download Middleware.
+        download: Fetches a Request through the download Middleware and a Fetcher.
+    """
+
+    components: tuple[object, ...]
+    download: Download
+
+    @classmethod
+    def build(cls, crawler: Crawler) -> DownloadAssembly:
+        """Build the Fetchers and the download Middleware of the settings, and chain them.
+
+        Args:
+            crawler: Builds the components.
+
+        Returns:
+            The assembly, not opened yet.
+
+        Raises:
+            pernix.errors.ComponentError: A component cannot be built, or does not fit
+                its role.
+            pernix.errors.SettingsError: Two Fetchers claim the same URL scheme.
+        """
+        fetchers = _build_named(crawler, "fetchers")
+        middlewares = _build_all(crawler, "middlewares")
+        download = build_download_chain(middlewares, FetcherDispatch(fetchers))
+        return cls(components=(*fetchers.values(), *middlewares), download=download)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,15 +148,14 @@ class RunAssembly:
             setup_addon(addon, events=events, settings=settings)
         sinks = _build_sinks(crawler)
         extensions = _build_all(crawler, "extensions")
-        fetchers = _build_named(crawler, "fetchers")
-        middlewares = _build_all(crawler, "middlewares")
+        downloading = DownloadAssembly.build(crawler)
         spider_middlewares = _build_all(crawler, "spider_middlewares")
         pipelines = _build_all(crawler, "pipelines")
         failed_pipelines = _build_all(crawler, "failed_pipelines")
         feeds = _build_feeds(crawler, output)
         items = _item_processor(crawler, pipelines, failed_pipelines, feeds, outlet)
         core_stats = CoreStats(crawler.stats)
-        download = core_stats.count_downloads(build_download_chain(middlewares, FetcherDispatch(fetchers)))
+        download = core_stats.count_downloads(downloading.download)
         handle = build_spider_chain(spider_middlewares, run_callbacks(crawler.spider))
         frontier = MemoryFrontier(fingerprint=_fingerprint_function(crawler))
         throttle = Throttle(settings.section(DomainSettings))
@@ -140,8 +177,7 @@ class RunAssembly:
         components = (
             *sinks,
             *extensions,
-            *fetchers.values(),
-            *middlewares,
+            *downloading.components,
             *spider_middlewares,
             *pipelines,
             *failed_pipelines,

@@ -124,6 +124,7 @@ def _problems(excinfo: pytest.ExceptionInfo[SettingsError]) -> str:
         (3, 4, "environment variable PERNIX_CONCURRENCY"),
         (4, 5, "Spider.settings"),
         (5, 6, "run() arguments"),
+        (6, 7, "-s concurrency"),
     ],
 )
 def test_each_layer_overrides_the_ones_below(tmp_path: Path, layers: int, expected: int, origin: str) -> None:
@@ -135,6 +136,7 @@ def test_each_layer_overrides_the_ones_below(tmp_path: Path, layers: int, expect
         addon_layers=[{"concurrency": 2}] if layers >= 1 else [],
         spider_settings={"concurrency": 5} if layers >= 4 else None,
         overrides={"concurrency": 6} if layers >= 5 else None,
+        command_line={"concurrency": "7"} if layers >= 6 else None,
     )
 
     assert settings["concurrency"] == expected
@@ -215,6 +217,18 @@ def test_invalid_environment_values_name_the_variable(tmp_path: Path) -> None:
     assert "domain.delay: Expected `float`, got `str` (from environment variable PERNIX_DOMAIN__DELAY)" in (
         excinfo.value.problems
     )
+
+
+def test_command_line_values_are_parsed_by_type_and_name_their_option(tmp_path: Path) -> None:
+    settings = _load(tmp_path, command_line={"domain.codes": "[429]", "domain.verify": "false"})
+
+    assert (settings.section(DomainSettings).codes, settings.section(DomainSettings).verify) == ([429], False)
+    with pytest.raises(SettingsError) as excinfo:
+        _load(tmp_path, command_line={"domain.delay": "soon", "concurency": "2"})
+    assert sorted(excinfo.value.problems) == [
+        "domain.delay: Expected `float`, got `str` (from -s domain.delay)",
+        "unknown setting 'concurency' from -s concurency; did you mean 'concurrency'?",
+    ]
 
 
 def test_secrets_load_from_strings_and_stay_redacted(tmp_path: Path) -> None:

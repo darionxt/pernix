@@ -31,12 +31,14 @@ def load_settings(
     environ: Mapping[str, str] | None = None,
     spider_settings: Mapping[str, Any] | None = None,
     overrides: Mapping[str, Any] | None = None,
+    command_line: Mapping[str, str] | None = None,
     ignore_unknown: bool = False,
 ) -> Settings:
     """Merge every settings layer, validate the result, and freeze it.
 
     Layers, from lowest to highest precedence: Section defaults, Addons, the project
-    file, `PERNIX_*` environment variables, `Spider.settings`, and run arguments.
+    file, `PERNIX_*` environment variables, `Spider.settings`, run arguments, and the
+    command line.
     A later layer replaces a value; for a component map it adds or overrides entries.
     Keys may be dotted (`"domain.delay"`) or nested (`{"domain": {"delay": 0.5}}`).
 
@@ -52,7 +54,9 @@ def load_settings(
         environ: The environment to read `PERNIX_*` variables from; defaults to
             `os.environ`.
         spider_settings: The `settings` attribute of the Spider.
-        overrides: Settings passed to `run()` or on the command line.
+        overrides: Settings passed to `run()`, `crawl()`, or `stream()`.
+        command_line: Settings given as text, such as with `-s` on the command line;
+            values are parsed like environment variables.
         ignore_unknown: Skip keys that no known Section declares instead of failing,
             to read a few settings before every Section is known.
 
@@ -78,6 +82,15 @@ def load_settings(
     )
     sources.append(_Source(spider_settings or {}, "Spider.settings"))
     sources.append(_Source(overrides or {}, "run() arguments"))
+    if command_line:
+        sources.append(
+            _Source(
+                command_line,
+                "the command line",
+                lenient=True,
+                key_origins={key: f"-s {key}" for key in command_line},
+            )
+        )
     return _Loader(sources, sections, ignore_unknown=ignore_unknown).load()
 
 

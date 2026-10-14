@@ -391,7 +391,8 @@ Layers, from lowest to highest precedence:
 3. Project file (`pernix.toml`, or `[tool.pernix]` in `pyproject.toml`), found by walking up from the working directory; the nearest `pyproject.toml` ends the search
 4. Environment variables `PERNIX_*`
 5. `Spider.settings`
-6. The `settings=` argument of `run()`, `crawl()`, and `stream()`, or CLI arguments
+6. The `settings=` argument of `run()`, `crawl()`, and `stream()`
+7. `-s KEY=VALUE` on the command line, parsed like environment variables
 
 ```python
 class Books(Spider):
@@ -445,12 +446,22 @@ Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (se
 
 | Command | Purpose |
 | --- | --- |
-| `pernix run spider.py[:Name] -a k=v -s key=val -o out.jsonl --job-dir DIR` | Run a Spider |
-| `pernix shell URL [--render]` | Interactive debugging with `response` preloaded |
-| `pernix fetch URL [--render] [--impersonate X]` | Fetch once and print the Response |
-| `pernix new NAME` | Generate a project skeleton (optional; project mode does not enforce a directory layout) |
-| `pernix check` | Validate settings, components, and the browser environment |
-| `pernix browser install` | Install browser engines |
+| `pernix run TARGET[:Name] -a k=v -s key=val -o out.jsonl --run-id ID` | Run a Spider, as `Spider.run()` does |
+| `pernix fetch URL [--fetcher NAME] [--timeout S] [--json] [-o FILE]` | Fetch once and print the Response |
+| `pernix shell [URL]` | Interactive console with top-level `await`, and `request`, `response`, `settings`, and `fetch()` preloaded |
+| `pernix check [TARGET]` | Validate settings and components (and, with the browser Fetcher, the browser environment) |
+| `pernix run ... --job-dir DIR` | Resume a Run (planned, with persistent Frontiers) |
+| `pernix new NAME` | Generate a project skeleton (planned; project mode does not enforce a directory layout) |
+| `pernix browser install` | Install browser engines (planned, with the browser Fetcher) |
+
+- Every command takes `-s KEY=VALUE`, the highest settings layer (§4.11). `run` and `check` take `-a KEY=VALUE` Spider arguments. Results go to stdout; messages and logs go to stderr.
+- TARGET is a `.py` file, imported under its stem with its directory first on `sys.path`, or an import path such as `myproject.spiders.books`. `:Name` picks a Spider by class name or `Spider.name`; it may be left out when the module defines exactly one Spider, not counting those it imports.
+- Exit codes are those of `run()`: 0 completed, 1 failed, 2 configuration error (including invalid options, and a TARGET that cannot be found), 130 stopped by a signal.
+- `fetch` and `shell` fetch through the download Middleware and the Fetchers of the project settings, without retries, a Frontier, or Pipelines. `--fetcher` names a registered Fetcher, `browser` once it exists; otherwise the URL scheme picks one. Impersonation is on by default with the pinned Profile (§5.4); `-s http.impersonate=...` changes it.
+- `fetch` writes the status line, the redirects, and the headers to stderr, and the body to stdout: decoded text for text media types, raw bytes otherwise, though never to a terminal. `-o FILE` writes the body byte for byte. It exits with 0 for any Response, whatever its status, and 1 when fetching failed.
+- `fetch --json` writes one JSON object instead: `url` (requested), `final_url`, `status`, `http_version`, `headers` as `[name, value]` pairs in order, `encoding`, `elapsed` in seconds, `redirects` as `{url, status}` objects, `fetcher`, `body` (the decoded text, or `null` for a binary body or one written with `-o`), and `body_bytes`. A failure is `{"url": ..., "error": {"type": ..., "message": ..., "code": ...}}`, where `code` is the transport's error code, such as libcurl's.
+- In `shell`, `await fetch(url_or_request)` returns the Response and rebinds `request` and `response`; Ctrl-C cancels what is being awaited, and Ctrl-D leaves.
+- `check` builds every component without opening it, so import paths, component roles, chains, and Feed paths are all checked, and prints a summary of the project file, the Spider, and the components; every problem is reported at once.
 
 ## 5. Fetching layer
 
@@ -791,8 +802,8 @@ Rules:
 
 | Phase | Contents |
 | --- | --- |
-| M0 Kernel | Settings, Events, Request/Response, Engine, in-memory Frontier, HTTP Fetcher, deduplication, retries, rate limiting, stats, logging, Feeds, `run`/`fetch`/`shell`, `pernix.testing` basics |
-| M1 Browser and Sessions | Browser Fetcher, `render`, Session/Session Pool, Cookie interoperability, proxies, Blocked-response detection, anti-detection defaults |
+| M0 Kernel | Settings, Events, Request/Response, Engine, in-memory Frontier, HTTP Fetcher, deduplication, retries, rate limiting, stats, logging, Feeds, `run`/`fetch`/`shell`/`check`, `pernix.testing` basics |
+| M1 Browser and Sessions | Browser Fetcher, `render`, Session/Session Pool, Cookie interoperability, proxies, Blocked-response detection, anti-detection defaults, `pernix fetch` for agents (text and Markdown extraction, selection, size limits, batches, a private-address guard) |
 | M2 Persistence and control | SQLite Frontier, `job_dir` resuming, stop modes, `ControlSource`, robots |
 | M3 Distributed | Redis Frontier, Redis Session Pool, shared rate limiting, completion check, Redis `ControlSource`, `pernix pool` commands |
 | M4 Ecosystem | API crawling helpers, file downloads, Sitemap, database Pipelines (MySQL / PostgreSQL / MongoDB / Kafka), Prometheus/OTel, capture and replay |

@@ -107,6 +107,7 @@ class Crawler:
         *,
         args: Mapping[str, object] | None = None,
         settings: Mapping[str, Any] | None = None,
+        command_line: Mapping[str, str] | None = None,
         output: str | os.PathLike[str] | None = None,
     ) -> Crawler:
         """Load the settings, including enabled Addons, create the Spider, and create a Crawler.
@@ -120,7 +121,9 @@ class Crawler:
             spider_type: The Spider class; a new object is created for the Run.
             args: The Spider arguments, by name; strings are converted to the
                 annotated types.
-            settings: Settings for this Run, the highest settings layer.
+            settings: Settings for this Run, above every layer but the command line.
+            command_line: Settings given as text on the command line, parsed like
+                environment variables; the highest layer.
             output: A Feed for the Items besides the `feeds` setting, such as
                 `"books.jsonl"`, `"books.csv"`, or `"books.json"`.
 
@@ -133,13 +136,18 @@ class Crawler:
             pernix.errors.SpiderArgumentError: The Spider arguments are invalid.
         """
         enabled = load_settings(
-            sections=(CoreSettings,), spider_settings=spider_type.settings, overrides=settings, ignore_unknown=True
+            sections=(CoreSettings,),
+            spider_settings=spider_type.settings,
+            overrides=settings,
+            command_line=command_line,
+            ignore_unknown=True,
         )
         addons = load_addons(enabled.section(CoreSettings).addons)
         final = load_settings(
             addon_layers=[addon_settings(addon) for addon in addons],
             spider_settings=spider_type.settings,
             overrides=settings,
+            command_line=command_line,
         )
         return cls(create_spider(spider_type, args or {}), settings=final, output=output, addons=addons)
 
