@@ -469,31 +469,37 @@ A Fetcher is a component with `async def fetch(self, request) -> Response` and a
 
 ### 5.1 HTTP Fetcher (curl-cffi)
 
+The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
+
 **curl session pool**
 
-- Underlying curl sessions are grouped and reused by `(Session, Profile, curl session options)`, and evicted by LRU plus an idle timeout. A single underlying curl session never mixes different Profiles.
-- impersonate is set explicitly on every Request, so a reused connection handle never carries over the previous Request's Profile.
+- Underlying curl sessions are grouped and reused by `(Session, Profile)` (by Profile alone until Sessions exist), created on first use inside the running event loop, and evicted by LRU beyond `http.pool_size` (8) plus an idle timeout of `http.pool_idle` (300 s); a session in use is never closed, one idle too long is replaced rather than reused, and retired sessions close in tasks of their own, which closing the Fetcher waits for. A single underlying curl session never mixes different Profiles, so connections are never shared between Profiles.
+- impersonate is set explicitly on every Request, so a reused connection handle never carries over the previous Request's Profile. The Profile is `http.impersonate`, or `Request(impersonate=...)`; both must name a pinned target (§5.4).
+- Cleartext `http://` Requests use HTTP/1.1, as browsers never upgrade those to HTTP/2; HTTPS negotiates as the Profile does.
 
 **Timeouts and cancellation**
 
-- `timeout` maps to curl's connect/read timeouts; the overall deadline (including time spent waiting in line) is enforced by the framework with asyncio.
-- curl-cffi exceptions are mapped onto the framework's own exception hierarchy, `FetchError` and its subclasses `Timeout`, `ConnectError`, `ProxyError` (407 responses also fall under this), `TLSError`, `TooManyRedirects`, `DecodeError`; the original curl error code is kept in `code`, and the curl-cffi exception is the `__cause__`.
+- `http.timeout` (30 s), or `Request(timeout=...)`, limits connecting and waiting for the response headers, precisely, with asyncio, and then each pause in the body, to the nearest second, with curl. `http.deadline` (180 s) limits the whole fetch, waiting for a connection and reading the body included, so a server trickling data cannot hold a worker forever.
+- Every transfer is streamed from curl. A fetch that is cancelled, times out, or stops reading early, before or after the headers arrived, stops its transfer: curl drops the handle and its unfinished connection, and the pool stays usable.
+- curl-cffi exceptions are mapped onto the framework's own exception hierarchy, `FetchError` and its subclasses `Timeout`, `ConnectError`, `ProxyError` (a 407 response from a proxy also raises it), `TLSError`, `TooManyRedirects`, `DecodeError`, and `ResponseTooLarge`; the original curl error code is kept in `code` (0 for limits the framework enforces), and the curl-cffi exception is the `__cause__`.
 
 **Concurrency**
 
-- Per-host connection limits are implemented by the framework's concurrency slots, not by curl's multi-handle options.
-- HTTP/2 connection reuse is enabled.
+- Per-host connection limits are implemented by the framework's concurrency slots, not by curl's multi-handle options; each curl session allows `concurrency` transfers in flight.
+- HTTP/2 connection reuse is enabled (`PIPEWAIT`).
 
 **Data**
 
-- Request headers preserve order and case, and support duplicate keys.
-- Response headers are read with all multiple values preserved, and `Content-Encoding` is removed from decompressed responses.
-- Streaming downloads: `async with crawler.stream(request)`, with a byte limit, and can be written directly to a file.
+- Request headers preserve order and case, and support duplicate keys; they follow the Profile's own headers.
+- Response headers are read with all multiple values preserved. A body decoded from gzip, deflate, br, or zstd loses `Content-Encoding` and `Content-Length`, which describe the encoded body; a `HEAD` Response keeps them.
+- Redirects are followed up to `http.max_redirects` (20, as browsers do), and recorded in `Response.history`.
+- A body larger than `http.max_body_size` (100 MiB; 0 for no limit) fails with `ResponseTooLarge`: at once when `Content-Length` declares it, unless the response has no body (`HEAD`, 1xx, 204, 304), otherwise as soon as curl receives more, counted from the first byte in curl's write callback, however slowly the body is read.
+- Streaming downloads: `async with fetcher.stream(request, max_bytes=...) as streamed:` gives a `StreamedResponse` whose `response` holds everything but the body, read once with `iter_bytes()` or written to a file with `save(path)`. `http.deadline` then limits only the wait for the headers. Until reading pauses curl, a slow reader buffers up to `max_bytes` in memory. How a Callback reaches it, and that backpressure, come with Inline Fetch (§4.6).
 
 **Delegated to the framework**
 
 - Without a Session, no cookies persist between Requests (ADR 0011): each transfer starts with only the Request's cookies, and cookies set during it, including on redirects, go to `Response.cookies` instead of shared state. Connections are still reused. With a Session, its cookies are managed by the framework, see §5.3.
-- Retries are handled by the framework; curl-cffi's built-in retries are turned off.
+- Retries are handled by the framework; curl-cffi's built-in retries are turned off, and so are proxies from the environment.
 
 ### 5.2 Browser Fetcher (patchright)
 
@@ -571,7 +577,7 @@ class SessionPool(Protocol):
 
 **Profile consistency**
 
-- HTTP uses a pinned-version Chrome Profile by default, whose major version is aligned with that of the bundled browser. Aliases such as `chrome`, which drift as the library is upgraded, are not used.
+- HTTP uses a pinned-version Chrome Profile by default (`http.impersonate`, `chrome150`), whose major version is aligned with that of the bundled browser once the browser Fetcher lands. Aliases such as `chrome`, which drift as the library is upgraded, are rejected, as are unknown targets, with a suggestion.
 - Contract tests guarantee that, for the same Session, the UA major version, `sec-ch-ua`, and OS platform are consistent between the HTTP side and the browser side.
 - By default no extra browser characteristics are injected or randomly generated, to avoid contradicting the real TLS/HTTP2 characteristics. Locale-related headers such as `Accept-Language` are derived uniformly from the `locale` setting.
 

@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- A hardened HTTP Fetcher, configured by the `http.*` settings: a pinned `chrome150` Profile by default (`http.impersonate`), checked against curl-cffi's targets, with drifting aliases rejected; one curl session per Profile, kept in an LRU pool with idle eviction (`http.pool_size`, `http.pool_idle`); `http.timeout` for connecting, the headers, and each pause in the body, and `http.deadline` for the whole fetch; `http.max_redirects` (20); and `http.max_body_size` (100 MiB), raising the new `ResponseTooLarge`. HTTP/1.1 for cleartext URLs, HTTP/2 connection reuse, decoded bodies without `Content-Encoding` and `Content-Length`, and `ProxyError` for a 407 from a proxy.
+- `HTTPFetcher.stream(request, max_bytes=...)`, a `StreamedResponse` whose body is read with `iter_bytes()` or written with `save(path)`.
 - The `pernix` command, also `python -m pernix`: `run TARGET[:Name]` with `-a`, `-o`, and `--run-id`, where TARGET is a `.py` file or an import path; `fetch URL` with `--fetcher`, `--timeout`, `--json`, and `-o`; `shell [URL]`, an interactive console with top-level `await` and `fetch()`; and `check [TARGET]`, which builds every component without opening it. Every command takes `-s KEY=VALUE`.
 - A command-line settings layer above `settings=`, parsed like environment variables: `load_settings(command_line=...)` and `Crawler.from_spider(command_line=...)`.
 - `pernix.runner.run_program()`, which returns the exit status instead of ending the process, and `pernix.run_assembly.DownloadAssembly`, the download chain of a project's settings.

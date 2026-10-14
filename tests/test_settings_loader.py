@@ -598,4 +598,12 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "domain.codes": [],
         "domain.token": None,
         "test.plugins": {},
+        # registered by the default HTTP Fetcher
+        "http.impersonate": "chrome150",
+        "http.timeout": 30.0,
+        "http.deadline": 180.0,
+        "http.max_redirects": 20,
+        "http.max_body_size": 100 * 1024 * 1024,
+        "http.pool_size": 8,
+        "http.pool_idle": 300.0,
     }
