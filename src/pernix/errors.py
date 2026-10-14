@@ -17,6 +17,7 @@ __all__ = [
     "IgnoreRequest",
     "PernixError",
     "ProxyError",
+    "ResponseTooLarge",
     "RetriesExhausted",
     "Retry",
     "SerializationError",
@@ -129,6 +130,10 @@ class TLSError(FetchError):
 
 class TooManyRedirects(FetchError):
     """The Response redirected more often than allowed."""
+
+
+class ResponseTooLarge(FetchError):
+    """The body is larger than the limit, such as `http.max_body_size`; the transfer was stopped."""
 
 
 class DecodeError(FetchError):

@@ -145,6 +145,12 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
 | `items.failed_output` | `None` | The JSON-lines file where `FailedItemsFile` writes failed Items, with the error |
+| `http.impersonate` | `"chrome150"` | The browser Profile HTTP requests impersonate, a pinned version; `Request(impersonate=...)` overrides it |
+| `http.timeout` | `30.0` | Seconds to connect and receive the headers, and between two pieces of the body |
+| `http.deadline` | `180.0` | Seconds a whole fetch may take, waiting for a connection included |
+| `http.max_redirects` | `20` | Redirects followed at most |
+| `http.max_body_size` | `104857600` | Bytes a body may have at most (100 MiB); `0` for no limit |
+| `http.pool_size` / `http.pool_idle` | `8` / `300.0` | curl sessions kept, one per Profile, and seconds one is kept unused |
 | `shutdown.grace` | `20.0` | Seconds a Drain may take before it turns into a Force Stop |
 | `shutdown.close_timeout` | `5.0` | Seconds each component may take to close after a Force Stop; `0` for no limit |
 
@@ -259,7 +265,10 @@ src/pernix/
 ├── fetchers/
 │   ├── fetcher.py       Fetcher protocol
 │   ├── fetcher_dispatch.py picks the Fetcher of each Request
-│   └── http_fetcher.py  curl-cffi HTTP Fetcher
+│   ├── http_fetcher.py  curl-cffi HTTP Fetcher
+│   ├── http_settings.py the http.* settings and the pinned Profile
+│   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction
+│   └── streamed_response.py a Response whose body is read as it arrives
 ├── frontiers/
 │   ├── frontier.py      Frontier protocol, Lease
 │   └── memory_frontier.py in-memory Frontier

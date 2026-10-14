@@ -41,11 +41,13 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "attrs>=25.3",
+    "brotli>=1.2.0",
     "pydantic>=2.11",
     "pyright>=1.1.414",
     "pytest>=9.1",
     "pytest-asyncio>=1.4",
     "ruff>=0.17",
+    "zstandard>=0.25.0",
 ]
 
 [tool.ruff]

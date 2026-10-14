@@ -32,6 +32,9 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
+HTTP_KEYS = ("impersonate", "timeout", "deadline", "max_redirects", "max_body_size", "pool_size", "pool_idle")
+
+
 def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
     assert settings["concurrency"] == 4
     assert "concurrency" in settings
@@ -46,6 +49,7 @@ def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
         "failed_pipelines",
         "run_id",
         "test.plugins",
+        *(f"http.{name}" for name in HTTP_KEYS),  # registered by the default HTTP Fetcher
     }
 
     with pytest.raises(TypeError):
