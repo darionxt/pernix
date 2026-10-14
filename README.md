@@ -186,7 +186,8 @@ src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
 ├── spider.py            Spider base class and the run()/crawl()/stream() entry points
 ├── spider_arguments.py  checks and converts Spider arguments
-├── crawler.py           assembles the components of one Run, builds components
+├── crawler.py           Crawler: runs one Run, builds components with injection, stops it
+├── run_assembly.py      which components a Run has, built and wired before opening
 ├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
 ├── request_processor.py one attempt at a Request: fetch, retry decision, Callbacks
 ├── shutdown.py          Drain, its grace period, and Force Stop

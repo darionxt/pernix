@@ -54,6 +54,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - A string that is not valid JSON for a container setting is reported as `invalid JSON`.
 - From Python 3.14 on, the annotations of component and Spider `__init__` methods may name types defined later or imported only for type checking.
 - The per-Request processing of the Engine moved to `pernix.request_processor.RequestProcessor`.
+- Building and wiring the components of a Run moved from the Crawler to `pernix.run_assembly.RunAssembly`.
 
 - `output=` writes jsonl, csv, or json by the file extension, as a Feed; other extensions are rejected. `pernix.feeds.JsonLinesFeed` is replaced by `Feed`.
 - `ItemScraped` is emitted once an Item passed every Pipeline and was written to the Feeds, apart from its Callback. In Feed output, sets become lists, `Decimal`s strings, and values JSON cannot represent, such as `bytes`, fail the Run with `FeedError`.
