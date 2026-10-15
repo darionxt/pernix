@@ -44,6 +44,57 @@ def test_defaults() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("body", "method"),
+    [
+        ({}, "GET"),
+        ({"body": b"x"}, "POST"),
+        ({"body": ""}, "POST"),
+        ({"json": {"a": 1}}, "POST"),
+        ({"data": {"a": "1"}}, "POST"),
+    ],
+)
+def test_a_request_with_a_body_is_a_post_unless_it_names_a_method(body: dict[str, Any], method: str) -> None:
+    assert Request(URL, **body).method == method
+
+
+def test_an_explicit_method_wins() -> None:
+    assert Request(URL, method="put", json={"a": 1}).method == "PUT"
+    assert Request(URL, method="GET", body=b"query").method == "GET"
+    assert Request(URL, method="DELETE").method == "DELETE"
+
+
+def test_replace_keeps_the_method() -> None:
+    assert Request(URL).replace(body=b"x").method == "GET"
+    assert Request(URL, data={"a": "1"}).replace(url="https://example.com/other").method == "POST"
+
+
+def test_params_are_added_to_the_query_before_the_fragment() -> None:
+    assert Request(URL, params={"q": "a b", "page": 2}).url == "https://example.com/?q=a+b&page=2"
+    assert (
+        Request("https://example.com/s?lang=en#top", params=[("q", "dune"), ("q", "herbert")]).url
+        == "https://example.com/s?lang=en&q=dune&q=herbert#top"
+    )
+    assert (
+        Request("https://example.com/s?", params={"tag": ["x", "y"], "ratio": 0.5}).url
+        == "https://example.com/s?tag=x&tag=y&ratio=0.5"
+    )
+    assert Request(URL, params={}).url == URL
+
+
+def test_params_apply_to_relative_urls_once_resolved() -> None:
+    with resolve_relative_urls(lambda url: f"https://example.com/books/{url}"):
+        request = Request("search?lang=en", params={"q": "dune"})
+
+    assert request.url == "https://example.com/books/search?lang=en&q=dune"
+
+
+@pytest.mark.parametrize("value", [True, None, b"x", ["ok", False]])
+def test_params_must_be_strings_or_numbers(value: Any) -> None:
+    with pytest.raises(TypeError, match=r"params\['flag'\] must be a string or a number"):
+        Request(URL, params={"flag": value})
+
+
 def test_str_bodies_are_encoded_as_utf8() -> None:
     assert Request(URL, method="POST", body="名字").body == "名字".encode()
 
@@ -127,6 +178,8 @@ def test_replace_accepts_only_fields_and_revalidates() -> None:
     )
     with pytest.raises(TypeError, match=r"unknown fields \['json'\]"):
         request.replace(json={"b": 2})
+    with pytest.raises(TypeError, match=r"unknown fields \['params'\]"):
+        request.replace(params={"b": "2"})
     with pytest.raises(ValueError, match="not both"):
         request.replace(headers={"Cookie": "b=2"})
 

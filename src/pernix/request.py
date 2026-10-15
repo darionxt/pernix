@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -15,7 +15,7 @@ import orjson
 from pernix.headers import Headers, HeadersInput
 from pernix.urls import clean_url, is_absolute
 
-__all__ = ["Callback", "CallbackResult", "FormData", "Request", "resolve_relative_urls"]
+__all__ = ["Callback", "CallbackResult", "FormData", "QueryParams", "QueryValue", "Request", "resolve_relative_urls"]
 
 type CallbackResult = AsyncIterator[Any] | Awaitable[Any]
 """What a Callback returns: an async generator of outputs, or an awaitable of one output or a list."""
@@ -25,6 +25,12 @@ type Callback = Callable[..., CallbackResult]
 
 type FormData = Mapping[str, str | Sequence[str]] | Sequence[tuple[str, str]]
 """Form fields for `Request(data=...)`, as a mapping or as `(name, value)` pairs."""
+
+type QueryValue = str | int | float
+"""The value of a query parameter; booleans are refused, as sites spell them differently."""
+
+type QueryParams = Mapping[str, QueryValue | Sequence[QueryValue]] | Sequence[tuple[str, QueryValue]]
+"""Query parameters for `Request(params=...)`, as a mapping or as `(name, value)` pairs; a sequence repeats a name."""
 
 _JSON_CONTENT_TYPE = "application/json"
 _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
@@ -64,6 +70,9 @@ class Request:
     whose Callback is running (its final URL, or its `<base href>`), so `url` is
     always absolute. Outside a Callback, such as in `start()`, a relative URL is an
     error.
+
+    Without an explicit `method`, a Request with a body (`body`, `json`, or `data`) is
+    a POST, and one without is a GET.
 
     Attributes:
         url: The absolute URL to fetch.
@@ -111,7 +120,8 @@ class Request:
         self,
         url: str,
         *,
-        method: str = "GET",
+        method: str | None = None,
+        params: QueryParams | None = None,
         headers: HeadersInput = None,
         body: bytes | str | None = None,
         json: Any = None,
@@ -138,7 +148,10 @@ class Request:
             url: The URL to fetch. Inside a Callback it may be relative to the
                 Response being handled. Surrounding whitespace, tabs, and newlines are
                 removed, as browsers do.
-            method: The HTTP method; any case is accepted.
+            method: The HTTP method, in any case; `None` for POST when `body`, `json`,
+                or `data` is given, and GET otherwise.
+            params: Query parameters added to the URL, after those it has: strings
+                and numbers, with a sequence of values repeating a name.
             headers: Request headers as a mapping or as `(name, value)` pairs.
             body: The raw request body; a `str` is encoded as UTF-8.
             json: A value sent as a JSON body, with `Content-Type: application/json`
@@ -166,11 +179,16 @@ class Request:
             ValueError: `url` is relative outside a Callback; more than one of `body`,
                 `json`, and `data` is given; `cookies` is combined with a `Cookie`
                 header; or `timeout` is not positive.
-            TypeError: `callback` or `errback` is not a method of an object.
+            TypeError: `callback` or `errback` is not a method of an object, or a
+                value of `params` is neither a string nor a number.
         """
         url = _absolute(url)
+        if params is not None:
+            url = _with_params(url, params)
         if sum(value is not None for value in (body, json, data)) > 1:
             raise ValueError("body, json, and data are mutually exclusive")
+        if method is None:
+            method = "GET" if body is None and json is None and data is None else "POST"
         request_headers = Headers(headers)
         if cookies and "Cookie" in request_headers:
             raise ValueError("pass cookies either as cookies= or as a Cookie header, not both")
@@ -213,7 +231,8 @@ class Request:
 
         Args:
             **changes: New values, keyed by field name. To change the body, pass
-                `body`; `json` and `data` only exist when constructing a Request.
+                `body`; `json`, `data`, and `params` only exist when constructing a
+                Request. The method stays as it is unless `method` is passed.
 
         Returns:
             The new Request; this one is unchanged.
@@ -247,6 +266,35 @@ def _absolute(url: str) -> str:
     if not is_absolute(resolved):  # the Response URL has a scheme relative URLs cannot be resolved against
         raise ValueError(f"the relative URL {url!r} cannot be resolved against the Response being handled")
     return resolved
+
+
+def _with_params(url: str, params: QueryParams) -> str:
+    """Add query parameters to a URL, after its query and before its fragment."""
+    encoded = urlencode(list(_query_pairs(params)))
+    if not encoded:
+        return url
+    base, hash_mark, fragment = url.partition("#")
+    separator = "?" if "?" not in base else "" if base.endswith(("?", "&")) else "&"
+    return f"{base}{separator}{encoded}{hash_mark}{fragment}"
+
+
+def _query_pairs(params: QueryParams) -> Iterator[tuple[str, str]]:
+    items: Iterable[tuple[str, object]] = params.items() if isinstance(params, Mapping) else params
+    for name, value in items:
+        values: Iterable[object] = (
+            value if isinstance(value, Sequence) and not isinstance(value, str | bytes) else (value,)
+        )
+        for item in values:
+            yield name, _query_value(name, item)
+
+
+def _query_value(name: str, value: object) -> str:
+    """A query parameter value as text; the type annotations are not enforced, so check it."""
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        raise TypeError(
+            f"params[{name!r}] must be a string or a number, got {value!r}; spell booleans out, such as 'true'"
+        )
+    return str(value)
 
 
 def _frozen[V](values: Mapping[str, V] | None) -> Mapping[str, V]:

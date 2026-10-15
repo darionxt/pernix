@@ -49,7 +49,7 @@ def test_bodies_compare_by_content() -> None:
     by_bytes = Request(URL, method="POST", body=b'{"page":2}')
 
     assert request_fingerprint(by_json) == request_fingerprint(by_bytes)
-    assert request_fingerprint(Request(URL, body=b"")) == request_fingerprint(Request(URL))
+    assert request_fingerprint(Request(URL, method="GET", body=b"")) == request_fingerprint(Request(URL))
 
 
 def test_declared_headers_take_part() -> None:

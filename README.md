@@ -44,10 +44,10 @@ class Account(Spider):
     start_urls = ["https://example.com/"]
 
     async def parse(self, response: Response):
-        login = await self.fetch(Request("/login", method="POST", data={"user": "me", "password": "..."}))
+        login = await self.fetch(Request("/login", data={"user": "me", "password": "..."}))  # a POST
         page = 1
         while page:  # page through an API in order
-            data = (await self.fetch(Request(f"/api/orders?page={page}", cookies=login.cookies))).json()
+            data = (await self.fetch(Request("/api/orders", params={"page": page}, cookies=login.cookies))).json()
             for order in data["orders"]:
                 yield order
             page = data["next"]
