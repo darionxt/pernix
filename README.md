@@ -37,6 +37,26 @@ if __name__ == "__main__":
 
 Each Callback is an async generator that yields Requests to follow and Items to store: dicts, dataclasses, msgspec Structs, pydantic models, or attrs objects. `output=` writes them to a `.jsonl`, `.csv`, or `.json` file. A Request constructed in a Callback resolves a relative URL against the Response being handled, after redirects and honoring `<base href>`. `run()` blocks until every Request has been fetched.
 
+## Fetching inside a Callback
+
+```python
+class Account(Spider):
+    start_urls = ["https://example.com/"]
+
+    async def parse(self, response: Response):
+        login = await self.fetch(Request("/login", method="POST", data={"user": "me", "password": "..."}))
+        page = 1
+        while page:  # page through an API in order
+            data = (await self.fetch(Request(f"/api/orders?page={page}", cookies=login.cookies))).json()
+            for order in data["orders"]:
+                yield order
+            page = data["next"]
+        async with self.stream("/export.csv", max_bytes=0) as export:  # read as it arrives
+            await export.save("export.csv")
+```
+
+`await self.fetch()` is an Inline Fetch: the Request goes through the download Middleware and the per-domain limits, and is retried in place, but it skips the Frontier, so it is neither deduplicated nor stored, and no Callback runs for it. Once its retries run out it raises `RetriesExhausted`. It sends only the cookies you pass, unless the Request being handled has a Session. `self.stream()` reads a body as it arrives: a slow reader keeps about 1 MiB of it in memory, and the transfer holds its domain's slot until the block ends. A Force Stop cancels Inline Fetches with the Request they belong to. See [`docs/design.md`](docs/design.md) §4.6.
+
 ## Running and stopping
 
 ```python
@@ -52,12 +72,12 @@ class Search(Spider):
 result = Search.run(keyword="dune", max_pages="3", output="results.jsonl")  # as a program
 result = await Search.crawl(keyword="dune")  # inside an existing event loop
 
-async with Search.stream(keyword="dune") as items:  # the Items that pass every Pipeline
+async with Search.stream_items(keyword="dune") as items:  # the Items that pass every Pipeline
     async for item in items:
         ...
 ```
 
-Keyword arguments other than `settings=` and `output=` are Spider arguments, declared by the parameters of `__init__`. Strings, as from a command line, are converted to the annotated types: `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; `__init__` may raise `ValueError` to reject a value. `run()` and `crawl()` return a `RunResult` with the `run_id`, the `reason` the Run ended, and the final stats. `stream()` holds one Item at a time, so a slow consumer pauses the Callbacks; leaving the loop early stops the Run.
+Keyword arguments other than `settings=` and `output=` are Spider arguments, declared by the parameters of `__init__`. Strings, as from a command line, are converted to the annotated types: `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; `__init__` may raise `ValueError` to reject a value. `run()` and `crawl()` return a `RunResult` with the `run_id`, the `reason` the Run ended, and the final stats. `stream_items()` holds one Item at a time, so a slow consumer pauses the Callbacks; leaving the loop early stops the Run.
 
 `crawler.stop()` drains a Run: no new Request is claimed, and the Requests in flight and the queued Items are finished within `shutdown.grace`. `crawler.stop("force")` cancels the Requests in flight and returns them to the Frontier, and discards the Items not processed yet; the Feeds are still completed. `run()` drains on the first SIGINT or SIGTERM and force-stops on the second, and ends the process with an exit code when the Run does not complete:
 
@@ -68,7 +88,7 @@ Keyword arguments other than `settings=` and `output=` are Spider arguments, dec
 | `2` | Invalid settings, Spider arguments, or components; nothing was fetched |
 | `130` | A signal stopped the Run |
 
-`crawl()` and `stream()` raise errors instead, and leave signals to your application. See [`docs/design.md`](docs/design.md) §4.12 and §6.6.
+`crawl()` and `stream_items()` raise errors instead, and leave signals to your application. See [`docs/design.md`](docs/design.md) §4.12 and §6.6.
 
 ## Command line
 
@@ -85,7 +105,7 @@ pernix check books.py                                                # validate 
 
 ## Configuration
 
-Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, the `settings=` argument of `run()`, `crawl()`, and `stream()`, and `-s` on the command line.
+Settings come from several layers, from lowest to highest precedence: built-in defaults, Addons, the project file, `PERNIX_*` environment variables, `Spider.settings`, the `settings=` argument of `run()`, `crawl()`, and `stream_items()`, and `-s` on the command line.
 
 ```python
 class Titles(Spider):
@@ -203,12 +223,13 @@ The stats of a Run, such as `downloads.by_status.200` or `items.scraped`, are in
 ```
 src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
-├── spider.py            Spider base class and the run()/crawl()/stream() entry points
+├── spider.py            Spider base class, Inline Fetch, and the run()/crawl()/stream_items() entry points
 ├── spider_arguments.py  checks and converts Spider arguments
 ├── crawler.py           Crawler: runs one Run, builds components with injection, stops it
 ├── run_assembly.py      which components a Run has, built and wired before opening; the download chain
 ├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
 ├── request_processor.py one attempt at a Request: fetch, retry decision, Callbacks
+├── inline_fetch.py      Inline Fetch: fetching in place, retried in place, and streamed
 ├── shutdown.py          Drain, its grace period, and Force Stop
 ├── runner.py            run() as a program: exit codes
 ├── __main__.py          python -m pernix
@@ -263,11 +284,11 @@ src/pernix/
 │   ├── extension.py     Extension base class
 │   └── offsite.py       OffsiteFilter: drops Requests outside allowed_domains
 ├── fetchers/
-│   ├── fetcher.py       Fetcher protocol
-│   ├── fetcher_dispatch.py picks the Fetcher of each Request
+│   ├── fetcher.py       Fetcher and StreamingFetcher protocols
+│   ├── fetcher_dispatch.py picks the Fetcher of each Request; opens streamed transfers
 │   ├── http_fetcher.py  curl-cffi HTTP Fetcher
 │   ├── http_settings.py the http.* settings and the pinned Profile
-│   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction
+│   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   └── streamed_response.py a Response whose body is read as it arrives
 ├── frontiers/
 │   ├── frontier.py      Frontier protocol, Lease

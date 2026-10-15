@@ -14,6 +14,7 @@ from pernix.feeds import Feed, render_path
 from pernix.fetchers import FetcherDispatch
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier
+from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
@@ -99,6 +100,8 @@ class RunAssembly:
         items: Takes the Items through the Pipelines into the Feeds.
         frontier: Holds the Requests of the Run.
         engine: Fetches the Requests and runs their Callbacks.
+        inline_fetch: Fetches Requests in place, through the same download chain,
+            Throttle, and retry policy as the Engine.
         reporter: Takes the stats snapshots.
     """
 
@@ -107,6 +110,7 @@ class RunAssembly:
     items: ItemProcessor
     frontier: Frontier
     engine: Engine
+    inline_fetch: InlineFetch
     reporter: StatsReporter
 
     @classmethod
@@ -181,10 +185,11 @@ class RunAssembly:
         core_stats = CoreStats(crawler.stats)
         frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
+        download = core_stats.count_downloads(downloading.download)
         engine = Engine(
             crawler.spider,
             frontier=frontier,
-            download=core_stats.count_downloads(downloading.download),
+            download=download,
             handle=handle,
             put_item=items.put,
             events=events,
@@ -192,6 +197,9 @@ class RunAssembly:
             lease_ttl=settings.section(FrontierSettings).lease_ttl,
             retry_policy=retry_policy,
             throttle=throttle,
+        )
+        inline_fetch = InlineFetch(
+            download=download, throttle=throttle, retry_policy=retry_policy, events=events, stats=crawler.stats
         )
         events.subscribe_methods(core_stats)
         for sink in sinks:
@@ -210,6 +218,7 @@ class RunAssembly:
             items=items,
             frontier=frontier,
             engine=engine,
+            inline_fetch=inline_fetch,
             reporter=_reporter(crawler, frontier, throttle, run_log),
         )
 

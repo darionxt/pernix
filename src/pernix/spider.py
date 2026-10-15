@@ -12,7 +12,9 @@ from pernix.spider_arguments import check_argument_names
 if TYPE_CHECKING:
     import os
     from collections.abc import AsyncIterator, Mapping, Sequence
+    from contextlib import AbstractAsyncContextManager
 
+    from pernix.fetchers import StreamedResponse
     from pernix.items import ItemStream
     from pernix.request import CallbackResult
     from pernix.response import Response
@@ -138,6 +140,65 @@ class Spider:
         """
         raise NotImplementedError(f"{type(self).__name__}.parse() is not implemented")
 
+    async def fetch(self, request: Request | str) -> Response:
+        """Fetch a Request in place and return its Response: an Inline Fetch.
+
+        Use it to log in, to page through an API in order, or to assemble an Item
+        from several pages in one Callback. The Request goes through the download
+        Middleware and the rate limits, but not the Frontier: it is not deduplicated
+        or stored, and its Callback never runs. Failed attempts are retried in place.
+        It continues the Session of the Request being handled, if any; otherwise it
+        sends only the cookies it carries. See `Crawler.fetch()`.
+
+        Args:
+            request: The Request, or a URL to GET; a relative URL resolves against the
+                Response whose Callback is running.
+
+        Returns:
+            The Response, whatever its status code, unless the retry policy retries it.
+
+        Raises:
+            RuntimeError: The Run is not running.
+            pernix.errors.RetriesExhausted: The retry policy ran out of retries.
+            pernix.errors.FetchError: The fetch failed in a way the policy does not
+                retry.
+
+        Example:
+            >>> async def parse(self, response):
+            ...     login = await self.fetch(Request("/login", method="POST", data={"user": "me"}))
+            ...     account = await self.fetch(Request("/account", cookies=login.cookies))
+            ...     yield {"name": account.css("h1::text").get()}
+        """
+        return await self.crawler.fetch(request)
+
+    def stream(
+        self, request: Request | str, *, max_bytes: int | None = None
+    ) -> AbstractAsyncContextManager[StreamedResponse]:
+        """Fetch a Request in place, reading its body as it arrives, such as to download a file.
+
+        As `fetch()`, but the body is read once, with `iter_bytes()` or `save()`, and
+        a slow reader keeps only about a megabyte of it in memory. See
+        `Crawler.stream()`.
+
+        Args:
+            request: The Request, or a URL to GET.
+            max_bytes: Bytes the body may have at most; `None` for the Fetcher's own
+                limit, such as `http.max_body_size`, and 0 for no limit.
+
+        Returns:
+            An async context manager giving the `StreamedResponse`; the transfer is
+            closed on exit.
+
+        Raises:
+            RuntimeError: The Run is not running.
+
+        Example:
+            >>> async def parse(self, response):
+            ...     async with self.stream(response.css("a.video::attr(href)").get(), max_bytes=0) as video:
+            ...         await video.save(f"videos/{response.meta['id']}.mp4")
+        """
+        return self.crawler.stream(request, max_bytes=max_bytes)
+
     @classmethod
     def run(
         cls,
@@ -205,7 +266,7 @@ class Spider:
         return await Crawler.from_spider(cls, args=args, settings=settings, output=output).crawl()
 
     @classmethod
-    def stream(
+    def stream_items(
         cls,
         *,
         settings: Mapping[str, Any] | None = None,
@@ -234,8 +295,8 @@ class Spider:
             pernix.errors.AddonError: An enabled Addon cannot be loaded.
 
         Example:
-            >>> async with Books.stream(keyword="dune") as items:
+            >>> async with Books.stream_items(keyword="dune") as items:
             ...     async for item in items:
             ...         print(item["title"])
         """
-        return Crawler.from_spider(cls, args=args, settings=settings, output=output).stream()
+        return Crawler.from_spider(cls, args=args, settings=settings, output=output).stream_items()

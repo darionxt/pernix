@@ -5,6 +5,11 @@ download chain until the Response arrives. A slot admits a new fetch while fewer
 `domain.concurrency` are in progress, `domain.delay` has passed since the last start,
 the GCRA rate allows it, and the slot is not cooling down. A 429 or 503 Response with
 `Retry-After` cools its whole slot down for that long.
+
+A fetch nested in another of the same slot, in the same task, such as an Inline Fetch
+a download Middleware makes, shares the outer fetch's place instead of waiting for
+another, which the outer fetch could hold forever. It still waits for the delay and
+the rate, and is refused while the slot cools down.
 """
 
 from __future__ import annotations
@@ -13,13 +18,15 @@ import asyncio
 import datetime as dt
 import random
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pernix.retry_policy import retry_after_seconds
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
     from pernix.response import Response
     from pernix.settings import DomainSettings
@@ -28,6 +35,11 @@ __all__ = ["COOLDOWN_STATUSES", "Throttle", "ThrottleStats"]
 
 COOLDOWN_STATUSES = frozenset({429, 503})
 """Statuses whose `Retry-After` pauses the whole slot."""
+
+_held: ContextVar[frozenset[tuple[Throttle, str, asyncio.Task[Any] | None]]] = ContextVar(
+    "pernix_held_slots", default=frozenset()
+)
+"""The slots held by the fetches the current code runs inside of, with the task holding each."""
 
 
 @dataclass(slots=True)
@@ -106,14 +118,17 @@ class Throttle:
         state = self._slots.get(slot)
         return 0.0 if state is None else max(0.0, state.cool_until - self._clock())
 
-    async def acquire(self, slot: str) -> bool:
+    async def acquire(self, slot: str, *, shared: bool = False) -> bool:
         """Start a fetch in a slot, waiting until the slot admits it.
 
         Args:
             slot: The slot of the Request.
+            shared: The fetch shares the place of a fetch it is nested in, which
+                `holds()` tells: it waits for the delay and the rate, but not for a free
+                place, and takes none, so it must not `release()` the slot.
 
         Returns:
-            `True` once the fetch holds the slot; `False` at once if the slot is cooling
+            `True` once the fetch may start; `False` at once if the slot is cooling
             down, so the caller can return the Request instead of holding it.
         """
         started = self._clock()
@@ -125,18 +140,54 @@ class Throttle:
                 self.stats.refused += 1
                 return False
             ready_at = self._ready_at(state)
-            if state.active < self._settings.concurrency and ready_at <= now:
+            full = not shared and state.active >= self._settings.concurrency
+            if not full and ready_at <= now:
                 break
             waited = True
-            await self._wait(None if state.active >= self._settings.concurrency else ready_at - now)
+            await self._wait(None if full else ready_at - now)
         if waited:
             self.stats.waits += 1
             self.stats.wait_seconds += now - started
-        state.active += 1
+        if not shared:
+            state.active += 1
         state.next_start = now + self._delay()
         if self._interval:
             state.tat = max(state.tat, now) + self._interval
         return True
+
+    @contextmanager
+    def holding(self, slot: str) -> Generator[None]:
+        """Mark the code inside the block as holding a slot, in the current task.
+
+        A fetch wraps its download in this once `acquire()` gave it the slot, so that
+        the fetches nested in it share the slot: see `holds()`.
+
+        Args:
+            slot: The slot.
+
+        Yields:
+            Nothing; the block runs holding the slot.
+        """
+        token = _held.set(_held.get() | {(self, slot, asyncio.current_task())})
+        try:
+            yield
+        finally:
+            _held.reset(token)
+
+    def holds(self, slot: str) -> bool:
+        """Whether the current task holds a slot already, through a fetch it is nested in.
+
+        Such a fetch shares the place of the outer one, with `acquire(slot,
+        shared=True)`, rather than wait for another. Tasks the outer fetch starts do not
+        share it, so they cannot run past `domain.concurrency`.
+
+        Args:
+            slot: The slot.
+
+        Returns:
+            Whether it is held.
+        """
+        return (self, slot, asyncio.current_task()) in _held.get()
 
     def release(self, slot: str) -> None:
         """End a fetch that `acquire()` started.

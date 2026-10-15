@@ -8,6 +8,7 @@ back in the Frontier (`nack` with a delay), so they hold no concurrency slot.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import random
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -23,7 +24,17 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.settings import RetrySettings
 
-__all__ = ["Action", "Decision", "DefaultRetryPolicy", "RetryPolicy", "full_jitter", "retry_after_seconds"]
+__all__ = [
+    "Action",
+    "Decision",
+    "DefaultRetryPolicy",
+    "RetryPolicy",
+    "consult",
+    "full_jitter",
+    "retry_after_seconds",
+]
+
+logger = logging.getLogger(__name__)
 
 _RETRIED_ERRORS = (Timeout, ConnectError, ProxyError)
 _MAX_DOUBLINGS = 64
@@ -102,6 +113,26 @@ class RetryPolicy(Protocol):
             What to do next.
         """
         ...
+
+
+def consult(policy: RetryPolicy, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
+    """Ask a retry policy to judge an attempt; a policy that raises keeps the outcome.
+
+    Args:
+        policy: The retry policy.
+        request: The Request.
+        outcome: The Response, or the exception raised.
+        attempt: Which attempt this was, from 1.
+
+    Returns:
+        The policy's Decision; `Decision.accept()` if the policy raised, which is
+        logged.
+    """
+    try:
+        return policy.decide(request, outcome, attempt)
+    except Exception:
+        logger.exception("The retry policy failed to judge %r; keeping the outcome", request)
+        return Decision.accept()
 
 
 class DefaultRetryPolicy:

@@ -195,7 +195,9 @@ class HTTPFetcher:
         """Send a Request and read its body as it arrives.
 
         `http.deadline` limits the wait for the response headers; after that, only
-        `http.timeout` between two pieces of data limits the transfer.
+        `http.timeout` between two pieces of data limits the transfer. A slow reader
+        holds about a megabyte of the body in memory at most: curl stops receiving
+        until it catches up, and pausing never times out.
 
         Args:
             request: The Request to send.
@@ -204,6 +206,7 @@ class HTTPFetcher:
 
         Yields:
             The Response, with its body to read once; the transfer is closed on exit.
+            The Response is marked `streamed`.
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
@@ -218,7 +221,7 @@ class HTTPFetcher:
                 result, transfer = await self._send(session, request, profile, limit)
             try:
                 _check_declared_size(result, request, limit)
-                response = self._response(request, result, b"", elapsed=time.monotonic() - started)
+                response = self._response(request, result, b"", elapsed=time.monotonic() - started, streamed=True)
                 yield StreamedResponse(response, lambda: _chunks(result, request, transfer), max_bytes=limit)
             finally:
                 await _discard(result)
@@ -285,7 +288,9 @@ class HTTPFetcher:
         except CurlError as exc:
             raise _fetch_error(exc) from exc
 
-    def _response(self, request: Request, result: curl_cffi.Response, body: bytes, *, elapsed: float) -> Response:
+    def _response(
+        self, request: Request, result: curl_cffi.Response, body: bytes, *, elapsed: float, streamed: bool = False
+    ) -> Response:
         hops = [*result.history, result]
         set_cookies = [value for hop in hops for value in hop.headers.get_list("set-cookie") if value is not None]
         headers = _headers(result)
@@ -304,14 +309,16 @@ class HTTPFetcher:
             ip_address=result.primary_ip or None,
             http_version=_HTTP_VERSIONS.get(result.http_version),
             fetcher="http",
+            streamed=streamed,
         )
 
 
 async def _chunks(result: curl_cffi.Response, request: Request, transfer: Transfer) -> AsyncIterator[bytes]:
-    """Read a streamed body, as FetchErrors."""
+    """Read a streamed body, resuming curl as it is read, and failing with FetchErrors."""
     content = cast("AsyncIterator[bytes]", result.aiter_content())  # pyright: ignore[reportUnknownMemberType]  # untyped
     try:
         async for chunk in content:
+            transfer.read(len(chunk))
             yield chunk
     except CurlError as exc:
         if transfer.exceeded:

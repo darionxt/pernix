@@ -54,7 +54,7 @@ def load_settings(
         environ: The environment to read `PERNIX_*` variables from; defaults to
             `os.environ`.
         spider_settings: The `settings` attribute of the Spider.
-        overrides: Settings passed to `run()`, `crawl()`, or `stream()`.
+        overrides: Settings passed to `run()`, `crawl()`, or `stream_items()`.
         command_line: Settings given as text, such as with `-s` on the command line;
             values are parsed like environment variables.
         ignore_unknown: Skip keys that no known Section declares instead of failing,

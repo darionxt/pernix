@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 
 import pytest
 
@@ -49,6 +50,22 @@ async def test_each_domain_has_its_own_concurrency_limit() -> None:
     async with asyncio.timeout(5):
         assert await third
     assert (throttle.stats.waits, throttle.stats.wait_seconds) == (1, 0.0)  # the fake clock stood still
+
+
+async def test_a_shared_fetch_takes_no_place_but_keeps_the_pace() -> None:
+    throttle = Throttle(DomainSettings(concurrency=1, delay=0.05, delay_jitter=0.0))
+    assert await throttle.acquire(A)
+
+    started = time.monotonic()
+    async with asyncio.timeout(1):
+        assert await throttle.acquire(A, shared=True)  # the only place is taken, and shared
+    assert time.monotonic() - started >= 0.045  # after the delay all the same
+    throttle.release(A)
+    async with asyncio.timeout(1):
+        assert await throttle.acquire(A)  # the shared fetch took no place
+
+    throttle.observe(A, _response(429, "60"))
+    assert not await throttle.acquire(A, shared=True)
 
 
 async def test_delays_space_the_starts_of_one_domain() -> None:

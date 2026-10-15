@@ -40,7 +40,7 @@ def check_argument_names(spider_type: type[Spider]) -> None:
     if clashes:
         names = " and ".join(repr(name) for name in clashes)
         raise TypeError(
-            f"{spider_type.__qualname__}.__init__ takes {names}, which run(), crawl(), and stream() "
+            f"{spider_type.__qualname__}.__init__ takes {names}, which run(), crawl(), and stream_items() "
             "reserve for themselves; rename the Spider argument"
         )
     for name, parameter in parameters.items():

@@ -13,6 +13,7 @@ from pernix.errors import CONFIGURATION_ERRORS
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.items import ItemStream
 from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
+from pernix.request import Request
 from pernix.run_assembly import RunAssembly
 from pernix.run_result import RunResult
 from pernix.settings import (
@@ -31,13 +32,16 @@ from pernix.stats import Stats
 if TYPE_CHECKING:
     import os
     from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from contextlib import AbstractAsyncContextManager
 
     from pernix.engine import Engine
     from pernix.feeds import Feed
+    from pernix.fetchers import StreamedResponse
+    from pernix.inline_fetch import InlineFetch
     from pernix.items import ItemProcessor
+    from pernix.response import Response
     from pernix.shutdown import StopMode
     from pernix.spider import Spider
-    from pernix.stats import StatsReporter
 
 __all__ = ["Crawler"]
 
@@ -100,6 +104,7 @@ class Crawler:
         self._close_timeout = shutdown.close_timeout or None
         self._shutdown = Shutdown(grace=shutdown.grace, close_timeout=self._close_timeout)
         self._outlet: Callable[[Any], Awaitable[None]] | None = None
+        self._inline_fetch: InlineFetch | None = None
 
     @classmethod
     def from_spider(
@@ -198,7 +203,81 @@ class Crawler:
         """
         self._shutdown.request(mode)
 
-    def stream(self) -> ItemStream:
+    async def fetch(self, request: Request | str) -> Response:
+        """Fetch a Request in place and return its Response: an Inline Fetch.
+
+        The Request goes through the download Middleware and waits for its slot, as
+        Requests from the Frontier do, but it is not deduplicated or stored, and no
+        Callback runs for it. Nested in another fetch for the same domain, in the
+        same task, such as from a download Middleware, it shares that fetch's place
+        in the slot, though it still waits for the delay, the rate, and a cooldown. The retry policy judges it as usual, and a retry waits
+        in place. A Request without a Session continues the Session of the Request
+        whose Callback or errback is running; otherwise, as any Request, it sends
+        only the cookies it carries. Cancelling the caller, as a Force Stop does,
+        cancels the fetch.
+
+        It works while the Run runs, from `SpiderOpened` to `SpiderClosed`: in
+        `start()`, `on_idle()`, Callbacks, errbacks, and components.
+
+        Args:
+            request: The Request, or a URL to GET; a relative URL resolves against the
+                Response whose Callback is running.
+
+        Returns:
+            The Response, whatever its status code, unless the retry policy retries it.
+
+        Raises:
+            RuntimeError: The Run is not running.
+            pernix.errors.RetriesExhausted: The policy retried the Request until no
+                retry was left; it holds the last Response, or is caused by the last
+                exception.
+            pernix.errors.FetchError: The fetch failed in a way the policy does not
+                retry.
+            pernix.errors.IgnoreRequest: A download Middleware dropped the Request.
+
+        Example:
+            >>> async def parse(self, response):
+            ...     api = await self.crawler.fetch(f"/api/comments?id={response.meta['id']}")
+            ...     yield {"comments": api.json()["data"]}
+        """
+        return await self._running_inline_fetch().fetch(_as_request(request))
+
+    def stream(
+        self, request: Request | str, *, max_bytes: int | None = None
+    ) -> AbstractAsyncContextManager[StreamedResponse]:
+        """Fetch a Request in place, reading its body as it arrives, such as to download a file.
+
+        As `fetch()`, but the body is read once from the `StreamedResponse`, with
+        `iter_bytes()` or `save()`. A slow reader holds about a megabyte of it in
+        memory at most, as the Fetcher stops receiving until the reader catches up.
+        Only the attempts up to the response headers are retried, and the stream
+        holds its slot until it is closed; the fetches made in the block, in the same
+        task, share it.
+
+        Download Middleware see the Response marked `streamed`, without its body. A
+        Middleware may return another Response, such as a cached one, whose body is
+        then read instead. A Fetcher without `stream()` reads the whole body first.
+
+        Args:
+            request: The Request, or a URL to GET.
+            max_bytes: Bytes the body may have at most; `None` for the Fetcher's own
+                limit, such as `http.max_body_size`, and 0 for no limit.
+
+        Returns:
+            An async context manager giving the `StreamedResponse`; the transfer is
+            closed on exit.
+
+        Raises:
+            RuntimeError: The Run is not running.
+
+        Example:
+            >>> async def parse(self, response):
+            ...     async with self.crawler.stream(response.css("a.pdf::attr(href)").get()) as pdf:
+            ...         await pdf.save("report.pdf")
+        """
+        return self._running_inline_fetch().stream(_as_request(request), max_bytes=max_bytes)
+
+    def stream_items(self) -> ItemStream:
         """Run the Spider while streaming the Items that pass every Pipeline.
 
         The Run starts with the first iteration; see `pernix.items.ItemStream`.
@@ -268,7 +347,7 @@ class Crawler:
                 try:
                     if await self._shutdown.run_stage(self._open(lifecycle, run.components, run.feeds)):
                         return RunResult(self.run_id, "forced", self.stats.snapshot())
-                    return await self._run(run.engine, run.items, run.reporter)
+                    return await self._run(run)
                 except asyncio.CancelledError:
                     lifecycle.limit_closing(self._close_timeout)
                     raise
@@ -285,21 +364,31 @@ class Crawler:
         for feed in feeds:
             await lifecycle.open(feed)
 
-    async def _run(self, engine: Engine, items: ItemProcessor, reporter: StatsReporter) -> RunResult:
+    async def _run(self, run: RunAssembly) -> RunResult:
         reason = "failed"
-        reporter.start()
+        run.reporter.start()
+        self._inline_fetch = run.inline_fetch
         try:
             try:
                 await self.events.emit(SpiderOpened(self.spider))
-                reason = await self._work(engine, items)
+                reason = await self._work(run.engine, run.items)
             except asyncio.CancelledError:
                 reason = "cancelled"
                 raise
             finally:
                 await self.events.emit(SpiderClosed(self.spider, reason))
         finally:
-            snapshot = await reporter.finish(reason)
+            self._inline_fetch = None
+            snapshot = await run.reporter.finish(reason)
         return RunResult(self.run_id, reason, snapshot)
+
+    def _running_inline_fetch(self) -> InlineFetch:
+        if self._inline_fetch is None:
+            raise RuntimeError(
+                "Inline Fetches work only while the Run runs, from SpiderOpened to SpiderClosed: "
+                "in start(), on_idle(), Callbacks, errbacks, and components"
+            )
+        return self._inline_fetch
 
     async def _work(self, engine: Engine, items: ItemProcessor) -> str:
         """Fetch and process the Items until done, or until stopped; return how the work ended."""
@@ -337,3 +426,7 @@ class Crawler:
             except KeyError:
                 return None
         return None
+
+
+def _as_request(request: Request | str) -> Request:
+    return Request(request) if isinstance(request, str) else request
