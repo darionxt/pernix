@@ -1,0 +1,384 @@
+"""Inline Fetch against fake download chains and Fetchers, without a network."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import pytest
+
+from pernix import IgnoreRequest, Request, Response, events
+from pernix.errors import ConnectError, ResponseTooLarge, RetriesExhausted, TLSError
+from pernix.fetchers import FetcherDispatch, StreamedResponse
+from pernix.inline_fetch import InlineFetch, handling
+from pernix.middlewares import build_download_chain
+from pernix.retry_policy import Decision, DefaultRetryPolicy
+from pernix.settings import DomainSettings, RetrySettings
+from pernix.stats import Stats
+from pernix.throttle import Throttle
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+
+    from pernix.middlewares import Download
+    from pernix.retry_policy import RetryPolicy
+
+SITE = "https://site.example"
+
+type Outcome = int | bytes | Exception
+"""A status for an empty Response, a body for a 200 Response, or an exception to raise."""
+
+
+def _response(request: Request, outcome: int | bytes, **options: Any) -> Response:
+    status, body = (outcome, b"") if isinstance(outcome, int) else (200, outcome)
+    return Response(url=request.url, status=status, headers=[], body=body, request=request, **options)
+
+
+class FakeSite:
+    """A download chain answering each path with its outcomes in turn, repeating the last."""
+
+    def __init__(self, pages: dict[str, list[Outcome]]) -> None:
+        self.pages = pages
+        self.fetched: list[Request] = []
+
+    async def __call__(self, request: Request) -> Response:
+        self.fetched.append(request)
+        outcomes = self.pages[request.url.removeprefix(SITE)]
+        outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _response(request, outcome)
+
+
+class Recording:
+    """Records the Events of one type."""
+
+    def __init__(self, bus: events.EventBus, event_type: type[events.Event]) -> None:
+        self.events: list[Any] = []
+        bus.on(event_type, self.events.append)
+
+
+def _inline(
+    download: Download,
+    *,
+    domain: DomainSettings | None = None,
+    retry_policy: RetryPolicy | None = None,
+    bus: events.EventBus | None = None,
+    stats: Stats | None = None,
+) -> InlineFetch:
+    return InlineFetch(
+        download=download,
+        throttle=Throttle(domain or DomainSettings()),
+        retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings(delay_scale=0)),
+        events=bus or events.EventBus(timeout=5),
+        stats=stats or Stats(),
+    )
+
+
+async def test_a_fetch_returns_the_response_whatever_its_status() -> None:
+    site = FakeSite({"/a": [b"<p>a</p>"], "/missing": [404]})
+    inline = _inline(site)
+
+    found, missing = await inline.fetch(Request(f"{SITE}/a")), await inline.fetch(Request(f"{SITE}/missing"))
+
+    assert (found.status, found.body, missing.status) == (200, b"<p>a</p>", 404)
+
+
+async def test_failed_attempts_are_retried_in_place() -> None:
+    site = FakeSite({"/flaky": [503, ConnectError("reset"), b"ok"]})
+    bus = events.EventBus(timeout=5)
+    retried = Recording(bus, events.RequestRetried)
+
+    response = await _inline(site, bus=bus).fetch(Request(f"{SITE}/flaky"))
+
+    assert response.body == b"ok"
+    assert len(site.fetched) == 3
+    assert [(event.attempt, event.reason) for event in retried.events] == [
+        (1, "HTTP 503"),
+        (2, "ConnectError: reset"),
+    ]
+
+
+async def test_retries_wait_their_delay_in_place() -> None:
+    site = FakeSite({"/flaky": [503, b"ok"]})
+
+    class Briefly:
+        def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
+            if isinstance(outcome, Response) and outcome.status == 503:
+                return Decision.retry(0.05, "busy")
+            return Decision.accept()
+
+    started = time.monotonic()
+    await _inline(site, retry_policy=Briefly()).fetch(Request(f"{SITE}/flaky"))
+
+    assert time.monotonic() - started >= 0.05
+
+
+async def test_once_the_retries_run_out_the_fetch_raises_retries_exhausted() -> None:
+    site = FakeSite({"/down": [503], "/unreachable": [ConnectError("refused")]})
+    inline = _inline(site, retry_policy=DefaultRetryPolicy(RetrySettings(times=1, delay_scale=0)))
+
+    with pytest.raises(RetriesExhausted, match="HTTP 503") as down:
+        await inline.fetch(Request(f"{SITE}/down"))
+    with pytest.raises(RetriesExhausted) as unreachable:
+        await inline.fetch(Request(f"{SITE}/unreachable"))
+
+    assert down.value.response is not None
+    assert down.value.response.status == 503
+    assert isinstance(unreachable.value.__cause__, ConnectError)
+    assert unreachable.value.response is None
+    assert len(site.fetched) == 4
+
+
+async def test_errors_the_policy_keeps_are_raised_as_they_are() -> None:
+    site = FakeSite({"/insecure": [TLSError("bad certificate")]})
+
+    with pytest.raises(TLSError, match="bad certificate"):
+        await _inline(site).fetch(Request(f"{SITE}/insecure"))
+    assert len(site.fetched) == 1
+
+
+async def test_a_request_a_middleware_ignores_raises_ignore_request() -> None:
+    judged: list[object] = []
+
+    class Judging:
+        def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
+            judged.append(outcome)
+            return Decision.retry(0, "always")
+
+    async def ignore(request: Request) -> Response:
+        raise IgnoreRequest("not needed")
+
+    with pytest.raises(IgnoreRequest, match="not needed"):
+        await _inline(ignore, retry_policy=Judging()).fetch(Request(f"{SITE}/a"))
+    assert judged == []
+
+
+async def test_each_attempt_waits_for_its_slot_and_frees_it() -> None:
+    running: dict[str, int] = {}
+    most: dict[str, int] = {}
+
+    async def slow(request: Request) -> Response:
+        host = request.url.split("/")[2]
+        running[host] = running.get(host, 0) + 1
+        most[host] = max(most.get(host, 0), running[host])
+        await asyncio.sleep(0.01)
+        running[host] -= 1
+        if request.url.endswith("/fail"):
+            raise TLSError("bad certificate")
+        return _response(request, b"")
+
+    inline = _inline(slow, domain=DomainSettings(concurrency=1))
+    urls = [f"{SITE}/{n}" for n in range(3)] + ["https://other.example/0", "https://other.example/1"]
+    with pytest.raises(TLSError):
+        await inline.fetch(Request(f"{SITE}/fail"))
+
+    async with asyncio.timeout(5):
+        await asyncio.gather(*(inline.fetch(Request(url)) for url in urls))
+
+    assert most == {"site.example": 1, "other.example": 1}
+
+
+async def test_a_cooling_slot_is_waited_out_in_place() -> None:
+    site = FakeSite({"/limited": [b"ok"]})
+    throttle = Throttle(DomainSettings(cooldown_max=0.05))
+    inline = InlineFetch(
+        download=site,
+        throttle=throttle,
+        retry_policy=DefaultRetryPolicy(RetrySettings(delay_scale=0)),
+        events=events.EventBus(timeout=5),
+        stats=Stats(),
+    )
+    request = Request(f"{SITE}/limited")
+    throttle.observe("site.example", _response(request, 429).replace(headers=[("Retry-After", "60")]))
+
+    started = time.monotonic()
+    response = await inline.fetch(request)
+
+    assert response.status == 200
+    assert time.monotonic() - started >= 0.04
+    assert throttle.stats.refused >= 1
+
+
+async def test_a_request_continues_the_session_of_the_request_being_handled() -> None:
+    site = FakeSite({"/a": [b""]})
+    inline = _inline(site)
+
+    with handling(Request(f"{SITE}/page", session="first")):
+        await inline.fetch(Request(f"{SITE}/a"))
+        await inline.fetch(Request(f"{SITE}/a", session="own"))
+    await inline.fetch(Request(f"{SITE}/a"))
+
+    assert [request.session for request in site.fetched] == ["first", "own", None]
+
+
+class Files:
+    """A Fetcher of fixed bodies that can stream them, tracking its open transfers."""
+
+    schemes: ClassVar[frozenset[str]] = frozenset({"https"})
+
+    def __init__(self, outcomes: list[int | bytes]) -> None:
+        self.outcomes = outcomes
+        self.opened = 0
+        self.open = 0
+        self.limits: list[int | None] = []
+
+    def _next(self) -> int | bytes:
+        return self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+
+    async def fetch(self, request: Request) -> Response:
+        return _response(request, self._next())
+
+    @asynccontextmanager
+    async def stream(self, request: Request, *, max_bytes: int | None = None) -> AsyncGenerator[StreamedResponse]:
+        outcome = self._next()
+        body = b"" if isinstance(outcome, int) else outcome
+        self.opened += 1
+        self.open += 1
+        self.limits.append(max_bytes)
+        try:
+            response = _response(request, outcome if isinstance(outcome, int) else 200, streamed=True)
+            yield StreamedResponse(response, lambda: _halves(body), max_bytes=max_bytes or None)
+        finally:
+            self.open -= 1
+
+
+async def _halves(body: bytes) -> AsyncIterator[bytes]:
+    middle = len(body) // 2
+    yield body[:middle]
+    yield body[middle:]
+
+
+type Layer = Callable[[Request, Download], Awaitable[Response]]
+
+
+def _chain(fetcher: object, *layers: Layer) -> Download:
+    return build_download_chain(list(layers), FetcherDispatch({"files": fetcher}))
+
+
+async def _read(streamed: StreamedResponse) -> bytes:
+    return b"".join([chunk async for chunk in streamed.iter_bytes()])
+
+
+async def test_a_streamed_fetch_passes_the_middleware_a_response_without_its_body() -> None:
+    files = Files([b"0123456789"])
+    seen: list[tuple[bool, bytes]] = []
+
+    async def record(request: Request, call_next: Download) -> Response:
+        response = await call_next(request)
+        seen.append((response.streamed, response.body))
+        return response.replace(headers=[("X-Seen", "yes")])
+
+    stats = Stats()
+    inline = _inline(_chain(files, record), stats=stats)
+    async with inline.stream(Request(f"{SITE}/file"), max_bytes=100) as streamed:
+        body = await _read(streamed)
+
+    assert seen == [(True, b"")]
+    assert body == b"0123456789"
+    assert (streamed.response.fetcher, streamed.response.headers.get("X-Seen")) == ("files", "yes")
+    assert (files.open, files.limits) == (0, [100])
+    assert stats.snapshot()["downloads.bytes"] == 10
+
+
+async def test_a_middleware_may_answer_a_streamed_fetch_with_a_whole_response() -> None:
+    files = Files([b"fetched"])
+
+    async def cache(request: Request, call_next: Download) -> Response:
+        return _response(request, b"cached")
+
+    async with _inline(_chain(files, cache)).stream(Request(f"{SITE}/file")) as streamed:
+        body = await _read(streamed)
+
+    assert body == b"cached"
+    assert (streamed.response.streamed, streamed.response.body) == (True, b"")
+    assert files.opened == 0
+
+
+async def test_a_middleware_fetching_twice_reads_the_second_transfer_and_closes_the_first() -> None:
+    files = Files([b"first", b"second"])
+    open_while_fetching_again: list[int] = []
+
+    async def twice(request: Request, call_next: Download) -> Response:
+        await call_next(request)
+        open_while_fetching_again.append(files.open)
+        return await call_next(request)
+
+    async with _inline(_chain(files, twice)).stream(Request(f"{SITE}/file")) as streamed:
+        assert files.open == 1
+        body = await _read(streamed)
+
+    assert body == b"second"
+    assert open_while_fetching_again == [1]
+    assert (files.opened, files.open) == (2, 0)
+
+
+async def test_a_fetcher_without_stream_is_read_whole() -> None:
+    class Whole:
+        schemes: ClassVar[frozenset[str]] = frozenset({"https"})
+
+        async def fetch(self, request: Request) -> Response:
+            return _response(request, b"whole body")
+
+    inline = _inline(_chain(Whole()))
+    async with inline.stream(Request(f"{SITE}/file")) as streamed:
+        assert await _read(streamed) == b"whole body"
+    async with inline.stream(Request(f"{SITE}/file"), max_bytes=4) as streamed:
+        with pytest.raises(ResponseTooLarge, match="exceeds 4 bytes"):
+            await _read(streamed)
+
+
+async def test_a_stream_holds_its_slot_until_it_is_closed() -> None:
+    files = Files([b"data"])
+    inline = _inline(_chain(files), domain=DomainSettings(concurrency=1))
+    order: list[str] = []
+
+    async def other() -> None:
+        await inline.fetch(Request(f"{SITE}/other"))
+        order.append("other fetched")
+
+    async with asyncio.timeout(5):
+        async with inline.stream(Request(f"{SITE}/file")) as streamed:
+            waiting = asyncio.create_task(other())
+            await asyncio.sleep(0.02)
+            await _read(streamed)
+            order.append("stream closing")
+        await waiting
+
+    assert order == ["stream closing", "other fetched"]
+
+
+async def test_a_streamed_fetch_is_retried_until_its_headers_are_accepted() -> None:
+    files = Files([503, b"ok"])
+    bus = events.EventBus(timeout=5)
+    retried = Recording(bus, events.RequestRetried)
+
+    async with _inline(_chain(files), bus=bus).stream(Request(f"{SITE}/file")) as streamed:
+        body = await _read(streamed)
+
+    assert body == b"ok"
+    assert [event.reason for event in retried.events] == ["HTTP 503"]
+    assert (files.opened, files.open) == (2, 0)
+
+
+async def test_fetches_nested_in_a_streamed_fetch_read_whole_responses() -> None:
+    files = Files([b"data"])
+    nested: list[tuple[bool, bytes]] = []
+    inline: InlineFetch | None = None
+
+    async def authorize(request: Request, call_next: Download) -> Response:
+        if request.url.endswith("/token"):
+            return await call_next(request)
+        assert inline is not None
+        token = await inline.fetch(Request(f"{SITE}/token"))
+        nested.append((token.streamed, token.body))
+        return await call_next(request)
+
+    inline = _inline(_chain(files, authorize))
+    async with inline.stream(Request(f"{SITE}/file")) as streamed:
+        assert await _read(streamed) == b"data"
+
+    assert nested == [(False, b"data")]
+    assert files.opened == 1

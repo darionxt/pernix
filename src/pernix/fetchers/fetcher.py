@@ -3,10 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
+    from pernix.fetchers.streamed_response import StreamedResponse
     from pernix.request import Request
     from pernix.response import Response
 
-__all__ = ["Fetcher"]
+__all__ = ["Fetcher", "StreamingFetcher"]
 
 
 class Fetcher(Protocol):
@@ -33,5 +36,28 @@ class Fetcher(Protocol):
 
         Returns:
             The Response, whatever its status code.
+        """
+        ...
+
+
+class StreamingFetcher(Fetcher, Protocol):
+    """A Fetcher that can also give a body as it arrives, for `Crawler.stream()`.
+
+    Without `stream()`, a streamed fetch reads the whole body with `fetch()` first.
+    """
+
+    def stream(
+        self, request: Request, *, max_bytes: int | None = None
+    ) -> AbstractAsyncContextManager[StreamedResponse]:
+        """Fetch one Request, giving its body as it arrives.
+
+        Args:
+            request: The Request to fetch.
+            max_bytes: Bytes the body may have at most; `None` for the Fetcher's own
+                limit, and 0 for no limit.
+
+        Returns:
+            An async context manager giving the Response, whose body is read once,
+            and ending the transfer on exit.
         """
         ...

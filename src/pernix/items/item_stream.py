@@ -27,7 +27,7 @@ class ItemStream:
     stopped only once it is garbage-collected.
 
     Example:
-        >>> async with Books.stream(keyword="dune") as items:
+        >>> async with Books.stream_items(keyword="dune") as items:
         ...     async for item in items:
         ...         print(item)
     """
@@ -38,7 +38,7 @@ class ItemStream:
         stop: Callable[[StopMode], None],
         channel: asyncio.Queue[Any],
     ) -> None:
-        """Stream the Items of a Run; `pernix.crawler.Crawler.stream()` creates it.
+        """Stream the Items of a Run; `pernix.crawler.Crawler.stream_items()` creates it.
 
         Args:
             crawl: Runs the Run.

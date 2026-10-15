@@ -4,6 +4,7 @@ import asyncio
 import gzip
 import socket
 import time
+import tracemalloc
 import zlib
 from typing import TYPE_CHECKING
 
@@ -455,6 +456,46 @@ async def test_streamed_bodies_respect_the_byte_limit(server: LoopbackServer) ->
                         pass
             async with fetcher.stream(Request(server.url("/file")), max_bytes=0) as streamed:
                 assert len(b"".join([chunk async for chunk in streamed.iter_bytes()])) == 2000
+
+
+_MIB = 1024 * 1024
+
+
+@pytest.mark.parametrize("limited", [False, True], ids=["without-a-limit", "at-the-limit"])
+async def test_a_slow_reader_keeps_a_bounded_part_of_the_body_in_memory(server: LoopbackServer, limited: bool) -> None:
+    body = b"x" * (32 * _MIB)
+    server.route("/big", body, headers=[("Content-Type", "application/octet-stream")])
+
+    limit = len(body) if limited else 0
+    async with HTTPFetcher() as fetcher, fetcher.stream(Request(server.url("/big")), max_bytes=limit) as streamed:
+        chunks = streamed.iter_bytes()
+        size = len(await anext(chunks))
+        tracemalloc.start()
+        try:
+            await asyncio.sleep(0.5)  # long enough to receive the whole body over loopback, unless curl pauses
+            held, _ = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        async for chunk in chunks:  # the chunks curl kept while paused count once toward the limit
+            size += len(chunk)
+
+    assert held < 4 * _MIB
+    assert size == len(body)
+
+
+async def test_a_paused_transfer_never_times_out(server: LoopbackServer) -> None:
+    body = b"x" * (8 * _MIB)
+    server.route("/big", body)
+
+    fetcher = HTTPFetcher(HTTPSettings(timeout=1))
+    async with fetcher, fetcher.stream(Request(server.url("/big")), max_bytes=0) as streamed:
+        chunks = streamed.iter_bytes()
+        size = len(await anext(chunks))
+        await asyncio.sleep(1.5)  # longer than the timeout, while curl is paused
+        async for chunk in chunks:
+            size += len(chunk)
+
+    assert size == len(body)
 
 
 def _read(path: Path) -> bytes:

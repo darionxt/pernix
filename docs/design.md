@@ -152,7 +152,7 @@ Request(
 
 ### 4.4 Response
 
-- Common fields: `url` (final URL), `status`, `headers` (multi-valued), `body: bytes`, `request`, `meta`, `session`, `cookies`, `history` (the redirects followed, oldest first, as `Redirect(url, status, headers)` records), `elapsed` (seconds), `ip_address`, `http_version` (`"HTTP/1.1"`, `"HTTP/2"`, `"HTTP/3"`), `fetcher` (such as `"http"`).
+- Common fields: `url` (final URL), `status`, `headers` (multi-valued), `body: bytes`, `request`, `meta`, `session`, `cookies`, `history` (the redirects followed, oldest first, as `Redirect(url, status, headers)` records), `elapsed` (seconds), `ip_address`, `http_version` (`"HTTP/1.1"`, `"HTTP/2"`, `"HTTP/3"`), `fetcher` (such as `"http"`), `streamed` (the body is read as it arrives, apart from the Response, whose `body` is then empty; see §4.6).
 - Responses are immutable; `response.replace(...)` derives a copy, for example `response.replace(encoding="gbk")` to decode the same body with another encoding.
 - `cookies`: the cookies the client holds after the fetch, as name → value: those the Request carried (`cookies=` or a `Cookie` header) plus those set during the fetch, including on redirects, with expired ones removed. `Set-Cookie` is parsed as one cookie per header, ignoring attributes other than `Max-Age` and `Expires`. Domain and path are not tracked, so same-named cookies collapse into one; full cookie records come with Sessions. `Request(next_url, cookies=response.cookies)` continues the conversation without a Session.
 - `text`: decoded lazily, in this order: user-specified → BOM → HTTP charset → `<meta>` / XML declaration in the first 4096 bytes → strict UTF-8 → encoding detection → configurable default (`response.default_encoding`, UTF-8 unless set).
@@ -168,7 +168,7 @@ Request(
 - A Callback can be an `async def` async generator that yields `Request` objects or Items (None is ignored), or a plain `async def` that returns a single object, a list, or None.
 - **Output is streamed**: each yielded object is processed immediately. Requests go to the Frontier; Items go into a bounded queue, and when the queue is full the Callback is suspended (backpressure).
 - **When a Callback raises** (confirmed):
-  - The Request is marked as failed: it is kept as a Dead Request, `RequestFailed` is emitted, and the errback is called. It is **not retried**, because parsing errors are usually deterministic; this holds for every exception a Callback raises, including a `FetchError` from an Inline Fetch that already exhausted its own retries.
+  - The Request is marked as failed: it is kept as a Dead Request, `RequestFailed` is emitted, and the errback is called. It is **not retried**, because parsing errors are usually deterministic; this holds for every exception a Callback raises, including one from an Inline Fetch, such as `RetriesExhausted` once its own retries ran out.
   - Output yielded before the exception is kept.
   - To retry, the user explicitly writes `raise Retry(reason, delay=None)`; the retry policy still decides whether a retry is left (§6.4). Deciding whether a page is Blocked is covered in §5.4 and handled automatically by the framework.
 - **Errbacks**: `errback(request, error)` runs once a Request fails for good, whether its fetch failed, its retries ran out (`error` is then `RetriesExhausted`, carrying the last `response` or the last exception as its cause), or its Callback raised. Like a Callback, it may yield Requests and Items; relative URLs resolve against the failed Request's URL. An errback that raises is logged.
@@ -180,13 +180,26 @@ Request(
 async def parse_detail(self, response):
     api = await self.fetch(Request(comments_api(response)))   # also accepts a URL string
     yield {"title": response.css("h1::text").get(), "comments": api.json()["data"]}
+
+async def parse_report(self, response):
+    async with self.stream(response.css("a.pdf::attr(href)").get(), max_bytes=0) as pdf:   # the body as it arrives
+        await pdf.save(f"reports/{response.meta['id']}.pdf")   # or: async for chunk in pdf.iter_bytes()
 ```
 
-- Use cases: logging in, exchanging for a Token, paging sequentially through a paginated API, and cases such as "detail page + comments API" where the output has to be assembled within one Callback.
+- Use cases: logging in, exchanging for a Token, paging sequentially through a paginated API, cases such as "detail page + comments API" where the output has to be assembled within one Callback, and downloading files.
+- `self.fetch()` and `self.stream()` call `Crawler.fetch()` and `Crawler.stream()`, so components given the Crawler can fetch inline too. They work while the Run runs, from `SpiderOpened` to `SpiderClosed`: in `start()`, `on_idle()`, Callbacks, errbacks, and components; elsewhere they raise `RuntimeError`. A URL string is fetched with a GET, and a relative one resolves against the Response being handled. A Request's `callback`, `errback`, `priority`, and `dont_filter` play no part.
 - Semantics:
-  - Goes through the same download Middleware chain and the same rate limiter. It uses the current Request's Session if it has one; otherwise it is independent like any Request and sends only the cookies passed to it.
-  - **Does not enter the Frontier, is not deduplicated, and is not persisted**; on failure it is retried in place according to the retry policy, and `FetchError` is raised if it ultimately fails.
-  - When the parent Request is cancelled, its Inline Fetches are cancelled with it.
+  - Goes through the same download Middleware chain and the same rate limiting: each attempt waits for its domain's slot, and waits out a Cooldown in place. It runs in the task of the Request being handled and takes no worker of its own, so Inline Fetches run concurrently, such as with `asyncio.gather`, are limited by `domain.concurrency` alone.
+  - Uses the current Request's Session if it has one, unless it names its own; otherwise it is independent like any Request and sends only the cookies passed to it.
+  - **Does not enter the Frontier, is not deduplicated, and is not persisted.**
+  - The retry policy judges each attempt as usual, but a retry waits in place for its delay, emitting `RequestRetried`. The Response is returned whatever its status, unless the policy retries it. Once the retries run out, `RetriesExhausted` is raised, holding the last Response or caused by the last exception, as errbacks receive it; an exception the policy does not retry, such as a `TLSError`, or `IgnoreRequest` from a Middleware, is raised as it is. Uncaught, it fails the Callback (§4.5).
+  - It is counted in `downloads.*`, but not emitted as `ResponseReceived`, which is for Responses handed to Callbacks, nor as `RequestFailed`: the error goes to the caller. Its log records carry the `request_id` of the Request being handled.
+  - When the parent Request is cancelled, as by a Force Stop, its Inline Fetches are cancelled with it and their transfers stopped; a Drain lets them finish within its grace period.
+- **Streaming**: `self.stream(request, max_bytes=None)` gives a `StreamedResponse` whose `response` holds everything but the body, read once with `iter_bytes()` or written with `save(path)`; leaving `async with` closes the transfer. `max_bytes` defaults to the Fetcher's limit, such as `http.max_body_size`, and 0 sets none.
+  - Download Middleware see the Response marked `streamed`, with an empty `body`; Middleware that read bodies, such as caches, should pass those through. A Middleware may answer with another Response, such as a cached one, whose body is then read instead; one that fetches more than once reads the last transfer, the earlier ones closed. A Fetcher without `stream()` reads the whole body first.
+  - Only the attempts up to the response headers are retried; a failure while reading the body is raised from `iter_bytes()`.
+  - The stream holds its domain's slot until it is closed, so `domain.concurrency` counts the transfers open. An Inline Fetch to the same domain inside the block therefore needs another slot, and with `domain.concurrency = 1` waits forever.
+  - A slow reader keeps about 1 MiB of the body in memory, with or without `max_bytes`: the Fetcher stops receiving until the reader catches up, and a paused transfer never times out. Streamed bytes count toward `downloads.bytes` as they are read.
 
 ### 4.7 Render and page interaction
 
@@ -391,7 +404,7 @@ Layers, from lowest to highest precedence:
 3. Project file (`pernix.toml`, or `[tool.pernix]` in `pyproject.toml`), found by walking up from the working directory; the nearest `pyproject.toml` ends the search
 4. Environment variables `PERNIX_*`
 5. `Spider.settings`
-6. The `settings=` argument of `run()`, `crawl()`, and `stream()`
+6. The `settings=` argument of `run()`, `crawl()`, and `stream_items()`
 7. `-s KEY=VALUE` on the command line, parsed like environment variables
 
 ```python
@@ -432,17 +445,17 @@ Rules:
 ```python
 result = Books.run(output="books.jsonl", settings={"concurrency": 32})  # synchronous entry point, the main program of a script
 result = await Books.crawl(keyword="x")               # run inside an existing event loop; keyword arguments are Spider arguments
-async with Books.stream(keyword="x") as items:        # bounded streaming consumption, suited to embedding in other applications
+async with Books.stream_items(keyword="x") as items:  # bounded streaming consumption, suited to embedding in other applications
     async for item in items:
         ...
 ```
 
-Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (see §4.2); settings for the Run are passed in `settings=`, and an extra Feed in `output=`. The `run_id` is the `run_id` setting, so it can come from `settings=`, from `PERNIX_RUN_ID`, or from the CLI; otherwise one is generated.
+Keyword arguments of `run()`, `crawl()`, and `stream_items()` are Spider arguments (see §4.2); settings for the Run are passed in `settings=`, and an extra Feed in `output=`. The `run_id` is the `run_id` setting, so it can come from `settings=`, from `PERNIX_RUN_ID`, or from the CLI; otherwise one is generated.
 
 - `run()` and `crawl()` return a `RunResult(run_id, reason, stats)`, where `reason` is `finished`, `drained`, or `forced`, and `stats` is the final snapshot.
 - `run()` behaves as a program: it creates its own event loop, installs the stop signals (§6.6) in the main thread, and ends the process when the Run does not complete. A configuration error (invalid settings, Spider arguments, or components, all found before anything is opened) is written to stderr, or logged by the Run, without a traceback, and exits with 2; a failed Run is logged with its traceback and exits with 1; a Run stopped by a signal exits with 130, whether it drained or was forced. A Run that finished, or that code stopped, returns.
-- `crawl()` and `stream()` are library calls: errors are raised, signals are left to the application, and cancelling the task stops the Run like a Force Stop (`cancelled`). For finer control, `Crawler.from_spider(Books, args=..., settings=...)` gives the Crawler, with `crawl()`, `stream()`, and `stop()`.
-- `stream()` yields the Items that pass every Pipeline, the same ones the Feeds receive, holding one at a time. A slow consumer therefore pauses the Item processing, then the Callbacks once the Item queue is full, and so the fetching. The Run starts with the first iteration; if it fails, the error is raised after the Items already received. Leaving early (`break`, an exception, leaving `async with`) force-stops the Run: `async with` or `aclose()` waits for it to stop, while an abandoned stream stops once it is garbage-collected.
+- `crawl()` and `stream_items()` are library calls: errors are raised, signals are left to the application, and cancelling the task stops the Run like a Force Stop (`cancelled`). For finer control, `Crawler.from_spider(Books, args=..., settings=...)` gives the Crawler, with `crawl()`, `stream_items()`, and `stop()`.
+- `stream_items()` yields the Items that pass every Pipeline, the same ones the Feeds receive, holding one at a time. A slow consumer therefore pauses the Item processing, then the Callbacks once the Item queue is full, and so the fetching. The Run starts with the first iteration; if it fails, the error is raised after the Items already received. Leaving early (`break`, an exception, leaving `async with`) force-stops the Run: `async with` or `aclose()` waits for it to stop, while an abandoned stream stops once it is garbage-collected.
 
 | Command | Purpose |
 | --- | --- |
@@ -465,7 +478,7 @@ Keyword arguments of `run()`, `crawl()`, and `stream()` are Spider arguments (se
 
 ## 5. Fetching layer
 
-A Fetcher is a component with `async def fetch(self, request) -> Response` and a `schemes` attribute, the URL schemes it fetches by default. Fetchers are registered by name with the `fetchers` setting, `{"http": HTTPFetcher}` by default; registering another component under a built-in name replaces it, and `None` (`false`) disables one. The innermost step of the download chain picks the Fetcher: the one named by `Request(fetcher=...)`, otherwise `browser` if the Request needs rendering, otherwise the one whose `schemes` include the URL's scheme. No two Fetchers may claim the same scheme, and a Request no Fetcher fits fails. `Response.fetcher` records the name. Like other components, Fetchers get services injected and are opened and closed with the Run.
+A Fetcher is a component with `async def fetch(self, request) -> Response` and a `schemes` attribute, the URL schemes it fetches by default. It may also have `stream(request, *, max_bytes)`, an async context manager giving a `StreamedResponse`, for streamed Inline Fetches (§4.6). Fetchers are registered by name with the `fetchers` setting, `{"http": HTTPFetcher}` by default; registering another component under a built-in name replaces it, and `None` (`false`) disables one. The innermost step of the download chain picks the Fetcher: the one named by `Request(fetcher=...)`, otherwise `browser` if the Request needs rendering, otherwise the one whose `schemes` include the URL's scheme. No two Fetchers may claim the same scheme, and a Request no Fetcher fits fails. `Response.fetcher` records the name. Like other components, Fetchers get services injected and are opened and closed with the Run.
 
 ### 5.1 HTTP Fetcher (curl-cffi)
 
@@ -494,7 +507,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 - Response headers are read with all multiple values preserved. A body decoded from gzip, deflate, br, or zstd loses `Content-Encoding` and `Content-Length`, which describe the encoded body; a `HEAD` Response keeps them.
 - Redirects are followed up to `http.max_redirects` (20, as browsers do), and recorded in `Response.history`.
 - A body larger than `http.max_body_size` (100 MiB; 0 for no limit) fails with `ResponseTooLarge`: at once when `Content-Length` declares it, unless the response has no body (`HEAD`, 1xx, 204, 304), otherwise as soon as curl receives more, counted from the first byte in curl's write callback, however slowly the body is read.
-- Streaming downloads: `async with fetcher.stream(request, max_bytes=...) as streamed:` gives a `StreamedResponse` whose `response` holds everything but the body, read once with `iter_bytes()` or written to a file with `save(path)`. `http.deadline` then limits only the wait for the headers. Until reading pauses curl, a slow reader buffers up to `max_bytes` in memory. How a Callback reaches it, and that backpressure, come with Inline Fetch (§4.6).
+- Streaming downloads: `async with fetcher.stream(request, max_bytes=...) as streamed:` gives a `StreamedResponse` whose `response` holds everything but the body, marked `streamed`, read once with `iter_bytes()` or written to a file with `save(path)`. `http.deadline` then limits only the wait for the headers. curl stops receiving while 1 MiB of the body waits to be read, and resumes once half of it has been, so a slow reader holds a bounded part of the body in memory, whatever `max_bytes` is; a paused transfer never times out. The chunks curl keeps while paused count once toward `max_bytes`. Callbacks reach it with `self.stream()` (§4.6).
 
 **Delegated to the framework**
 
@@ -650,7 +663,7 @@ Engine integration:
 
 - **Concurrency**:
   - Global default 16 (`concurrency`, the number of workers), per-domain default 8 (`domain.concurrency`); browser pages are counted separately.
-  - A domain is a host name, and each has its own slot (the Lease's `slot`). A fetch holds its slot from just before the download chain until the Response arrives; Callbacks hold none.
+  - A domain is a host name, and each has its own slot (the Lease's `slot`). A fetch holds its slot from just before the download chain until the Response arrives; Callbacks hold none, but their Inline Fetches hold slots as fetches do, a streamed one until it is closed (§4.6).
   - Workers claim only Requests whose slot can start a fetch now: `claim(skip_slots=...)` skips slots that are full, cooling down, or waiting for their delay or rate, so one slow domain never holds back the others. Idle workers wake when the Frontier changes or a slot frees up.
   - Requests that are backing off go back to the Frontier to wait and do not occupy concurrency slots.
 - **Delay**: `domain.delay` seconds between the starts of two fetches from one domain, randomized within ± `domain.delay_jitter` (50 % by default).
@@ -761,7 +774,7 @@ Rules:
 | `requests.dropped`, `requests.dropped_by_reason.<reason>` | Requests vetoed or dropped as duplicates, such as `duplicate` and `offsite` |
 | `requests.retried`, `requests.ignored` | Attempts retried; Requests ignored |
 | `requests.failed`, `requests.failed_by_error.<ErrorType>` | Requests that failed for good |
-| `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards, and their body bytes |
+| `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards and those of Inline Fetches, and their body bytes, streamed ones as they are read |
 | `downloads.errors`, `downloads.errors_by_type.<ErrorType>` | Exceptions fetching raised, other than `IgnoreRequest` and `Retry` |
 | `responses.received` | Responses handed to Callbacks |
 | `items.scraped`, `items.dropped`, `items.errors`, `items.retried`, `items.failures_lost`, `items.discarded` | Items stored, dropped, or failed; Pipeline calls retried; failed Items a failure Pipeline lost; Items a stopped Run never processed |

@@ -62,8 +62,9 @@ class CoreStats:
     - `requests.failed`, `requests.failed_by_error.<ErrorType>`: Requests that failed
       for good.
     - `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes`: Responses
-      the download chain returned, including those retried afterwards, and their
-      body bytes.
+      the download chain returned, including those retried afterwards and those of
+      Inline Fetches, and their body bytes; the Inline Fetch counts streamed bodies
+      as they are read.
     - `downloads.errors`, `downloads.errors_by_type.<ErrorType>`: Exceptions it raised,
       other than `IgnoreRequest` and `Retry`.
     - `responses.received`: Responses handed to Callbacks.

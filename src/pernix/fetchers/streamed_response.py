@@ -18,7 +18,7 @@ __all__ = ["StreamedResponse"]
 class StreamedResponse:
     """A Response whose body is read as it arrives, once, instead of held in memory.
 
-    `HTTPFetcher.stream()` gives it. The body may be read with `iter_bytes()` or
+    `HTTPFetcher.stream()` and `Crawler.stream()` give it. The body may be read with `iter_bytes()` or
     written to a file with `save()`, at most `max_bytes` of it.
 
     Attributes:

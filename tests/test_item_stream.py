@@ -55,7 +55,9 @@ async def test_the_items_that_pass_the_pipelines_are_streamed_while_the_feeds_st
     spider = _counting(home, 3, [])
 
     async with asyncio.timeout(10):
-        stream = spider.stream(settings={**SETTINGS, "pipelines": {Tag: 100}}, output=tmp_path / "items.jsonl", start=5)
+        stream = spider.stream_items(
+            settings={**SETTINGS, "pipelines": {Tag: 100}}, output=tmp_path / "items.jsonl", start=5
+        )
         items = [item async for item in stream]
 
     assert items == [{"n": 5, "tagged": True}, {"n": 6, "tagged": True}, {"n": 7, "tagged": True}]
@@ -66,7 +68,7 @@ async def test_a_slow_consumer_pauses_the_callbacks(home: LoopbackServer) -> Non
     produced: list[int] = []
     crawler = Crawler.from_spider(_counting(home, 100, produced), settings={**SETTINGS, "items.queue_size": 2})
 
-    async with asyncio.timeout(10), crawler.stream() as items:
+    async with asyncio.timeout(10), crawler.stream_items() as items:
         first = await anext(items)
         await asyncio.sleep(0.05)  # everything that can move has moved
         paused_at = len(produced)
@@ -83,7 +85,7 @@ async def test_leaving_early_force_stops_the_run(home: LoopbackServer) -> None:
     produced: list[int] = []
     crawler = Crawler.from_spider(_counting(home, 100, produced), settings={**SETTINGS, "items.queue_size": 2})
 
-    async with asyncio.timeout(10), crawler.stream() as items:
+    async with asyncio.timeout(10), crawler.stream_items() as items:
         async for item in items:
             assert item == {"n": 0}
             await asyncio.sleep(0.05)
@@ -100,7 +102,7 @@ async def test_an_abandoned_stream_stops_once_garbage_collected(home: LoopbackSe
     closed: list[str] = []
     ended = asyncio.Event()
     crawler.events.on(events.SpiderClosed, lambda event: (closed.append(event.reason), ended.set()))
-    items = crawler.stream()
+    items = crawler.stream_items()
     assert await anext(items) == {"n": 0}
 
     del items
@@ -118,7 +120,7 @@ async def test_the_error_of_a_failed_run_follows_the_items_received(home: Loopba
                 raise FeedError("the store is gone")
             return item
 
-    items = _counting(home, 5, []).stream(settings={**SETTINGS, "pipelines": {FailThird: 100}})
+    items = _counting(home, 5, []).stream_items(settings={**SETTINGS, "pipelines": {FailThird: 100}})
 
     async with asyncio.timeout(10):
         received = [await anext(items), await anext(items)]
@@ -131,12 +133,12 @@ async def test_the_error_of_a_failed_run_follows_the_items_received(home: Loopba
 
 def test_invalid_arguments_are_reported_when_the_stream_is_created(home: LoopbackServer) -> None:
     with pytest.raises(SpiderArgumentError, match="start: Expected `int`, got `str`"):
-        _counting(home, 1, []).stream(start="first")
+        _counting(home, 1, []).stream_items(start="first")
 
 
 async def test_a_crawler_streams_only_once(home: LoopbackServer) -> None:
     crawler = Crawler.from_spider(_counting(home, 1, []), settings=SETTINGS)
-    crawler.stream()
+    crawler.stream_items()
 
     with pytest.raises(RuntimeError, match="a Crawler runs only once"):
-        crawler.stream()
+        crawler.stream_items()

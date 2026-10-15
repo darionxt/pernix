@@ -151,7 +151,7 @@ def test_arguments_cannot_use_the_names_of_the_run_options(name: str) -> None:
     source = f"class Clash(Spider):\n    def __init__(self, {name}: str) -> None:\n        pass\n"
 
     with pytest.raises(
-        TypeError, match=f"Clash.__init__ takes '{name}', which run\\(\\), crawl\\(\\), and stream\\(\\)"
+        TypeError, match=f"Clash.__init__ takes '{name}', which run\\(\\), crawl\\(\\), and stream_items\\(\\)"
     ):
         exec(source, namespace)  # noqa: S102  # a class statement made up above
 

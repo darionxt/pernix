@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from curl_cffi import Curl, CurlOpt
-from curl_cffi.curl import CURL_WRITEFUNC_ERROR
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR, CURL_WRITEFUNC_PAUSE, CURLPAUSE_CONT
 from curl_cffi.requests import AsyncSession
 
 from pernix.errors import ResponseTooLarge
@@ -20,28 +20,52 @@ if TYPE_CHECKING:
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
 
-__all__ = ["CurlSession", "CurlSessionPool", "Transfer"]
+__all__ = ["BUFFER_SIZE", "CurlSession", "CurlSessionPool", "Transfer"]
 
 logger = logging.getLogger(__name__)
+
+BUFFER_SIZE = 1024 * 1024
+"""Bytes of body a transfer holds, delivered but not read yet, before curl stops receiving."""
 
 
 @dataclass(slots=True)
 class Transfer:
     """The curl handle of one request, and how much body it delivered.
 
+    Once `BUFFER_SIZE` bytes wait to be read, curl stops receiving; it resumes once
+    half of them have been read, as `read()` notes.
+
     Attributes:
         curl: The handle.
         limit: Bytes of body it may deliver; `None` for no limit.
         received: Bytes of body delivered so far, decoded.
+        buffered: Bytes of body delivered but not read yet.
         exceeded: Whether the limit stopped it.
+        paused: Whether curl stopped receiving until more is read.
         returned: Whether the handle went back to the session's pool.
     """
 
     curl: Curl
     limit: int | None
     received: int = 0
+    buffered: int = 0
     exceeded: bool = False
+    paused: bool = False
     returned: bool = False
+
+    def read(self, size: int) -> None:
+        """Note that bytes of body were read, resuming curl once few enough wait.
+
+        Args:
+            size: The bytes read.
+
+        Raises:
+            curl_cffi.CurlError: curl failed to resume.
+        """
+        self.buffered -= size
+        if self.paused and self.buffered <= BUFFER_SIZE // 2 and not self.returned:
+            self.paused = False
+            self.curl.pause(CURLPAUSE_CONT)  # curl delivers the chunk it kept first
 
 
 @dataclass(slots=True)
@@ -55,14 +79,15 @@ _starting: ContextVar[_Start | None] = ContextVar("pernix_curl_start", default=N
 
 
 class CurlSession(AsyncSession):
-    """A curl-cffi session that limits each streamed body as curl receives it, and stops abandoned transfers.
+    """A curl-cffi session that bounds each streamed body as curl receives it, and stops abandoned transfers.
 
     curl-cffi queues a streamed body without bound, and runs the transfer in a task of
     its own, which goes on when the request waiting for the headers is cancelled.
     `start()` therefore notes the handle a request takes, through the `pop_curl()` and
-    `push_curl()` hooks of curl-cffi's handle pool: it counts the body in the handle's
-    write callback, failing the transfer past the limit, and removes the handle from
-    curl when the request is cancelled.
+    `push_curl()` hooks of curl-cffi's handle pool. The handle's write callback counts
+    the body, failing the transfer past the limit, and pauses curl while
+    `BUFFER_SIZE` bytes wait to be read; the handle is removed from curl when the
+    request is cancelled.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -119,8 +144,7 @@ class CurlSession(AsyncSession):
         if start is not None and start.transfer is None:
             transfer = start.transfer = Transfer(curl, start.limit)
             self._transfers[curl] = transfer
-            if start.limit is not None:
-                setattr(curl, "setopt", _counting(curl.setopt, transfer))  # noqa: B010  # before curl-cffi sets it up
+            setattr(curl, "setopt", _metered(curl.setopt, transfer))  # noqa: B010  # before curl-cffi sets it up
         return curl
 
     def push_curl(self, curl: Curl | None) -> None:
@@ -131,25 +155,29 @@ class CurlSession(AsyncSession):
         super().push_curl(curl)
 
 
-def _counting(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer) -> Callable[[CurlOpt, Any], int]:
-    """Wrap a handle's `setopt()` so that the write callback it installs counts the body."""
+def _metered(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer) -> Callable[[CurlOpt, Any], int]:
+    """Wrap a handle's `setopt()` so that the write callback it installs meters the body."""
 
-    def counting_setopt(option: CurlOpt, value: Any) -> int:
+    def metered_setopt(option: CurlOpt, value: Any) -> int:
         if option == CurlOpt.WRITEFUNCTION and callable(value):
             write: Callable[[bytes], Any] = value
-            limit = transfer.limit or 0
+            limit = transfer.limit
 
-            def counted(chunk: bytes) -> Any:
+            def metered(chunk: bytes) -> Any:
+                if transfer.buffered >= BUFFER_SIZE:
+                    transfer.paused = True
+                    return CURL_WRITEFUNC_PAUSE  # curl keeps the chunk, and delivers it again once resumed
                 transfer.received += len(chunk)
-                if transfer.received > limit:
+                if limit is not None and transfer.received > limit:
                     transfer.exceeded = True
                     return CURL_WRITEFUNC_ERROR  # curl stops receiving at once
+                transfer.buffered += len(chunk)
                 return write(chunk)
 
-            value = counted
+            value = metered
         return setopt(option, value)
 
-    return counting_setopt
+    return metered_setopt
 
 
 @dataclass(slots=True)

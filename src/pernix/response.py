@@ -62,6 +62,9 @@ class Response:
         http_version: The HTTP version used, such as `"HTTP/2"`, if known.
         fetcher: The name of the Fetcher that produced this Response, such as `"http"`.
         session: The Session the Request was sent as; `None` for none.
+        streamed: Whether the body is read as it arrives, apart from the Response,
+            whose `body` is then empty: download Middleware see such Responses for
+            the streamed fetches of `Crawler.stream()`.
     """
 
     url: str
@@ -76,6 +79,7 @@ class Response:
     http_version: str | None
     fetcher: str | None
     session: str | None
+    streamed: bool
     _encoding: str | None
     _default_encoding: str
     _decoded: DecodedText | None
@@ -100,6 +104,7 @@ class Response:
         http_version: str | None = None,
         fetcher: str | None = None,
         session: str | None = None,
+        streamed: bool = False,
     ) -> None:
         """Create a Response. Fetchers build these; user code rarely needs to.
 
@@ -119,6 +124,7 @@ class Response:
             http_version: The HTTP version used.
             fetcher: The name of the Fetcher that produced this Response.
             session: The Session the Request was sent as.
+            streamed: Whether the body is read apart from the Response.
 
         Raises:
             LookupError: `encoding` or `default_encoding` names no text encoding.
@@ -139,6 +145,7 @@ class Response:
         set_field(self, "http_version", http_version)
         set_field(self, "fetcher", fetcher)
         set_field(self, "session", session)
+        set_field(self, "streamed", streamed)
         set_field(self, "_encoding", encoding)
         set_field(self, "_default_encoding", default_encoding)
         set_field(self, "_decoded", None)
@@ -358,6 +365,7 @@ class Response:
             "http_version": self.http_version,
             "fetcher": self.fetcher,
             "session": self.session,
+            "streamed": self.streamed,
         }
 
 
