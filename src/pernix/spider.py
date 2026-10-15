@@ -165,7 +165,7 @@ class Spider:
 
         Example:
             >>> async def parse(self, response):
-            ...     login = await self.fetch(Request("/login", method="POST", data={"user": "me"}))
+            ...     login = await self.fetch(Request("/login", data={"user": "me"}))  # a POST
             ...     account = await self.fetch(Request("/account", cookies=login.cookies))
             ...     yield {"name": account.css("h1::text").get()}
         """

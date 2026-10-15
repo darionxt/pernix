@@ -124,7 +124,8 @@ class Search(Spider):
 ```python
 Request(
     url,
-    method="GET",
+    method=None,           # GET, or POST when a body is given
+    params=None,           # query parameters added to the URL
     headers=None,          # order-preserving, case-preserving, duplicate keys allowed
     body=None, json=None, data=None,
     callback=None,         # defaults to parse; must be a Spider method (referenced by name when persisted)
@@ -145,6 +146,8 @@ Request(
 ```
 
 - Requests are immutable; derive new ones with `request.replace(...)`.
+- Without `method`, a Request with a body (`body`, `json`, or `data`) is a POST, and one without is a GET. An explicit method always wins, including a GET with a body, and `replace()` keeps the method as it is.
+- `params` adds query parameters to the URL, after those it has and before the fragment: strings and numbers, with a sequence of values repeating a name. Booleans are refused, as sites spell them differently. Like `json` and `data`, it exists only when constructing a Request.
 - Requests are independent by default (ADR 0011): no cookies persist from one Request to another. A Request sends only the cookies it carries (`cookies=`, which cannot be combined with a `Cookie` header). Within one Request's redirect chain cookies flow as in a browser. To continue a conversation explicitly, pass `cookies=response.cookies`; to keep state across many Requests, use a Session Pool (§5.3).
 - Relative URLs: a Request created while a Callback is running resolves a relative `url` against that Callback's Response, using its final URL after redirects and honoring `<base href>` in HTML. `request.url` is therefore absolute as soon as the Request is constructed; this also applies to Inline Fetch. Outside a Callback (for example in `start()` or `on_idle()`, or in an Event subscriber), `url` must be absolute, and a relative URL raises `ValueError`. As in browsers, leading and trailing whitespace, tabs, and newlines are removed from every URL.
 - `meta` holds only user data. Framework-internal state (retry count, the Session used, etc.) lives in typed fields, and component-private data lives in namespaces keyed by component name, so different components do not become implicitly coupled through `meta`.
