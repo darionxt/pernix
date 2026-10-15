@@ -291,7 +291,7 @@ class HTTPFetcher:
                 max_redirects=self._settings.max_redirects,
                 http_version=_http_version(request.url),
                 body_limit=limit,
-                guard=guard if request.proxy is None else None,  # a loopback proxy takes every hop
+                guard=None if request.proxy else guard,  # a loopback proxy takes every hop
             )
         except CurlError as exc:
             raise _fetch_error(exc) from exc

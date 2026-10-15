@@ -13,6 +13,7 @@ from pernix.testing import FakeFetcher, crawl, make_response, run_callback
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
+    from pernix.crawler import Crawler
     from pernix.items import ItemContext
     from pernix.testing import LoopbackServer
 
@@ -91,6 +92,22 @@ async def test_without_a_fetcher_the_spider_fetches_for_real_from_a_loopback_ser
     report = await crawl(Local)
 
     assert report.items == [{"title": "Dune", "source": "list"}]
+
+
+class StopsAtOnce:
+    def __init__(self, crawler: Crawler) -> None:
+        self.crawler = crawler
+
+    async def open(self) -> None:
+        self.crawler.stop("force")
+
+
+async def test_a_run_force_stopped_while_opening_is_reported_as_forced() -> None:
+    fake = FakeFetcher()
+
+    report = await crawl(Books, fetcher=fake, settings={"extensions": {StopsAtOnce: 100}})
+
+    assert (report.reason, report.items, fake.requests) == ("forced", [], [])
 
 
 async def test_run_callback_runs_the_requested_callback_with_its_kwargs() -> None:

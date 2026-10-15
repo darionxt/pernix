@@ -95,7 +95,9 @@ def test_a_directory_is_served_below_the_routes(tmp_path: Path) -> None:
     (site / "index.html").write_text("<h1>home</h1>")
     (site / "books" / "index.html").write_text("<h1>books</h1>")
     (site / "books" / "dune.json").write_text('{"title": "Dune"}')
+    (site / "linked").mkdir()
     (tmp_path / "secret.txt").write_text("secret")
+    (site / "linked" / "index.html").symlink_to(tmp_path / "secret.txt")
 
     with LoopbackServer({"/books/dune.json": "routed"}, directory=site) as server:
         with _get(server.url("/")) as home, _get(server.url("/books/")) as books:
@@ -103,7 +105,7 @@ def test_a_directory_is_served_below_the_routes(tmp_path: Path) -> None:
             assert books.read() == b"<h1>books</h1>"
         with _get(server.url("/books/dune.json")) as routed:
             assert routed.read() == b"routed"
-        for missing in ("/books/missing.html", "/../secret.txt", "/%2e%2e/secret.txt"):
+        for missing in ("/books/missing.html", "/../secret.txt", "/%2e%2e/secret.txt", "/linked/"):
             with pytest.raises(urllib.error.HTTPError) as excinfo:
                 _get(server.url(missing))
             with excinfo.value as error:

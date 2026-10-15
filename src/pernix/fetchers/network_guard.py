@@ -103,4 +103,7 @@ def is_loopback_host(host: str) -> bool:
 
 
 def _host(url: str) -> str:
-    return urlsplit(url if "://" in url else f"//{url}").hostname or ""  # a proxy may leave out its scheme
+    try:
+        return urlsplit(url if "://" in url else f"//{url}").hostname or ""  # a proxy may leave out its scheme
+    except ValueError:  # such as an unclosed IPv6 bracket
+        return ""

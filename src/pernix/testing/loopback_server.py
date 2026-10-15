@@ -188,10 +188,10 @@ class LoopbackServer:
         if self._directory is None:
             return None
         target = (self._directory / unquote(path).lstrip("/")).resolve()
-        if not target.is_relative_to(self._directory):
-            return None  # outside the directory, as with "/../secret"
         if target.is_dir():
-            target /= "index.html"
+            target = (target / "index.html").resolve()
+        if not target.is_relative_to(self._directory):
+            return None  # outside the directory, as with "/../secret" or a link out of it
         if not target.is_file():
             return None
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"

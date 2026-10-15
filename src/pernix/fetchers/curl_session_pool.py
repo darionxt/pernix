@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
+from ada_url import URL
 from curl_cffi import Curl, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR, CURL_WRITEFUNC_PAUSE, CURLPAUSE_CONT
 from curl_cffi.requests import AsyncSession
@@ -227,14 +228,37 @@ class _RedirectCheck:
             code = text.split(maxsplit=2)[1:2]
             self._status = int(code[0]) if code and code[0].isdigit() else 0
         elif 300 <= self._status < 400 and text[:9].lower() == "location:":
-            self._url = urljoin(self._url, text[9:].strip())
-            try:
-                self._guard.check(self._url)
-            except NetworkBlocked:
-                self._transfer.blocked = self._url
+            refused = self._follow(text[9:].strip())
+            if refused is not None:
+                self._transfer.blocked = refused
                 return CURL_WRITEFUNC_ERROR  # curl stops the transfer
         self._buffer.write(line)
         return len(line)
+
+    def _follow(self, location: str) -> str | None:
+        """Follow a redirect to its `Location`, returning the URL the guard refuses, if any.
+
+        urllib and WHATWG resolve some Locations to different hosts, such as
+        `http:///other.example/`, which curl, like WHATWG, takes as a host. Both
+        results must be admitted, and a Location WHATWG cannot parse is refused.
+        """
+        targets: list[str] = []
+        for join in (urljoin, _whatwg_join):
+            try:
+                targets.append(join(self._url, location))
+            except ValueError:
+                targets.append(location)  # refused below, as it names no host the guard admits
+        for url in dict.fromkeys(targets):
+            try:
+                self._guard.check(url)
+            except NetworkBlocked:
+                return url
+        self._url = targets[-1]  # as curl reads it
+        return None
+
+
+def _whatwg_join(base: str, url: str) -> str:
+    return URL(url, base).href
 
 
 @dataclass(slots=True)
@@ -248,7 +272,8 @@ class CurlSessionPool:
     """Keeps one curl session per Profile, so connections are reused but never shared between Profiles.
 
     A session is created on first use, inside the running event loop, with curl's own
-    retries off, proxies from the environment ignored, and HTTP/2 connections reused.
+    retries off, proxies from the environment ignored, `NO_PROXY` included, and HTTP/2
+    connections reused.
     Beyond `size` sessions, the least recently used one not in use is closed, and so
     is one unused for `idle` seconds, including the one about to be used, which is
     then replaced; both are checked whenever a session is taken. Retired sessions
@@ -317,7 +342,8 @@ class CurlSessionPool:
             impersonate=profile,
             trust_env=False,
             retry=0,
-            curl_options={CurlOpt.PIPEWAIT: 1},
+            # libcurl reads NO_PROXY itself, even for a proxy given explicitly; "" stops that.
+            curl_options={CurlOpt.PIPEWAIT: 1, CurlOpt.NOPROXY: ""},
         )
 
     def _detach_evicted(self, now: float) -> list[CurlSession]:

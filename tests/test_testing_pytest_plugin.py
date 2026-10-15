@@ -42,8 +42,54 @@ def test_a_test_whose_fetch_the_guard_refused_fails_even_if_the_run_carried_on(s
 
     result = session.runpytest("-p", "no:cacheprovider")
 
-    result.assert_outcomes(passed=1, errors=1)
-    result.stdout.fnmatch_lines(["*network guard refused http://192.0.2.1/ during this test*pernix_network*"])
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*network guard refused http://192.0.2.1/ while running this test*pernix_network*"])
+
+
+def test_fixtures_of_every_scope_are_guarded_as_they_are_set_up_and_torn_down(session: pytest.Pytester) -> None:
+    session.makepyfile(
+        """
+        import asyncio
+        import pytest
+        from pernix import Request
+        from pernix.errors import NetworkBlocked
+        from pernix.fetchers import HTTPFetcher
+
+        def fetch(url):
+            async def attempt():
+                async with HTTPFetcher() as fetcher:
+                    try:
+                        await fetcher.fetch(Request(url))
+                    except NetworkBlocked:
+                        pass
+            asyncio.run(attempt())
+
+        @pytest.fixture(scope="session")
+        def remote_setup():
+            fetch("http://192.0.2.1/setup")
+
+        @pytest.fixture(scope="module")
+        def remote_teardown():
+            yield
+            fetch("http://192.0.2.1/teardown")
+
+        def test_set_up(remote_setup):
+            pass
+
+        def test_torn_down(remote_teardown):
+            pass
+        """
+    )
+
+    result = session.runpytest("-p", "no:cacheprovider")
+
+    result.assert_outcomes(passed=1, errors=2)
+    result.stdout.fnmatch_lines(
+        [
+            "*refused http://192.0.2.1/setup while setting up this test*",
+            "*refused http://192.0.2.1/teardown while tearing down this test*",
+        ]
+    )
 
 
 def test_a_marked_test_or_an_allowing_ini_option_turns_the_guard_off(session: pytest.Pytester) -> None:

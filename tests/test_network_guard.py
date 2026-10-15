@@ -103,3 +103,45 @@ async def test_a_loopback_proxy_takes_requests_to_any_host(server: LoopbackServe
 
     assert response.body == b"proxied"
     assert guard.blocked == []
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http:///192.0.2.1/page",  # urllib: a path on this host; curl and WHATWG: a host
+        "http:\\\\192.0.2.1/page",  # WHATWG: backslashes are slashes
+        "http://[unclosed/page",  # unparseable
+    ],
+)
+async def test_redirects_are_refused_however_their_location_may_be_read(server: LoopbackServer, location: str) -> None:
+    server.route("/away", status=302, headers=[("Location", location)])
+
+    async with HTTPFetcher() as fetcher:
+        with blocking_network() as guard, pytest.raises(NetworkBlocked):
+            await fetcher.fetch(Request(server.url("/away")))
+
+    assert len(guard.blocked) == 1
+
+
+async def test_an_empty_proxy_is_no_proxy(server: LoopbackServer) -> None:
+    server.route("/away", status=302, headers=[("Location", PUBLIC)])
+
+    async with HTTPFetcher() as fetcher:
+        with blocking_network() as guard, pytest.raises(NetworkBlocked):
+            await fetcher.fetch(Request(server.url("/away"), proxy=""))
+
+    assert guard.blocked == [PUBLIC]
+
+
+async def test_no_proxy_in_the_environment_never_bypasses_a_given_proxy(
+    server: LoopbackServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server.route("/", "proxied")
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+
+    async with HTTPFetcher() as fetcher:
+        with blocking_network():
+            response = await fetcher.fetch(Request("http://shop.invalid/", proxy=server.base_url))
+
+    assert response.body == b"proxied"
