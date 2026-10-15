@@ -10,18 +10,18 @@ from urllib.parse import urlsplit
 import orjson
 import pytest
 
-from loopback import Reply
 from pernix import Middleware, Request, Response, Spider, middleware
 from pernix.crawler import Crawler
 from pernix.errors import RetriesExhausted
+from pernix.testing import Reply
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
     from pathlib import Path
 
-    from loopback import LoopbackServer, ReceivedRequest
     from pernix.middlewares import Download
     from pernix.run_result import RunResult
+    from pernix.testing import LoopbackServer, ReceivedRequest
 
 SETTINGS: Mapping[str, Any] = {"stats.interval": 0, "retry.delay_scale": 0}
 

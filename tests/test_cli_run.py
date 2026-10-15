@@ -16,7 +16,7 @@ from pernix.cli import main
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
     WriteSpider = Callable[[str, str], Path]
 

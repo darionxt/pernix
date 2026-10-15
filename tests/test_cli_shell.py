@@ -11,7 +11,7 @@ import pytest
 from pernix.cli import main
 
 if TYPE_CHECKING:
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
 
 @pytest.fixture

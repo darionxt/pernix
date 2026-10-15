@@ -23,9 +23,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
     from pathlib import Path
 
-    from loopback import LoopbackServer
     from pernix.items import FailedItem
     from pernix.stats import Stats
+    from pernix.testing import LoopbackServer
 
 
 @dataclasses.dataclass

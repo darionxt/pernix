@@ -12,7 +12,7 @@ from pernix.extensions import OffsiteFilter
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
 
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
 
 def _filter(*domains: str) -> OffsiteFilter:

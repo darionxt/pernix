@@ -11,20 +11,21 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import pytest
 
-from loopback import ReceivedRequest, Reply
 from pernix import Request, Response, Spider, events
 from pernix.errors import ComponentError, FeedError, SettingsError
 from pernix.retry_policy import Decision
+from pernix.testing import FakeFetcher, ReceivedRequest, Reply, crawl, make_response
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
 PAGES = 3
 FIRST_PAGE = "/catalogue/page-1.html"
 BOOKS_PER_PAGE = 3
+SITE = "https://site.example"
 
 
 def _list_page(page: int, *, base: str | None = None) -> str:
@@ -44,13 +45,17 @@ def _book_page(n: int) -> str:
 HTML = [("Content-Type", "text/html; charset=utf-8")]
 
 
+def _catalogue() -> dict[str, str]:
+    """A small paginated catalogue, by path: list pages link to detail pages and to each other."""
+    pages = {f"/catalogue/page-{page}.html": _list_page(page) for page in range(1, PAGES + 1)}
+    return pages | {f"/book/{n}.html": _book_page(n) for n in range(1, PAGES * BOOKS_PER_PAGE + 1)}
+
+
 @pytest.fixture
 def bookstore(server: LoopbackServer) -> LoopbackServer:
-    """A small paginated catalogue: list pages link to detail pages and to each other."""
-    for page in range(1, PAGES + 1):
-        server.route(f"/catalogue/page-{page}.html", _list_page(page), headers=HTML)
-    for n in range(1, PAGES * BOOKS_PER_PAGE + 1):
-        server.route(f"/book/{n}.html", _book_page(n), headers=HTML)
+    """The catalogue on the loopback server."""
+    for path, page in _catalogue().items():
+        server.route(path, page, headers=HTML)
     return server
 
 
@@ -149,11 +154,9 @@ async def test_crawl_runs_inside_an_event_loop(bookstore: LoopbackServer, tmp_pa
     assert _sorted(_read_items(output)) == _sorted(EXPECTED_BOOKS)
 
 
-async def test_callback_exception_is_logged_and_run_continues(
-    bookstore: LoopbackServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_callback_exception_is_logged_and_run_continues(caplog: pytest.LogCaptureFixture) -> None:
     class Flaky(Books):
-        start_urls = (bookstore.url(FIRST_PAGE),)
+        start_urls = (f"{SITE}{FIRST_PAGE}",)
 
         async def parse_book(self, response: Response) -> AsyncIterator[Any]:
             if response.url.endswith("/book/5.html"):
@@ -161,11 +164,11 @@ async def test_callback_exception_is_logged_and_run_continues(
             async for item in super().parse_book(response):
                 yield item
 
-    output = tmp_path / "books.jsonl"
+    catalogue = FakeFetcher({f"{SITE}{path}": page for path, page in _catalogue().items()})
     async with asyncio.timeout(10):
-        await Flaky.crawl(output=output)
+        report = await crawl(Flaky, fetcher=catalogue)
 
-    titles = {item["title"] for item in _read_items(output)}
+    titles = {item["title"] for item in report.items}
     assert titles == {f"Book {n}" for n in range(1, PAGES * BOOKS_PER_PAGE + 1)} - {"Book 5"}
     [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert "parse_book" in record.getMessage()
@@ -221,20 +224,17 @@ async def test_post_request_sends_body_and_headers(server: LoopbackServer, tmp_p
     assert received.header("X-Trace") == "1"
 
 
-async def test_coroutine_callbacks_may_return_a_list(server: LoopbackServer, tmp_path: Path) -> None:
-    server.route("/", "<p>a</p><p>b</p>")
-
+async def test_coroutine_callbacks_may_return_a_list() -> None:
     class Paragraphs(Spider):
-        start_urls = (server.url("/"),)
+        start_urls = (f"{SITE}/",)
 
         async def parse(self, response: Response) -> list[dict[str, str | None]]:
             return [{"text": text} for text in response.css("p::text").getall()]
 
-    output = tmp_path / "items.jsonl"
     async with asyncio.timeout(10):
-        await Paragraphs.crawl(output=output)
+        report = await crawl(Paragraphs, fetcher=FakeFetcher({f"{SITE}/": "<p>a</p><p>b</p>"}))
 
-    assert _read_items(output) == [{"text": "a"}, {"text": "b"}]
+    assert report.items == [{"text": "a"}, {"text": "b"}]
 
 
 @pytest.mark.parametrize("concurrency", [0, -1])
@@ -403,43 +403,37 @@ async def test_a_self_cancelled_item_error_subscriber_does_not_hide_the_storage_
             await Unserializable.crawl(output=tmp_path / "items.jsonl", settings=settings)
 
 
-async def test_callbacks_receive_the_request_kwargs(server: LoopbackServer, tmp_path: Path) -> None:
-    server.route("/", "ok")
-    server.route("/item", "item")
-
+async def test_callbacks_receive_the_request_kwargs() -> None:
     class Catalogue(Spider):
-        start_urls = (server.url("/"),)
+        start_urls = (f"{SITE}/",)
 
         async def parse(self, response: Response) -> AsyncIterator[Any]:
-            yield Request(server.url("/item"), callback=self.parse_item, kwargs={"category": "books", "page": 2})
+            yield Request("/item", callback=self.parse_item, kwargs={"category": "books", "page": 2})
 
         async def parse_item(self, response: Response, category: str, page: int) -> AsyncIterator[Any]:
             yield {"category": category, "page": page, "body": response.text}
 
-    output = tmp_path / "items.jsonl"
     async with asyncio.timeout(10):
-        await Catalogue.crawl(output=output)
+        report = await crawl(Catalogue, fetcher=FakeFetcher({f"{SITE}/": "ok", f"{SITE}/item": "item"}))
 
-    assert _read_items(output) == [{"category": "books", "page": 2, "body": "item"}]
+    assert report.items == [{"category": "books", "page": 2, "body": "item"}]
 
 
-async def test_dont_filter_bypasses_deduplication(server: LoopbackServer) -> None:
-    server.route("/", "ok")
-    server.route("/again", "again")
-
+async def test_dont_filter_bypasses_deduplication() -> None:
     class Repeat(Spider):
-        start_urls = (server.url("/"),)
+        start_urls = (f"{SITE}/",)
 
         async def parse(self, response: Response) -> AsyncIterator[Any]:
             if response.url.endswith("/"):
-                yield Request(server.url("/again"))
-                yield Request(server.url("/again"))
-                yield Request(server.url("/again"), dont_filter=True)
+                yield Request("/again")
+                yield Request("/again")
+                yield Request("/again", dont_filter=True)
 
+    fake = FakeFetcher({f"{SITE}/": "ok", f"{SITE}/again": "again"})
     async with asyncio.timeout(10):
-        await Repeat.crawl()
+        await crawl(Repeat, fetcher=fake)
 
-    assert [r.path for r in server.received].count("/again") == 2
+    assert [request.url for request in fake.requests].count(f"{SITE}/again") == 2
 
 
 def _item_links(server: LoopbackServer, *hrefs: str) -> None:
@@ -495,22 +489,30 @@ async def test_fingerprint_settings_are_checked_before_the_run() -> None:
         await Idle.crawl(settings={"fingerprint.function": 42})
 
 
-async def test_retries_go_back_through_the_frontier(server: LoopbackServer, tmp_path: Path) -> None:
-    replies = [Reply(status=503, headers=[("Retry-After", "120")]), Reply(status=500), Reply(body="<p>ok</p>")]
-    server.route("/flaky", handler=lambda request: replies.pop(0))
+async def test_retries_go_back_through_the_frontier() -> None:
+    flaky = f"{SITE}/flaky"
+    fake = FakeFetcher(
+        {
+            flaky: [
+                make_response(flaky, status=503, headers=[("Retry-After", "120")]),
+                make_response(flaky, status=500),
+                "<p>ok</p>",
+            ]
+        }
+    )
 
     class Flaky(Spider):
-        start_urls = (server.url("/flaky"),)
+        start_urls = (flaky,)
 
         async def parse(self, response: Response) -> AsyncIterator[Any]:
             yield {"body": response.css("p::text").get()}
 
-    output = tmp_path / "items.jsonl"
-    async with asyncio.timeout(10):
-        await Flaky.crawl(output=output, settings={"retry.delay_scale": 0, "domain.cooldown_max": 0})
+    async with asyncio.timeout(10):  # crawl() waits neither for the retries nor for the cooldown
+        report = await crawl(Flaky, fetcher=fake)
 
-    assert _read_items(output) == [{"body": "ok"}]
-    assert [request.path for request in server.received] == ["/flaky"] * 3
+    assert report.items == [{"body": "ok"}]
+    assert [request.url for request in fake.requests] == [flaky] * 3
+    assert report.stats["requests.retried"] == 2
 
 
 class NoRetries:

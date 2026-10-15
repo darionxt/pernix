@@ -1,4 +1,4 @@
-"""Inline Fetch against fake download chains and Fetchers, without a network."""
+"""Inline Fetch against FakeFetchers and a fake streaming Fetcher, without a network."""
 
 from __future__ import annotations
 
@@ -17,18 +17,17 @@ from pernix.middlewares import build_download_chain
 from pernix.retry_policy import Decision, DefaultRetryPolicy
 from pernix.settings import DomainSettings, RetrySettings
 from pernix.stats import Stats
+from pernix.testing import FakeFetcher, make_response
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 
     from pernix.middlewares import Download
     from pernix.retry_policy import RetryPolicy
+    from pernix.testing import Answer
 
 SITE = "https://site.example"
-
-type Outcome = int | bytes | Exception
-"""A status for an empty Response, a body for a 200 Response, or an exception to raise."""
 
 
 def _response(request: Request, outcome: int | bytes, **options: Any) -> Response:
@@ -36,20 +35,14 @@ def _response(request: Request, outcome: int | bytes, **options: Any) -> Respons
     return Response(url=request.url, status=status, headers=[], body=body, request=request, **options)
 
 
-class FakeSite:
-    """A download chain answering each path with its outcomes in turn, repeating the last."""
+def _site(pages: Mapping[str, list[Answer]]) -> FakeFetcher:
+    """A FakeFetcher answering the pages of SITE, given by path, with their answers in turn."""
+    return FakeFetcher({f"{SITE}{path}": answers for path, answers in pages.items()})
 
-    def __init__(self, pages: dict[str, list[Outcome]]) -> None:
-        self.pages = pages
-        self.fetched: list[Request] = []
 
-    async def __call__(self, request: Request) -> Response:
-        self.fetched.append(request)
-        outcomes = self.pages[request.url.removeprefix(SITE)]
-        outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return _response(request, outcome)
+def _status(status: int) -> Answer:
+    """An empty Response with a status."""
+    return lambda request: make_response(request.url, status=status, request=request)
 
 
 class Recording:
@@ -79,8 +72,8 @@ def _inline(
 
 
 async def test_a_fetch_returns_the_response_whatever_its_status() -> None:
-    site = FakeSite({"/a": [b"<p>a</p>"], "/missing": [404]})
-    inline = _inline(site)
+    site = _site({"/a": [b"<p>a</p>"], "/missing": [_status(404)]})
+    inline = _inline(site.fetch)
 
     found, missing = await inline.fetch(Request(f"{SITE}/a")), await inline.fetch(Request(f"{SITE}/missing"))
 
@@ -88,14 +81,14 @@ async def test_a_fetch_returns_the_response_whatever_its_status() -> None:
 
 
 async def test_failed_attempts_are_retried_in_place() -> None:
-    site = FakeSite({"/flaky": [503, ConnectError("reset"), b"ok"]})
+    site = _site({"/flaky": [_status(503), ConnectError("reset"), b"ok"]})
     bus = events.EventBus(timeout=5)
     retried = Recording(bus, events.RequestRetried)
 
-    response = await _inline(site, bus=bus).fetch(Request(f"{SITE}/flaky"))
+    response = await _inline(site.fetch, bus=bus).fetch(Request(f"{SITE}/flaky"))
 
     assert response.body == b"ok"
-    assert len(site.fetched) == 3
+    assert len(site.requests) == 3
     assert [(event.attempt, event.reason) for event in retried.events] == [
         (1, "HTTP 503"),
         (2, "ConnectError: reset"),
@@ -103,7 +96,7 @@ async def test_failed_attempts_are_retried_in_place() -> None:
 
 
 async def test_retries_wait_their_delay_in_place() -> None:
-    site = FakeSite({"/flaky": [503, b"ok"]})
+    site = _site({"/flaky": [_status(503), b"ok"]})
 
     class Briefly:
         def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
@@ -112,14 +105,14 @@ async def test_retries_wait_their_delay_in_place() -> None:
             return Decision.accept()
 
     started = time.monotonic()
-    await _inline(site, retry_policy=Briefly()).fetch(Request(f"{SITE}/flaky"))
+    await _inline(site.fetch, retry_policy=Briefly()).fetch(Request(f"{SITE}/flaky"))
 
     assert time.monotonic() - started >= 0.05
 
 
 async def test_once_the_retries_run_out_the_fetch_raises_retries_exhausted() -> None:
-    site = FakeSite({"/down": [503], "/unreachable": [ConnectError("refused")]})
-    inline = _inline(site, retry_policy=DefaultRetryPolicy(RetrySettings(times=1, delay_scale=0)))
+    site = _site({"/down": [_status(503)], "/unreachable": [ConnectError("refused")]})
+    inline = _inline(site.fetch, retry_policy=DefaultRetryPolicy(RetrySettings(times=1, delay_scale=0)))
 
     with pytest.raises(RetriesExhausted, match="HTTP 503") as down:
         await inline.fetch(Request(f"{SITE}/down"))
@@ -130,15 +123,15 @@ async def test_once_the_retries_run_out_the_fetch_raises_retries_exhausted() -> 
     assert down.value.response.status == 503
     assert isinstance(unreachable.value.__cause__, ConnectError)
     assert unreachable.value.response is None
-    assert len(site.fetched) == 4
+    assert len(site.requests) == 4
 
 
 async def test_errors_the_policy_keeps_are_raised_as_they_are() -> None:
-    site = FakeSite({"/insecure": [TLSError("bad certificate")]})
+    site = _site({"/insecure": [TLSError("bad certificate")]})
 
     with pytest.raises(TLSError, match="bad certificate"):
-        await _inline(site).fetch(Request(f"{SITE}/insecure"))
-    assert len(site.fetched) == 1
+        await _inline(site.fetch).fetch(Request(f"{SITE}/insecure"))
+    assert len(site.requests) == 1
 
 
 async def test_a_request_a_middleware_ignores_raises_ignore_request() -> None:
@@ -183,9 +176,9 @@ async def test_each_attempt_waits_for_its_slot_and_frees_it() -> None:
 
 
 async def test_a_cooling_slot_is_waited_out_in_place() -> None:
-    site = FakeSite({"/limited": [b"ok"]})
+    site = _site({"/limited": [b"ok"]})
     throttle = Throttle(DomainSettings(cooldown_max=0.05))
-    inline = _inline(site, throttle=throttle)
+    inline = _inline(site.fetch, throttle=throttle)
     request = Request(f"{SITE}/limited")
     throttle.observe("site.example", _response(request, 429).replace(headers=[("Retry-After", "60")]))
 
@@ -198,15 +191,15 @@ async def test_a_cooling_slot_is_waited_out_in_place() -> None:
 
 
 async def test_a_request_continues_the_session_of_the_request_being_handled() -> None:
-    site = FakeSite({"/a": [b""]})
-    inline = _inline(site)
+    site = _site({"/a": [b""]})
+    inline = _inline(site.fetch)
 
     with handling(Request(f"{SITE}/page", session="first")):
         await inline.fetch(Request(f"{SITE}/a"))
         await inline.fetch(Request(f"{SITE}/a", session="own"))
     await inline.fetch(Request(f"{SITE}/a"))
 
-    assert [request.session for request in site.fetched] == ["first", "own", None]
+    assert [request.session for request in site.requests] == ["first", "own", None]
 
 
 class Files:

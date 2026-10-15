@@ -31,6 +31,9 @@ classifiers = [
 [project.scripts]
 pernix = "pernix.cli:main"
 
+[project.entry-points.pytest11]
+pernix = "pernix.testing.pytest_plugin"
+
 [project.urls]
 Repository = "https://github.com/darionxt/pernix"
 

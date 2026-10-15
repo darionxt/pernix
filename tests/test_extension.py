@@ -12,8 +12,8 @@ from pernix.extensions import Extension
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from loopback import LoopbackServer
     from pernix.events import EventBus
+    from pernix.testing import LoopbackServer
 
 
 class Journal(Extension):

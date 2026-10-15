@@ -346,6 +346,7 @@ class Crawler:
                 self._shutdown.begin(lifecycle)
                 try:
                     if await self._shutdown.run_stage(self._open(lifecycle, run.components, run.feeds)):
+                        self.stats.set("run.reason", "forced")  # as the reporter records it once a Run started
                         return RunResult(self.run_id, "forced", self.stats.snapshot())
                     return await self._run(run)
                 except asyncio.CancelledError:

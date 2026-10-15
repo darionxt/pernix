@@ -1,16 +1,18 @@
-"""Tests for the loopback server and the network guard used by the test suite."""
+"""The loopback server of pernix.testing."""
 
 from __future__ import annotations
 
 import asyncio
-import socket
 import urllib.error
 import urllib.request
+from typing import TYPE_CHECKING
 
 import pytest
 
-from loopback import LoopbackServer, ReceivedRequest, Reply
-from netguard import NetworkAccessError
+from pernix.testing import LoopbackServer, ReceivedRequest, Reply
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _get(url: str, data: bytes | None = None, headers: dict[str, str] | None = None):
@@ -73,9 +75,38 @@ async def test_async_tests_run_on_an_event_loop(server: LoopbackServer) -> None:
     assert await asyncio.to_thread(fetch) == b"ok"
 
 
-def test_external_network_is_blocked() -> None:
-    with (
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock,
-        pytest.raises(NetworkAccessError),
-    ):
-        sock.connect(("192.0.2.1", 80))
+def test_routes_may_be_given_up_front() -> None:
+    def echo(request: ReceivedRequest) -> Reply:
+        return Reply(body=request.header("X-Echo") or "")
+
+    routes = {"/text": "<p>text</p>", "/bytes": b"\x00\x01", "/reply": Reply(status=204), "/echo": echo}
+    with LoopbackServer(routes) as server:
+        with _get(server.url("/text")) as text, _get(server.url("/bytes")) as raw:
+            assert (text.read(), raw.read()) == (b"<p>text</p>", b"\x00\x01")
+        with _get(server.url("/reply")) as reply:
+            assert reply.status == 204
+        with _get(server.url("/echo"), headers={"X-Echo": "ping"}) as echoed:
+            assert echoed.read() == b"ping"
+
+
+def test_a_directory_is_served_below_the_routes(tmp_path: Path) -> None:
+    site = tmp_path / "site"
+    (site / "books").mkdir(parents=True)
+    (site / "index.html").write_text("<h1>home</h1>")
+    (site / "books" / "index.html").write_text("<h1>books</h1>")
+    (site / "books" / "dune.json").write_text('{"title": "Dune"}')
+    (site / "linked").mkdir()
+    (tmp_path / "secret.txt").write_text("secret")
+    (site / "linked" / "index.html").symlink_to(tmp_path / "secret.txt")
+
+    with LoopbackServer({"/books/dune.json": "routed"}, directory=site) as server:
+        with _get(server.url("/")) as home, _get(server.url("/books/")) as books:
+            assert (home.read(), books.headers["Content-Type"]) == (b"<h1>home</h1>", "text/html")
+            assert books.read() == b"<h1>books</h1>"
+        with _get(server.url("/books/dune.json")) as routed:
+            assert routed.read() == b"routed"
+        for missing in ("/books/missing.html", "/../secret.txt", "/%2e%2e/secret.txt", "/linked/"):
+            with pytest.raises(urllib.error.HTTPError) as excinfo:
+                _get(server.url(missing))
+            with excinfo.value as error:
+                assert error.code == 404

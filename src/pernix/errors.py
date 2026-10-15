@@ -15,6 +15,7 @@ __all__ = [
     "FeedError",
     "FetchError",
     "IgnoreRequest",
+    "NetworkBlocked",
     "PernixError",
     "ProxyError",
     "ResponseTooLarge",
@@ -138,6 +139,10 @@ class ResponseTooLarge(FetchError):
 
 class DecodeError(FetchError):
     """The body could not be decoded, for example from its `Content-Encoding`."""
+
+
+class NetworkBlocked(FetchError):
+    """A network guard, such as the one tests run under, refused a host other than a loopback one."""
 
 
 class RetriesExhausted(PernixError):

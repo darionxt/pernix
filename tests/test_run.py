@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
 SETTINGS = {"concurrency": 1, "stats.interval": 0}
 

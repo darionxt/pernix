@@ -7,18 +7,22 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin
 
+from ada_url import URL
 from curl_cffi import Curl, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR, CURL_WRITEFUNC_PAUSE, CURLPAUSE_CONT
 from curl_cffi.requests import AsyncSession
 
-from pernix.errors import ResponseTooLarge
+from pernix.errors import NetworkBlocked, ResponseTooLarge
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
+
+    from pernix.fetchers.network_guard import NetworkGuard
 
 __all__ = ["BUFFER_SIZE", "CurlSession", "CurlSessionPool", "Transfer"]
 
@@ -43,6 +47,7 @@ class Transfer:
         exceeded: Whether the limit stopped it.
         paused: Whether curl stopped receiving until more is read.
         returned: Whether the handle went back to the session's pool.
+        blocked: The redirect the network guard refused, which stopped it.
     """
 
     curl: Curl
@@ -52,6 +57,7 @@ class Transfer:
     exceeded: bool = False
     paused: bool = False
     returned: bool = False
+    blocked: str | None = None
 
     def read(self, size: int) -> None:
         """Note that bytes of body were read, resuming curl once few enough wait.
@@ -70,7 +76,9 @@ class Transfer:
 
 @dataclass(slots=True)
 class _Start:
+    url: str
     limit: int | None
+    guard: NetworkGuard | None
     transfer: Transfer | None = None
 
 
@@ -87,7 +95,8 @@ class CurlSession(AsyncSession):
     `push_curl()` hooks of curl-cffi's handle pool. The handle's write callback counts
     the body, failing the transfer past the limit, and pauses curl while
     `BUFFER_SIZE` bytes wait to be read; the handle is removed from curl when the
-    request is cancelled.
+    request is cancelled. Under a network guard, the header callback stops a transfer
+    before curl follows a redirect the guard refuses.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -100,7 +109,13 @@ class CurlSession(AsyncSession):
         self._transfers: dict[Curl, Transfer] = {}
 
     async def start(
-        self, method: HttpMethod, url: str, *, body_limit: int | None, **options: Any
+        self,
+        method: HttpMethod,
+        url: str,
+        *,
+        body_limit: int | None,
+        guard: NetworkGuard | None = None,
+        **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
 
@@ -108,6 +123,7 @@ class CurlSession(AsyncSession):
             method: The HTTP method.
             url: The URL.
             body_limit: Bytes of body the transfer may deliver; `None` for no limit.
+            guard: The network guard every redirect must pass, if any.
             **options: The options of `AsyncSession.request()`, but `stream`.
 
         Returns:
@@ -117,8 +133,9 @@ class CurlSession(AsyncSession):
             curl_cffi.CurlError: The transfer failed before the headers arrived.
             pernix.errors.ResponseTooLarge: The limit stopped the transfer before the
                 headers came back.
+            pernix.errors.NetworkBlocked: The guard refused a redirect.
         """
-        start = _Start(body_limit)
+        start = _Start(url, body_limit, guard)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -130,6 +147,10 @@ class CurlSession(AsyncSession):
         except Exception as exc:
             if start.transfer is not None and start.transfer.exceeded:
                 raise ResponseTooLarge(f"the body of {url} exceeds {body_limit} bytes") from exc
+            if start.transfer is not None and start.transfer.blocked is not None:
+                raise NetworkBlocked(
+                    f"the network guard refused the redirect from {url} to {start.transfer.blocked}"
+                ) from exc
             raise
         finally:
             _starting.reset(token)
@@ -144,7 +165,8 @@ class CurlSession(AsyncSession):
         if start is not None and start.transfer is None:
             transfer = start.transfer = Transfer(curl, start.limit)
             self._transfers[curl] = transfer
-            setattr(curl, "setopt", _metered(curl.setopt, transfer))  # noqa: B010  # before curl-cffi sets it up
+            watched = _watched(curl.setopt, transfer, start.url, start.guard)
+            setattr(curl, "setopt", watched)  # noqa: B010  # before curl-cffi sets it up
         return curl
 
     def push_curl(self, curl: Curl | None) -> None:
@@ -155,10 +177,12 @@ class CurlSession(AsyncSession):
         super().push_curl(curl)
 
 
-def _metered(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer) -> Callable[[CurlOpt, Any], int]:
-    """Wrap a handle's `setopt()` so that the write callback it installs meters the body."""
+def _watched(
+    setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, url: str, guard: NetworkGuard | None
+) -> Callable[[CurlOpt, Any], int]:
+    """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and check redirects."""
 
-    def metered_setopt(option: CurlOpt, value: Any) -> int:
+    def watched_setopt(option: CurlOpt, value: Any) -> int:
         if option == CurlOpt.WRITEFUNCTION and callable(value):
             write: Callable[[bytes], Any] = value
             limit = transfer.limit
@@ -175,9 +199,66 @@ def _metered(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer) -> Calla
                 return write(chunk)
 
             value = metered
+        elif option == CurlOpt.HEADERDATA and guard is not None:
+            # A header function, unlike the buffer's write(), can fail the transfer by its return value.
+            option, value = CurlOpt.HEADERFUNCTION, _RedirectCheck(value, url, guard, transfer)
         return setopt(option, value)
 
-    return metered_setopt
+    return watched_setopt
+
+
+class _RedirectCheck:
+    """Writes the response headers of one transfer to curl-cffi's buffer, refusing redirects the guard does not admit.
+
+    curl follows a redirect after delivering the headers of the response, so failing
+    the header callback on a refused `Location` stops the transfer before curl
+    connects to it.
+    """
+
+    def __init__(self, buffer: Any, url: str, guard: NetworkGuard, transfer: Transfer) -> None:
+        self._buffer = buffer
+        self._url = url
+        self._guard = guard
+        self._transfer = transfer
+        self._status = 0
+
+    def __call__(self, line: bytes) -> int:
+        text = line.decode("latin-1").strip()
+        if text.startswith("HTTP/"):
+            code = text.split(maxsplit=2)[1:2]
+            self._status = int(code[0]) if code and code[0].isdigit() else 0
+        elif 300 <= self._status < 400 and text[:9].lower() == "location:":
+            refused = self._follow(text[9:].strip())
+            if refused is not None:
+                self._transfer.blocked = refused
+                return CURL_WRITEFUNC_ERROR  # curl stops the transfer
+        self._buffer.write(line)
+        return len(line)
+
+    def _follow(self, location: str) -> str | None:
+        """Follow a redirect to its `Location`, returning the URL the guard refuses, if any.
+
+        urllib and WHATWG resolve some Locations to different hosts, such as
+        `http:///other.example/`, which curl, like WHATWG, takes as a host. Both
+        results must be admitted, and a Location WHATWG cannot parse is refused.
+        """
+        targets: list[str] = []
+        for join in (urljoin, _whatwg_join):
+            try:
+                targets.append(join(self._url, location))
+            except ValueError:
+                targets.append(location)  # refused below, as it names no host the guard admits
+        for url in dict.fromkeys(targets):
+            try:
+                self._guard.check(url)
+            except NetworkBlocked:
+                return url
+        self._url = targets[-1]  # as curl reads it
+        return None
+
+
+def _whatwg_join(base: str, url: str) -> str:
+    return URL(url, base).href
 
 
 @dataclass(slots=True)
@@ -191,7 +272,8 @@ class CurlSessionPool:
     """Keeps one curl session per Profile, so connections are reused but never shared between Profiles.
 
     A session is created on first use, inside the running event loop, with curl's own
-    retries off, proxies from the environment ignored, and HTTP/2 connections reused.
+    retries off, proxies from the environment ignored, `NO_PROXY` included, and HTTP/2
+    connections reused.
     Beyond `size` sessions, the least recently used one not in use is closed, and so
     is one unused for `idle` seconds, including the one about to be used, which is
     then replaced; both are checked whenever a session is taken. Retired sessions
@@ -260,7 +342,8 @@ class CurlSessionPool:
             impersonate=profile,
             trust_env=False,
             retry=0,
-            curl_options={CurlOpt.PIPEWAIT: 1},
+            # libcurl reads NO_PROXY itself, even for a proxy given explicitly; "" stops that.
+            curl_options={CurlOpt.PIPEWAIT: 1, CurlOpt.NOPROXY: ""},
         )
 
     def _detach_evicted(self, now: float) -> list[CurlSession]:

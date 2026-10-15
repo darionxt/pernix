@@ -21,6 +21,7 @@ from pernix.errors import (
 )
 from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.http_settings import HTTPSettings, check_profile
+from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
@@ -102,6 +103,9 @@ class HTTPFetcher:
     Requests are independent (ADR 0011): each transfer sends only `request.cookies`,
     cookies set during it flow within its own redirect chain, and none are kept for
     later Requests. Connections are still reused.
+
+    Under a network guard (`pernix.fetchers.network_guard`), as in tests, only
+    loopback hosts are reached, redirects included; others raise `NetworkBlocked`.
 
     Attributes:
         schemes: The URL schemes it fetches by default: `http` and `https`.
@@ -270,6 +274,9 @@ class HTTPFetcher:
     async def _request(
         self, session: CurlSession, request: Request, profile: str, curl_timeout: float, limit: int | None
     ) -> tuple[curl_cffi.Response, Transfer]:
+        guard = current_guard()
+        if guard is not None:
+            guard.check(request.url, proxy=request.proxy)
         try:
             return await session.start(
                 cast("HttpMethod", request.method),
@@ -284,6 +291,7 @@ class HTTPFetcher:
                 max_redirects=self._settings.max_redirects,
                 http_version=_http_version(request.url),
                 body_limit=limit,
+                guard=None if request.proxy else guard,  # a loopback proxy takes every hop
             )
         except CurlError as exc:
             raise _fetch_error(exc) from exc
