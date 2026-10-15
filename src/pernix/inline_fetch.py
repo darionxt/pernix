@@ -64,8 +64,9 @@ class InlineFetch:
     Request being handled, if it has one.
 
     A fetch nested in another of the same slot, in the same task, such as one a
-    download Middleware makes, shares the outer fetch's slot instead of waiting for
-    another. A streamed fetch holds its slot until the stream is closed, so the
+    download Middleware makes, shares the outer fetch's place instead of waiting for
+    another, though it still waits for the delay, the rate, and a cooldown. A
+    streamed fetch holds its slot until the stream is closed, so the
     fetches made in its block share it too; only the attempts up to the response
     headers are retried.
     """
@@ -165,21 +166,22 @@ class InlineFetch:
 
     @asynccontextmanager
     async def _holding(self, slot: str) -> AsyncGenerator[None]:
-        """Hold a slot for a fetch, sharing the one the fetch is nested in, if any."""
+        """Hold a slot for a fetch, or share the place of the fetch it is nested in, pacing it either way."""
         if self._throttle.holds(slot):
+            await self._acquire(slot, shared=True)
             yield
             return
-        await self._acquire(slot)
+        await self._acquire(slot, shared=False)
         try:
             with self._throttle.holding(slot):
                 yield
         finally:
             self._throttle.release(slot)
 
-    async def _acquire(self, slot: str) -> None:
+    async def _acquire(self, slot: str, *, shared: bool) -> None:
         """Start a fetch in its slot, waiting out a cooldown in place."""
         while True:
-            if await self._throttle.acquire(slot):
+            if await self._throttle.acquire(slot, shared=shared):
                 return
             # The Throttle refuses a cooling slot rather than wait, as Frontier Requests wait in the Frontier.
             await asyncio.sleep(self._throttle.cooldown_left(slot))

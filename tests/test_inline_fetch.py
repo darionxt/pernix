@@ -64,13 +64,14 @@ def _inline(
     download: Download,
     *,
     domain: DomainSettings | None = None,
+    throttle: Throttle | None = None,
     retry_policy: RetryPolicy | None = None,
     bus: events.EventBus | None = None,
     stats: Stats | None = None,
 ) -> InlineFetch:
     return InlineFetch(
         download=download,
-        throttle=Throttle(domain or DomainSettings()),
+        throttle=throttle or Throttle(domain or DomainSettings()),
         retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings(delay_scale=0)),
         events=bus or events.EventBus(timeout=5),
         stats=stats or Stats(),
@@ -184,13 +185,7 @@ async def test_each_attempt_waits_for_its_slot_and_frees_it() -> None:
 async def test_a_cooling_slot_is_waited_out_in_place() -> None:
     site = FakeSite({"/limited": [b"ok"]})
     throttle = Throttle(DomainSettings(cooldown_max=0.05))
-    inline = InlineFetch(
-        download=site,
-        throttle=throttle,
-        retry_policy=DefaultRetryPolicy(RetrySettings(delay_scale=0)),
-        events=events.EventBus(timeout=5),
-        stats=Stats(),
-    )
+    inline = _inline(site, throttle=throttle)
     request = Request(f"{SITE}/limited")
     throttle.observe("site.example", _response(request, 429).replace(headers=[("Retry-After", "60")]))
 
@@ -412,6 +407,44 @@ async def test_fetches_in_the_block_of_a_stream_share_its_slot() -> None:
         body = await _read(streamed)
 
     assert (page.body, body) == (b"data", b"data")
+
+
+async def test_fetches_sharing_a_slot_still_wait_for_the_delay() -> None:
+    files = Files([b"secret"])
+    started: dict[str, float] = {}
+    inline: InlineFetch | None = None
+
+    async def authorize(request: Request, call_next: Download) -> Response:
+        started[request.url.removeprefix(SITE)] = time.monotonic()
+        if request.url.endswith("/token"):
+            return await call_next(request)
+        assert inline is not None
+        await inline.fetch(Request(f"{SITE}/token"))
+        return await call_next(request)
+
+    inline = _inline(_chain(files, authorize), domain=DomainSettings(concurrency=1, delay=0.05, delay_jitter=0.0))
+    async with asyncio.timeout(2):
+        await inline.fetch(Request(f"{SITE}/data"))
+
+    assert started["/token"] - started["/data"] >= 0.045
+
+
+async def test_fetches_sharing_a_slot_wait_out_its_cooldown() -> None:
+    files = Files([b"data"])
+    throttle = Throttle(DomainSettings(concurrency=1, cooldown_max=0.05))
+    inline = _inline(_chain(files), throttle=throttle)
+
+    async with asyncio.timeout(2), inline.stream(Request(f"{SITE}/file")) as streamed:
+        throttle.observe(
+            "site.example", _response(streamed.response.request, 429).replace(headers=[("Retry-After", "60")])
+        )
+        started = time.monotonic()
+        await inline.fetch(Request(f"{SITE}/page"))
+        waited = time.monotonic() - started
+        await _read(streamed)
+
+    assert waited >= 0.04
+    assert throttle.stats.refused == 1
 
 
 async def test_tasks_started_inside_a_fetch_wait_for_slots_of_their_own() -> None:

@@ -209,7 +209,8 @@ class Crawler:
         The Request goes through the download Middleware and waits for its slot, as
         Requests from the Frontier do, but it is not deduplicated or stored, and no
         Callback runs for it. Nested in another fetch for the same domain, in the
-        same task, such as from a download Middleware, it shares that fetch's slot. The retry policy judges it as usual, and a retry waits
+        same task, such as from a download Middleware, it shares that fetch's place
+        in the slot, though it still waits for the delay, the rate, and a cooldown. The retry policy judges it as usual, and a retry waits
         in place. A Request without a Session continues the Session of the Request
         whose Callback or errback is running; otherwise, as any Request, it sends
         only the cookies it carries. Cancelling the caller, as a Force Stop does,
