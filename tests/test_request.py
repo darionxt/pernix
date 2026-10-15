@@ -82,6 +82,18 @@ def test_params_are_added_to_the_query_before_the_fragment() -> None:
     assert Request(URL, params={}).url == URL
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://example.com/s?q=why?", "https://example.com/s?q=why?&page=2"),
+        ("https://example.com/s#a?b", "https://example.com/s?page=2#a?b"),
+        ("https://example.com/s?q=1&", "https://example.com/s?q=1&page=2"),
+    ],
+)
+def test_params_join_the_query_wherever_question_marks_appear(url: str, expected: str) -> None:
+    assert Request(url, params={"page": 2}).url == expected
+
+
 def test_params_apply_to_relative_urls_once_resolved() -> None:
     with resolve_relative_urls(lambda url: f"https://example.com/books/{url}"):
         request = Request("search?lang=en", params={"q": "dune"})

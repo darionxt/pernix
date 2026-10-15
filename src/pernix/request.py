@@ -274,7 +274,8 @@ def _with_params(url: str, params: QueryParams) -> str:
     if not encoded:
         return url
     base, hash_mark, fragment = url.partition("#")
-    separator = "?" if "?" not in base else "" if base.endswith(("?", "&")) else "&"
+    _, question_mark, query = base.partition("?")  # a later "?" belongs to the query
+    separator = "?" if not question_mark else "" if not query or query.endswith("&") else "&"
     return f"{base}{separator}{encoded}{hash_mark}{fragment}"
 
 
