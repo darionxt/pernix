@@ -23,6 +23,8 @@ from pernix.testing.loopback_server import LoopbackServer
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator
 
+    from pernix.fetchers.network_guard import NetworkGuard
+
 _NETWORK = "pernix_network"
 _NETWORK_VALUES = ("block", "allow")
 
@@ -69,14 +71,22 @@ def _guarding(item: pytest.Item, phase: str) -> Generator[None, object, object]:
     if item.config.getini(_NETWORK) == "allow" or item.get_closest_marker(_NETWORK) is not None:
         return (yield)
     with blocking_network() as guard:
-        result = yield
+        try:
+            result = yield
+        except (Exception, pytest.skip.Exception, pytest.fail.Exception):  # not KeyboardInterrupt or pytest.exit()
+            _fail_if_refused(guard, phase)  # a skip, say, must not hide a refused URL
+            raise
+    _fail_if_refused(guard, phase)
+    return result
+
+
+def _fail_if_refused(guard: NetworkGuard, phase: str) -> None:
     if guard.blocked:
         pytest.fail(
             f"Pernix's network guard refused {', '.join(guard.blocked)} while {phase} this test; serve "
             f"the pages from loopback_server or a FakeFetcher, or mark the test with @pytest.mark.{_NETWORK}",
             pytrace=False,
         )
-    return result
 
 
 @pytest.fixture

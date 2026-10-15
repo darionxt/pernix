@@ -46,6 +46,38 @@ def test_a_test_whose_fetch_the_guard_refused_fails_even_if_the_run_carried_on(s
     result.stdout.fnmatch_lines(["*network guard refused http://192.0.2.1/ while running this test*pernix_network*"])
 
 
+def test_a_skip_or_a_failure_does_not_hide_a_refused_url(session: pytest.Pytester) -> None:
+    session.makepyfile(
+        """
+        import pytest
+        from pernix import Request
+        from pernix.errors import NetworkBlocked
+        from pernix.fetchers import HTTPFetcher
+
+        async def test_skipped_when_unavailable():
+            async with HTTPFetcher() as fetcher:
+                try:
+                    await fetcher.fetch(Request("http://192.0.2.1/"))
+                except NetworkBlocked:
+                    pytest.skip("the service is unavailable")
+
+        async def test_failing():
+            async with HTTPFetcher() as fetcher:
+                await fetcher.fetch(Request("http://192.0.2.1/other"))
+        """
+    )
+
+    result = session.runpytest("-p", "no:cacheprovider")
+
+    result.assert_outcomes(failed=2)
+    result.stdout.fnmatch_lines(
+        [
+            "*refused http://192.0.2.1/ while running this test*",
+            "*refused http://192.0.2.1/other while running this test*",
+        ]
+    )
+
+
 def test_fixtures_of_every_scope_are_guarded_as_they_are_set_up_and_torn_down(session: pytest.Pytester) -> None:
     session.makepyfile(
         """
