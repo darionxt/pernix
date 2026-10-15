@@ -211,6 +211,48 @@ Pernix logs on the `pernix.*` loggers; `self.logger` in a Spider is `pernix.spid
 
 The stats of a Run, such as `downloads.by_status.200` or `items.scraped`, are in `crawler.stats` (`self.stats` in a Spider, where you can add your own). They are logged every minute and summarized at the end, and Stats Sinks registered with `stats.sinks` receive every snapshot. See [`docs/design.md`](docs/design.md) §8 for the keys.
 
+## Testing
+
+```python
+import re
+
+from pernix import Request, Spider
+from pernix.errors import Timeout
+from pernix.testing import FakeFetcher, crawl, make_response, run_callback
+
+
+class Books(Spider):
+    start_urls = ["https://shop.example/"]
+
+    async def parse(self, response):
+        for href in response.css("a::attr(href)").getall():
+            yield Request(href, callback=self.parse_book)
+
+    async def parse_book(self, response):
+        yield {"title": response.css("h1::text").get()}
+
+
+async def test_books():
+    fake = FakeFetcher({
+        "https://shop.example/": "<a href='/book/1'>Dune</a><a href='/book/2'>Emma</a>",
+        re.compile(r"https://shop\.example/book/1"): "<h1>Dune</h1>",
+        "https://shop.example/book/2": [Timeout("slow"), "<h1>Emma</h1>"],  # in turn, the last repeating
+    })
+    report = await crawl(Books, fetcher=fake)
+    assert sorted(item["title"] for item in report.items) == ["Dune", "Emma"]
+    assert report.stats["requests.retried"] == 1
+    assert fake.unmatched == []  # Requests no route matched got 404
+
+
+async def test_parse():
+    outputs = await run_callback(Books(), make_response("https://shop.example/", "<a href='/book/1'>Dune</a>"))
+    assert [request.url for request in outputs] == ["https://shop.example/book/1"]
+```
+
+`pernix.testing` runs Spiders without a network. `FakeFetcher` answers Requests from canned bodies, Responses, exceptions, or functions, by URL or pattern. `crawl()` runs a Spider to completion and reports its Items and stats, without the delays that would only make a test wait, and `run_callback()` runs one Callback as a Run would. `LoopbackServer`, also the `loopback_server` fixture, serves routes or a directory on 127.0.0.1 for tests that fetch for real.
+
+Installing Pernix adds a pytest plugin that keeps the Fetchers off the network in every test: only loopback hosts can be reached, redirects included, and a test during which another host was refused fails. curl does not use Python's sockets, so other network-blocking plugins cannot do this. Mark a test with `@pytest.mark.pernix_network` to let it reach the network, or set `pernix_network = allow` in the pytest configuration. See [`docs/design.md`](docs/design.md) §9.
+
 ## Documentation
 
 - [`CONTEXT.md`](CONTEXT.md): terminology
@@ -289,6 +331,7 @@ src/pernix/
 │   ├── http_fetcher.py  curl-cffi HTTP Fetcher
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
+│   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
 │   └── streamed_response.py a Response whose body is read as it arrives
 ├── frontiers/
 │   ├── frontier.py      Frontier protocol, Lease
@@ -311,6 +354,11 @@ src/pernix/
 │   ├── conversion.py    validates values, converting strings from the environment
 │   └── secret.py        Secret, a redacted value
 └── testing/
+    ├── fake_fetcher.py  FakeFetcher: canned answers by URL or pattern
+    ├── responses.py     make_response(), Responses for tests
+    ├── crawling.py      crawl() and run_callback(): running Spiders and Callbacks in tests
+    ├── loopback_server.py LoopbackServer: routes and files served on 127.0.0.1
+    ├── pytest_plugin.py the pytest plugin: the network guard, the loopback_server fixture
     └── frontier.py      conformance suite for Frontier backends
 tests/                   one test module per source module, plus end-to-end crawls
 ```

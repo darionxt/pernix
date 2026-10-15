@@ -8,11 +8,14 @@ from typing import TYPE_CHECKING
 import pytest
 
 import netguard
-from loopback import LoopbackServer
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
+
+    from pernix.testing import LoopbackServer
+
+pytest_plugins = ["pytester"]
 
 
 @pytest.fixture(autouse=True)
@@ -39,9 +42,9 @@ def _restore_import_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def server() -> Iterator[LoopbackServer]:
-    with LoopbackServer() as srv:
-        yield srv
+def server(loopback_server: LoopbackServer) -> LoopbackServer:
+    """The pytest plugin's `loopback_server`, under the shorter name the suite uses."""
+    return loopback_server
 
 
 @pytest.fixture

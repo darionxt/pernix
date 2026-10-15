@@ -7,16 +7,16 @@ from typing import TYPE_CHECKING
 import orjson
 import pytest
 
-from loopback import Reply
 from pernix import Request, Response, middleware
 from pernix.cli import main
 from pernix.cli.fetch_command import describe_response, is_text
+from pernix.testing import Reply
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from loopback import LoopbackServer, ReceivedRequest
     from pernix.middlewares import Download
+    from pernix.testing import LoopbackServer, ReceivedRequest
 
 
 @middleware

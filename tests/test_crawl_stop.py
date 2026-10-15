@@ -16,9 +16,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
     from pathlib import Path
 
-    from loopback import LoopbackServer
     from pernix.items import ItemContext
     from pernix.shutdown import StopMode
+    from pernix.testing import LoopbackServer
 
 
 def _lines(path: Path) -> list[Any]:

@@ -16,9 +16,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from loopback import LoopbackServer
     from pernix import Response
     from pernix.items import ItemContext
+    from pernix.testing import LoopbackServer
 
 SETTINGS = {"stats.interval": 0}
 

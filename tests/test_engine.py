@@ -1,4 +1,4 @@
-"""The Engine against an in-memory Frontier and a fake download chain, without a network."""
+"""The Engine against an in-memory Frontier and a FakeFetcher, without a network."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from pernix.errors import ConnectError, RetriesExhausted
 from pernix.frontiers import MemoryFrontier
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import DomainSettings, RetrySettings
+from pernix.testing import FakeFetcher, make_response
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
@@ -25,38 +26,24 @@ if TYPE_CHECKING:
     from pernix.items import ItemContext
     from pernix.middlewares import Download
     from pernix.retry_policy import Decision, RetryPolicy
+    from pernix.testing import Answer
 
 SITE = "https://site.example"
 
 
-type Outcome = str | int | Exception
-"""A page body for a 200 Response, a status for an empty Response, or an exception to raise."""
+def _site(pages: Mapping[str, Answer | list[Answer]]) -> FakeFetcher:
+    """A FakeFetcher answering the pages of SITE, given by path."""
+    return FakeFetcher({f"{SITE}{path}": answer for path, answer in pages.items()})
 
 
-class FakeSite:
-    """A download chain answering from a dict of pages; a missing page fails.
+def _status(status: int) -> Answer:
+    """An empty Response with a status."""
+    return lambda request: make_response(request.url, status=status, request=request)
 
-    A page given as a list answers with its outcomes in turn, repeating the last.
-    """
 
-    def __init__(self, pages: dict[str, Outcome | list[Outcome]]) -> None:
-        self.pages = pages
-        self.fetched: list[str] = []
-
-    async def __call__(self, request: Request) -> Response:
-        path = request.url.removeprefix(SITE)
-        self.fetched.append(path)
-        if path == "/ignored":
-            raise IgnoreRequest("not needed")
-        outcome = self.pages[path]
-        if isinstance(outcome, list):
-            outcome = outcome.pop(0) if len(outcome) > 1 else outcome[0]
-        if isinstance(outcome, Exception):
-            raise outcome
-        status, body = (outcome, "") if isinstance(outcome, int) else (200, outcome)
-        return Response(
-            url=request.url, status=status, headers=[("Content-Type", "text/html")], body=body.encode(), request=request
-        )
+def _paths(site: FakeFetcher) -> list[str]:
+    """The paths the Requests fetched from SITE, in order."""
+    return [request.url.removeprefix(SITE) for request in site.requests]
 
 
 def _collect(items: list[Any], contexts: list[ItemContext] | None = None) -> PutItem:
@@ -74,7 +61,7 @@ async def _discard(_item: Any, _ctx: ItemContext) -> None:
 
 async def _run(
     spider: Spider,
-    site: FakeSite,
+    site: FakeFetcher,
     *,
     concurrency: int = 4,
     lease_ttl: float = 60.0,
@@ -92,7 +79,7 @@ async def _run(
     engine = Engine(
         spider,
         frontier=frontier,
-        download=site,
+        download=site.fetch,
         handle=run_callbacks(spider),
         put_item=_collect(items, contexts),
         events=bus,
@@ -123,7 +110,7 @@ async def test_requests_added_before_their_parent_is_settled_keep_the_run_going(
             async for output in super().parse(response):
                 yield output
 
-    site = FakeSite({"/a": "<p>a</p><a href='/b'>b</a>", "/b": "<p>b</p><a href='/c'>c</a>", "/c": "<p>c</p>"})
+    site = _site({"/a": "<p>a</p><a href='/b'>b</a>", "/b": "<p>b</p><a href='/c'>c</a>", "/c": "<p>c</p>"})
 
     frontier, items, _ = await _run(Slow(), site)
 
@@ -139,7 +126,14 @@ async def test_outcomes_settle_the_leases() -> None:
             async for output in super().parse(response):
                 yield output
 
-    site = FakeSite({"/a": "<a href='/ignored'></a><a href='/missing'></a><a href='/broken'></a>", "/broken": ""})
+    site = _site(
+        {
+            "/a": "<a href='/ignored'></a><a href='/missing'></a><a href='/broken'></a>",
+            "/ignored": IgnoreRequest("not needed"),
+            "/missing": LookupError("no such page"),
+            "/broken": "",
+        }
+    )
 
     frontier, _, _ = await _run(Mixed(), site)
 
@@ -155,7 +149,7 @@ async def test_on_idle_runs_until_it_adds_nothing_new() -> None:
             calls.append(len(calls) + 1)
             yield Request(f"{SITE}/later")  # new the first time, a duplicate afterwards
 
-    site = FakeSite({"/a": "<p>a</p>", "/later": "<p>later</p>"})
+    site = _site({"/a": "<p>a</p>", "/later": "<p>later</p>"})
     idle: list[str] = []
 
     spider = MoreOnIdle()
@@ -164,7 +158,7 @@ async def test_on_idle_runs_until_it_adds_nothing_new() -> None:
     bus = events.EventBus(timeout=5)
     bus.on(events.SpiderIdle, lambda event: idle.append(event.spider.name))
     engine = Engine(
-        spider, frontier=frontier, download=site, handle=run_callbacks(spider), put_item=_collect(items), events=bus,
+        spider, frontier=frontier, download=site.fetch, handle=run_callbacks(spider), put_item=_collect(items), events=bus,
         concurrency=2,
     )  # fmt: skip
     async with asyncio.timeout(10):
@@ -180,7 +174,7 @@ async def test_a_failing_on_idle_ends_the_run(caplog: pytest.LogCaptureFixture) 
         async def on_idle(self) -> AsyncIterator[Request]:
             yield Request("/relative")
 
-    await _run(Broken(), FakeSite({"/a": "<p>a</p>"}))
+    await _run(Broken(), _site({"/a": "<p>a</p>"}))
 
     assert "on_idle() of spider 'links' failed" in caplog.text
 
@@ -192,11 +186,11 @@ async def test_leases_are_renewed_while_a_request_is_processed() -> None:
             async for output in super().parse(response):
                 yield output
 
-    site = FakeSite({"/a": "<p>a</p>"})
+    site = _site({"/a": "<p>a</p>"})
 
     frontier, items, _ = await _run(Slow(), site, lease_ttl=0.06)
 
-    assert site.fetched == ["/a"]
+    assert _paths(site) == ["/a"]
     assert items == [{"page": "a"}]
     assert (await frontier.counts()).done == 1
 
@@ -209,7 +203,7 @@ def test_invalid_engine_settings_are_rejected(concurrency: int, lease_ttl: float
         Engine(
             spider,
             frontier=MemoryFrontier(),
-            download=FakeSite({}),
+            download=_site({}).fetch,
             handle=run_callbacks(spider),
             put_item=_discard,
             events=events.EventBus(),
@@ -233,11 +227,11 @@ class Recovering(Links):
 
 
 async def test_retried_statuses_are_fetched_again_until_one_succeeds() -> None:
-    site = FakeSite({"/a": [503, 429, "<p>a</p>"]})
+    site = _site({"/a": [_status(503), _status(429), "<p>a</p>"]})
 
     frontier, items, recorded = await _run(Links(), site, record=(events.RequestRetried,))
 
-    assert site.fetched == ["/a", "/a", "/a"]
+    assert _paths(site) == ["/a", "/a", "/a"]
     assert items == [{"page": "a"}]
     assert [(event.attempt, event.reason) for event in recorded if isinstance(event, events.RequestRetried)] == [
         (1, "HTTP 503"),
@@ -247,12 +241,12 @@ async def test_retried_statuses_are_fetched_again_until_one_succeeds() -> None:
 
 
 async def test_exhausted_retries_keep_a_dead_request_and_call_the_errback() -> None:
-    site = FakeSite({"/a": 503, "/fallback": "<p>fallback</p>"})
+    site = _site({"/a": _status(503), "/fallback": "<p>fallback</p>"})
 
     contexts: list[ItemContext] = []
     frontier, items, recorded = await _run(Recovering(), site, record=(events.RequestFailed,), contexts=contexts)
 
-    assert site.fetched == ["/a"] * 4 + ["/fallback"]
+    assert _paths(site) == ["/a"] * 4 + ["/fallback"]
     assert items == [{"failed": "/a", "error": "RetriesExhausted"}, {"page": "fallback"}]
     [failed] = [event for event in recorded if isinstance(event, events.RequestFailed)]
     assert isinstance(failed.error, RetriesExhausted)
@@ -264,11 +258,11 @@ async def test_exhausted_retries_keep_a_dead_request_and_call_the_errback() -> N
 
 
 async def test_transport_errors_are_retried_and_become_the_cause() -> None:
-    site = FakeSite({"/a": ConnectError("refused", code=7), "/fallback": "<p>fallback</p>"})
+    site = _site({"/a": ConnectError("refused", code=7), "/fallback": "<p>fallback</p>"})
 
     _, items, recorded = await _run(Recovering(), site, record=(events.RequestFailed,))
 
-    assert site.fetched.count("/a") == 4
+    assert _paths(site).count("/a") == 4
     [failed] = recorded
     assert isinstance(failed, events.RequestFailed)
     assert isinstance(failed.error, RetriesExhausted)
@@ -277,11 +271,11 @@ async def test_transport_errors_are_retried_and_become_the_cause() -> None:
 
 
 async def test_errors_the_policy_keeps_fail_at_once() -> None:
-    site = FakeSite({"/a": ValueError("broken fetcher"), "/fallback": "<p>fallback</p>"})
+    site = _site({"/a": ValueError("broken fetcher"), "/fallback": "<p>fallback</p>"})
 
     frontier, items, _ = await _run(Recovering(), site)
 
-    assert site.fetched == ["/a", "/fallback"]
+    assert _paths(site) == ["/a", "/fallback"]
     assert items[0] == {"failed": "/a", "error": "ValueError"}
     assert (await frontier.counts()).dead == 1
 
@@ -294,11 +288,11 @@ async def test_callback_errors_are_not_retried_and_keep_earlier_outputs() -> Non
             yield {"page": "a"}
             raise ValueError("cannot parse")
 
-    site = FakeSite({"/a": "<p>a</p>", "/fallback": ""})
+    site = _site({"/a": "<p>a</p>", "/fallback": ""})
 
     frontier, items, _ = await _run(Fragile(), site)
 
-    assert site.fetched == ["/a", "/fallback"]
+    assert _paths(site) == ["/a", "/fallback"]
     assert items == [{"page": "a"}, {"failed": "/a", "error": "ValueError"}]
     counts = await frontier.counts()
     assert (counts.dead, counts.done) == (1, 1)
@@ -312,7 +306,7 @@ async def test_callbacks_can_ask_for_a_retry() -> None:
             async for output in super().parse(response):
                 yield output
 
-    site = FakeSite({"/a": ["<p>not ready</p>", "<p>a</p>"]})
+    site = _site({"/a": ["<p>not ready</p>", "<p>a</p>"]})
 
     frontier, items, recorded = await _run(Patient(), site, record=(events.RequestRetried,))
 
@@ -326,11 +320,11 @@ async def test_a_failing_retry_policy_keeps_the_outcome(caplog: pytest.LogCaptur
         def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
             raise RuntimeError("policy bug")
 
-    site = FakeSite({"/a": 503})
+    site = _site({"/a": _status(503)})
 
     _, items, _ = await _run(Links(), site, retry_policy=Broken())
 
-    assert site.fetched == ["/a"]
+    assert _paths(site) == ["/a"]
     assert items == [{"page": None}]
     assert "The retry policy failed to judge" in caplog.text
 
@@ -341,7 +335,7 @@ async def test_errback_failures_are_logged(caplog: pytest.LogCaptureFixture) -> 
             raise RuntimeError("errback bug")
             yield
 
-    frontier, _, _ = await _run(Clumsy(), FakeSite({"/a": ValueError("broken")}))
+    frontier, _, _ = await _run(Clumsy(), _site({"/a": ValueError("broken")}))
 
     assert "Clumsy.failed failed for <Request GET https://site.example/a>" in caplog.text
     assert (await frontier.counts()).dead == 1
@@ -364,7 +358,7 @@ async def test_a_cancelled_run_returns_requests_in_flight_without_counting_an_at
     engine = Engine(
         spider,
         frontier=frontier,
-        download=FakeSite({"/a": "<p>a</p>"}),
+        download=_site({"/a": "<p>a</p>"}).fetch,
         handle=run_callbacks(spider),
         put_item=_discard,
         events=bus,
@@ -392,11 +386,11 @@ async def test_transport_errors_raised_by_a_callback_are_not_retried() -> None:
                 raise ConnectError("an inline fetch failed for good", code=7)
             yield {"page": "fallback"}
 
-    site = FakeSite({"/a": "<p>a</p>", "/fallback": ""})
+    site = _site({"/a": "<p>a</p>", "/fallback": ""})
 
     _, items, _ = await _run(Inline(), site)
 
-    assert site.fetched == ["/a", "/fallback"]
+    assert _paths(site) == ["/a", "/fallback"]
     assert items == [{"failed": "/a", "error": "ConnectError"}, {"page": "fallback"}]
 
 
@@ -414,7 +408,7 @@ async def test_a_run_cancelled_while_settling_returns_the_request_without_counti
     engine = Engine(
         spider,
         frontier=frontier,
-        download=FakeSite({"/a": "<p>a</p>"}),
+        download=_site({"/a": "<p>a</p>"}).fetch,
         handle=run_callbacks(spider),
         put_item=_discard,
         events=events.EventBus(timeout=5),
@@ -572,7 +566,7 @@ async def test_requests_added_while_workers_start_waiting_are_not_missed() -> No
             await asyncio.sleep(0)  # the workers find nothing and start waiting meanwhile
             yield Request(f"{SITE}/a")
 
-    _, items, _ = await _run(Late(), FakeSite({"/a": "<p>a</p>"}), concurrency=1)
+    _, items, _ = await _run(Late(), _site({"/a": "<p>a</p>"}), concurrency=1)
 
     assert items == [{"page": "a"}]
 
@@ -590,7 +584,7 @@ async def test_a_lease_claimed_while_a_worker_stops_waiting_goes_back_if_cancell
     spider = Links()
     frontier = CancelledAfterClaim()
     await frontier.add([Request(f"{SITE}/a")])
-    engine = _engine(spider, FakeSite({}), frontier, Throttle(DomainSettings()))
+    engine = _engine(spider, _site({}).fetch, frontier, Throttle(DomainSettings()))
 
     task = asyncio.create_task(engine._wait_for_work())  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(asyncio.CancelledError):
@@ -603,11 +597,13 @@ async def test_a_lease_claimed_while_a_worker_stops_waiting_goes_back_if_cancell
     assert lease.attempt == 1
 
 
-def _gated_engine(spider: Spider, site: FakeSite, frontier: MemoryFrontier, put_item: PutItem, **kwargs: Any) -> Engine:
+def _gated_engine(
+    spider: Spider, site: FakeFetcher, frontier: MemoryFrontier, put_item: PutItem, **kwargs: Any
+) -> Engine:
     return Engine(
         spider,
         frontier=frontier,
-        download=site,
+        download=site.fetch,
         handle=run_callbacks(spider),
         put_item=put_item,
         events=events.EventBus(timeout=5),
@@ -630,7 +626,7 @@ async def test_a_drain_finishes_the_requests_in_flight_and_claims_no_more() -> N
             yield Request(f"{SITE}/next")
 
     spider, frontier, items = Gated(), MemoryFrontier(), list[Any]()
-    site = FakeSite({"/a": "", "/b": "", "/c": ""})
+    site = _site({"/a": "", "/b": "", "/c": ""})
     engine = _gated_engine(spider, site, frontier, _collect(items))
     run = asyncio.create_task(engine.run())
     async with asyncio.timeout(5):
@@ -640,7 +636,7 @@ async def test_a_drain_finishes_the_requests_in_flight_and_claims_no_more() -> N
         release.set()
         await run
 
-    assert site.fetched == ["/a"]
+    assert _paths(site) == ["/a"]
     assert items == [{"page": "/a"}]
     counts = await frontier.counts()
     assert (counts.ready, counts.leased, counts.done) == (3, 0, 1)  # /b, /c, and /next are kept for later
@@ -662,7 +658,7 @@ async def test_a_drain_stops_scheduling_the_requests_of_start_and_wakes_idle_wor
     async def put_item(_item: Any, _ctx: ItemContext) -> None:
         put.set()
 
-    site = FakeSite({"/a": "<p>a</p>"})
+    site = _site({"/a": "<p>a</p>"})
     engine = _gated_engine(Endless(), site, MemoryFrontier(), put_item, concurrency=3)
     run = asyncio.create_task(engine.run())
     async with asyncio.timeout(5):
@@ -672,7 +668,7 @@ async def test_a_drain_stops_scheduling_the_requests_of_start_and_wakes_idle_wor
         await run
 
     assert closed.is_set()
-    assert site.fetched == ["/a"]
+    assert _paths(site) == ["/a"]
 
 
 async def test_an_engine_drained_before_it_runs_schedules_and_fetches_nothing() -> None:
@@ -684,7 +680,7 @@ async def test_an_engine_drained_before_it_runs_schedules_and_fetches_nothing() 
             for path in ("/a", "/b", "/c"):
                 yield Request(f"{SITE}{path}")
 
-    site = FakeSite({"/a": "<p>a</p>"})
+    site = _site({"/a": "<p>a</p>"})
     frontier = MemoryFrontier()
     engine = _gated_engine(Seeds(), site, frontier, _discard, concurrency=2)
 
@@ -692,7 +688,7 @@ async def test_an_engine_drained_before_it_runs_schedules_and_fetches_nothing() 
     async with asyncio.timeout(5):
         await engine.run()
 
-    assert (site.fetched, started) == ([], [])
+    assert (_paths(site), started) == ([], [])
     assert (await frontier.counts()).unfinished == 0
 
 
@@ -709,7 +705,7 @@ async def test_a_drain_when_the_run_goes_idle_skips_on_idle() -> None:
     engine = Engine(
         spider,
         frontier=MemoryFrontier(),
-        download=FakeSite({"/a": "<p>a</p>"}),
+        download=_site({"/a": "<p>a</p>"}).fetch,
         handle=run_callbacks(spider),
         put_item=_discard,
         events=bus,
@@ -729,7 +725,7 @@ async def test_a_cancellation_raised_by_start_is_not_taken_for_its_end() -> None
             yield Request(f"{SITE}/a")
             raise asyncio.CancelledError  # as awaiting a cancelled seed source would
 
-    engine = _gated_engine(Cancelled(), FakeSite({"/a": "<p>a</p>"}), MemoryFrontier(), _discard)
+    engine = _gated_engine(Cancelled(), _site({"/a": "<p>a</p>"}), MemoryFrontier(), _discard)
 
     with pytest.raises(asyncio.CancelledError):
         async with asyncio.timeout(5):
@@ -754,7 +750,7 @@ async def test_a_drain_from_start_still_finishes_the_requests_in_flight() -> Non
             yield {"page": response.url.removeprefix(SITE)}
 
     frontier, items = MemoryFrontier(), list[Any]()
-    site = FakeSite({"/a": "", "/b": ""})
+    site = _site({"/a": "", "/b": ""})
     engine = _gated_engine(DrainsItself(), site, frontier, _collect(items))
     run = asyncio.create_task(engine.run())
     async with asyncio.timeout(5):

@@ -13,7 +13,6 @@ import orjson
 import pytest
 import zstandard
 
-from loopback import ReceivedRequest, Reply, ScriptedServer
 from pernix import Request
 from pernix.errors import (
     ConnectError,
@@ -26,12 +25,14 @@ from pernix.errors import (
     TooManyRedirects,
 )
 from pernix.fetchers import HTTPFetcher, HTTPSettings
+from pernix.testing import ReceivedRequest, Reply
+from scripted_server import ScriptedServer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
 
 def _cookie_echo(request: ReceivedRequest) -> Reply:

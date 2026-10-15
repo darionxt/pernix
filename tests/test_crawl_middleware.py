@@ -15,9 +15,9 @@ from pernix.middlewares import Middleware, SpiderMiddleware, middleware
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from loopback import LoopbackServer
     from pernix.middlewares import Download, HandleResponse
     from pernix.settings import Settings
+    from pernix.testing import LoopbackServer
 
 HTML = [("Content-Type", "text/html; charset=utf-8")]
 

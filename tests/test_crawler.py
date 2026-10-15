@@ -8,17 +8,17 @@ from typing import TYPE_CHECKING, Any, Protocol
 import msgspec
 import pytest
 
-from loopback import ReceivedRequest, Reply
 from pernix import Response, Spider
 from pernix.crawler import Crawler
 from pernix.errors import ComponentError
 from pernix.settings import CORE_SECTIONS, ComponentMap, Section, Settings, load_settings
+from pernix.testing import ReceivedRequest, Reply
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from loopback import LoopbackServer
+    from pernix.testing import LoopbackServer
 
 
 class PluginSettings(Section):

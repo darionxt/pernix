@@ -12,17 +12,17 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import pytest
 
-from loopback import Reply
 from pernix import Extension, Request, Response, Spider, events
 from pernix.crawler import Crawler
 from pernix.errors import ComponentError
 from pernix.settings import Secret, Section
+from pernix.testing import Reply
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
-    from loopback import LoopbackServer
     from pernix.stats import Stats  # injected by its name, so a type-only import suffices
+    from pernix.testing import LoopbackServer
 
 
 def _json_lines(stream: io.StringIO) -> list[dict[str, Any]]:

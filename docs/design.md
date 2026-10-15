@@ -802,11 +802,34 @@ Rules:
 
 ## 9. Testing support (`pernix.testing`)
 
-- **Fake fetching**: `FakeFetcher` and Response factories, so Callbacks and Pipelines can be tested without network access.
-- **Capture and replay**: unified for HTTP and the browser, with capture, replay, and mixed modes.
-- **Local fixture server**.
-- **pytest plugin**: provides `crawler`-related fixtures and adds network-access protection at the Fetcher layer. This layer is necessary: curl-cffi does not go through Python's socket, so the usual network-blocking plugins cannot stop it.
-- **The framework's own tests**: use the same tools; network failures are simulated with a fault-injection proxy; cancellation semantics are regression-tested across a matrix of Python versions.
+```python
+from pernix.testing import FakeFetcher, crawl, make_response, run_callback
+
+async def test_books():
+    fake = FakeFetcher({
+        "https://shop.example/": "<a href='/book/1'>Dune</a>",
+        re.compile(r"https://shop\.example/book/\d+"): "<h1>Dune</h1>",
+        "https://shop.example/flaky": [Timeout("slow"), "<p>ok</p>"],   # answers in turn, the last repeating
+    })
+    report = await crawl(Books, fetcher=fake, keyword="dune")          # Spider arguments as keywords
+    assert report.items == [{"title": "Dune"}]
+    assert report.stats["items.scraped"] == 1
+    assert fake.unmatched == []
+
+async def test_parse():
+    outputs = await run_callback(Books(), make_response("https://shop.example/", "<a href='/book/1'>Dune</a>"))
+    assert [request.url for request in outputs] == ["https://shop.example/book/1"]
+```
+
+- **Fake fetching**: `FakeFetcher(routes)` answers Requests from canned answers. A route's key is a URL, matched exactly, or a compiled pattern the whole URL must match; the first route added that matches answers, and `add(key, answer, method=...)` can limit one to a method. An answer is a body (200), a `Response` (bound to the Request fetched, so its Callback runs), an exception to raise, or a function of the Request returning or awaiting one of those; a list of answers is used in turn, its last one repeating. Unmatched Requests get 404 and are recorded in `unmatched`, every Request in `requests`. It fetches `http` and `https`, standing in for the HTTP Fetcher when registered as `http`.
+- **Responses**: `make_response(url, body, status=, headers=, json=, request=, encoding=)` builds a Response as a Fetcher would: a `str` body is UTF-8 HTML unless the headers say otherwise, `json=` makes a JSON body, and `request` (by default `Request(url)`) carries the Callback, `kwargs`, and `meta`.
+- **Running**: `crawl(Spider, fetcher=..., settings=..., **args)` runs a Spider to completion and returns a `CrawlReport` with the Items that passed every Pipeline, the final stats, the reason, and the `run_id`. It runs without periodic stats, retry delays, or per-domain delay, rate, and cooldowns, as those only make a test wait; `settings` override that. `run_callback(spider, response)` runs one Callback as a Run would, the Request's or `parse`, with its `kwargs`, resolving relative URLs against the Response, and returns its outputs; spider Middleware do not run, and Inline Fetches need `crawl()`.
+- **Local server**: `LoopbackServer` serves on 127.0.0.1: routes registered with `route()` or given up front (a body, a `Reply`, or a handler of the `ReceivedRequest`), then the files of a `directory`. It records every request with its headers in wire order.
+- **Network guard**: while `blocking_network()` is in effect, the Fetchers reach only loopback hosts (loopback addresses, `localhost`, `*.localhost`), or any host through a proxy on one; others raise `NetworkBlocked`, a `FetchError`, and are recorded in the guard. The HTTP Fetcher checks the URL before connecting, and each redirect's `Location` before curl follows it. This layer is necessary: curl-cffi does not go through Python's socket, so the usual network-blocking plugins cannot stop it.
+- **pytest plugin**, loaded as `pernix` once Pernix is installed (`-p no:pernix` disables it): the network guard is on in every test, and a test during which it refused a URL fails, even when the refusal happened inside a Run, which only logs a failed fetch. `@pytest.mark.pernix_network` lets a test use the network, and the ini option `pernix_network = allow` lets every test. The `loopback_server` fixture gives a started `LoopbackServer`.
+- `pernix.testing` itself does not need pytest; the plugin and the Frontier conformance suite (`pernix.testing.frontier`) do.
+- **Capture and replay** (planned): unified for HTTP and the browser, with capture, replay, and mixed modes.
+- **The framework's own tests**: use the same tools; network failures are simulated with scripted loopback servers, and later a fault-injection proxy; cancellation semantics are regression-tested across a matrix of Python versions.
 
 ## 10. Runtime and dependencies
 
