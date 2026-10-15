@@ -156,7 +156,10 @@ class RequestProcessor:
     async def _fetch(self, lease: Lease) -> Response:
         """Fetch through the download chain in the slot `acquire()` gave the Lease, then free the slot."""
         try:
-            response = expect_response(await self._download(lease.request), f"the download chain for {lease.request!r}")
+            with self._throttle.holding(lease.slot):  # Inline Fetches a Middleware makes share it
+                response = expect_response(
+                    await self._download(lease.request), f"the download chain for {lease.request!r}"
+                )
             self._throttle.observe(lease.slot, response)
             return response
         finally:

@@ -208,7 +208,8 @@ class Crawler:
 
         The Request goes through the download Middleware and waits for its slot, as
         Requests from the Frontier do, but it is not deduplicated or stored, and no
-        Callback runs for it. The retry policy judges it as usual, and a retry waits
+        Callback runs for it. Nested in another fetch for the same domain, in the
+        same task, such as from a download Middleware, it shares that fetch's slot. The retry policy judges it as usual, and a retry waits
         in place. A Request without a Session continues the Session of the Request
         whose Callback or errback is running; otherwise, as any Request, it sends
         only the cookies it carries. Cancelling the caller, as a Force Stop does,
@@ -249,8 +250,8 @@ class Crawler:
         `iter_bytes()` or `save()`. A slow reader holds about a megabyte of it in
         memory at most, as the Fetcher stops receiving until the reader catches up.
         Only the attempts up to the response headers are retried, and the stream
-        holds its slot until it is closed: an Inline Fetch to the same slot inside the
-        block waits for a free slot.
+        holds its slot until it is closed; the fetches made in the block, in the same
+        task, share it.
 
         Download Middleware see the Response marked `streamed`, without its body. A
         Middleware may return another Response, such as a cached one, whose body is

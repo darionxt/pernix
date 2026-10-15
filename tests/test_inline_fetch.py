@@ -363,9 +363,8 @@ async def test_a_streamed_fetch_is_retried_until_its_headers_are_accepted() -> N
     assert (files.opened, files.open) == (2, 0)
 
 
-async def test_fetches_nested_in_a_streamed_fetch_read_whole_responses() -> None:
-    files = Files([b"data"])
-    nested: list[tuple[bool, bytes]] = []
+def _authorizing(files: Files, nested: list[tuple[bool, bytes]]) -> InlineFetch:
+    """An Inline Fetch with one slot per domain, whose Middleware fetches a token from the same domain first."""
     inline: InlineFetch | None = None
 
     async def authorize(request: Request, call_next: Download) -> Response:
@@ -374,11 +373,64 @@ async def test_fetches_nested_in_a_streamed_fetch_read_whole_responses() -> None
         assert inline is not None
         token = await inline.fetch(Request(f"{SITE}/token"))
         nested.append((token.streamed, token.body))
-        return await call_next(request)
+        return await call_next(request.replace(headers=[("Authorization", token.text)]))
 
-    inline = _inline(_chain(files, authorize))
-    async with inline.stream(Request(f"{SITE}/file")) as streamed:
+    inline = _inline(_chain(files, authorize), domain=DomainSettings(concurrency=1))
+    return inline
+
+
+async def test_a_fetch_a_middleware_nests_shares_the_slot_of_the_outer_fetch() -> None:
+    files = Files([b"secret"])
+    nested: list[tuple[bool, bytes]] = []
+    inline = _authorizing(files, nested)
+
+    async with asyncio.timeout(2):
+        response = await inline.fetch(Request(f"{SITE}/data"))
+
+    assert response.request.headers.get("Authorization") == "secret"
+    assert nested == [(False, b"secret")]
+
+
+async def test_fetches_nested_in_a_streamed_fetch_share_its_slot_and_read_whole_responses() -> None:
+    files = Files([b"data"])
+    nested: list[tuple[bool, bytes]] = []
+    inline = _authorizing(files, nested)
+
+    async with asyncio.timeout(2), inline.stream(Request(f"{SITE}/file")) as streamed:
         assert await _read(streamed) == b"data"
 
     assert nested == [(False, b"data")]
     assert files.opened == 1
+
+
+async def test_fetches_in_the_block_of_a_stream_share_its_slot() -> None:
+    files = Files([b"data"])
+    inline = _inline(_chain(files), domain=DomainSettings(concurrency=1))
+
+    async with asyncio.timeout(2), inline.stream(Request(f"{SITE}/file")) as streamed:
+        page = await inline.fetch(Request(f"{SITE}/page"))
+        body = await _read(streamed)
+
+    assert (page.body, body) == (b"data", b"data")
+
+
+async def test_tasks_started_inside_a_fetch_wait_for_slots_of_their_own() -> None:
+    files = Files([b"data"])
+    running = most = 0
+
+    async def track(request: Request, call_next: Download) -> Response:
+        nonlocal running, most
+        if request.url.endswith("/file"):
+            return await call_next(request)
+        running += 1
+        most = max(most, running)
+        await asyncio.sleep(0.01)
+        running -= 1
+        return await call_next(request)
+
+    inline = _inline(_chain(files, track), domain=DomainSettings(concurrency=2))
+    async with asyncio.timeout(5), inline.stream(Request(f"{SITE}/file")) as streamed:
+        await asyncio.gather(*(inline.fetch(Request(f"{SITE}/{n}")) for n in range(3)))
+        await _read(streamed)
+
+    assert most == 1  # the stream holds one slot of two; the tasks share the other

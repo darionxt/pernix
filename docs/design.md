@@ -190,6 +190,7 @@ async def parse_report(self, response):
 - `self.fetch()` and `self.stream()` call `Crawler.fetch()` and `Crawler.stream()`, so components given the Crawler can fetch inline too. They work while the Run runs, from `SpiderOpened` to `SpiderClosed`: in `start()`, `on_idle()`, Callbacks, errbacks, and components; elsewhere they raise `RuntimeError`. A URL string is fetched with a GET, and a relative one resolves against the Response being handled. A Request's `callback`, `errback`, `priority`, and `dont_filter` play no part.
 - Semantics:
   - Goes through the same download Middleware chain and the same rate limiting: each attempt waits for its domain's slot, and waits out a Cooldown in place. It runs in the task of the Request being handled and takes no worker of its own, so Inline Fetches run concurrently, such as with `asyncio.gather`, are limited by `domain.concurrency` alone.
+  - A fetch nested in another for the same domain, in the same task, such as one a download Middleware makes to get a token, shares the outer fetch's slot instead of waiting for another, which the outer fetch could hold forever. Tasks the outer fetch starts need slots of their own.
   - Uses the current Request's Session if it has one, unless it names its own; otherwise it is independent like any Request and sends only the cookies passed to it.
   - **Does not enter the Frontier, is not deduplicated, and is not persisted.**
   - The retry policy judges each attempt as usual, but a retry waits in place for its delay, emitting `RequestRetried`. The Response is returned whatever its status, unless the policy retries it. Once the retries run out, `RetriesExhausted` is raised, holding the last Response or caused by the last exception, as errbacks receive it; an exception the policy does not retry, such as a `TLSError`, or `IgnoreRequest` from a Middleware, is raised as it is. Uncaught, it fails the Callback (§4.5).
@@ -198,7 +199,7 @@ async def parse_report(self, response):
 - **Streaming**: `self.stream(request, max_bytes=None)` gives a `StreamedResponse` whose `response` holds everything but the body, read once with `iter_bytes()` or written with `save(path)`; leaving `async with` closes the transfer. `max_bytes` defaults to the Fetcher's limit, such as `http.max_body_size`, and 0 sets none.
   - Download Middleware see the Response marked `streamed`, with an empty `body`; Middleware that read bodies, such as caches, should pass those through. A Middleware may answer with another Response, such as a cached one, whose body is then read instead; one that fetches more than once reads the last transfer, the earlier ones closed. A Fetcher without `stream()` reads the whole body first.
   - Only the attempts up to the response headers are retried; a failure while reading the body is raised from `iter_bytes()`.
-  - The stream holds its domain's slot until it is closed, so `domain.concurrency` counts the transfers open. An Inline Fetch to the same domain inside the block therefore needs another slot, and with `domain.concurrency = 1` waits forever.
+  - The stream holds its domain's slot until it is closed, so `domain.concurrency` counts the transfers open. Fetches made in the block, in the same task, share the slot as nested fetches do.
   - A slow reader keeps about 1 MiB of the body in memory, with or without `max_bytes`: the Fetcher stops receiving until the reader catches up, and a paused transfer never times out. Streamed bytes count toward `downloads.bytes` as they are read.
 
 ### 4.7 Render and page interaction
@@ -663,7 +664,7 @@ Engine integration:
 
 - **Concurrency**:
   - Global default 16 (`concurrency`, the number of workers), per-domain default 8 (`domain.concurrency`); browser pages are counted separately.
-  - A domain is a host name, and each has its own slot (the Lease's `slot`). A fetch holds its slot from just before the download chain until the Response arrives; Callbacks hold none, but their Inline Fetches hold slots as fetches do, a streamed one until it is closed (§4.6).
+  - A domain is a host name, and each has its own slot (the Lease's `slot`). A fetch holds its slot from just before the download chain until the Response arrives; Callbacks hold none, but their Inline Fetches hold slots as fetches do, a streamed one until it is closed; a fetch nested in another for the same domain, in the same task, shares its slot (§4.6).
   - Workers claim only Requests whose slot can start a fetch now: `claim(skip_slots=...)` skips slots that are full, cooling down, or waiting for their delay or rate, so one slow domain never holds back the others. Idle workers wake when the Frontier changes or a slot frees up.
   - Requests that are backing off go back to the Frontier to wait and do not occupy concurrency slots.
 - **Delay**: `domain.delay` seconds between the starts of two fetches from one domain, randomized within ± `domain.delay_jitter` (50 % by default).

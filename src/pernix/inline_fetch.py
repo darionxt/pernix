@@ -63,8 +63,11 @@ class InlineFetch:
     `RequestRetried`. A Request without a Session continues the Session of the
     Request being handled, if it has one.
 
-    A streamed fetch holds its slot until the stream is closed, and only the attempts
-    up to the response headers are retried.
+    A fetch nested in another of the same slot, in the same task, such as one a
+    download Middleware makes, shares the outer fetch's slot instead of waiting for
+    another. A streamed fetch holds its slot until the stream is closed, so the
+    fetches made in its block share it too; only the attempts up to the response
+    headers are retried.
     """
 
     def __init__(
@@ -115,11 +118,8 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            await self._acquire(slot)
-            try:
+            async with self._holding(slot):
                 outcome = await self._attempt(request, slot, None)
-            finally:
-                self._throttle.release(slot)
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
                 return _accepted(outcome)
@@ -150,8 +150,7 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            await self._acquire(slot)
-            try:
+            async with self._holding(slot):  # through the block too, whose fetches share the slot
                 streams = Streams(max_bytes)
                 try:
                     outcome = await self._attempt(request, slot, streams)
@@ -161,10 +160,21 @@ class InlineFetch:
                         return
                 finally:
                     await streams.close()
-            finally:
-                self._throttle.release(slot)
             await self._retry_later(request, outcome, decision, attempt)
             attempt += 1
+
+    @asynccontextmanager
+    async def _holding(self, slot: str) -> AsyncGenerator[None]:
+        """Hold a slot for a fetch, sharing the one the fetch is nested in, if any."""
+        if self._throttle.holds(slot):
+            yield
+            return
+        await self._acquire(slot)
+        try:
+            with self._throttle.holding(slot):
+                yield
+        finally:
+            self._throttle.release(slot)
 
     async def _acquire(self, slot: str) -> None:
         """Start a fetch in its slot, waiting out a cooldown in place."""

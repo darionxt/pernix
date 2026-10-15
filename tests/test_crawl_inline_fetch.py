@@ -11,7 +11,7 @@ import orjson
 import pytest
 
 from loopback import Reply
-from pernix import Request, Response, Spider, middleware
+from pernix import Middleware, Request, Response, Spider, middleware
 from pernix.crawler import Crawler
 from pernix.errors import RetriesExhausted
 
@@ -236,6 +236,37 @@ async def test_inline_fetches_go_through_the_download_middleware_with_the_sessio
 
     assert items == [{"done": True}]
     assert seen == [("/", "alice"), ("/a", "alice"), ("/b", "bob")]
+
+
+async def test_a_middleware_may_fetch_a_token_from_the_domain_it_is_fetching(
+    server: LoopbackServer, tmp_path: Path
+) -> None:
+    server.route("/token", "t0ken")
+    server.route("/", handler=lambda request: Reply(body=f"<p>{request.header('Authorization')}</p>"))
+
+    class Authorize(Middleware):
+        def __init__(self, crawler: Crawler) -> None:
+            self.crawler = crawler
+
+        async def __call__(self, request: Request, call_next: Download) -> Response:
+            if _path(request.url) == "/token":
+                return await call_next(request)
+            token = await self.crawler.fetch(server.url("/token"))
+            return await call_next(request.replace(headers=[("Authorization", token.text)]))
+
+    class Home(Spider):
+        start_urls = (server.url("/"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"authorization": response.css("p::text").get()}
+
+    output = tmp_path / "items.jsonl"
+    crawler = _crawler(Home, output, **{"domain.concurrency": 1, "middlewares": {Authorize: 100}})
+    async with asyncio.timeout(5):  # the token fetch shares the slot the page fetch holds
+        await crawler.crawl()
+
+    assert output.read_text() == '{"authorization":"t0ken"}\n'
+    assert [request.path for request in server.received] == ["/token", "/"]
 
 
 async def test_a_callback_streams_a_download_to_a_file(server: LoopbackServer, tmp_path: Path) -> None:
