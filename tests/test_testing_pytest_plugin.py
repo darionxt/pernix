@@ -78,6 +78,32 @@ def test_a_skip_or_a_failure_does_not_hide_a_refused_url(session: pytest.Pyteste
     )
 
 
+def test_an_exit_after_a_refused_url_still_ends_the_session(session: pytest.Pytester) -> None:
+    session.makepyfile(
+        """
+        import pytest
+        from pernix import Request
+        from pernix.errors import NetworkBlocked
+        from pernix.fetchers import HTTPFetcher
+
+        async def test_exiting():
+            async with HTTPFetcher() as fetcher:
+                try:
+                    await fetcher.fetch(Request("http://192.0.2.1/"))
+                except NetworkBlocked:
+                    pytest.exit("no network, no point", returncode=3)
+
+        def test_after():
+            pass
+        """
+    )
+
+    result = session.runpytest("-p", "no:cacheprovider")
+
+    assert result.ret == 3
+    result.assert_outcomes()  # neither failed nor run on
+
+
 def test_fixtures_of_every_scope_are_guarded_as_they_are_set_up_and_torn_down(session: pytest.Pytester) -> None:
     session.makepyfile(
         """

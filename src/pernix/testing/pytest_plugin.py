@@ -73,7 +73,9 @@ def _guarding(item: pytest.Item, phase: str) -> Generator[None, object, object]:
     with blocking_network() as guard:
         try:
             result = yield
-        except (Exception, pytest.skip.Exception, pytest.fail.Exception):  # not KeyboardInterrupt or pytest.exit()
+        except pytest.exit.Exception:  # an Exception, but ending the session must stay as asked
+            raise
+        except (Exception, pytest.skip.Exception, pytest.fail.Exception):  # not KeyboardInterrupt either
             _fail_if_refused(guard, phase)  # a skip, say, must not hide a refused URL
             raise
     _fail_if_refused(guard, phase)
