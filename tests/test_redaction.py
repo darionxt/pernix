@@ -23,11 +23,36 @@ def test_url_credentials_are_masked(text: str, redacted: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        ("proxy alice:pa55@proxy:8080 failed", "proxy ***@proxy:8080 failed"),
+        ("alice:p%40ss:w0rd@10.0.0.1", "***@10.0.0.1"),
+        ("APIKEY:@proxy.example:8011", "***@proxy.example:8011"),
+        (":s3cret@proxy.example:8011", "***@proxy.example:8011"),
+        ("proxy=alice:pa55@[::1]:3128", "proxy=***@[::1]:3128"),
+        ("http://alice:pa55@a.example:1 then bob:pw@b.example:2", "http://***@a.example:1 then ***@b.example:2"),
+        ("{'proxy': 'alice:pa55@proxy:8080'}", "{'proxy': '***@proxy:8080'}"),
+        ('{"proxy":"alice:pa55@proxy:8080"}', '{"proxy":"***@proxy:8080"}'),
+        ("ProxyError('alice:pa55@proxy:8080')", "ProxyError('***@proxy:8080')"),
+        ("<Proxy alice:pa55@proxy:8080>", "<Proxy ***@proxy:8080>"),
+    ],
+)
+def test_credentials_of_proxies_without_a_scheme_are_masked(text: str, redacted: str) -> None:
+    assert Redactor().redact(text) == redacted
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "https://example.com/path?email=a@b.example",
         "mail me at someone@example.com",
         "https://example.com:8443/a",
+        "From: someone@example.com",
+        "{'email': 'someone@example.com'}",
+        '{"to":"x","email":"someone@example.com"}',
+        "Skipping mailto:someone@example.com and MailTo:x@shop.example",
+        "git@github.com:org/repo.git",
+        "10:30 @alice, a:b @ c, and a:b@",
     ],
 )
 def test_text_without_credentials_is_kept(text: str) -> None:
