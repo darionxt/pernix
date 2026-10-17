@@ -26,15 +26,18 @@ from typing import TYPE_CHECKING, Any
 from pernix.retry_policy import retry_after_seconds
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Collection, Generator
 
     from pernix.response import Response
     from pernix.settings import DomainSettings
 
-__all__ = ["COOLDOWN_STATUSES", "Throttle", "ThrottleStats"]
+__all__ = ["COOLDOWN_STATUSES", "SESSION_COOLDOWN_STATUSES", "Throttle", "ThrottleStats"]
 
 COOLDOWN_STATUSES = frozenset({429, 503})
 """Statuses whose `Retry-After` pauses the whole slot."""
+
+SESSION_COOLDOWN_STATUSES = frozenset({503})
+"""Statuses whose `Retry-After` pauses the whole slot of a fetch under a Session: a 429 cools the Session down."""
 
 _held: ContextVar[frozenset[tuple[Throttle, str, asyncio.Task[Any] | None]]] = ContextVar(
     "pernix_held_slots", default=frozenset()
@@ -198,14 +201,17 @@ class Throttle:
         self._slots[slot].active -= 1
         self._notify()
 
-    def observe(self, slot: str, response: Response) -> None:
+    def observe(self, slot: str, response: Response, *, statuses: Collection[int] = COOLDOWN_STATUSES) -> None:
         """Cool a slot down if a Response asks its domain to wait.
 
         Args:
             slot: The slot the Response was fetched in.
-            response: The Response; a 429 or 503 with `Retry-After` starts the cooldown.
+            response: The Response; one of `statuses` with `Retry-After` starts the
+                cooldown.
+            statuses: The statuses that pause the whole slot; under a Session, a 429
+                cools only the Session down, so only 503 pauses the slot.
         """
-        if response.status not in COOLDOWN_STATUSES:
+        if response.status not in statuses:
             return
         seconds = retry_after_seconds(response.headers.get("Retry-After"), now=dt.datetime.now(dt.UTC))
         if seconds is None or seconds <= 0:

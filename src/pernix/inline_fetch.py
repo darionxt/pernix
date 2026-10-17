@@ -8,13 +8,15 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from pernix.errors import IgnoreRequest, RetriesExhausted
+from pernix.errors import IgnoreRequest, RetriesExhausted, SessionError
 from pernix.events import RequestRetried
 from pernix.fetchers import StreamedResponse
 from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
 from pernix.frontiers import host_slot
 from pernix.response import Response, expect_response
 from pernix.retry_policy import Action, consult
+from pernix.sessions.session_leasing import sending_session, sending_with
+from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download
     from pernix.request import Request
     from pernix.retry_policy import Decision, RetryPolicy
+    from pernix.sessions.session_leasing import Sending, SessionLeasing
     from pernix.stats import Stats
     from pernix.throttle import Throttle
 
@@ -60,15 +63,17 @@ class InlineFetch:
     attempt waits for its slot in the Throttle, waiting out a cooldown in place, and
     goes through the download chain. The retry policy judges every attempt, as for
     Requests from the Frontier, but a retry waits in place for its delay, emitting
-    `RequestRetried`. A Request without a Session continues the Session of the
-    Request being handled, if it has one.
+    `RequestRetried`. With a Session Pool, each attempt leases a Session, waiting
+    for one in place. A Request without a Session continues the Session of the fetch
+    it is nested in, or of the Request being handled, if it has one; a fetch nested
+    in another of the same Session, in the same task, shares its Lease.
 
     A fetch nested in another of the same slot, in the same task, such as one a
     download Middleware makes, shares the outer fetch's place instead of waiting for
     another, though it still waits for the delay, the rate, and a cooldown. A
     streamed fetch holds its slot until the stream is closed, so the
-    fetches made in its block share it too; only the attempts up to the response
-    headers are retried.
+    fetches made in its block share it too, as they share its Session; only the
+    attempts up to the response headers are retried.
     """
 
     def __init__(
@@ -80,6 +85,7 @@ class InlineFetch:
         events: EventBus,
         stats: Stats,
         slot_of: Callable[[Request], str] = host_slot,
+        sessions: SessionLeasing | None = None,
     ) -> None:
         """Wire the Inline Fetch to the Run's collaborators.
 
@@ -90,6 +96,7 @@ class InlineFetch:
             events: Where `RequestRetried` is emitted.
             stats: Where streamed body bytes are counted, as `downloads.bytes`.
             slot_of: Computes the concurrency slot of a Request.
+            sessions: Leases Sessions from the Session Pool; `None` without one.
         """
         self._download = download
         self._throttle = throttle
@@ -97,6 +104,7 @@ class InlineFetch:
         self._events = events
         self._stats = stats
         self._slot_of = slot_of
+        self._sessions = sessions
 
     async def fetch(self, request: Request) -> Response:
         """Fetch a Request, retrying in place, and return its Response.
@@ -112,6 +120,8 @@ class InlineFetch:
                 retry was left; it holds the last Response, or is caused by the last
                 exception.
             pernix.errors.IgnoreRequest: A download Middleware dropped the Request.
+            pernix.errors.SessionError: No Session can ever be leased for the
+                Request, or it names one while no Session Pool is enabled.
             Exception: Fetching raised what the policy does not retry, such as a
                 `FetchError`.
         """
@@ -119,8 +129,8 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            async with self._holding(slot):
-                outcome = await self._attempt(request, slot, None)
+            async with self._holding(slot), sending_with(self._sessions, request, wait=None) as sending:
+                outcome = await self._attempt(sending, slot, None)
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
                 return _accepted(outcome)
@@ -144,6 +154,8 @@ class InlineFetch:
             pernix.errors.RetriesExhausted: The policy retried the Request until no
                 retry was left.
             pernix.errors.IgnoreRequest: A download Middleware dropped the Request.
+            pernix.errors.SessionError: No Session can ever be leased for the
+                Request, or it names one while no Session Pool is enabled.
             Exception: Fetching raised what the policy does not retry, such as a
                 `FetchError`.
         """
@@ -151,10 +163,11 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            async with self._holding(slot):  # through the block too, whose fetches share the slot
+            # Through the block too, whose fetches share the slot and the Session.
+            async with self._holding(slot), sending_with(self._sessions, request, wait=None) as sending:
                 streams = Streams(max_bytes)
                 try:
-                    outcome = await self._attempt(request, slot, streams)
+                    outcome = await self._attempt(sending, slot, streams)
                     decision = consult(self._retry_policy, request, outcome, attempt)
                     if decision.action is Action.ACCEPT:
                         yield await self._streamed(_accepted(outcome), streams)
@@ -186,16 +199,20 @@ class InlineFetch:
             # The Throttle refuses a cooling slot rather than wait, as Frontier Requests wait in the Frontier.
             await asyncio.sleep(self._throttle.cooldown_left(slot))
 
-    async def _attempt(self, request: Request, slot: str, streams: Streams | None) -> Response | Exception:
+    async def _attempt(self, sending: Sending, slot: str, streams: Streams | None) -> Response | Exception:
         """Fetch once through the download chain, streaming into `streams` if given; return the Response or the exception."""
+        request = sending.request
         try:
             with streaming_into(streams):
                 response = expect_response(await self._download(request), f"the download chain for {request!r}")
-        except IgnoreRequest:
+        except (IgnoreRequest, SessionError):
             raise
         except Exception as exc:
+            sending.error = exc
             return exc
-        self._throttle.observe(slot, response)
+        sending.response = response
+        statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
+        self._throttle.observe(slot, response, statuses=statuses)
         return response
 
     async def _retry_later(
@@ -241,11 +258,12 @@ class InlineFetch:
 
 
 def _continuing(request: Request) -> Request:
-    """The Request, continuing the Session of the Request being handled unless it has its own."""
+    """The Request, continuing the Session of the fetch it is nested in, or of the Request being handled, unless it has its own."""
+    if request.session is not None:
+        return request
     handled = _handled.get()
-    if request.session is None and handled is not None and handled.session is not None:
-        return request.replace(session=handled.session)
-    return request
+    session = sending_session() or (handled.session if handled is not None else None)
+    return request if session is None else request.replace(session=session)
 
 
 def _accepted(outcome: Response | Exception) -> Response:

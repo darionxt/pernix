@@ -22,6 +22,7 @@ __all__ = [
     "RetriesExhausted",
     "Retry",
     "SerializationError",
+    "SessionError",
     "SettingsError",
     "SpiderArgumentError",
     "TLSError",
@@ -143,6 +144,10 @@ class DecodeError(FetchError):
 
 class NetworkBlocked(FetchError):
     """A network guard, such as the one tests run under, refused a host other than a loopback one."""
+
+
+class SessionError(PernixError):
+    """A Request cannot be sent under a Session: none can be leased for it, ever, or no Session Pool is enabled."""
 
 
 class RetriesExhausted(PernixError):

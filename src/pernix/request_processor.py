@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pernix.callbacks import iterate_and_close, run_errback
-from pernix.errors import IgnoreRequest, RetriesExhausted, Retry
+from pernix.errors import IgnoreRequest, RetriesExhausted, Retry, SessionError
 from pernix.events import RequestFailed, RequestIgnored, RequestRetried, ResponseReceived
 from pernix.inline_fetch import handling
 from pernix.items import ItemContext, is_item
 from pernix.request import Request
 from pernix.response import expect_response
 from pernix.retry_policy import Action, consult
+from pernix.sessions.session_leasing import NoSessionYet, sending_with
+from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
     from pernix.events import EventBus
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download, HandleResponse
     from pernix.response import Response
     from pernix.retry_policy import Decision, RetryPolicy
+    from pernix.sessions.session_leasing import SessionLeasing
     from pernix.spider import Spider
     from pernix.throttle import Throttle
 
@@ -33,6 +36,9 @@ type PutItem = Callable[[Any, ItemContext], Awaitable[None]]
 
 type Schedule = Callable[[Request], Awaitable[bool]]
 """Adds a Request to the Frontier; returns whether it was added."""
+
+_SESSION_WAIT = 1.0
+"""Seconds a worker waits for a busy Session before its Request goes back to the Frontier."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,9 +70,13 @@ class RequestProcessor:
     """Makes one attempt at a claimed Request and tells how to settle its Lease.
 
     The Request waits for its slot in the Throttle; a slot cooling down sends it back
-    to the Frontier without counting an attempt. It is fetched through the download
-    chain while holding the slot, and the Response is handled through the spider
-    chain, which ends in the Callback. The outputs are dispatched as they come:
+    to the Frontier without counting an attempt. With a Session Pool, it then leases
+    a Session, the one it names or any, waiting a moment for a busy one; when every
+    Session that fits is busy or cooling down, it goes back to the Frontier the same
+    way, until one stops cooling down, and a Request no Session can ever be leased
+    for fails. It is fetched through the download chain while holding the slot, and
+    its Session, and the Response is handled through the spider chain, which ends in
+    the Callback. The outputs are dispatched as they come:
     Requests are scheduled, and Items, recognized with `pernix.items.is_item()`, are
     handed to `put_item`.
 
@@ -92,6 +102,7 @@ class RequestProcessor:
         events: EventBus,
         retry_policy: RetryPolicy,
         throttle: Throttle,
+        sessions: SessionLeasing | None = None,
     ) -> None:
         """Wire the processor to its collaborators.
 
@@ -104,6 +115,7 @@ class RequestProcessor:
             events: Where Request and Response Events are emitted.
             retry_policy: Decides which attempts are retried.
             throttle: Paces fetches per slot.
+            sessions: Leases Sessions from the Session Pool; `None` without one.
         """
         self._spider = spider
         self._download = download
@@ -113,6 +125,7 @@ class RequestProcessor:
         self._events = events
         self._retry_policy = retry_policy
         self._throttle = throttle
+        self._sessions = sessions
 
     async def attempt(self, lease: Lease) -> Settlement:
         """Fetch a Request and run its Callback once.
@@ -129,6 +142,11 @@ class RequestProcessor:
             return Again(self._throttle.cooldown_left(lease.slot), "domain cooling down", count_attempt=False)
         try:
             response = await self._fetch(lease)
+        except NoSessionYet as wait:
+            return Again(wait.delay, "no Session available", count_attempt=False)
+        except SessionError as exc:
+            logger.error("Cannot send %r: %s", request, exc)
+            return await self._fail(request, exc)
         except IgnoreRequest as exc:
             logger.debug("Ignored %r: %s", request, exc.reason)
             await self._events.emit(RequestIgnored(request, exc.reason))
@@ -154,13 +172,16 @@ class RequestProcessor:
         return await self._fail(request, error)
 
     async def _fetch(self, lease: Lease) -> Response:
-        """Fetch through the download chain in the slot `acquire()` gave the Lease, then free the slot."""
+        """Fetch through the download chain in the slot `acquire()` gave the Lease, under its Session, then free the slot."""
         try:
             with self._throttle.holding(lease.slot):  # Inline Fetches a Middleware makes share it
-                response = expect_response(
-                    await self._download(lease.request), f"the download chain for {lease.request!r}"
-                )
-            self._throttle.observe(lease.slot, response)
+                async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
+                    response = expect_response(
+                        await self._download(sending.request), f"the download chain for {lease.request!r}"
+                    )
+                    sending.response = response
+            statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
+            self._throttle.observe(lease.slot, response, statuses=statuses)
             return response
         finally:
             self._throttle.release(lease.slot)

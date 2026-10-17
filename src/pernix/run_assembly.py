@@ -19,6 +19,8 @@ from pernix.items import ItemProcessor
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.retry_policy import DefaultRetryPolicy
+from pernix.sessions import MemorySessionPool
+from pernix.sessions.session_leasing import SessionLeasing
 from pernix.settings import (
     CoreSettings,
     DomainSettings,
@@ -28,6 +30,7 @@ from pernix.settings import (
     FrontierSettings,
     ItemSettings,
     RetrySettings,
+    SessionSettings,
     StatsSettings,
 )
 from pernix.stats import CoreStats, StatsReporter
@@ -43,7 +46,7 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
-    from pernix.stats import Gauge, StatsSink
+    from pernix.stats import Gauge, Stats, StatsSink
 
 __all__ = ["DownloadAssembly", "RunAssembly"]
 
@@ -185,6 +188,7 @@ class RunAssembly:
         core_stats = CoreStats(crawler.stats)
         frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
+        sessions = _session_leasing(settings.section(SessionSettings), crawler.stats)
         download = core_stats.count_downloads(downloading.download)
         engine = Engine(
             crawler.spider,
@@ -197,9 +201,15 @@ class RunAssembly:
             lease_ttl=settings.section(FrontierSettings).lease_ttl,
             retry_policy=retry_policy,
             throttle=throttle,
+            sessions=sessions,
         )
         inline_fetch = InlineFetch(
-            download=download, throttle=throttle, retry_policy=retry_policy, events=events, stats=crawler.stats
+            download=download,
+            throttle=throttle,
+            retry_policy=retry_policy,
+            events=events,
+            stats=crawler.stats,
+            sessions=sessions,
         )
         events.subscribe_methods(core_stats)
         for sink in sinks:
@@ -221,6 +231,21 @@ class RunAssembly:
             inline_fetch=inline_fetch,
             reporter=_reporter(crawler, frontier, throttle, run_log),
         )
+
+
+def _session_leasing(settings: SessionSettings, stats: Stats) -> SessionLeasing | None:
+    """The leasing of the Run's Session Pool, held in this process; `None` when Requests are independent."""
+    if not settings.enabled:
+        return None
+    pool = MemorySessionPool(
+        settings.pool,
+        size=settings.size,
+        max_concurrency=settings.max_concurrency,
+        lease_ttl=settings.lease_ttl,
+        eager=settings.eager,
+        stats=stats,
+    )
+    return SessionLeasing(pool, settings, stats=stats)
 
 
 class _Problems:

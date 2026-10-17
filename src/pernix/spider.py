@@ -148,7 +148,8 @@ class Spider:
         Middleware and the rate limits, but not the Frontier: it is not deduplicated
         or stored, and its Callback never runs. Failed attempts are retried in place.
         It continues the Session of the Request being handled, if any; otherwise it
-        sends only the cookies it carries. See `Crawler.fetch()`.
+        leases one when a Session Pool is enabled, and without one it sends only the
+        cookies it carries. See `Crawler.fetch()`.
 
         Args:
             request: The Request, or a URL to GET; a relative URL resolves against the

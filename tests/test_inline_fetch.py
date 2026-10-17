@@ -10,12 +10,14 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from pernix import IgnoreRequest, Request, Response, events
-from pernix.errors import ConnectError, ResponseTooLarge, RetriesExhausted, TLSError
+from pernix.errors import ConnectError, ResponseTooLarge, RetriesExhausted, SessionError, TLSError
 from pernix.fetchers import FetcherDispatch, StreamedResponse
 from pernix.inline_fetch import InlineFetch, handling
 from pernix.middlewares import build_download_chain
 from pernix.retry_policy import Decision, DefaultRetryPolicy
-from pernix.settings import DomainSettings, RetrySettings
+from pernix.sessions import MemorySessionPool
+from pernix.sessions.session_leasing import SessionLeasing
+from pernix.settings import DomainSettings, RetrySettings, SessionSettings
 from pernix.stats import Stats
 from pernix.testing import FakeFetcher, make_response
 from pernix.throttle import Throttle
@@ -61,6 +63,7 @@ def _inline(
     retry_policy: RetryPolicy | None = None,
     bus: events.EventBus | None = None,
     stats: Stats | None = None,
+    sessions: SessionLeasing | None = None,
 ) -> InlineFetch:
     return InlineFetch(
         download=download,
@@ -68,7 +71,13 @@ def _inline(
         retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings(delay_scale=0)),
         events=bus or events.EventBus(timeout=5),
         stats=stats or Stats(),
+        sessions=sessions,
     )
+
+
+def _leasing() -> SessionLeasing:
+    settings = SessionSettings(enabled=True)
+    return SessionLeasing(MemorySessionPool(), settings, stats=Stats())
 
 
 async def test_a_fetch_returns_the_response_whatever_its_status() -> None:
@@ -192,14 +201,29 @@ async def test_a_cooling_slot_is_waited_out_in_place() -> None:
 
 async def test_a_request_continues_the_session_of_the_request_being_handled() -> None:
     site = _site({"/a": [b""]})
-    inline = _inline(site.fetch)
+    inline = _inline(site.fetch, sessions=_leasing())
 
     with handling(Request(f"{SITE}/page", session="first")):
         await inline.fetch(Request(f"{SITE}/a"))
         await inline.fetch(Request(f"{SITE}/a", session="own"))
     await inline.fetch(Request(f"{SITE}/a"))
 
-    assert [request.session for request in site.requests] == ["first", "own", None]
+    continued, own, leased = (request.session for request in site.requests)
+    assert (continued, own) == ("first", "own")
+    assert leased is not None  # one the pool gives
+
+
+async def test_naming_a_session_without_a_session_pool_fails() -> None:
+    site = _site({"/a": [b""]})
+    inline = _inline(site.fetch)
+
+    with pytest.raises(SessionError, match="no Session Pool is enabled"):
+        await inline.fetch(Request(f"{SITE}/a", session="alice"))
+    with handling(Request(f"{SITE}/page")):
+        response = await inline.fetch(Request(f"{SITE}/a"))
+
+    assert response.request.session is None
+    assert len(site.requests) == 1
 
 
 class Files:

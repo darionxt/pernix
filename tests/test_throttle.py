@@ -9,7 +9,7 @@ import pytest
 from pernix import Request, Response
 from pernix.settings import DomainSettings
 from pernix.testing.frontier import FakeClock
-from pernix.throttle import Throttle
+from pernix.throttle import SESSION_COOLDOWN_STATUSES, Throttle
 
 A = "a.example"
 B = "b.example"
@@ -138,6 +138,15 @@ def test_only_429_and_503_with_retry_after_cool_down_up_to_the_cap(
     throttle = _throttle(FakeClock(), cooldown_max=60.0)
 
     throttle.observe(A, _response(status, retry_after))
+
+    assert throttle.cooldown_left(A) == cooldown
+
+
+@pytest.mark.parametrize(("status", "cooldown"), [(429, 0.0), (503, 30.0)])
+def test_under_a_session_only_503_cools_the_domain_down(status: int, cooldown: float) -> None:
+    throttle = _throttle(FakeClock(), cooldown_max=60.0)
+
+    throttle.observe(A, _response(status, "30"), statuses=SESSION_COOLDOWN_STATUSES)
 
     assert throttle.cooldown_left(A) == cooldown
 

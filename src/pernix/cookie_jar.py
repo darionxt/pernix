@@ -30,7 +30,7 @@ from pernix.urls import is_loopback_host
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
-__all__ = ["Cookie", "CookieJar", "cookie_host"]
+__all__ = ["Cookie", "CookieJar", "CookieKey", "cookie_host", "cookie_key"]
 
 _MAX_SIZE = 4096
 """Bytes a cookie's name and value may have together, as browsers take at most."""
@@ -40,6 +40,9 @@ _MAX_LIFETIME = 400 * 24 * 3600
 
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 """The control characters a cookie may not hold: all but the tab (RFC 6265bis §5.6)."""
+
+type CookieKey = tuple[str, bool, str, str]
+"""What tells a cookie from the others in a jar: its domain, host-only flag, path, and name."""
 
 _COOKIE_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 _SECURE_SCHEMES = frozenset({"https", "wss"})
@@ -97,7 +100,7 @@ class CookieJar:
         Args:
             cookies: Cookies to keep, as `set()` keeps them.
         """
-        self._cookies: dict[tuple[str, bool, str, str], Cookie] = {}
+        self._cookies: dict[CookieKey, Cookie] = {}
         for cookie in cookies:
             self.set(cookie)
 
@@ -116,7 +119,7 @@ class CookieJar:
         Args:
             cookie: The cookie.
         """
-        self._cookies[_key(cookie)] = cookie
+        self._cookies[cookie_key(cookie)] = cookie
 
     def receive(self, url: str, set_cookie_headers: Iterable[str], *, now: float | None = None) -> None:
         """Apply the `Set-Cookie` headers of a response to the jar, in order, as a browser would.
@@ -270,7 +273,15 @@ class _Origin:
         return on_host and _path_matches(self.path, cookie.path)
 
 
-def _key(cookie: Cookie) -> tuple[str, bool, str, str]:
+def cookie_key(cookie: Cookie) -> CookieKey:
+    """Return what tells a cookie from the others in a jar.
+
+    Args:
+        cookie: The cookie.
+
+    Returns:
+        Its domain, host-only flag, path, and name.
+    """
     return (cookie.domain, cookie.host_only, cookie.path, cookie.name)
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlsplit
 
 import orjson
@@ -224,6 +224,8 @@ async def test_inline_fetches_go_through_the_download_middleware_with_the_sessio
     server.route("/", "<p>home</p>")
 
     class Sessions(Spider):
+        settings: ClassVar[Mapping[str, Any]] = {"sessions.enabled": True}
+
         async def start(self) -> AsyncIterator[Request]:
             yield Request(server.url("/"), session="alice")
 
