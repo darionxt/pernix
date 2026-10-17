@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from pernix.request import Request
+    from pernix.session import Session
 
 __all__ = ["Answer", "FakeFetcher"]
 
@@ -98,11 +99,12 @@ class FakeFetcher:
             raise ValueError(f"the route {key!r} needs at least one answer")
         self._routes.append(_Route(key, answers, None if method is None else method.upper()))
 
-    async def fetch(self, request: Request) -> Response:
+    async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
         """Answer a Request from the first route that matches it.
 
         Args:
             request: The Request.
+            session: The Session it is sent under, which the Response names.
 
         Returns:
             The answer, as a Response to `request`; 404 if no route matches.
@@ -115,13 +117,15 @@ class FakeFetcher:
         route = next((route for route in self._routes if route.matches(request)), None)
         if route is None:
             self.unmatched.append(request)
-            return make_response(request.url, b"", status=404, request=request)
-        answer = route.next_answer()
-        if callable(answer):
-            answer = answer(request)
-            if inspect.isawaitable(answer):
-                answer = await answer
-        return _respond(answer, request)
+            response = make_response(request.url, b"", status=404, request=request)
+        else:
+            answer = route.next_answer()
+            if callable(answer):
+                answer = answer(request)
+                if inspect.isawaitable(answer):
+                    answer = await answer
+            response = _respond(answer, request)
+        return response if session is None else response.replace(session=session.id)
 
 
 def _respond(answer: object, request: Request) -> Response:

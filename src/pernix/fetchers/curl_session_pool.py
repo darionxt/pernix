@@ -6,11 +6,11 @@ import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin
 
 from ada_url import URL
-from curl_cffi import Curl, CurlOpt
+from curl_cffi import Curl, CurlInfo, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR, CURL_WRITEFUNC_PAUSE, CURLPAUSE_CONT
 from curl_cffi.requests import AsyncSession
 
@@ -80,8 +80,12 @@ class _Start:
     limit: int | None
     guard: NetworkGuard | None
     cookie_lines: Sequence[str]
+    on_headers: HeadersCallback | None
     transfer: Transfer | None = None
 
+
+type HeadersCallback = Callable[[str, list[str]], object]
+"""Called with the URL of each response a transfer receives and its `Set-Cookie` values."""
 
 _starting: ContextVar[_Start | None] = ContextVar("pernix_curl_start", default=None)
 """The request the current task is starting with `CurlSession.start()`, if any."""
@@ -96,9 +100,11 @@ class CurlSession(AsyncSession):
     `push_curl()` hooks of curl-cffi's handle pool. The handle's write callback counts
     the body, failing the transfer past the limit, and pauses curl while
     `BUFFER_SIZE` bytes wait to be read; the handle is removed from curl when the
-    request is cancelled. Under a network guard, the header callback stops a transfer
-    before curl follows a redirect the guard refuses. The cookie lines a request is
-    started with are loaded once curl-cffi has cleared the cookies the handle held.
+    request is cancelled. The header callback follows the responses of each redirect
+    hop: it reports their `Set-Cookie` headers as they arrive, and under a network
+    guard it stops a transfer before curl follows a redirect the guard refuses. The
+    cookie lines a request is started with are loaded once curl-cffi has cleared the
+    cookies the handle held.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -118,6 +124,7 @@ class CurlSession(AsyncSession):
         body_limit: int | None,
         guard: NetworkGuard | None = None,
         cookie_lines: Sequence[str] = (),
+        on_headers: HeadersCallback | None = None,
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
@@ -129,6 +136,9 @@ class CurlSession(AsyncSession):
             guard: The network guard every redirect must pass, if any.
             cookie_lines: Cookies for curl's cookie engine, as lines of its cookie
                 file format, loaded in this order.
+            on_headers: Called at the end of the headers of each response but
+                informational ones, redirects included, with the URL it answered and
+                its `Set-Cookie` values; an error it raises is logged.
             **options: The options of `AsyncSession.request()`, but `stream` and
                 `cookies`.
 
@@ -141,7 +151,7 @@ class CurlSession(AsyncSession):
                 headers came back.
             pernix.errors.NetworkBlocked: The guard refused a redirect.
         """
-        start = _Start(url, body_limit, guard, cookie_lines)
+        start = _Start(url, body_limit, guard, cookie_lines, on_headers)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -189,7 +199,7 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
     It also loads the cookie lines of the request once curl-cffi has cleared the
     cookies the handle held.
     """
-    guard = start.guard
+    watching = start.guard is not None or start.on_headers is not None
 
     def watched_setopt(option: CurlOpt, value: Any) -> int:
         if option == CurlOpt.WRITEFUNCTION and callable(value):
@@ -208,9 +218,9 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
                 return write(chunk)
 
             value = metered
-        elif option == CurlOpt.HEADERDATA and guard is not None:
+        elif option == CurlOpt.HEADERDATA and watching:
             # A header function, unlike the buffer's write(), can fail the transfer by its return value.
-            option, value = CurlOpt.HEADERFUNCTION, _RedirectCheck(value, start.url, guard, transfer)
+            option, value = CurlOpt.HEADERFUNCTION, _HeaderWatch(value, start, transfer)
         elif option == CurlOpt.COOKIELIST and value == "ALL":
             result = setopt(option, value)
             for line in start.cookie_lines:
@@ -221,54 +231,90 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
     return watched_setopt
 
 
-class _RedirectCheck:
-    """Writes the response headers of one transfer to curl-cffi's buffer, refusing redirects the guard does not admit.
+class _HeaderWatch:
+    """Writes the response headers of one transfer to curl-cffi's buffer, following the response of each hop.
 
-    curl follows a redirect after delivering the headers of the response, so failing
-    the header callback on a refused `Location` stops the transfer before curl
-    connects to it.
+    At the end of the headers of each response, it reports the URL curl requested
+    for it and its `Set-Cookie` values. curl unfolds folded lines itself; one that
+    gets through still continues the header before it. Informational
+    responses and 407s, which answer for a proxy, are not reported, nor are headers
+    after the body, trailers. curl follows a redirect after delivering the headers of
+    the response, so failing the callback on a `Location` the guard refuses stops the
+    transfer before curl connects to it.
     """
 
-    def __init__(self, buffer: Any, url: str, guard: NetworkGuard, transfer: Transfer) -> None:
+    def __init__(self, buffer: Any, start: _Start, transfer: Transfer) -> None:
         self._buffer = buffer
-        self._url = url
-        self._guard = guard
+        self._guard = start.guard
+        self._on_headers = start.on_headers
         self._transfer = transfer
         self._status = 0
+        self._set_cookies: list[str] = []
+        self._in_set_cookie = False
 
     def __call__(self, line: bytes) -> int:
         text = line.decode("latin-1").strip()
         if text.startswith("HTTP/"):
             code = text.split(maxsplit=2)[1:2]
             self._status = int(code[0]) if code and code[0].isdigit() else 0
-        elif 300 <= self._status < 400 and text[:9].lower() == "location:":
-            refused = self._follow(text[9:].strip())
-            if refused is not None:
-                self._transfer.blocked = refused
+            self._set_cookies, self._in_set_cookie = [], False
+        elif not text:
+            self._end()
+        elif self._status < 200:  # an informational response, or trailers
+            pass
+        elif line[:1] in (b" ", b"\t"):  # a folded line, continuing the header before it
+            if self._in_set_cookie:
+                self._set_cookies[-1] += f" {text}"
+        else:
+            name, _, value = text.partition(":")
+            name, value = name.strip().lower(), value.strip()
+            self._in_set_cookie = name == "set-cookie"
+            if self._in_set_cookie:
+                self._set_cookies.append(value)
+            elif name == "location" and 300 <= self._status < 400 and not self._admitted(value):
                 return CURL_WRITEFUNC_ERROR  # curl stops the transfer
         self._buffer.write(line)
         return len(line)
 
-    def _follow(self, location: str) -> str | None:
-        """Follow a redirect to its `Location`, returning the URL the guard refuses, if any.
+    def _url(self) -> str:
+        """The URL curl requested for the response it is receiving, which names international hosts in UTF-8."""
+        effective = cast("bytes", self._transfer.curl.getinfo(CurlInfo.EFFECTIVE_URL))
+        return effective.decode("utf-8", "replace")  # a host left unreadable takes no cookies
+
+    def _end(self) -> None:
+        """End the headers of a response, reporting its cookies."""
+        if self._status >= 200 and self._status != 407 and self._on_headers is not None and self._set_cookies:
+            url = self._url()
+            try:
+                self._on_headers(url, self._set_cookies)
+            except Exception:
+                logger.exception("Handling the Set-Cookie headers of %s failed", url)
+        if self._status >= 200:
+            self._status = 0  # what follows the body is no response
+
+    def _admitted(self, location: str) -> bool:
+        """Whether the guard, if any, admits the URL a redirect leads to.
 
         urllib and WHATWG resolve some Locations to different hosts, such as
         `http:///other.example/`, which curl, like WHATWG, takes as a host. Both
         results must be admitted, and a Location WHATWG cannot parse is refused.
         """
+        if self._guard is None:
+            return True
+        base = self._url()
         targets: list[str] = []
         for join in (urljoin, _whatwg_join):
             try:
-                targets.append(join(self._url, location))
+                targets.append(join(base, location))
             except ValueError:
                 targets.append(location)  # refused below, as it names no host the guard admits
         for url in dict.fromkeys(targets):
             try:
                 self._guard.check(url)
             except NetworkBlocked:
-                return url
-        self._url = targets[-1]  # as curl reads it
-        return None
+                self._transfer.blocked = url
+                return False
+        return True
 
 
 def _whatwg_join(base: str, url: str) -> str:
@@ -283,7 +329,10 @@ class _Entry:
 
 
 class CurlSessionPool:
-    """Keeps one curl session per Profile, so connections are reused but never shared between Profiles.
+    """Keeps one curl session per Profile and owner, so connections are reused but never shared between them.
+
+    The owner is the Session Requests are sent under, if any, so two Sessions never
+    share a connection.
 
     A session is created on first use, inside the running event loop, with curl's own
     retries off, proxies from the environment ignored, `NO_PROXY` included, and HTTP/2
@@ -306,27 +355,29 @@ class CurlSessionPool:
         self._size = size
         self._idle = idle
         self._max_clients = max_clients
-        self._entries: dict[str, _Entry] = {}  # least recently used first
+        self._entries: dict[tuple[str, str | None], _Entry] = {}  # least recently used first
         self._closing: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
-    async def session(self, profile: str) -> AsyncGenerator[CurlSession]:
-        """Use the session of a Profile, creating it if needed.
+    async def session(self, profile: str, *, owner: str | None = None) -> AsyncGenerator[CurlSession]:
+        """Use the session of a Profile and owner, creating it if needed.
 
         Args:
             profile: The Profile, already checked.
+            owner: The id of the Session Requests are sent under; `None` for none.
 
         Yields:
             The session; it stays open while in use.
         """
         now = time.monotonic()
-        entry = self._entries.pop(profile, None)
+        key = (profile, owner)
+        entry = self._entries.pop(key, None)
         if entry is not None and entry.users == 0 and now - entry.last_used > self._idle:
             self._retire(entry.session)
             entry = None
         if entry is None:
             entry = _Entry(self._new_session(profile))
-        self._entries[profile] = entry
+        self._entries[key] = entry
         entry.users += 1
         for evicted in self._detach_evicted(now):
             self._retire(evicted)
@@ -357,17 +408,16 @@ class CurlSessionPool:
             trust_env=False,
             retry=0,
             # libcurl reads NO_PROXY itself, even for a proxy given explicitly; "" stops that.
-            curl_options={CurlOpt.PIPEWAIT: 1, CurlOpt.NOPROXY: ""},
+            # A proxy's answers to CONNECT are not the headers of a response to report.
+            curl_options={CurlOpt.PIPEWAIT: 1, CurlOpt.NOPROXY: "", CurlOpt.SUPPRESS_CONNECT_HEADERS: 1},
         )
 
     def _detach_evicted(self, now: float) -> list[CurlSession]:
         """Remove the sessions to close: the least recently used beyond `size`, and the idle ones."""
-        unused = [profile for profile, entry in self._entries.items() if entry.users == 0]
+        unused = [key for key, entry in self._entries.items() if entry.users == 0]
         excess = max(0, len(self._entries) - self._size)
-        evicted = unused[:excess] + [
-            profile for profile in unused[excess:] if now - self._entries[profile].last_used > self._idle
-        ]
-        return [self._entries.pop(profile).session for profile in evicted]
+        evicted = unused[:excess] + [key for key in unused[excess:] if now - self._entries[key].last_used > self._idle]
+        return [self._entries.pop(key).session for key in evicted]
 
 
 async def _close(session: AsyncSession) -> None:

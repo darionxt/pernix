@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
-from urllib.parse import unquote, urlsplit
 
-from ada_url import idna_to_ascii
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
 
+from pernix.cookie_jar import Cookie, cookie_host
 from pernix.cookies import merge_set_cookies, request_cookies, requires_secure
 from pernix.errors import (
     ConnectError,
@@ -30,13 +30,14 @@ from pernix.response import Redirect, Response
 from pernix.settings import CoreSettings, ResponseSettings, Section
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
 
     from pernix.crawler import Crawler
     from pernix.request import Request
+    from pernix.session import Session
 
 __all__ = ["HTTPFetcher"]
 
@@ -78,6 +79,9 @@ _ERROR_CODES: dict[int, type[FetchError]] = {
 }
 """libcurl error codes and the FetchErrors they become, for errors curl-cffi raises without a specific class."""
 
+_NOT_IN_LINE = re.compile(r"[\x00-\x1f\x7f]")
+"""Characters a line of curl's cookie file format cannot carry in its fields: the tab separates them."""
+
 _BODYLESS_STATUSES = frozenset({204, 304})
 """Statuses whose responses have no body, whatever `Content-Length` says."""
 
@@ -109,6 +113,13 @@ class HTTPFetcher:
     whatever its port or scheme, and to no other host. curl sends longer cookie names
     first, and names of one length in the order given: one `Cookie` header over
     HTTP/1.1, a `cookie` field each over HTTP/2.
+
+    A Request sent under a Session (`session=`) also sends the Session's cookies that
+    match each hop, and the cookies set during the fetch, on redirects included, are
+    kept in the Session as the headers of each hop arrive, even if a later hop fails;
+    the Request's own cookies are not. The Session's proxy and
+    Profile apply unless the Request names its own, and each Session has curl
+    sessions of its own, so two Sessions never share a connection.
 
     Under a network guard (`pernix.fetchers.network_guard`), as in tests, only
     loopback hosts are reached, redirects included; others raise `NetworkBlocked`.
@@ -167,26 +178,28 @@ class HTTPFetcher:
         if pool is not None:
             await pool.close()
 
-    async def fetch(self, request: Request) -> Response:
+    async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
         """Send a Request and read the whole response body.
 
         Args:
             request: The Request to send.
+            session: The Session to send it under, if any.
 
         Returns:
             The Response, whatever its status code.
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
-            ValueError: `request.impersonate` is not a pinned Profile.
+            ValueError: The Profile to use is not a pinned one, or `request.session`
+                names another Session.
             pernix.errors.FetchError: The transfer failed; a subclass names the kind of
                 failure, and `code` is libcurl's error code, or 0.
         """
-        pool, profile = self._pool_and_profile(request)
+        pool, profile = self._pool_and_profile(request, session)
         limit = self._settings.max_body_size or None
         started = time.monotonic()
-        async with pool.session(profile) as session, self._deadline(request):
-            result, transfer = await self._send(session, request, profile, limit)
+        async with pool.session(profile, owner=_owner(session)) as curl, self._deadline(request):
+            result, transfer = await self._send(curl, request, session, profile, limit)
             try:
                 _check_declared_size(result, request, limit)
                 chunks: list[bytes] = []
@@ -198,10 +211,12 @@ class HTTPFetcher:
                     chunks.append(chunk)
             finally:
                 await _discard(result)
-        return self._response(request, result, b"".join(chunks), elapsed=time.monotonic() - started)
+        return self._response(request, session, result, b"".join(chunks), elapsed=time.monotonic() - started)
 
     @asynccontextmanager
-    async def stream(self, request: Request, *, max_bytes: int | None = None) -> AsyncGenerator[StreamedResponse]:
+    async def stream(
+        self, request: Request, *, max_bytes: int | None = None, session: Session | None = None
+    ) -> AsyncGenerator[StreamedResponse]:
         """Send a Request and read its body as it arrives.
 
         `http.deadline` limits the wait for the response headers; after that, only
@@ -213,6 +228,7 @@ class HTTPFetcher:
             request: The Request to send.
             max_bytes: Bytes the body may have at most; `None` takes
                 `http.max_body_size`, and 0 sets no limit.
+            session: The Session to send it under, if any.
 
         Yields:
             The Response, with its body to read once; the transfer is closed on exit.
@@ -220,27 +236,31 @@ class HTTPFetcher:
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
-            ValueError: `request.impersonate` is not a pinned Profile.
+            ValueError: The Profile to use is not a pinned one, or `request.session`
+                names another Session.
             pernix.errors.FetchError: The transfer failed before the headers arrived.
         """
-        pool, profile = self._pool_and_profile(request)
+        pool, profile = self._pool_and_profile(request, session)
         limit = (self._settings.max_body_size if max_bytes is None else max_bytes) or None
         started = time.monotonic()
-        async with pool.session(profile) as session:
+        async with pool.session(profile, owner=_owner(session)) as curl:
             async with self._deadline(request):
-                result, transfer = await self._send(session, request, profile, limit)
+                result, transfer = await self._send(curl, request, session, profile, limit)
             try:
                 _check_declared_size(result, request, limit)
-                response = self._response(request, result, b"", elapsed=time.monotonic() - started, streamed=True)
+                elapsed = time.monotonic() - started
+                response = self._response(request, session, result, b"", elapsed=elapsed, streamed=True)
                 yield StreamedResponse(response, lambda: _chunks(result, request, transfer), max_bytes=limit)
             finally:
                 await _discard(result)
 
-    def _pool_and_profile(self, request: Request) -> tuple[CurlSessionPool, str]:
+    def _pool_and_profile(self, request: Request, session: Session | None) -> tuple[CurlSessionPool, str]:
         if self._pool is None:
             raise RuntimeError("HTTPFetcher must be entered with 'async with' before fetching")
-        profile = self._settings.impersonate if request.impersonate is None else check_profile(request.impersonate)
-        return self._pool, profile
+        if session is not None and request.session is not None and request.session != session.id:
+            raise ValueError(f"the Request names the Session {request.session!r}, but is sent under {session.id!r}")
+        named = request.impersonate or (session.profile if session is not None else None)
+        return self._pool, self._settings.impersonate if named is None else check_profile(named)
 
     @asynccontextmanager
     async def _deadline(self, request: Request) -> AsyncGenerator[None]:
@@ -256,7 +276,7 @@ class HTTPFetcher:
             raise
 
     async def _send(
-        self, session: CurlSession, request: Request, profile: str, limit: int | None
+        self, curl: CurlSession, request: Request, session: Session | None, profile: str, limit: int | None
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Send a Request and wait for its response headers, following redirects.
 
@@ -264,49 +284,64 @@ class HTTPFetcher:
         curl limits each pause in the body to whole seconds.
         """
         timeout = request.timeout or self._settings.timeout
+        proxy = request.proxy or (session.proxy if session is not None else None)
         scope = asyncio.timeout(timeout)
         try:
             async with scope:
-                result, transfer = await self._request(session, request, profile, timeout, limit)
+                result, transfer = await self._request(curl, request, session, proxy, profile, timeout, limit)
         except TimeoutError:
             if scope.expired():
                 raise Timeout(f"{request.url} did not respond within {timeout} s") from None
             raise
-        if result.status_code == 407 and request.proxy is not None:
+        if result.status_code == 407 and proxy is not None:
             await _discard(result)
             raise ProxyError(f"the proxy refused {request.url}: 407 Proxy Authentication Required")
         return result, transfer
 
     async def _request(
-        self, session: CurlSession, request: Request, profile: str, curl_timeout: float, limit: int | None
+        self,
+        curl: CurlSession,
+        request: Request,
+        session: Session | None,
+        proxy: str | None,
+        profile: str,
+        curl_timeout: float,
+        limit: int | None,
     ) -> tuple[curl_cffi.Response, Transfer]:
         guard = current_guard()
         if guard is not None:
-            guard.check(request.url, proxy=request.proxy)
+            guard.check(request.url, proxy=proxy)
         try:
-            return await session.start(
+            return await curl.start(
                 cast("HttpMethod", request.method),
                 request.url,
                 headers=request.headers.items(),
                 data=request.body,
-                cookie_lines=_cookie_lines(request),
+                cookie_lines=_cookie_lines(request, session),
+                on_headers=None if session is None else session.cookies.receive,
                 discard_cookies=True,
-                proxy=request.proxy,
+                proxy=proxy,
                 impersonate=cast("Any", profile),
                 timeout=curl_timeout,
                 max_redirects=self._settings.max_redirects,
                 http_version=_http_version(request.url),
                 body_limit=limit,
-                guard=None if request.proxy else guard,  # a loopback proxy takes every hop
+                guard=None if proxy else guard,  # a loopback proxy takes every hop
             )
         except CurlError as exc:
             raise _fetch_error(exc) from exc
 
     def _response(
-        self, request: Request, result: curl_cffi.Response, body: bytes, *, elapsed: float, streamed: bool = False
+        self,
+        request: Request,
+        session: Session | None,
+        result: curl_cffi.Response,
+        body: bytes,
+        *,
+        elapsed: float,
+        streamed: bool = False,
     ) -> Response:
-        hops = [*result.history, result]
-        set_cookies = [value for hop in hops for value in hop.headers.get_list("set-cookie") if value is not None]
+        set_cookies = [value for hop in [*result.history, result] for value in _set_cookies(hop)]
         headers = _headers(result)
         if request.method != "HEAD" and _decoded(headers):
             headers = Headers((name, value) for name, value in headers if name.lower() not in _DECODED_HEADERS)
@@ -322,6 +357,7 @@ class HTTPFetcher:
             elapsed=elapsed,
             ip_address=result.primary_ip or None,
             http_version=_HTTP_VERSIONS.get(result.http_version),
+            session=None if session is None else session.id,
             fetcher="http",
             streamed=streamed,
         )
@@ -363,46 +399,60 @@ def _check_declared_size(result: curl_cffi.Response, request: Request, limit: in
         raise ResponseTooLarge(f"the body of {request.url} has {declared} bytes, more than {limit}")
 
 
-def _cookie_lines(request: Request) -> list[str]:
-    """`request.cookies` as lines of curl's cookie file format, held for the Request's host only, for every path.
+def _cookie_lines(request: Request, session: Session | None) -> list[str]:
+    """The cookies to send, as lines of curl's cookie file format: the Session's, then `request.cookies`.
 
-    curl-cffi would hold them for a host of its own, with `.local` appended to names
-    without a dot, which curl then never sends them to. Among names of one length,
-    curl sends the newest cookie first, so the lines go in reverse. Names with a
-    prefix browsers take only on Secure cookies are Secure, as curl requires too.
-    A host that cannot be named as curl names it holds none, as there is no telling
-    which host they would go to.
+    curl matches them to each hop itself. `request.cookies` are held for the
+    Request's host only, for every path, replacing a Session cookie held so; curl-cffi
+    would instead hold them for a host of its own, with `.local` appended to names
+    without a dot, which curl then never sends them to. Names with a prefix browsers
+    take only on Secure cookies are Secure, as curl requires too. A host that cannot
+    be named as curl names it holds none, as there is no telling which host they
+    would go to. Session cookies with control characters, which the format cannot
+    carry, are left out. Among cookies whose paths, domains, and names are as long,
+    curl sends the newest first, so the lines go in reverse.
     """
-    host = _cookie_host(request.url)
-    if host is None:
-        return []
-    return [
-        "\t".join((host, "FALSE", "/", "TRUE" if requires_secure(name) else "FALSE", "0", name, value))
-        for name, value in reversed(list(request.cookies.items()))
+    host = cookie_host(request.url)
+    own: Mapping[str, str] = request.cookies if host is not None else {}
+    kept = [] if session is None else [cookie for cookie in session.cookies if not _replaced(cookie, host, own)]
+    lines = [_cookie_line(cookie) for cookie in kept if not _NOT_IN_LINE.search(_line_fields(cookie))]
+    lines += [
+        "\t".join((host or "", "FALSE", "/", "TRUE" if requires_secure(name) else "FALSE", "0", name, value))
+        for name, value in own.items()
     ]
+    return lines[::-1]
 
 
-def _cookie_host(url: str) -> str | None:
-    """The host of a URL as curl matches cookies to it: lower-cased, IPv6 without brackets, and in ASCII.
+def _set_cookies(response: curl_cffi.Response) -> list[str]:
+    return [value for value in response.headers.get_list("set-cookie") if value is not None]
 
-    The host is the one curl connects to: after the last `@` of the authority, even
-    where WHATWG URLs would end the authority earlier, such as at a backslash, and
-    percent-decoded. One that is not ASCII is then converted as WHATWG URLs convert
-    hosts, without the transitional IDNA mappings, as curl does too: `faß` is
-    `xn--fa-hia`, not `fass`.
 
-    Returns:
-        The host, or `None` for none, or for one that WHATWG URLs reject, which curl
-        converts differently on each platform.
-    """
-    parts = urlsplit(url)
-    authority = parts.netloc.rpartition("@")[2]
-    if authority.startswith("["):
-        return parts.hostname  # an IPv6 address
-    host = unquote(authority.partition(":")[0])  # not lower-cased yet, which would turn a final Σ into ς
-    if host.isascii():
-        return host.lower() or None
-    return idna_to_ascii(host).decode("ascii") or None
+def _cookie_line(cookie: Cookie) -> str:
+    expires = "0" if cookie.expires is None else str(max(1, int(cookie.expires)))  # 0 is a cookie without expiry
+    return "\t".join(
+        (
+            cookie.domain,
+            "FALSE" if cookie.host_only else "TRUE",
+            cookie.path,
+            "TRUE" if cookie.secure else "FALSE",
+            expires,
+            cookie.name,
+            cookie.value,
+        )
+    )
+
+
+def _line_fields(cookie: Cookie) -> str:
+    return cookie.domain + cookie.path + cookie.name + cookie.value
+
+
+def _replaced(cookie: Cookie, host: str | None, own: Mapping[str, str]) -> bool:
+    """Whether a Session cookie is the one a cookie of the Request, held for its host and the path /, replaces."""
+    return cookie.host_only and cookie.domain == host and cookie.path == "/" and cookie.name in own
+
+
+def _owner(session: Session | None) -> str | None:
+    return None if session is None else session.id
 
 
 def _http_version(url: str) -> CurlHttpVersion | None:
