@@ -81,9 +81,10 @@ class Redactor:
       the end of the line;
     - every occurrence of the given secret values, such as those of `Secret` settings.
 
-    Names match case-insensitively. Every rule looks at the text as given, and values
-    that several rules find, overlapping or side by side, are masked as one. Masking is
-    heuristic: it errs toward masking too much rather than too little.
+    Names match case-insensitively. Once secret values are masked, every rule looks at
+    the same text, and values that several rules find, overlapping or side by side, are
+    masked as one. Masking is heuristic: it errs toward masking too much rather than
+    too little.
 
     Example:
         >>> Redactor().redact("via http://alice:pw@proxy:8080/?token=abc")
@@ -104,7 +105,7 @@ class Redactor:
         self._assignments = re.compile(rf"(?i)(?<![\w-])((?:{fields})=)[^&#;\s'\",)}}\]]+")
         self._quoted = re.compile(
             rf"""(?i)(?<![\w-])(?P<key>(?P<quote>['"])(?:{fields})(?P=quote)\s*[:,]\s*)"""
-            r"""(?P<value>'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s,)}\]]+)"""
+            r"""(?P<value>'(?P<single>(?:[^'\\]|\\.)*)'|"(?P<double>(?:[^"\\]|\\.)*)"|[^\s,)}\]]+)"""
         )
         self._headers = re.compile(rf"(?im)(?<![\w'\"-])((?:{headers}):[ \t]*)[^\s][^\r\n]*")
         values = sorted({secret for secret in secrets if secret}, key=len, reverse=True)
@@ -119,14 +120,13 @@ class Redactor:
         Returns:
             The masked text.
         """
+        if self._secrets is not None:  # first, so that a name right after a secret value stands apart
+            text = self._secrets.sub(MASK, text)
         return _masked(text, self._sensitive_spans(text))
 
     def _sensitive_spans(self, text: str) -> list[tuple[int, int]]:
-        # Every rule looks at the text as given, so that masking a value never hides another from a rule.
-        spans: list[tuple[int, int]] = []
-        if self._secrets is not None:
-            spans.extend(match.span() for match in self._secrets.finditer(text))
-        spans.extend(match.span() for match in _USERINFO.finditer(text))
+        # Every rule looks at the same text, so that masking a value never hides another from a rule.
+        spans = [match.span() for match in _USERINFO.finditer(text)]
         spans.extend((match.end(1), match.end()) for match in self._assignments.finditer(text))
         headers = list(self._headers.finditer(text))
         spans.extend((match.end(1), match.end()) for match in headers)
@@ -210,8 +210,11 @@ def _alternation(names: Iterable[str]) -> str:
 
 
 def _quoted_value(match: re.Match[str]) -> tuple[int, int]:
-    start, end = match.span("value")
-    return (start + 1, end - 1) if match["value"][0] in "'\"" else (start, end)
+    # Inside its quotes, unless it lacks the closing one, as a value cut short does: then all of it.
+    for inner in ("single", "double"):
+        if match[inner] is not None:
+            return match.span(inner)
+    return match.span("value")
 
 
 def _masked(text: str, spans: Iterable[tuple[int, int]]) -> str:

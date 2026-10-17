@@ -100,6 +100,9 @@ def test_text_without_credentials_is_kept(text: str) -> None:
         ("{'Proxy-Authorization': 'Basic YWxp'}", "{'Proxy-Authorization': '***'}"),
         ('{"password": "hunter2", "user": "alice"}', '{"password": "***", "user": "alice"}'),
         ('{"api_key":12345}', '{"api_key":***}'),
+        ("{'password': ''}", "{'password': '***'}"),
+        ('"password": "hunter2', '"password": ***'),
+        ("{'password': 'hunt", "{'password': ***"),
         ("?monkey=1&key=2", "?monkey=1&key=***"),
     ],
 )
@@ -125,6 +128,7 @@ def test_secret_values_are_masked_wherever_they_occur() -> None:
     redactor = Redactor(secrets=["sk-live-123", "sk-live-123456", ""])
 
     assert redactor.redact("key sk-live-123456 and sk-live-123.") == "key *** and ***."
+    assert redactor.redact("sk-live-123'password': 'hunter2'") == "***'password': '***'"
 
 
 def test_secrets_are_found_inside_the_settings_values() -> None:
