@@ -335,3 +335,18 @@ async def test_a_proxy_asking_for_credentials_sets_no_cookies(server: LoopbackSe
             await fetcher.fetch(Request("http://pernix.test/", proxy=server.base_url), session=session)
 
     assert list(session.cookies) == []
+
+
+@pytest.mark.parametrize(
+    ("host", "domain"), [("faß.localhost", "xn--fa-hia.localhost"), ("bücher.localhost", "xn--bcher-kva.localhost")]
+)
+async def test_cookies_of_an_international_host_are_kept_under_its_ascii_name(
+    cookie_server: CookieServer, host: str, domain: str
+) -> None:
+    cookie_server.routes["/"] = [("Set-Cookie", "a=1")]
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/", host=host)), session=session)
+
+    assert [(cookie.name, cookie.domain) for cookie in session.cookies] == [("a", domain)]

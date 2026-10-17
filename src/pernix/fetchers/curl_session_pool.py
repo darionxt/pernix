@@ -277,8 +277,9 @@ class _HeaderWatch:
         return len(line)
 
     def _url(self) -> str:
-        """The URL curl requested for the response it is receiving."""
-        return cast("bytes", self._transfer.curl.getinfo(CurlInfo.EFFECTIVE_URL)).decode("latin-1")
+        """The URL curl requested for the response it is receiving, which names international hosts in UTF-8."""
+        effective = cast("bytes", self._transfer.curl.getinfo(CurlInfo.EFFECTIVE_URL))
+        return effective.decode("utf-8", "replace")  # a host left unreadable takes no cookies
 
     def _end(self) -> None:
         """End the headers of a response, reporting its cookies."""
