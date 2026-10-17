@@ -214,3 +214,37 @@ async def test_a_kept_context_records_what_each_page_requested_from_other_hosts_
                 await fetcher.fetch(_render(server.url("/")), session=session)
 
     assert guard.blocked == ["https://pernix.invalid/cover.png"] * 3
+
+
+async def test_a_cookie_a_page_set_over_a_requests_own_is_kept_as_the_page_set_it(server: LoopbackServer) -> None:
+    server.route("/swap", "<p>swapped</p>", headers=[*HTML, ("Set-Cookie", "sid=new")])
+    stored = Cookie(
+        name="sid",
+        value="session",
+        domain="app.example.localhost",
+        expires=float(int(time.time()) + 3600),
+        secure=True,
+        http_only=True,
+    )
+    session = Session("alice", cookies=[stored])
+
+    async with BrowserFetcher() as fetcher:
+        url = _on(server, "app.example.localhost", "/swap")
+        await fetcher.fetch(_render(url, cookies={"sid": "own"}), session=session)
+
+    [sid] = session.cookies
+    assert (sid.value, sid.secure, sid.http_only, sid.expires) == ("new", False, False, None)
+
+
+async def test_the_pages_a_page_opened_are_closed_with_it(server: LoopbackServer) -> None:
+    server.route("/", "<script>window.open('/popup')</script><p>opener</p>", headers=HTML)
+    server.route(
+        "/popup", "<script>setInterval(() => { document.cookie = 'tick=' + Date.now() }, 20)</script>", headers=HTML
+    )
+    settings = BrowserSettings(launch_options={"args": ["--disable-popup-blocking"]})
+
+    async with BrowserFetcher(settings) as fetcher:
+        await fetcher.fetch(_render(server.url("/")), session=Session("alice"))
+        pages = list(fetcher._contexts._waiting[0].context.pages)  # pyright: ignore[reportPrivateUsage]
+
+    assert pages == []

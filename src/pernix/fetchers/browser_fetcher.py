@@ -109,9 +109,10 @@ class BrowserFetcher:
     created with the Session's localStorage and the proxy of the Request or of the
     Session, which never change afterwards: a Session whose proxy or localStorage
     changed elsewhere gets a new one. Before each fetch, the context is made to hold
-    the Session's cookies, with the Request's own, and after it the cookies the page
-    changed, and the localStorage of the page's origin, are kept in the Session,
-    whether the page loaded or not, but not when the fetch is cancelled. Attributes
+    the Session's cookies, with the Request's own, and after it its pages are
+    closed, those the page opened included, and the cookies the page changed, and
+    the localStorage of the page's origin, are kept in the Session, whether the page
+    loaded or not, but not when the fetch is cancelled. Attributes
     the browser does not tell, such as an unspecified SameSite or when a cookie was
     first set, are kept from the Session's cookie jar; a cookie the page made without
     SameSite is held as Lax, as the browser reports it. The localStorage of frames
@@ -327,10 +328,10 @@ class BrowserFetcher:
         return await self._response(page, document, load, session)
 
     async def _done(self, page: Page, watch: _PageLoad, kept: SessionContext | None, session: Session | None) -> None:
-        """End a fetch: keep what it changed in its Session, and close its page in a kept context."""
+        """End a fetch: in a kept context, close its pages and keep what it changed in its Session."""
         watch.stop()
         if kept is None or session is None:
-            return  # its context is closed, with the page
+            return  # its context is closed, with the pages
         try:
             await kept.merge(page, session, now=time.time())
         except Exception:
@@ -340,10 +341,6 @@ class BrowserFetcher:
                 session.id,
                 exc_info=True,
             )
-        try:
-            await page.close()
-        except Exception:
-            kept.broken = True
 
     async def _failed_load(self, error: Exception, watch: _PageLoad, load: _Load, session: Session | None) -> Response:
         """Turn a page that did not load into the Response it still had, or the error it is."""

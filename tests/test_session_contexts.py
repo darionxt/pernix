@@ -28,6 +28,7 @@ class FakeContext:
         self.local_storage = local_storage
         self.held: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.added: list[list[dict[str, Any]]] = []
+        self.pages: list[Any] = []
 
     async def cookies(self) -> list[dict[str, Any]]:
         return [dict(cookie) for cookie in self.held.values()]
@@ -236,3 +237,58 @@ async def test_an_opaque_origin_keeps_no_storage() -> None:
         await held.merge(cast("Page", FakePage("null", {"k": "v"})), session, now=NOW)
 
     assert session.local_storage == {}
+
+
+async def test_a_cookie_the_page_set_over_a_requests_own_takes_the_attributes_the_browser_reports() -> None:
+    browser = Browser()
+    contexts = _contexts(browser)
+    stored = Cookie(
+        name="sid",
+        value="session",
+        domain="shop.example",
+        expires=NOW + 3600,
+        secure=True,
+        http_only=True,
+        created=NOW - 10,
+        modified=NOW - 10,
+    )
+    session = Session("alice", cookies=[stored])
+
+    async with contexts.using(LAUNCHED, session, proxy=None) as held:
+        await held.sync(session, [request_cookie("shop.example", "sid", "own")], now=NOW)
+        context = cast("FakeContext", held.context)
+        context.held[("sid", "shop.example", "/")]["value"] = (
+            "new"  # replaced, like the Request's: plain, for the session
+        )
+        await held.merge(cast("Page", FakePage(ORIGIN, {})), session, now=NOW)
+
+    [sid] = session.cookies
+    assert (sid.value, sid.secure, sid.http_only, sid.expires, sid.created) == ("new", False, False, None, NOW - 10)
+
+
+async def test_a_fetch_cancelled_while_its_changes_are_read_keeps_none_of_them() -> None:
+    browser = Browser()
+    contexts = _contexts(browser)
+    session = Session("alice", cookies=[Cookie(name="sid", value="1", domain="shop.example")])
+    reading = asyncio.Event()
+
+    class Stuck:
+        async def evaluate(self, _expression: str) -> list[Any]:
+            reading.set()
+            await asyncio.Event().wait()
+            return []
+
+    async def fetch() -> None:
+        async with contexts.using(LAUNCHED, session, proxy=None) as held:
+            await held.sync(session, [], now=NOW)
+            cast("FakeContext", held.context).held[("sid", "shop.example", "/")]["value"] = "2"
+            await held.merge(cast("Page", Stuck()), session, now=NOW)
+
+    task = asyncio.create_task(fetch())
+    await reading.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [cookie.value for cookie in session.cookies] == ["1"]
+    assert len(browser.closed) == 1

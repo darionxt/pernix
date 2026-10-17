@@ -67,6 +67,8 @@ class SessionContext:
         self.broken = False
         self._cookies: dict[BrowserKey, BrowserCookie] | None = None
         """The cookies the context held once synced for the fetch in progress; `None` until then."""
+        self._overrides: frozenset[BrowserKey] = frozenset()
+        """The keys of the cookies it holds as the Request's own for the fetch in progress."""
 
     def fits(self, session: Session, *, proxy: str | None, launched: LaunchedBrowser) -> bool:
         """Whether a fetch under a Session can use the context: same browser and proxy, and the Session's localStorage.
@@ -98,7 +100,9 @@ class SessionContext:
         """
         self._cookies = None
         own = [browser_cookie(cookie) for cookie in session.cookies if cookie.expires is None or cookie.expires > now]
-        wanted = {browser_key(cookie): cookie for cookie in [*own, *request_cookies]}
+        overrides = [*request_cookies]
+        wanted = {browser_key(cookie): cookie for cookie in [*own, *overrides]}
+        self._overrides = frozenset(browser_key(cookie) for cookie in overrides)
         held = keyed(await self.context.cookies())
         missing = changes(held, wanted)
         if missing:
@@ -107,10 +111,13 @@ class SessionContext:
         self._cookies = held
 
     async def merge(self, page: Page, session: Session, *, now: float) -> None:
-        """Keep in a Session the cookies the fetch changed, and the localStorage of its page's origin.
+        """End a fetch: close its pages, and keep in its Session the cookies it changed and the localStorage of its page.
 
-        A context that was not synced for the fetch, as syncing failed, changes
-        nothing and is marked broken, as what it holds is not known.
+        What the fetch changed is read, and the pages of the context closed, the
+        page's and those it opened, before any of it is kept in the Session, so a
+        fetch cancelled meanwhile keeps nothing. A context that was not synced for
+        the fetch, as syncing failed, changes nothing and is marked broken, as what it
+        holds is not known; so is one whose pages cannot be closed.
 
         Args:
             page: The page of the fetch, still open.
@@ -121,11 +128,22 @@ class SessionContext:
         if before is None:
             self.broken = True
             return
-        apply_page_changes(session.cookies, before, keyed(await self.context.cookies()), now=now)
+        after = keyed(await self.context.cookies())
         storage = await _local_storage(page)
-        if storage is None:
-            return
-        origin, items = storage
+        await self._close_pages()
+        apply_page_changes(session.cookies, before, after, now=now, overrides=self._overrides)
+        if storage is not None:
+            self._keep_local_storage(session, *storage)
+
+    async def _close_pages(self) -> None:
+        """Close every page of the context: one fetch uses it at a time, so they are all its fetch's."""
+        try:
+            for page in list(self.context.pages):
+                await page.close()
+        except Exception:
+            self.broken = True
+
+    def _keep_local_storage(self, session: Session, origin: str, items: dict[str, str]) -> None:
         if items == self.local_storage.get(origin, {}):
             return
         if items:

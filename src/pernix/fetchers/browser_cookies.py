@@ -8,7 +8,7 @@ from pernix.cookie_jar import Cookie, cookie_key
 from pernix.cookies import requires_secure
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Collection, Iterable, Mapping
 
     from patchright._impl._api_structures import Cookie as BrowserCookie
     from patchright._impl._api_structures import SetCookieParam
@@ -146,28 +146,33 @@ def apply_page_changes(
     after: Mapping[BrowserKey, BrowserCookie],
     *,
     now: float,
+    overrides: Collection[BrowserKey] = (),
 ) -> None:
     """Make in a jar the changes a page made to the cookies of its browser context.
 
     A cookie the page set or changed is kept with the attributes the browser says
     changed, and the jar's own for the others, which the browser may not tell, such
     as an unspecified SameSite, which it reports as Lax; it keeps the time the jar
-    first held it. One the page removed, or that expired, is removed, the removal
-    recorded. Cookies the page left as they were, a Request's own included, change
-    nothing.
+    first held it. Where the browser held a Request's own cookie in place of the
+    jar's, the attributes of the cookie the page set are all the browser's, as they
+    have nothing to do with the jar's. One the page removed, or that expired, is
+    removed, the removal recorded. Cookies the page left as they were, a Request's
+    own included, change nothing.
 
     Args:
         jar: The jar, such as a Session's.
         before: The cookies the context held when the page started, from `keyed()`.
         after: Those it holds now, from `keyed()`.
         now: The time of the changes, in seconds since the epoch.
+        overrides: The keys of the cookies the browser held as a Request's own.
     """
     held = {cookie_key(cookie): cookie for cookie in jar}
     for key, cookie in after.items():
         previous = before.get(key)
         if previous is not None and _fields(previous) == _fields(cookie):
             continue
-        jar.set(_changed(cookie, previous, held.get(_jar_key(cookie)), now))
+        jar_cookie = held.get(_jar_key(cookie))
+        jar.set(_changed(cookie, None if key in overrides else previous, jar_cookie, now))
     for key, cookie in before.items():
         if key not in after:
             jar.discard(_jar_key(cookie), now=now)
