@@ -12,7 +12,7 @@ import trustme
 
 from cookie_server import CookieServer
 from pernix import Cookie, Request, Session
-from pernix.errors import ConnectError, Timeout
+from pernix.errors import ConnectError, ProxyError, Timeout
 from pernix.fetchers import HTTPFetcher, HTTPSettings
 from pernix.testing import Reply
 from scripted_server import ScriptedServer
@@ -296,3 +296,42 @@ async def test_informational_responses_set_no_cookies(cookie_server: CookieServe
 
     assert response.status == 200
     assert [cookie.name for cookie in session.cookies] == ["final"]
+
+
+async def test_cookies_belong_to_the_host_curl_requested(cookie_server: CookieServer) -> None:
+    other = (
+        f"http://trusted.localhost\\@evil.localhost:{cookie_server.port}/end"  # WHATWG URLs would say trusted.localhost
+    )
+    cookie_server.routes["/start"] = [("Location", other)]
+    cookie_server.routes["/end"] = [("Set-Cookie", "planted=1")]
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/start")), session=session)
+
+    assert cookie_server.received[-1].host.split(":")[0] == "evil.localhost"
+    assert [(cookie.name, cookie.domain) for cookie in session.cookies] == [("planted", "evil.localhost")]
+
+
+async def test_a_folded_set_cookie_keeps_its_attributes() -> None:
+    head = b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc;\r\n Secure;\r\n\tHttpOnly\r\nX-After: 1\r\n Folded\r\nContent-Length: 0\r\n\r\n"
+    session = Session()
+
+    with ScriptedServer([(head, 0)]) as server:
+        async with HTTPFetcher() as fetcher:
+            await fetcher.fetch(Request(server.url), session=session)
+
+    assert [(cookie.name, cookie.value, cookie.secure, cookie.http_only) for cookie in session.cookies] == [
+        ("sid", "abc", True, True)
+    ]
+
+
+async def test_a_proxy_asking_for_credentials_sets_no_cookies(server: LoopbackServer) -> None:
+    server.route("/", status=407, headers=[("Proxy-Authenticate", 'Basic realm="proxy"'), ("Set-Cookie", "proxy=1")])
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        with pytest.raises(ProxyError):
+            await fetcher.fetch(Request("http://pernix.test/", proxy=server.base_url), session=session)
+
+    assert list(session.cookies) == []

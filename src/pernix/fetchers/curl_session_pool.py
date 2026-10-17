@@ -6,11 +6,11 @@ import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin
 
 from ada_url import URL
-from curl_cffi import Curl, CurlOpt
+from curl_cffi import Curl, CurlInfo, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR, CURL_WRITEFUNC_PAUSE, CURLPAUSE_CONT
 from curl_cffi.requests import AsyncSession
 
@@ -234,75 +234,85 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
 class _HeaderWatch:
     """Writes the response headers of one transfer to curl-cffi's buffer, following the response of each hop.
 
-    At the end of the headers of each response but informational ones, it reports the
-    URL the response answered and its `Set-Cookie` values; a redirect's `Location`
-    gives the URL of the next. curl follows a redirect after delivering the headers
-    of the response, so failing the callback on a `Location` the guard refuses stops
-    the transfer before curl connects to it. Headers after the body, trailers, are
-    not a response of their own.
+    At the end of the headers of each response, it reports the URL curl requested
+    for it and its `Set-Cookie` values. curl unfolds folded lines itself; one that
+    gets through still continues the header before it. Informational
+    responses and 407s, which answer for a proxy, are not reported, nor are headers
+    after the body, trailers. curl follows a redirect after delivering the headers of
+    the response, so failing the callback on a `Location` the guard refuses stops the
+    transfer before curl connects to it.
     """
 
     def __init__(self, buffer: Any, start: _Start, transfer: Transfer) -> None:
         self._buffer = buffer
-        self._url = start.url
         self._guard = start.guard
         self._on_headers = start.on_headers
         self._transfer = transfer
         self._status = 0
-        self._next: str | None = None
         self._set_cookies: list[str] = []
+        self._in_set_cookie = False
 
     def __call__(self, line: bytes) -> int:
         text = line.decode("latin-1").strip()
         if text.startswith("HTTP/"):
             code = text.split(maxsplit=2)[1:2]
             self._status = int(code[0]) if code and code[0].isdigit() else 0
-            self._next, self._set_cookies = None, []
+            self._set_cookies, self._in_set_cookie = [], False
         elif not text:
             self._end()
-        elif line[:1] not in (b" ", b"\t") and self._status >= 200:  # not a folded line, nor a trailer
+        elif self._status < 200:  # an informational response, or trailers
+            pass
+        elif line[:1] in (b" ", b"\t"):  # a folded line, continuing the header before it
+            if self._in_set_cookie:
+                self._set_cookies[-1] += f" {text}"
+        else:
             name, _, value = text.partition(":")
             name, value = name.strip().lower(), value.strip()
-            if name == "set-cookie":
+            self._in_set_cookie = name == "set-cookie"
+            if self._in_set_cookie:
                 self._set_cookies.append(value)
-            elif name == "location" and 300 <= self._status < 400 and not self._follow(value):
+            elif name == "location" and 300 <= self._status < 400 and not self._admitted(value):
                 return CURL_WRITEFUNC_ERROR  # curl stops the transfer
         self._buffer.write(line)
         return len(line)
 
+    def _url(self) -> str:
+        """The URL curl requested for the response it is receiving."""
+        return cast("bytes", self._transfer.curl.getinfo(CurlInfo.EFFECTIVE_URL)).decode("latin-1")
+
     def _end(self) -> None:
-        """End the headers of a response: report its cookies, and move on to the URL it redirects to."""
-        if self._status >= 200 and self._on_headers is not None and self._set_cookies:
+        """End the headers of a response, reporting its cookies."""
+        if self._status >= 200 and self._status != 407 and self._on_headers is not None and self._set_cookies:
+            url = self._url()
             try:
-                self._on_headers(self._url, self._set_cookies)
+                self._on_headers(url, self._set_cookies)
             except Exception:
-                logger.exception("Handling the Set-Cookie headers of %s failed", self._url)
+                logger.exception("Handling the Set-Cookie headers of %s failed", url)
         if self._status >= 200:
             self._status = 0  # what follows the body is no response
-            if self._next is not None:
-                self._url = self._next
 
-    def _follow(self, location: str) -> bool:
-        """Note the URL a redirect leads to, unless the guard refuses it.
+    def _admitted(self, location: str) -> bool:
+        """Whether the guard, if any, admits the URL a redirect leads to.
 
         urllib and WHATWG resolve some Locations to different hosts, such as
         `http:///other.example/`, which curl, like WHATWG, takes as a host. Both
         results must be admitted, and a Location WHATWG cannot parse is refused.
         """
+        if self._guard is None:
+            return True
+        base = self._url()
         targets: list[str] = []
         for join in (urljoin, _whatwg_join):
             try:
-                targets.append(join(self._url, location))
+                targets.append(join(base, location))
             except ValueError:
                 targets.append(location)  # refused below, as it names no host the guard admits
-        if self._guard is not None:
-            for url in dict.fromkeys(targets):
-                try:
-                    self._guard.check(url)
-                except NetworkBlocked:
-                    self._transfer.blocked = url
-                    return False
-        self._next = targets[-1]  # as curl reads it
+        for url in dict.fromkeys(targets):
+            try:
+                self._guard.check(url)
+            except NetworkBlocked:
+                self._transfer.blocked = url
+                return False
         return True
 
 
