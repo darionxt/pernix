@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 import orjson
 
+from pernix.cookies import check_cookies
 from pernix.headers import Headers, HeadersInput
 from pernix.urls import clean_url, is_absolute
 
@@ -178,7 +179,9 @@ class Request:
         Raises:
             ValueError: `url` is relative outside a Callback; more than one of `body`,
                 `json`, and `data` is given; `cookies` is combined with a `Cookie`
-                header; or `timeout` is not positive.
+                header; a cookie name is empty or has `=`, `;`, or a control
+                character, or a cookie value has `;` or a control character; or
+                `timeout` is not positive.
             TypeError: `callback` or `errback` is not a method of an object, or a
                 value of `params` is neither a string nor a number.
         """
@@ -192,6 +195,8 @@ class Request:
         request_headers = Headers(headers)
         if cookies and "Cookie" in request_headers:
             raise ValueError("pass cookies either as cookies= or as a Cookie header, not both")
+        if cookies:
+            check_cookies(cookies)
         if timeout is not None and timeout <= 0:
             raise ValueError(f"timeout must be positive, got {timeout}")
         for name, method_ in (("callback", callback), ("errback", errback)):

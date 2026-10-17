@@ -149,6 +149,22 @@ def test_cookies_are_read_only_and_exclusive_with_a_cookie_header() -> None:
     assert Request(URL, headers={"Cookie": "b=2"}).headers.get("cookie") == "b=2"
 
 
+@pytest.mark.parametrize(
+    "cookies",
+    [{"": "1"}, {"a=b": "1"}, {"a;b": "1"}, {"a\tb": "1"}, {"a": "1; b=2"}, {"a": "1\r\nX-Injected: 1"}, {"a": "\x7f"}],
+)
+def test_cookies_a_cookie_header_cannot_carry_are_refused(cookies: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="cookie"):
+        Request(URL, cookies=cookies)
+
+
+def test_a_refused_cookie_value_stays_out_of_the_error() -> None:
+    with pytest.raises(ValueError, match="'session'") as refused:
+        Request(URL, cookies={"session": "secret;"})
+
+    assert "secret" not in str(refused.value)
+
+
 def test_callbacks_must_be_methods() -> None:
     shop = Shop()
 

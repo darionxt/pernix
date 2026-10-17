@@ -4,11 +4,12 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
+from urllib.parse import urlsplit
 
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
 
-from pernix.cookies import merge_set_cookies, request_cookies
+from pernix.cookies import merge_set_cookies, request_cookies, requires_secure
 from pernix.errors import (
     ConnectError,
     DecodeError,
@@ -102,7 +103,11 @@ class HTTPFetcher:
 
     Requests are independent (ADR 0011): each transfer sends only `request.cookies`,
     cookies set during it flow within its own redirect chain, and none are kept for
-    later Requests. Connections are still reused.
+    later Requests. Connections are still reused. `request.cookies` are held for the
+    Request's host only, for every path, so they go to each hop on that host,
+    whatever its port or scheme, and to no other host. curl sends longer cookie names
+    first, and names of one length in the order given: one `Cookie` header over
+    HTTP/1.1, a `cookie` field each over HTTP/2.
 
     Under a network guard (`pernix.fetchers.network_guard`), as in tests, only
     loopback hosts are reached, redirects included; others raise `NetworkBlocked`.
@@ -283,7 +288,7 @@ class HTTPFetcher:
                 request.url,
                 headers=request.headers.items(),
                 data=request.body,
-                cookies=dict(request.cookies),
+                cookie_lines=_cookie_lines(request),
                 discard_cookies=True,
                 proxy=request.proxy,
                 impersonate=cast("Any", profile),
@@ -355,6 +360,32 @@ def _check_declared_size(result: curl_cffi.Response, request: Request, limit: in
     declared = result.headers.get("content-length")
     if limit is not None and declared is not None and declared.isdigit() and int(declared) > limit:
         raise ResponseTooLarge(f"the body of {request.url} has {declared} bytes, more than {limit}")
+
+
+def _cookie_lines(request: Request) -> list[str]:
+    """`request.cookies` as lines of curl's cookie file format, held for the Request's host only, for every path.
+
+    curl-cffi would hold them for a host of its own, with `.local` appended to names
+    without a dot, which curl then never sends them to. Among names of one length,
+    curl sends the newest cookie first, so the lines go in reverse. Names with a
+    prefix browsers take only on Secure cookies are Secure, as curl requires too.
+    """
+    host = _cookie_host(request.url)
+    return [
+        "\t".join((host, "FALSE", "/", "TRUE" if requires_secure(name) else "FALSE", "0", name, value))
+        for name, value in reversed(list(request.cookies.items()))
+    ]
+
+
+def _cookie_host(url: str) -> str:
+    """The host of a URL as curl matches cookies to it: lower-cased, IPv6 without brackets, and in ASCII."""
+    host = urlsplit(url).hostname or ""
+    if host.isascii():
+        return host
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:  # such as an empty label; curl then fails the transfer anyway
+        return host
 
 
 def _http_version(url: str) -> CurlHttpVersion | None:

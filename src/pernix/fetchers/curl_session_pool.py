@@ -17,7 +17,7 @@ from curl_cffi.requests import AsyncSession
 from pernix.errors import NetworkBlocked, ResponseTooLarge
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Sequence
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
@@ -79,6 +79,7 @@ class _Start:
     url: str
     limit: int | None
     guard: NetworkGuard | None
+    cookie_lines: Sequence[str]
     transfer: Transfer | None = None
 
 
@@ -96,7 +97,8 @@ class CurlSession(AsyncSession):
     the body, failing the transfer past the limit, and pauses curl while
     `BUFFER_SIZE` bytes wait to be read; the handle is removed from curl when the
     request is cancelled. Under a network guard, the header callback stops a transfer
-    before curl follows a redirect the guard refuses.
+    before curl follows a redirect the guard refuses. The cookie lines a request is
+    started with are loaded once curl-cffi has cleared the cookies the handle held.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -115,6 +117,7 @@ class CurlSession(AsyncSession):
         *,
         body_limit: int | None,
         guard: NetworkGuard | None = None,
+        cookie_lines: Sequence[str] = (),
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
@@ -124,7 +127,10 @@ class CurlSession(AsyncSession):
             url: The URL.
             body_limit: Bytes of body the transfer may deliver; `None` for no limit.
             guard: The network guard every redirect must pass, if any.
-            **options: The options of `AsyncSession.request()`, but `stream`.
+            cookie_lines: Cookies for curl's cookie engine, as lines of its cookie
+                file format, loaded in this order.
+            **options: The options of `AsyncSession.request()`, but `stream` and
+                `cookies`.
 
         Returns:
             The response, its body still to read, and the transfer.
@@ -135,7 +141,7 @@ class CurlSession(AsyncSession):
                 headers came back.
             pernix.errors.NetworkBlocked: The guard refused a redirect.
         """
-        start = _Start(url, body_limit, guard)
+        start = _Start(url, body_limit, guard, cookie_lines)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -165,7 +171,7 @@ class CurlSession(AsyncSession):
         if start is not None and start.transfer is None:
             transfer = start.transfer = Transfer(curl, start.limit)
             self._transfers[curl] = transfer
-            watched = _watched(curl.setopt, transfer, start.url, start.guard)
+            watched = _watched(curl.setopt, transfer, start)
             setattr(curl, "setopt", watched)  # noqa: B010  # before curl-cffi sets it up
         return curl
 
@@ -177,10 +183,13 @@ class CurlSession(AsyncSession):
         super().push_curl(curl)
 
 
-def _watched(
-    setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, url: str, guard: NetworkGuard | None
-) -> Callable[[CurlOpt, Any], int]:
-    """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and check redirects."""
+def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _Start) -> Callable[[CurlOpt, Any], int]:
+    """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and check redirects.
+
+    It also loads the cookie lines of the request once curl-cffi has cleared the
+    cookies the handle held.
+    """
+    guard = start.guard
 
     def watched_setopt(option: CurlOpt, value: Any) -> int:
         if option == CurlOpt.WRITEFUNCTION and callable(value):
@@ -201,7 +210,12 @@ def _watched(
             value = metered
         elif option == CurlOpt.HEADERDATA and guard is not None:
             # A header function, unlike the buffer's write(), can fail the transfer by its return value.
-            option, value = CurlOpt.HEADERFUNCTION, _RedirectCheck(value, url, guard, transfer)
+            option, value = CurlOpt.HEADERFUNCTION, _RedirectCheck(value, start.url, guard, transfer)
+        elif option == CurlOpt.COOKIELIST and value == "ALL":
+            result = setopt(option, value)
+            for line in start.cookie_lines:
+                setopt(CurlOpt.COOKIELIST, line)
+            return result
         return setopt(option, value)
 
     return watched_setopt

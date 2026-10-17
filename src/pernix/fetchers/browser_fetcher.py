@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, ClassVar, Self
 from urllib.parse import urlsplit
 
-from pernix.cookies import request_cookies
+from pernix.cookies import request_cookies, requires_secure
 from pernix.errors import (
     ComponentError,
     ConnectError,
@@ -53,9 +53,6 @@ _ENCODING_HEADERS = frozenset({"content-encoding", "content-length"})
 """Headers that describe the body as it was sent, not as the browser decoded it."""
 
 _NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss"})
-
-_SECURE_PREFIXES = ("__secure-", "__host-")
-"""Cookie name prefixes the browser takes only on Secure cookies, matched in any case."""
 
 _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 """Headers the browser would send on to every host a redirect leads to."""
@@ -442,7 +439,7 @@ def _host_cookies(url: str, cookies: dict[str, str]) -> list[SetCookieParam]:
         {
             "name": name,
             "value": value,
-            "url": f"https://{host}/" if name.lower().startswith(_SECURE_PREFIXES) else f"http://{host}/",
+            "url": f"https://{host}/" if requires_secure(name) else f"http://{host}/",
         }
         for name, value in cookies.items()
     ]
