@@ -9,7 +9,7 @@ from typing import Annotated, Any, TypeAliasType, Union, cast, get_args, get_ori
 import msgspec
 import orjson
 
-from pernix.settings.secret import Secret
+from pernix.secret import Secret
 
 __all__ = ["convert_value"]
 

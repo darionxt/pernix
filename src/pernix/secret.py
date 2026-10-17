@@ -4,7 +4,7 @@ __all__ = ["Secret"]
 
 
 class Secret:
-    """A setting value that must not appear in logs, stats, or reprs.
+    """A sensitive value, such as a setting or a password, that must not appear in logs, stats, or reprs.
 
     `str()` and `repr()` are redacted; call `reveal()` where the real value is needed.
 

@@ -4,6 +4,7 @@ from types import MappingProxyType
 
 import pytest
 
+from pernix import Account
 from pernix.logs import Redactor, revealed_secrets
 from pernix.settings import Secret
 
@@ -154,6 +155,12 @@ def test_secrets_are_found_inside_the_settings_values() -> None:
     ]
 
     assert revealed_secrets(values) == {"a", "b", "c", "d", "e"}
+
+
+def test_secrets_are_found_inside_msgspec_structs() -> None:
+    accounts = (Account(username="alice", password=Secret("pw"), extra={"totp": Secret("seed")}),)
+
+    assert revealed_secrets([accounts]) == {"pw", "seed"}
 
 
 def test_strings_inside_values_are_masked_in_copies() -> None:

@@ -271,3 +271,126 @@ async def test_the_state_loaded_is_a_copy() -> None:
     (await pool.load_state(lease)).local_storage["https://a.example"]["k"] = "changed"
 
     assert (await pool.load_state(lease)).local_storage == {"https://a.example": {"k": "1"}}
+
+
+async def test_a_session_that_logs_in_is_leased_to_one_fetch_until_it_logged_in() -> None:
+    pool, _ = _pool(max_concurrency=2, logs_in=True)
+
+    first = await pool.acquire(session="s", timeout=0)
+    assert first is not None
+    assert first.must_log_in
+    assert await pool.acquire(session="s", timeout=0) is None  # busy while logging in
+    assert await pool.logged_in(first)
+    second = await pool.acquire(session="s", timeout=0)
+
+    assert second is not None
+    assert not second.must_log_in
+    assert not await pool.logged_in(second)  # it was not to log in
+
+
+async def test_a_waiting_acquire_gets_the_session_once_it_logged_in() -> None:
+    pool, _ = _pool(max_concurrency=2, logs_in=True)
+    first = await pool.acquire(session="s")
+    assert first is not None
+
+    waiting = asyncio.create_task(pool.acquire(session="s", timeout=5))
+    await asyncio.sleep(0.01)
+    assert not waiting.done()
+    await pool.logged_in(first)
+    lease = await waiting
+
+    assert lease is not None
+    assert not lease.must_log_in
+
+
+@pytest.mark.parametrize("ending", ["released", "expired"])
+async def test_a_login_given_up_lets_another_lease_log_in(ending: str) -> None:
+    pool, clock = _pool(logs_in=True, lease_ttl=10)
+    first = await pool.acquire(session="s")
+    assert first is not None
+
+    if ending == "released":
+        await pool.release(first, Outcome("ok"))
+    else:
+        clock.now += 10
+    again = await pool.acquire(session="s", timeout=0)
+
+    assert again is not None
+    assert again.must_log_in
+
+
+async def test_auth_expired_has_the_session_log_in_again_unless_it_logged_in_since() -> None:
+    pool, _ = _pool(max_concurrency=2, logs_in=True)
+    first = await pool.acquire(session="s")
+    assert first is not None
+    await pool.logged_in(first)
+    older = await pool.acquire(session="s")  # leased before the login expired
+    assert older is not None
+
+    await pool.release(first, Outcome("auth_expired"))
+    relogin = await pool.acquire(session="s", timeout=0)
+    assert relogin is not None
+    assert relogin.must_log_in
+    await pool.logged_in(relogin)
+    await pool.release(older, Outcome("auth_expired"))  # what it saw was the login before
+    after = await pool.acquire(session="s", timeout=0)
+
+    assert after is not None
+    assert not after.must_log_in
+
+
+async def test_failed_logins_cool_the_session_down_then_retire_it() -> None:
+    pool, clock = _pool(logs_in=True, login_attempts=2)
+    lease = await pool.acquire(session="s")
+    assert lease is not None
+
+    await pool.release(lease, Outcome("login_failed", until=NOW + 10))
+    assert pool.health("s") == "cooldown"
+    clock.now += 10
+    again = await pool.acquire(session="s", timeout=0)
+    assert again is not None
+    assert again.must_log_in
+    await pool.release(again, Outcome("login_failed", until=NOW + 20))
+
+    assert pool.health("s") == "retired"
+
+
+async def test_a_login_that_worked_starts_the_count_of_failures_again() -> None:
+    pool, _ = _pool(logs_in=True, login_attempts=2)
+    for outcome in ("login_failed", "ok", "login_failed"):
+        lease = await pool.acquire(session="s")
+        assert lease is not None
+        if outcome == "ok":
+            await pool.logged_in(lease)
+        await pool.release(lease, Outcome(outcome))  # type: ignore[arg-type]
+
+    assert pool.health("s") == "available"
+
+
+async def test_without_logins_no_lease_logs_its_session_in() -> None:
+    pool, _ = _pool()
+
+    lease = await pool.acquire(session="s")
+
+    assert lease is not None
+    assert not lease.must_log_in
+
+
+async def test_a_failed_login_of_a_login_replaced_since_changes_nothing() -> None:
+    pool, _ = _pool(max_concurrency=3, logs_in=True, login_attempts=1)
+    first = await pool.acquire(session="s")
+    assert first is not None
+    await pool.logged_in(first)  # its fetch is still in flight
+    other = await pool.acquire(session="s")
+    assert other is not None
+    await pool.release(other, Outcome("auth_expired"))
+    relogin = await pool.acquire(session="s")
+    assert relogin is not None
+    await pool.logged_in(relogin)
+
+    await pool.release(first, Outcome("login_failed", until=NOW + 30))  # logged out, under the replaced login
+    after = await pool.acquire(session="s", timeout=0)
+
+    assert pool.health("s") == "available"
+    assert after is not None
+    assert not after.must_log_in

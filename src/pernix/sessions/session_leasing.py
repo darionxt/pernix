@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from pernix.errors import IgnoreRequest, ProxyError, SessionError
+from pernix.errors import IgnoreRequest, LoginExpired, ProxyError, SessionError
 from pernix.fetchers.fetcher_dispatch import BROWSER_FETCHER, sending_as
 from pernix.retry_policy import retry_after_seconds
 from pernix.session import Session, SessionState
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
     from pernix.request import Request
     from pernix.response import Response
+    from pernix.sessions.session_login import SessionLogin
     from pernix.sessions.session_pool import SessionLease, SessionPool
     from pernix.settings import SessionSettings
     from pernix.stats import Stats
@@ -31,7 +32,15 @@ __all__ = ["NoSessionYet", "Sending", "SessionLeasing", "sending_session", "send
 
 logger = logging.getLogger(__name__)
 
-_SEVERITY: tuple[OutcomeKind, ...] = ("rate_limited", "blocked", "auth_expired", "proxy_failed", "error", "ok")
+_SEVERITY: tuple[OutcomeKind, ...] = (
+    "rate_limited",
+    "blocked",
+    "login_failed",
+    "auth_expired",
+    "proxy_failed",
+    "error",
+    "ok",
+)
 """The outcomes, the one a Lease is released with first, when the fetches sharing it fared differently."""
 
 
@@ -42,6 +51,8 @@ class _Held:
     leasing: SessionLeasing
     session: Session
     task: asyncio.Task[Any] | None
+    logging_in: bool = False
+    """Whether the fetch is logging the Session in, so the Responses of the fetches nested in it are not judged."""
     nested: list[Outcome] = field(default_factory=list[Outcome])
 
 
@@ -50,7 +61,7 @@ _held: ContextVar[tuple[_Held, ...]] = ContextVar("pernix_held_sessions", defaul
 
 
 class NoSessionYet(Exception):
-    """No Session could be leased in time; the Request is to wait elsewhere for `delay` seconds.
+    """No Session could be leased in time, or the one leased failed to log in; the Request is to wait elsewhere.
 
     Attributes:
         delay: Seconds until a Session that fits stops cooling down; 0 if one is
@@ -77,12 +88,34 @@ class Sending:
         response: The Response, once it arrived, which tells how the Session fared.
         error: The exception the fetch failed with, for a caller that handles it
             inside the block, which tells how the Session fared too.
+        is_logged_out: Whether a Response shows the Session logged out; `None`
+            when no Response is judged, as without a login, or during one.
+        nested: Whether the fetch shares the Lease of a fetch it is nested in, such
+            as one a download Middleware makes. Its Session logs in again only once
+            that fetch ends, so a `LoginExpired` is for that fetch to retry.
     """
 
     request: Request
     session: Session | None = None
     response: Response | None = None
     error: BaseException | None = None
+    is_logged_out: Callable[[Response], bool] | None = field(default=None, repr=False)
+    nested: bool = False
+
+    def received(self, response: Response) -> None:
+        """Record the Response the fetch got.
+
+        Args:
+            response: The Response.
+
+        Raises:
+            pernix.errors.LoginExpired: The Response shows the Session logged out;
+                it is recorded as the `error` too.
+        """
+        self.response = response
+        if self.is_logged_out is not None and self.is_logged_out(response):
+            self.error = LoginExpired(response)
+            raise self.error
 
 
 class SessionLeasing:
@@ -94,11 +127,21 @@ class SessionLeasing:
     the state the pool holds, its Lease renewed meanwhile; then the changes it made
     are saved and the Lease is released with its outcome: `rate_limited` for a 429,
     until its `Retry-After` or for `sessions.cooldown` seconds, at most
-    `sessions.cooldown_max`; `proxy_failed` for a `ProxyError`; `error` for other
-    exceptions; and `ok` otherwise. A fetch nested in another of the same Session,
-    in the same task, such as one a download Middleware makes, shares the outer
-    fetch's Lease and Session; the Lease is released with the most severe outcome of
-    them all, so a 429 one of them got cools the Session down.
+    `sessions.cooldown_max`; `auth_expired` for a Response the login judges logged
+    out; `proxy_failed` for a `ProxyError`; `error` for other exceptions; and `ok`
+    otherwise. A fetch nested in another of the same Session, in the same task, such
+    as one a download Middleware makes, shares the outer fetch's Lease and Session;
+    the Lease is released with the most severe outcome of them all, so a 429 one of
+    them got cools the Session down.
+
+    With a login, a fetch whose Lease must log its Session in runs the login first,
+    in the fetch's task, where the fetches the login makes share the Lease and are
+    not judged; the cookies it set are saved, and the pool told, before the fetch goes
+    on. A login that raises is logged, and the Lease released as `login_failed`,
+    cooling the Session down for `sessions.cooldown` seconds; the fetch then waits
+    for another Session, as for a busy one. A fetch logged out right after the login
+    it made counts as a failed login too, so a login that does not work is not
+    repeated past `sessions.login_attempts`.
     """
 
     def __init__(
@@ -107,6 +150,7 @@ class SessionLeasing:
         settings: SessionSettings,
         *,
         stats: Stats,
+        login: SessionLogin | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """Wire the leasing to its pool.
@@ -114,20 +158,23 @@ class SessionLeasing:
         Args:
             pool: The Session Pool.
             settings: The `sessions.*` settings.
-            stats: Where Leases and outcomes are counted.
+            stats: Where Leases, logins, and outcomes are counted.
+            login: Logs Sessions in, and judges the Responses fetched under them;
+                `None` when Sessions do not log in.
             clock: The current time, in seconds since the epoch.
         """
         self.pool = pool
         self._settings = settings
         self._stats = stats
+        self._login = login
         self._clock = clock
 
     @asynccontextmanager
     async def sending(self, request: Request, *, wait: float | None) -> AsyncGenerator[Sending]:
-        """Lease a Session for a Request and send it under the Session inside the block.
+        """Lease a Session for a Request, logging it in if it must, and send the Request under it inside the block.
 
-        Set `response` on what this yields once the Response arrived. The Session's
-        changes are saved, and its Lease released, on exit.
+        Call `received()` on what this yields once the Response arrived. The
+        Session's changes are saved, and its Lease released, on exit.
 
         Args:
             request: The Request.
@@ -137,7 +184,8 @@ class SessionLeasing:
             The Request as it is to be sent, and its Session.
 
         Raises:
-            NoSessionYet: No Session could be leased within `wait`.
+            NoSessionYet: No Session could be leased within `wait`, or the one
+                leased failed to log in.
             pernix.errors.SessionError: No Session can ever be leased for the
                 Request, or it is rendered but names a Session.
         """
@@ -149,7 +197,7 @@ class SessionLeasing:
             return
         held = _held_by(self, request.session)
         if held is not None:
-            shared = Sending(request, held.session)
+            shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
                 with sending_as(held.session):
@@ -170,22 +218,68 @@ class SessionLeasing:
             await self.pool.release(lease, Outcome("ok"))
             raise
         session = Session.from_state(lease.session, before)
-        sending = Sending(request.replace(session=lease.session), session)
         renewing = asyncio.create_task(self._renew(lease))
-        holding = _Held(self, session, asyncio.current_task())
+        holding = _Held(self, session, asyncio.current_task(), logging_in=lease.must_log_in)
         token = _held.set((*_held.get(), holding))
-        error: BaseException | None = None
         try:
-            with sending_as(session):
-                yield sending
-        except BaseException as exc:
-            error = exc
-            raise
+            if lease.must_log_in:
+                before = await self._log_in(lease, before, holding, request)
+            sending = Sending(request.replace(session=lease.session), session, is_logged_out=self._judge(holding))
+            error: BaseException | None = None
+            try:
+                with sending_as(session):
+                    yield sending
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                outcomes = [self._outcome(sending.response, error or sending.error), *holding.nested]
+                await self._finish(lease, before, sending, session, outcomes)
         finally:
             _held.reset(token)
             renewing.cancel()
-            outcomes = [self._outcome(sending.response, error or sending.error), *holding.nested]
-            await self._finish(lease, before, sending, session, outcomes)
+
+    async def _log_in(
+        self, lease: SessionLease, before: SessionState, holding: _Held, request: Request
+    ) -> SessionState:
+        """Log in the Session a Lease must log in, and save what the login set; return the state it left.
+
+        Raises:
+            NoSessionYet: The login failed; the Lease was released, and the Request
+                is to wait for another Session.
+            pernix.errors.SessionError: The login failed, and no Session can ever be
+                leased for the Request now.
+        """
+        session = holding.session
+        try:
+            if self._login is not None:
+                await self._login.log_in(session)
+        except Exception as exc:
+            logger.error("Logging in the Session %r failed", lease.session, exc_info=exc)
+            await self._fail_login(lease, holding.nested)
+            raise NoSessionYet(await self.pool.ready_in(session=request.session)) from exc
+        except BaseException:
+            await self.pool.release(lease, Outcome("ok"))
+            raise
+        finally:
+            holding.logging_in = False
+        after = session.state()
+        delta = StateDelta.between(before, after, now=self._clock(), removed_at=session.cookies.removals)
+        if (delta.empty or await self.pool.save_state(lease, delta)) and await self.pool.logged_in(lease):
+            self._stats.inc("sessions.logins")
+            logger.info("Logged in the Session %r", lease.session)
+        return after
+
+    async def _fail_login(self, lease: SessionLease, nested: list[Outcome]) -> None:
+        """Release the Lease of a Session whose login failed, cooling it down."""
+        cooldowns = [outcome.until for outcome in nested if outcome.kind == "rate_limited" and outcome.until]
+        outcome = Outcome("login_failed", until=max([self._clock() + self._settings.cooldown, *cooldowns]))
+        released = await self.pool.release(lease, outcome)
+        self._stats.inc("sessions.login_failures")
+        for each in (outcome, *nested):
+            self._stats.inc(f"sessions.outcomes.{each.kind}")
+        if not released:
+            self._stats.inc("sessions.stale")
 
     async def _finish(
         self, lease: SessionLease, before: SessionState, sending: Sending, session: Session, outcomes: list[Outcome]
@@ -193,12 +287,19 @@ class SessionLeasing:
         """Save the changes the fetches made to their Session, then release the Lease with the most telling outcome.
 
         The cookies removed are timed as the jar removed them, so a cookie another
-        fetch set later is kept.
+        fetch set later is kept. A fetch logged out right after the login it made
+        reports the login as failed.
         """
         now = self._clock()
         delta = StateDelta.between(before, session.state(), now=now, removed_at=session.cookies.removals)
         saved = delta.empty or await self.pool.save_state(lease, delta)
         outcome = _most_telling(outcomes)
+        if lease.must_log_in and outcome.kind == "auth_expired":
+            logger.warning(
+                "The Session %r was logged out right after logging in; the login counts as failed", lease.session
+            )
+            self._stats.inc("sessions.login_failures")
+            outcome = Outcome("login_failed", until=now + self._settings.cooldown)
         released = await self.pool.release(lease, outcome)
         for each in outcomes:
             self._stats.inc(f"sessions.outcomes.{each.kind}")
@@ -212,7 +313,15 @@ class SessionLeasing:
                 sending.request,
             )
 
+    def _judge(self, held: _Held) -> Callable[[Response], bool] | None:
+        """How the Responses fetched under a held Session are judged logged out; `None` during its login, or without one."""
+        if self._login is None or held.logging_in:
+            return None
+        return self._login.logged_out
+
     def _outcome(self, response: Response | None, error: BaseException | None) -> Outcome:
+        if isinstance(error, LoginExpired):
+            return Outcome("auth_expired")
         if isinstance(error, ProxyError):
             return Outcome("proxy_failed")
         if isinstance(error, Exception) and not isinstance(error, IgnoreRequest):

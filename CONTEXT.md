@@ -63,6 +63,10 @@ _Avoid_: browser fingerprint, fingerprint
 Login credentials for a target site, which can be bound to a Session.
 _Avoid_: user
 
+**Login**:
+Bringing a Session into a site's logged-in state, with its Account if it has one, before the Session is first used and again once a Response shows it logged out. A Session logs in once at a time.
+_Avoid_: sign-in, authentication
+
 **Lease**:
 A time-limited claim on a Session or a Request. It carries a token and becomes invalid once it expires.
 _Avoid_: lock, checkout

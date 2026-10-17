@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 __all__ = ["CookieRemoval", "Outcome", "OutcomeKind", "SessionLease", "SessionPool", "StateDelta"]
 
-type OutcomeKind = Literal["ok", "rate_limited", "blocked", "auth_expired", "proxy_failed", "error"]
+type OutcomeKind = Literal["ok", "rate_limited", "blocked", "auth_expired", "login_failed", "proxy_failed", "error"]
 """How a Session fared in a fetch."""
 
 
@@ -28,10 +28,12 @@ class Outcome:
     Attributes:
         kind: `ok` when nothing went wrong; `rate_limited` when the site asked the
             Session to slow down, until `until`; `blocked` when the site refused
-            the Session; `auth_expired` when its login expired; `proxy_failed`
-            when its proxy failed; and `error` when the fetch failed otherwise.
-        until: For `rate_limited`, when the Session may be used again, in seconds
-            since the epoch.
+            the Session; `auth_expired` when its login expired; `login_failed`
+            when logging it in failed, which cools it down until `until`;
+            `proxy_failed` when its proxy failed; and `error` when the fetch failed
+            otherwise.
+        until: For `rate_limited` and `login_failed`, when the Session may be used
+            again, in seconds since the epoch.
     """
 
     kind: OutcomeKind
@@ -47,11 +49,15 @@ class SessionLease:
         token: Tells this Lease from the others; the pool rejects a release or a
             save from a Lease that expired or was released.
         expires_at: When the Lease ends unless renewed, in seconds since the epoch.
+        must_log_in: The Session is to log in before its fetch, as it never did or
+            its login expired. The pool gives no other Lease on it until the holder
+            reports `logged_in()`, or releases this one.
     """
 
     session: str
     token: str
     expires_at: float
+    must_log_in: bool = False
 
 
 class CookieRemoval(msgspec.Struct, frozen=True, kw_only=True):
@@ -139,7 +145,9 @@ class SessionPool(Protocol):
 
     A Lease holds a Session for one fetch, and its state is loaded when the fetch
     starts and saved, as the changes the fetch made, when it ends. Releasing the
-    Lease reports how the Session fared, which may cool it down. The in-process
+    Lease reports how the Session fared, which may cool it down. In a pool whose
+    Sessions log in, a Session logs in once at a time: a Lease that must log it in
+    is the only one given on it until the login ends. The in-process
     implementation is `pernix.sessions.MemorySessionPool`; one shared by several
     processes keeps the same protocol.
 
@@ -156,7 +164,7 @@ class SessionPool(Protocol):
         tags: Collection[str] = (),
         timeout: float | None = None,  # noqa: ASYNC109  # a pool shared by processes waits on its own terms
     ) -> SessionLease | None:
-        """Lease a Session that is neither cooling down, retired, nor at its `max_concurrency`.
+        """Lease a Session that is neither cooling down, retired, logging in, nor at its `max_concurrency`.
 
         Args:
             session: The id of the Session to lease; any Session when `None`.
@@ -201,8 +209,28 @@ class SessionPool(Protocol):
         """
         ...
 
+    async def logged_in(self, lease: SessionLease) -> bool:
+        """Report that the holder of a Lease that must log its Session in did, so other Leases may be given on it.
+
+        Args:
+            lease: The Lease, whose `must_log_in` is set.
+
+        Returns:
+            `False`, changing nothing, if the Lease expired or was released, or
+            was not to log its Session in.
+        """
+        ...
+
     async def release(self, lease: SessionLease, outcome: Outcome) -> bool:
         """End a Lease, reporting how its Session fared.
+
+        A `rate_limited` outcome cools the Session down. In a pool whose Sessions
+        log in, `auth_expired` has the Session log in again; `login_failed` has it
+        log in again too, once it cooled down, and Retires it after too many in a
+        row. Neither changes anything if the Session logged in again since the Lease
+        was given, or since its holder logged it in. A Lease that was to log
+        its Session in and is released before `logged_in()` lets another Lease log
+        it in.
 
         Args:
             lease: The Lease.

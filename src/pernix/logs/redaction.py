@@ -4,6 +4,8 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import cast
 
+import msgspec
+
 from pernix.settings import Secret
 
 __all__ = ["ELIDED", "HEADER_NAMES", "MASK", "SENSITIVE_NAMES", "Redactor", "revealed_secrets"]
@@ -186,10 +188,10 @@ class Redactor:
 
 
 def revealed_secrets(values: Iterable[object]) -> frozenset[str]:
-    """Collect the values of the `Secret`s in some values, including inside containers.
+    """Collect the values of the `Secret`s in some values, including inside containers and msgspec Structs.
 
     Args:
-        values: Values such as those of the settings.
+        values: Values such as those of the settings, or `pernix.Account`s.
 
     Returns:
         The revealed values of every `Secret` found.
@@ -206,6 +208,8 @@ def revealed_secrets(values: Iterable[object]) -> frozenset[str]:
             pending.extend(entries.values())
         elif isinstance(value, list | tuple | set | frozenset):
             pending.extend(cast("Iterable[object]", value))
+        elif isinstance(value, msgspec.Struct):
+            pending.extend(getattr(value, name) for name in value.__struct_fields__)
     return frozenset(found)
 
 

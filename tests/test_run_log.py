@@ -88,6 +88,19 @@ async def test_records_become_redacted_json_lines_with_their_run_and_request(mon
     assert (run_log.counts.error, run_log.counts.warning, run_log.counts.dropped) == (1, 0, 0)
 
 
+async def test_values_to_mask_can_be_added_once_the_run_started(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stream)
+
+    async with RunLog(LogSettings(output="stderr", format="json"), RUN, secrets=["first"]) as run_log:
+        with run_context(RUN):
+            run_log.mask(["second", "first"])
+            log.info("logging in with first and second")
+
+    [line] = [orjson.loads(line) for line in stream.getvalue().splitlines()]
+    assert line["message"] == "logging in with *** and ***"
+
+
 async def test_exceptions_are_rendered_before_queueing_and_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
     stream = io.StringIO()
     monkeypatch.setattr(sys, "stderr", stream)

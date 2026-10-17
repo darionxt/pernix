@@ -1,24 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from pernix.account import read_accounts
 from pernix.crawler import Crawler
 from pernix.request import Request
 from pernix.runner import run_spider
+from pernix.settings import SessionSettings
 from pernix.spider_arguments import check_argument_names
+from pernix.spider_hooks import base_hook
 
 if TYPE_CHECKING:
     import os
     from collections.abc import AsyncIterator, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
 
+    from pernix.account import Account
     from pernix.fetchers import StreamedResponse
     from pernix.items import ItemStream
     from pernix.request import CallbackResult
     from pernix.response import Response
     from pernix.run_result import RunResult
+    from pernix.session import Session
     from pernix.stats import Stats
 
 __all__ = ["Spider"]
@@ -34,6 +40,9 @@ class Spider:
     Run creates a new Spider object with them, converting strings, such as those from
     a command line, to the annotated types; `__init__` may raise `ValueError` to
     reject them. `settings` and `output` cannot name an argument.
+
+    With a Session Pool, `accounts()` gives the Accounts to bind Sessions to,
+    `login()` logs Sessions in, and `is_logged_out()` tells when one must log in again.
 
     Attributes:
         name: Identifies the Spider in logs; defaults to the lower-cased class name.
@@ -122,6 +131,79 @@ class Spider:
         """
         return
         yield  # makes this an async generator
+
+    @base_hook
+    async def accounts(self) -> AsyncIterator[Account]:
+        """Yield the Accounts to bind Sessions to, once, before the Run starts.
+
+        With a Session Pool, the pool then holds one Session per Account, under its
+        id, and no other. Override it to import Accounts from elsewhere, such as a
+        database; to add to those of the settings, yield those of
+        `super().accounts()` too. Inline Fetches are not available yet. The values
+        of the passwords and of the `extra` credentials are masked in the Run's log
+        from then on. It is not called without a Session Pool.
+
+        Yields:
+            The Accounts of `sessions.accounts`, then those of
+            `sessions.accounts_file`, unless overridden.
+        """
+        settings = self.crawler.settings.section(SessionSettings)
+        for account in settings.accounts:
+            yield account
+        if settings.accounts_file is not None:
+            for account in await asyncio.to_thread(read_accounts, settings.accounts_file):
+                yield account
+
+    @base_hook
+    async def login(self, session: Session, account: Account | None) -> None:
+        """Log a Session in, before it is first used, and again once it is logged out.
+
+        Override it to have the Sessions of the Session Pool log in. It runs in the
+        fetch that leases the Session first, or first after it was logged out, and
+        no other fetch leases the Session meanwhile, as fetches waiting for it wait
+        for the outcome. The Inline Fetches it makes, one after another, are sent
+        under the Session, over HTTP, which keeps the cookies they set; their
+        Responses are not judged with `is_logged_out()`. A Session without an
+        Account logs in too, which can warm it up, such as to take a guest token.
+
+        Check that the login worked, and raise if not: a login that raises is
+        logged, and tried again once the Session cooled down for
+        `sessions.cooldown` seconds, while the Requests waiting for it lease other
+        Sessions; after `sessions.login_attempts` failures in a row the Session is
+        Retired. A Session logged out by the very fetch it logged in for counts as a
+        failure too.
+
+        Args:
+            session: The Session to log in; set its cookies yourself where a login
+                hands out a token instead.
+            account: The Account the Session is bound to, if any.
+
+        Example:
+            >>> async def login(self, session, account):
+            ...     form = await self.fetch("https://shop.example/login")
+            ...     token = form.css("input[name=csrf]::attr(value)").get()
+            ...     data = {"user": account.username, "password": account.password.reveal(), "csrf": token}
+            ...     page = await self.fetch(Request("https://shop.example/login", data=data))
+            ...     if page.css(".error"):
+            ...         raise RuntimeError(f"cannot log in as {account.id}")
+        """
+
+    def is_logged_out(self, response: Response) -> bool:
+        """Tell whether a Response shows the Session it was fetched under logged out.
+
+        Once `login()` is overridden, every Response fetched under a Session is
+        judged, but those of a login, and a streamed one before its body is read. A
+        Session found logged out logs in again before its next fetch, and the
+        Request is retried at once, which counts as a retry. Override it for sites
+        that show a login page instead, such as by redirecting to one.
+
+        Args:
+            response: The Response.
+
+        Returns:
+            Whether its status is 401, unless overridden.
+        """
+        return response.status == 401
 
     def parse(self, response: Response) -> CallbackResult:
         """Handle a Response whose Request names no Callback.

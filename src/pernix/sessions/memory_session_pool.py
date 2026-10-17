@@ -26,8 +26,19 @@ type SessionHealth = Literal["available", "cooldown", "retired"]
 
 
 @dataclass(slots=True)
+class _Claim:
+    """A Lease given on a Session."""
+
+    expires_at: float
+    login: int
+    """The Session's logins when the Lease was given, or when its holder logged the Session in."""
+    logged_in: bool = False
+    """Whether its holder logged the Session in."""
+
+
+@dataclass(slots=True)
 class _Entry:
-    """A Session as the pool holds it: its state, cookies by key, and its health and Leases."""
+    """A Session as the pool holds it: its state, cookies by key, and its health, login, and Leases."""
 
     id: str
     cookies: dict[CookieKey, Cookie]
@@ -39,11 +50,17 @@ class _Entry:
     max_concurrency: int
     removed: dict[CookieKey, float] = field(default_factory=dict[CookieKey, float])
     """When the cookies removed were removed, so an older change cannot bring one back."""
-    leases: dict[str, float] = field(default_factory=dict[str, float])
-    """When each Lease expires, by token."""
+    leases: dict[str, _Claim] = field(default_factory=dict[str, _Claim])
+    """The Leases given on the Session, by token."""
     cool_until: float = 0.0
     retired: bool = False
     last_leased: float = 0.0
+    logged_in: bool = False
+    logging_in: str | None = None
+    """The token of the Lease logging the Session in, if any."""
+    logins: int = 0
+    login_failures: int = 0
+    """Failed logins since the last that worked."""
 
     def state(self) -> SessionState:
         return SessionState(
@@ -83,10 +100,18 @@ class MemorySessionPool:
     id, while there is room. `eager` creates them all at once. Each Session takes up
     to `max_concurrency` Leases at once, and the least recently leased of the free
     ones is leased first. A `rate_limited` outcome cools its Session down until the
-    time it gives; the other outcomes leave its health as it is. A Lease expires
-    after `lease_ttl` seconds unless renewed, and a release or a save from one that
-    expired or was released is rejected. States are merged per cookie, by
-    modification time.
+    time it gives. A Lease expires after `lease_ttl` seconds unless renewed, and a
+    release or a save from one that expired or was released is rejected. States are
+    merged per cookie, by modification time.
+
+    With `logs_in`, a Session logs in before it is first used: its first Lease must
+    log it in, and no other is given on it until the holder reports `logged_in()`.
+    An `auth_expired` outcome has it log in again. A `login_failed` outcome cools it
+    down until the time it gives, then has it log in again, and Retires it after
+    `login_attempts` in a row; a login counts as having worked once the Lease that
+    made it is released with another outcome. Either changes nothing if the Session
+    logged in again since the Lease was given, or since its holder logged it in, as
+    it tells of a login replaced since. The other outcomes leave a Session as it is.
 
     Attributes:
         name: The pool's name.
@@ -100,6 +125,8 @@ class MemorySessionPool:
         max_concurrency: int = 1,
         lease_ttl: float = 300.0,
         eager: bool = False,
+        logs_in: bool = False,
+        login_attempts: int = 3,
         stats: Stats | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -112,6 +139,8 @@ class MemorySessionPool:
                 its own.
             lease_ttl: Seconds a Lease lasts unless renewed.
             eager: Create all `size` Sessions now.
+            logs_in: Whether Sessions log in before they are used.
+            login_attempts: Failed logins in a row after which a Session is Retired.
             stats: Where created Sessions are counted, as `sessions.created`.
             clock: The current time, in seconds since the epoch.
         """
@@ -119,6 +148,8 @@ class MemorySessionPool:
         self._size = size
         self._max_concurrency = max_concurrency
         self._lease_ttl = lease_ttl
+        self._logs_in = logs_in
+        self._login_attempts = login_attempts
         self._stats = stats
         self._clock = clock
         self._entries: dict[str, _Entry] = {}
@@ -183,7 +214,7 @@ class MemorySessionPool:
         tags: Collection[str] = (),
         timeout: float | None = None,  # noqa: ASYNC109  # a pool shared by processes waits on its own terms
     ) -> SessionLease | None:
-        """Lease a Session that is neither cooling down, retired, nor at its `max_concurrency`.
+        """Lease a Session that is neither cooling down, retired, logging in, nor at its `max_concurrency`.
 
         Args:
             session: The id of the Session to lease; any Session when `None`.
@@ -241,11 +272,32 @@ class MemorySessionPool:
         entry = self._held_by(lease)
         if entry is None:
             return False
-        entry.leases[lease.token] = self._clock() + self._lease_ttl
+        entry.leases[lease.token].expires_at = self._clock() + self._lease_ttl
+        return True
+
+    async def logged_in(self, lease: SessionLease) -> bool:
+        """Mark the Session of a Lease that was to log it in as logged in, so other Leases may be given on it.
+
+        Args:
+            lease: The Lease.
+
+        Returns:
+            `False`, changing nothing, if the Lease expired or was released, or was
+            not to log its Session in.
+        """
+        entry = self._held_by(lease)
+        if entry is None or entry.logging_in != lease.token:
+            return False
+        entry.logging_in = None
+        entry.logged_in = True
+        entry.logins += 1
+        claim = entry.leases[lease.token]
+        claim.login, claim.logged_in = entry.logins, True
+        self._notify()
         return True
 
     async def release(self, lease: SessionLease, outcome: Outcome) -> bool:
-        """End a Lease, cooling its Session down for a `rate_limited` outcome.
+        """End a Lease, cooling its Session down, or having it log in again, as its outcome says.
 
         Args:
             lease: The Lease.
@@ -257,11 +309,29 @@ class MemorySessionPool:
         entry = self._held_by(lease)
         if entry is None:
             return False
-        del entry.leases[lease.token]
+        claim = entry.leases.pop(lease.token)
+        if entry.logging_in == lease.token:
+            entry.logging_in = None  # the login was given up; another Lease logs the Session in
         if outcome.kind == "rate_limited" and outcome.until is not None:
             entry.cool_until = max(entry.cool_until, outcome.until)
+        if outcome.kind in ("auth_expired", "login_failed"):
+            # Unless it tells of a login the Session replaced since.
+            if claim.login == entry.logins:
+                self._logged_out(entry, outcome)
+        elif claim.logged_in:
+            entry.login_failures = 0  # its fetch, after the login, went on logged in
         self._notify()
         return True
+
+    def _logged_out(self, entry: _Entry, outcome: Outcome) -> None:
+        """Have a Session log in again; after a failed login, once it cooled down, and Retire it after too many."""
+        entry.logged_in = False
+        if outcome.kind != "login_failed":
+            return
+        if outcome.until is not None:
+            entry.cool_until = max(entry.cool_until, outcome.until)
+        entry.login_failures += 1
+        entry.retired = entry.retired or entry.login_failures >= self._login_attempts
 
     async def load_state(self, lease: SessionLease) -> SessionState:
         """Return the state of a leased Session.
@@ -367,9 +437,12 @@ class MemorySessionPool:
     def _lease(self, entry: _Entry, now: float) -> SessionLease:
         token = uuid.uuid4().hex
         expires_at = now + self._lease_ttl
-        entry.leases[token] = expires_at
+        entry.leases[token] = _Claim(expires_at, entry.logins)
         entry.last_leased = now
-        return SessionLease(entry.id, token, expires_at)
+        must_log_in = self._logs_in and not entry.logged_in
+        if must_log_in:
+            entry.logging_in = token
+        return SessionLease(entry.id, token, expires_at, must_log_in=must_log_in)
 
     def _held_by(self, lease: SessionLease) -> _Entry | None:
         """The Session a Lease holds, if the Lease is still valid."""
@@ -379,13 +452,15 @@ class MemorySessionPool:
 
     def _expire(self, now: float) -> None:
         for entry in self._entries.values():
-            for token in [token for token, expires_at in entry.leases.items() if expires_at <= now]:
+            for token in [token for token, claim in entry.leases.items() if claim.expires_at <= now]:
                 del entry.leases[token]
+                if entry.logging_in == token:
+                    entry.logging_in = None
 
     def _next_change(self, now: float) -> float | None:
         """Seconds until a cooldown ends or a Lease expires, which could free a Session."""
         times = [entry.cool_until for entry in self._entries.values() if entry.cool_until > now]
-        times += [expires_at for entry in self._entries.values() for expires_at in entry.leases.values()]
+        times += [claim.expires_at for entry in self._entries.values() for claim in entry.leases.values()]
         return max(0.0, min(times) - now) if times else None
 
     async def _wait(self, at_most: float | None) -> None:
@@ -402,7 +477,13 @@ class MemorySessionPool:
 
 
 def _free(entry: _Entry, now: float) -> bool:
-    return not entry.retired and entry.cool_until <= now and len(entry.leases) < entry.max_concurrency
+    """Whether a Session can be leased now: neither retired, cooling down, logging in, nor at its `max_concurrency`."""
+    return (
+        not entry.retired
+        and entry.cool_until <= now
+        and entry.logging_in is None
+        and len(entry.leases) < entry.max_concurrency
+    )
 
 
 def _soonest(*delays: float | None) -> float | None:
