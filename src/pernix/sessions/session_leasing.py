@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pernix.errors import IgnoreRequest, LoginExpired, ProxyError, SessionError
-from pernix.fetchers.fetcher_dispatch import BROWSER_FETCHER, sending_as
+from pernix.fetchers.fetcher_dispatch import sending_as
 from pernix.retry_policy import retry_after_seconds
 from pernix.session import Session, SessionState
 from pernix.sessions.session_pool import Outcome, OutcomeKind, StateDelta
@@ -122,8 +122,7 @@ class SessionLeasing:
     """Leases a Session from a Session Pool for each fetch, and reports how it fared.
 
     A Request naming a Session leases that one; any other leases whichever the pool
-    gives. Rendered Requests are sent without a Session, as the browser takes none,
-    and one naming a Session is refused. The fetch runs under a Session built from
+    gives, rendered or not. The fetch runs under a Session built from
     the state the pool holds, its Lease renewed meanwhile; then the changes it made
     are saved and the Lease is released with its outcome: `rate_limited` for a 429,
     until its `Retry-After` or for `sessions.cooldown` seconds, at most
@@ -187,14 +186,8 @@ class SessionLeasing:
             NoSessionYet: No Session could be leased within `wait`, or the one
                 leased failed to log in.
             pernix.errors.SessionError: No Session can ever be leased for the
-                Request, or it is rendered but names a Session.
+                Request.
         """
-        if _rendered(request):
-            if request.session is not None:
-                raise SessionError(f"the browser renders no Request under a Session, and {request!r} names one")
-            with sending_as(None):
-                yield Sending(request)
-            return
         held = _held_by(self, request.session)
         if held is not None:
             shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
@@ -403,7 +396,3 @@ def _most_telling(outcomes: list[Outcome]) -> Outcome:
     first = min(outcomes, key=lambda outcome: _SEVERITY.index(outcome.kind))
     untils = [outcome.until for outcome in outcomes if outcome.kind == first.kind and outcome.until is not None]
     return Outcome(first.kind, until=max(untils) if untils else None)
-
-
-def _rendered(request: Request) -> bool:
-    return bool(request.render) or request.fetcher == BROWSER_FETCHER

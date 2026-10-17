@@ -162,7 +162,7 @@ class Spider:
         fetch that leases the Session first, or first after it was logged out, and
         no other fetch leases the Session meanwhile, as fetches waiting for it wait
         for the outcome. The Inline Fetches it makes, one after another, are sent
-        under the Session, over HTTP, which keeps the cookies they set; their
+        under the Session, over HTTP or rendered, which keeps the cookies they set; their
         Responses are not judged with `is_logged_out()`. A Session without an
         Account logs in too, which can warm it up, such as to take a guest token.
 

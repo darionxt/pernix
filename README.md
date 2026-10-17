@@ -93,7 +93,7 @@ class Account(Spider):
         yield Request("/orders", session=response.session)  # the login's cookies come along
 ```
 
-Requests are independent by default: each sends only the cookies it carries. With `sessions.enabled`, every Request leases a Session from the Run's Session Pool instead, and sends the Session's cookies, which keep those set during its fetches. Sessions are created as Requests need them, up to `sessions.size`, and each takes `sessions.max_concurrency` fetches at once. `Request(session="me")` leases the Session of that id, created on first use, and `session=response.session` continues the Session of a page; a Request a Callback yields without one leases whichever Session is free. Inline Fetches continue the Session of the Request being handled. A 429 cools only its Session down, so the others keep fetching from the domain. Rendered Requests do not lease Sessions yet. See [`docs/design.md`](docs/design.md) §5.3.
+Requests are independent by default: each sends only the cookies it carries. With `sessions.enabled`, every Request leases a Session from the Run's Session Pool instead, and sends the Session's cookies, which keep those set during its fetches. Sessions are created as Requests need them, up to `sessions.size`, and each takes `sessions.max_concurrency` fetches at once. `Request(session="me")` leases the Session of that id, created on first use, and `session=response.session` continues the Session of a page; a Request a Callback yields without one leases whichever Session is free. Inline Fetches continue the Session of the Request being handled. A 429 cools only its Session down, so the others keep fetching from the domain. Rendered Requests lease Sessions too: each Session has browser contexts of its own, which hold its cookies and localStorage, so a login in the browser carries over to HTTP, and the other way round. See [`docs/design.md`](docs/design.md) §5.3.
 
 ### Logging in with Accounts
 
@@ -114,7 +114,7 @@ class Shop(Spider):
 
 With Accounts, the pool holds one Session per Account, under its id, and no other; each takes one fetch at a time, unless the Account's `max_concurrency` says otherwise. Accounts come from `sessions.accounts`, tables with a `username`, a `password`, and optionally an `id`, `extra` credentials, and `max_concurrency`; from `sessions.accounts_file`, a JSON Lines or CSV file; and from `Spider.accounts()`, which yields both, and which a Spider overrides to import Accounts from elsewhere, such as a database. Passwords and `extra` credentials are `Secret`s, masked in the logs.
 
-`login()` runs before a Session is first used, in the fetch that leases it, and fetches that want the same Session wait for it to finish, so each Session logs in once at a time; the Inline Fetches it makes are sent under the Session. Sessions without an Account log in too, with `account=None`. A Response that `is_logged_out()`, a 401 by default, has its Session log in again, and the Request is retried at once, counting as a retry. A login that raises cools its Session down for `sessions.cooldown` and is tried again; after `sessions.login_attempts` failures in a row the Session is Retired. Logins are over HTTP until Sessions reach the browser. See [`docs/design.md`](docs/design.md) §5.3.
+`login()` runs before a Session is first used, in the fetch that leases it, and fetches that want the same Session wait for it to finish, so each Session logs in once at a time; the Inline Fetches it makes, over HTTP or rendered, are sent under the Session. Sessions without an Account log in too, with `account=None`. A Response that `is_logged_out()`, a 401 by default, has its Session log in again, and the Request is retried at once, counting as a retry. A login that raises cools its Session down for `sessions.cooldown` and is tried again; after `sessions.login_attempts` failures in a row the Session is Retired. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Running and stopping
 
@@ -242,6 +242,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `browser.timeout` | `30.0` | Seconds a page may take to load; `Request(timeout=...)` overrides it |
 | `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included |
 | `browser.launch_options` | `{}` | Options passed as they are to patchright's `launch()`, such as `executable_path` or `args` |
+| `browser.max_idle_contexts` / `browser.context_idle` | `8` / `300.0` | Browser contexts kept idle for Sessions between their fetches, at most, and seconds one may stay idle |
 | `shutdown.grace` | `20.0` | Seconds a Drain may take before it turns into a Force Stop |
 | `shutdown.close_timeout` | `5.0` | Seconds each component may take to close after a Force Stop; `0` for no limit |
 
@@ -407,6 +408,8 @@ src/pernix/
 │   ├── http_fetcher.py  curl-cffi HTTP Fetcher
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
+│   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
+│   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
 │   ├── launched_browser.py starts patchright and its browser, under the network guard if on
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
