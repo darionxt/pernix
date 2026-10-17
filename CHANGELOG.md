@@ -82,3 +82,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - The `Fetcher` protocol is `async def fetch(request)` plus `schemes`; Fetchers are opened and closed like other components and no longer check `render` or `fetcher` themselves.
 - Requests are independent: cookies no longer persist from one Request to another. Pass `cookies=` explicitly, or use a Session Pool once available (ADR 0011).
 - `Spider.run()` and `Spider.crawl()` take `settings={"concurrency": ...}` instead of a `concurrency` argument.
+- `Request` refuses cookies that a `Cookie` header cannot carry as given: an empty name, a name with `=`, `;`, or a control character, or a value with `;` or a control character. The error names the cookie, never its value.
+
+### Fixed
+
+- The HTTP Fetcher sends `Request(cookies=...)` to hosts without a dot, such as `localhost`, `intranet`, or `[::1]`, which never received them. They are held for the Request's host only, for every path, so they go to each redirect hop on that host, whatever its port or scheme, and to no other host. Their order no longer depends on their names alphabetically: curl sends longer names first, and names of one length in the order given, in one `Cookie` header over HTTP/1.1 and a `cookie` field each over HTTP/2. Cookies named with the `__Secure-` or `__Host-` prefix, which were never sent, go over HTTPS, and to loopback hosts.

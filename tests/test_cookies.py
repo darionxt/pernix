@@ -3,7 +3,14 @@ import logging
 
 import pytest
 
-from pernix.cookies import SetCookie, merge_set_cookies, parse_cookie_header, parse_set_cookie
+from pernix.cookies import (
+    SetCookie,
+    check_cookies,
+    merge_set_cookies,
+    parse_cookie_header,
+    parse_set_cookie,
+    requires_secure,
+)
 
 NOW = dt.datetime(2026, 10, 12, 12, 0, tzinfo=dt.UTC)
 
@@ -109,3 +116,22 @@ def test_long_zero_padded_max_age_values_convert_their_significant_digits(max_ag
 
     assert cookie is not None
     assert cookie.max_age == seconds
+
+
+@pytest.mark.parametrize(
+    ("name", "secure"),
+    [
+        ("__Secure-id", True),
+        ("__Host-id", True),
+        ("__secure-id", True),
+        ("__HOST-id", True),
+        ("id", False),
+        ("_Secure-id", False),
+    ],
+)
+def test_secure_only_prefixes_match_in_any_case(name: str, secure: bool) -> None:
+    assert requires_secure(name) is secure
+
+
+def test_cookies_a_cookie_header_carries_as_given_pass() -> None:
+    check_cookies({"session": 'a b,c"d"', "__Host-id": "", "lang": "=en="})

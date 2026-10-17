@@ -310,7 +310,7 @@ src/pernix/
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors, URL joining
 ├── headers.py           Headers
-├── cookies.py           applies Set-Cookie headers to cookies held by name
+├── cookies.py           checks cookies, and applies Set-Cookie headers to cookies held by name
 ├── urls.py              URL clean-up, joining, and normalization
 ├── text_decoding.py     decoding bodies: encoding declarations, labels, detection
 ├── fingerprint.py       Fingerprints of Requests

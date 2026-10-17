@@ -50,12 +50,14 @@ build-backend = "uv_build"
 dev = [
     "attrs>=25.3",
     "brotli>=1.2.0",
+    "h2>=4.4.1",
     "pernix[browser]",
     "pydantic>=2.11",
     "pyright>=1.1.414",
     "pytest>=9.1",
     "pytest-asyncio>=1.4",
     "ruff>=0.17",
+    "trustme>=1.2.1",
     "zstandard>=0.25.0",
 ]
 

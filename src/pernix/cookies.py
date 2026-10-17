@@ -20,13 +20,26 @@ if TYPE_CHECKING:
 
     from pernix.request import Request
 
-__all__ = ["SetCookie", "merge_set_cookies", "parse_cookie_header", "parse_set_cookie", "request_cookies"]
+__all__ = [
+    "SetCookie",
+    "check_cookies",
+    "merge_set_cookies",
+    "parse_cookie_header",
+    "parse_set_cookie",
+    "request_cookies",
+    "requires_secure",
+]
 
 logger = logging.getLogger(__name__)
 
 _MAX_AGE = re.compile(r"-?\d+")
 _MAX_AGE_DIGITS = 18
 """Longer `Max-Age` values are not converted: they only decide between expired and kept."""
+
+_NOT_IN_NAME = re.compile(r"[\x00-\x1f\x7f;=]")
+_NOT_IN_VALUE = re.compile(r"[\x00-\x1f\x7f;]")
+
+_SECURE_PREFIXES = ("__secure-", "__host-")
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +135,36 @@ def request_cookies(request: Request) -> dict[str, str]:
         sent.update(parse_cookie_header(header))
     sent.update(request.cookies)
     return sent
+
+
+def check_cookies(cookies: Mapping[str, str]) -> None:
+    """Refuse cookies that a `Cookie` header cannot carry as given.
+
+    Args:
+        cookies: The cookies by name.
+
+    Raises:
+        ValueError: A name is empty or has `=`, `;`, or a control character, or a
+            value has `;` or a control character. The message names the cookie, never
+            its value.
+    """
+    for name, value in cookies.items():
+        if not name or _NOT_IN_NAME.search(name):
+            raise ValueError(f"the cookie name {name!r} is empty or has '=', ';', or a control character")
+        if _NOT_IN_VALUE.search(value):
+            raise ValueError(f"the value of the cookie {name!r} has ';' or a control character")
+
+
+def requires_secure(name: str) -> bool:
+    """Whether browsers take a cookie of this name only when it is Secure.
+
+    Args:
+        name: The cookie name.
+
+    Returns:
+        `True` for names starting with `__Secure-` or `__Host-`, in any case.
+    """
+    return name.lower().startswith(_SECURE_PREFIXES)
 
 
 def merge_set_cookies(
