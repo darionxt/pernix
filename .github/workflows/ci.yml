@@ -43,12 +43,4 @@ jobs:
       - run: uv sync --locked
       - name: Install the browser engine
         run: uv run patchright install --with-deps --no-shell chromium
-      - name: Diagnose the browser tests (temporary)
-        if: runner.os == 'Linux'
-        timeout-minutes: 8
-        env:
-          DEBUG: "pw:api,pw:browser*"
-        run: >-
-          uv run pytest tests/test_browser_fetcher.py tests/test_crawl_render.py tests/test_launched_browser.py
-          -v -o log_cli=true --log-cli-level=DEBUG -o faulthandler_timeout=60
       - run: uv run pytest
