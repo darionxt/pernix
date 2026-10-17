@@ -39,7 +39,7 @@ def test_the_defaults_are_valid(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out.splitlines() == [
         "OK",
         "Project file: none",
-        "Fetchers: http (HTTPFetcher)",
+        "Fetchers: http (HTTPFetcher), browser (BrowserFetcher)",
         "Stats Sinks: none",
         "Extensions: OffsiteFilter",
         "Download Middleware: none",

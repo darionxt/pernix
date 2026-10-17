@@ -8,7 +8,7 @@ import pytest
 
 from pernix.errors import SettingsError
 from pernix.extensions import OffsiteFilter
-from pernix.fetchers import HTTPFetcher
+from pernix.fetchers import BrowserFetcher, HTTPFetcher
 from pernix.items import FailedItemsFile
 from pernix.settings import (
     ComponentMap,
@@ -589,7 +589,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "addons": (),
         "middlewares": {},
         "spider_middlewares": {},
-        "fetchers": {"http": HTTPFetcher},
+        "fetchers": {"http": HTTPFetcher, "browser": BrowserFetcher},
         "pipelines": {},
         "failed_pipelines": {FailedItemsFile: 100},
         "run_id": None,
@@ -606,4 +606,9 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "http.max_body_size": 100 * 1024 * 1024,
         "http.pool_size": 8,
         "http.pool_idle": 300.0,
+        # and by the default browser Fetcher
+        "browser.headless": True,
+        "browser.timeout": 30.0,
+        "browser.deadline": 180.0,
+        "browser.launch_options": {},
     }

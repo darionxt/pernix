@@ -37,6 +37,11 @@ pernix = "pernix.testing.pytest_plugin"
 [project.urls]
 Repository = "https://github.com/darionxt/pernix"
 
+[project.optional-dependencies]
+browser = [
+    "patchright==1.62.3",
+]
+
 [build-system]
 requires = ["uv_build>=0.12,<0.14"]
 build-backend = "uv_build"
@@ -45,6 +50,7 @@ build-backend = "uv_build"
 dev = [
     "attrs>=25.3",
     "brotli>=1.2.0",
+    "pernix[browser]",
     "pydantic>=2.11",
     "pyright>=1.1.414",
     "pytest>=9.1",
@@ -106,3 +112,6 @@ filterwarnings = ["error"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 asyncio_default_test_loop_scope = "function"
+
+[tool.uv.sources]
+pernix = { workspace = true }

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
 
-from pernix.cookies import merge_set_cookies, parse_cookie_header
+from pernix.cookies import merge_set_cookies, request_cookies
 from pernix.errors import (
     ConnectError,
     DecodeError,
@@ -310,7 +310,7 @@ class HTTPFetcher:
             headers=headers,
             body=body,
             request=request,
-            cookies=merge_set_cookies(_sent_cookies(request), set_cookies),
+            cookies=merge_set_cookies(request_cookies(request), set_cookies),
             default_encoding=self._default_encoding,
             history=[Redirect(hop.url, hop.status_code, _headers(hop)) for hop in result.history],
             elapsed=elapsed,
@@ -376,12 +376,3 @@ def _fetch_error(error: CurlError) -> FetchError:
 
 def _headers(response: curl_cffi.Response) -> Headers:
     return Headers((name, value) for name, value in response.headers.multi_items() if value is not None)
-
-
-def _sent_cookies(request: Request) -> dict[str, str]:
-    """The cookies a Request carries, whether as `cookies=` or as `Cookie` headers."""
-    sent: dict[str, str] = {}
-    for header in request.headers.get_all("Cookie"):
-        sent.update(parse_cookie_header(header))
-    sent.update(request.cookies)
-    return sent

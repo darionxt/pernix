@@ -18,7 +18,7 @@ from pernix.errors import NetworkBlocked
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-__all__ = ["NetworkGuard", "blocking_network", "current_guard", "is_loopback_host"]
+__all__ = ["NetworkGuard", "admitted", "blocking_network", "current_guard", "is_loopback_host"]
 
 
 @dataclass(slots=True)
@@ -41,7 +41,7 @@ class NetworkGuard:
         Returns:
             Whether the URL, or the proxy, is on a loopback host.
         """
-        return is_loopback_host(_host(proxy if proxy else url))
+        return admitted(url, proxy=proxy)
 
     def check(self, url: str, *, proxy: str | None = None) -> None:
         """Refuse a URL the guard does not admit.
@@ -77,6 +77,19 @@ def blocking_network() -> Generator[NetworkGuard]:
         yield _guard
     finally:
         _guard = previous
+
+
+def admitted(url: str, *, proxy: str | None = None) -> bool:
+    """Whether a network guard admits a URL: it, or the proxy it goes through, is on a loopback host.
+
+    Args:
+        url: The URL to connect to.
+        proxy: The proxy the connection goes through, if any.
+
+    Returns:
+        Whether the URL may be fetched while a guard is on.
+    """
+    return is_loopback_host(_host(proxy if proxy else url))
 
 
 def current_guard() -> NetworkGuard | None:

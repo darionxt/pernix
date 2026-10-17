@@ -8,7 +8,7 @@ from pernix import Pipeline, Spider
 from pernix.crawler import Crawler
 from pernix.errors import ComponentError, SettingsError
 from pernix.extensions import OffsiteFilter
-from pernix.fetchers import HTTPFetcher
+from pernix.fetchers import BrowserFetcher, HTTPFetcher
 from pernix.items import FailedItemsFile
 from pernix.logs import RunContext, RunLog
 from pernix.run_assembly import RunAssembly
@@ -52,6 +52,7 @@ def test_the_components_are_built_in_opening_order_and_none_is_opened() -> None:
         Recorded,
         Recorded,
         HTTPFetcher,
+        BrowserFetcher,
         Store,
         FailedItemsFile,
     ]

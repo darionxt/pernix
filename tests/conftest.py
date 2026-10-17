@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import textwrap
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -11,7 +13,6 @@ import netguard
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
     from pernix.testing import LoopbackServer
 
@@ -63,3 +64,27 @@ def write_spider(tmp_path: Path) -> Iterator[Callable[[str, str], Path]]:
         module = sys.modules.get(name)
         if module is not None and str(getattr(module, "__file__", "")).startswith(str(tmp_path)):
             del sys.modules[name]  # never a module of the same name loaded from elsewhere
+
+
+@pytest.fixture(scope="session")
+def browser_engine() -> None:
+    """Skip a test that needs the browser engine where it is not installed; fail it on CI, which installs it."""
+    missing = _missing_browser_engine()
+    if missing is not None:
+        if os.environ.get("CI"):
+            pytest.fail(missing)
+        pytest.skip(missing)
+
+
+def _missing_browser_engine() -> str | None:
+    try:
+        from patchright.async_api import async_playwright
+    except ImportError:
+        return "patchright is not installed"
+
+    async def executable() -> str:
+        async with async_playwright() as playwright:
+            return playwright.chromium.executable_path
+
+    path = asyncio.run(executable())
+    return None if Path(path).exists() else f"the browser engine is not installed: patchright install chromium ({path})"
