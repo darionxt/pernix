@@ -259,6 +259,36 @@ async def test_a_cancelled_fetch_leaves_the_browser_usable(server: LoopbackServe
     assert response.css("p::text").get() == "fast"
 
 
+async def test_closing_while_patchright_starts_leaves_nothing_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    import patchright.async_api
+
+    start_playwright = patchright.async_api.async_playwright
+    starting = asyncio.Event()
+
+    def watched() -> object:
+        manager = start_playwright()
+        start = manager.start
+
+        async def watched_start() -> object:
+            starting.set()
+            return await start()
+
+        manager.start = watched_start  # pyright: ignore[reportAttributeAccessIssue]
+        return manager
+
+    monkeypatch.setattr(patchright.async_api, "async_playwright", watched)
+
+    async with BrowserFetcher() as fetcher:
+        fetching = asyncio.create_task(fetcher.fetch(_render("http://127.0.0.1:9/")))
+        await starting.wait()
+        fetching.cancel()  # closing the fetcher then stops the launch while patchright starts
+        with pytest.raises(asyncio.CancelledError):
+            await fetching
+
+    left = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    assert left == []  # a task left running would hang closing the event loop
+
+
 async def test_fetches_share_one_browser(server: LoopbackServer) -> None:
     server.route("/", "<p>x</p>", headers=[("Content-Type", "text/html")])
 

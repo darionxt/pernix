@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
@@ -12,6 +13,7 @@ from pernix.fetchers.refusing_proxy import RefusingProxy
 
 if TYPE_CHECKING:
     from patchright.async_api import Browser, BrowserContext, Playwright, ProxySettings
+    from patchright.async_api._context_manager import PlaywrightContextManager
 
     from pernix.fetchers.browser_settings import BrowserSettings
 
@@ -97,7 +99,7 @@ async def launch_browser(settings: BrowserSettings) -> LaunchedBrowser:
             refusing_proxy = RefusingProxy()
             await refusing_proxy.start()
             options["proxy"] = {"server": refusing_proxy.url, "bypass": LOOPBACK_BYPASS}
-        playwright = await async_playwright().start()
+        playwright = await _start(async_playwright())
         try:
             browser = await playwright.chromium.launch(**options)
         except Error as exc:
@@ -111,6 +113,23 @@ async def launch_browser(settings: BrowserSettings) -> LaunchedBrowser:
             await refusing_proxy.close()
         raise
     return LaunchedBrowser(playwright, browser, refusing_proxy is not None, refusing_proxy)
+
+
+async def _start(manager: PlaywrightContextManager) -> Playwright:
+    """Start patchright's driver, finishing a start that is cancelled before stopping it.
+
+    patchright cannot stop a driver it is still starting: cancelled midway, it would
+    leave the driver and a task reading from it running, which keeps the event loop
+    from closing.
+    """
+    starting = asyncio.ensure_future(manager.start())
+    try:
+        return await asyncio.shield(starting)
+    except asyncio.CancelledError:
+        await asyncio.wait([starting])
+        if not starting.cancelled() and starting.exception() is None:
+            await starting.result().stop()
+        raise
 
 
 def _proxy_settings(proxy: str) -> ProxySettings:
