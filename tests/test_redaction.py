@@ -29,7 +29,9 @@ def test_url_credentials_are_masked(text: str, redacted: str) -> None:
         ("alice:p%40ss:w0rd@10.0.0.1", "***@10.0.0.1"),
         ("APIKEY:@proxy.example:8011", "***@proxy.example:8011"),
         (":s3cret@proxy.example:8011", "***@proxy.example:8011"),
-        ("proxy=alice:pa55@[::1]:3128", "proxy=***@[::1]:3128"),
+        ("YWxpY2U=:@proxy.example:8011", "***@proxy.example:8011"),
+        ("a&b;c:pa55@proxy:8080", "***@proxy:8080"),
+        ("proxy=alice:pa55@[::1]:3128", "***@[::1]:3128"),
         ("http://alice:pa55@a.example:1 then bob:pw@b.example:2", "http://***@a.example:1 then ***@b.example:2"),
         ("{'proxy': 'alice:pa55@proxy:8080'}", "{'proxy': '***@proxy:8080'}"),
         ('{"proxy":"alice:pa55@proxy:8080"}', '{"proxy":"***@proxy:8080"}'),
@@ -38,6 +40,17 @@ def test_url_credentials_are_masked(text: str, redacted: str) -> None:
     ],
 )
 def test_credentials_of_proxies_without_a_scheme_are_masked(text: str, redacted: str) -> None:
+    assert Redactor().redact(text) == redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        ("Cookie:email=alice@example.com; csrftoken=s3cret", "Cookie:***"),
+        ("{'token':abc@host}", "{'token':***}"),
+    ],
+)
+def test_sensitive_names_are_not_taken_for_proxy_users(text: str, redacted: str) -> None:
     assert Redactor().redact(text) == redacted
 
 

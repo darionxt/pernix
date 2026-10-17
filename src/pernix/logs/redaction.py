@@ -58,8 +58,9 @@ SENSITIVE_NAMES = HEADER_NAMES | {
 
 _USERINFO = re.compile(r"(?<=://)[^\s/?#@'\"<>]+@")
 # Without a scheme, only a user and a password joined by a colon count, either possibly empty: the colon tells them
-# from an e-mail address, whose local part has none. A mailto: address is the exception.
-_BARE_USERINFO = re.compile(r"(?<![\w.~%!$*+-])(?!(?i:mailto):)[\w.~%!$*+-]*:[^\s/?#@'\"<>]*@(?=[\w\[])")
+# from an e-mail address, whose local part has none. A mailto: address is the exception. The user takes the characters
+# of the password but the colon, so it is masked whole, with whatever is joined to it.
+_BARE_USERINFO = re.compile(r"(?<![^\s/?#@'\"<>:])(?!(?i:mailto):)[^\s/?#@'\"<>:]*:[^\s/?#@'\"<>]*@(?=[\w\[])")
 
 
 class Redactor:
@@ -71,8 +72,9 @@ class Redactor:
       `http://user:pass@proxy:8080` becomes `http://***@proxy:8080`, and in proxies
       given without a scheme, as curl takes them: `user:pass@proxy:8080` becomes
       `***@proxy:8080`. Without a scheme, only a user and a password joined by a colon
-      before `@` and a host are masked, so e-mail addresses are kept, `mailto:` ones
-      included, unless a word is joined to them by a colon (`contact:a@shop.example`);
+      before `@` and a host are masked, with whatever is joined to them, as `proxy=` in
+      `proxy=user:pass@proxy`. E-mail addresses are kept, `mailto:` ones included,
+      unless a word is joined to them by a colon (`contact:a@shop.example`);
     - the value of a sensitive name in query strings, forms, and cookies (`token=…`),
       in quoted pairs as reprs and JSON write them (`'Cookie': '…'`, `("Cookie", "…")`,
       `"password": "…"`), and after a sensitive header name (`Authorization: …`) up to
@@ -119,10 +121,11 @@ class Redactor:
         if self._secrets is not None:
             text = self._secrets.sub(MASK, text)
         text = _USERINFO.sub(f"{MASK}@", text)
-        text = _BARE_USERINFO.sub(f"{MASK}@", text)
         text = self._quoted.sub(_mask_quoted, text)
         text = self._assignments.sub(rf"\g<1>{MASK}", text)
-        return self._headers.sub(rf"\g<1>{MASK}", text)
+        text = self._headers.sub(rf"\g<1>{MASK}", text)
+        # Last, so that a header name, or the colon after a quoted name, is not taken for a user.
+        return _BARE_USERINFO.sub(f"{MASK}@", text)
 
     def redact_value(self, value: object) -> object:
         """Return `value` with the strings in it masked, including inside containers.
