@@ -4,7 +4,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from ada_url import idna_to_ascii
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
@@ -385,21 +385,24 @@ def _cookie_lines(request: Request) -> list[str]:
 def _cookie_host(url: str) -> str | None:
     """The host of a URL as curl matches cookies to it: lower-cased, IPv6 without brackets, and in ASCII.
 
-    The host is the one curl connects to, after the last `@` of the authority, even
-    where WHATWG URLs would end the authority earlier, such as at a backslash. One
-    that is not ASCII is converted as WHATWG URLs convert hosts, without the
-    transitional IDNA mappings, as curl does too: `faß` is `xn--fa-hia`, not `fass`.
+    The host is the one curl connects to: after the last `@` of the authority, even
+    where WHATWG URLs would end the authority earlier, such as at a backslash, and
+    percent-decoded. One that is not ASCII is then converted as WHATWG URLs convert
+    hosts, without the transitional IDNA mappings, as curl does too: `faß` is
+    `xn--fa-hia`, not `fass`.
 
     Returns:
-        The host, or `None` for one that WHATWG URLs reject, which curl converts
-        differently on each platform.
+        The host, or `None` for none, or for one that WHATWG URLs reject, which curl
+        converts differently on each platform.
     """
     parts = urlsplit(url)
-    host = parts.hostname or ""
+    authority = parts.netloc.rpartition("@")[2]
+    if authority.startswith("["):
+        return parts.hostname  # an IPv6 address
+    host = unquote(authority.partition(":")[0])  # not lower-cased yet, which would turn a final Σ into ς
     if host.isascii():
-        return host
-    written = parts.netloc.rpartition("@")[2].partition(":")[0]  # as given: lower-casing turns a final Σ into ς
-    return idna_to_ascii(written).decode("ascii") or None
+        return host.lower() or None
+    return idna_to_ascii(host).decode("ascii") or None
 
 
 def _http_version(url: str) -> CurlHttpVersion | None:

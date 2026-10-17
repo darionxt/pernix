@@ -92,9 +92,13 @@ async def test_request_cookies_reach_any_host_in_the_order_given(
         ("https://faß.example/", "xn--fa-hia.example"),  # not fass.example
         ("https://Faß.Example:8443/", "xn--fa-hia.example"),
         ("http://other.example\\@faß.example/", "xn--fa-hia.example"),  # the host curl connects to
+        ("http://faß%2Eexample/", "xn--fa-hia.example"),  # percent-decoded first, as curl does
+        ("http://fa%C3%9F.example/", "xn--fa-hia.example"),
+        ("http://Local%48ost/", "localhost"),
         ("https://ΣΑΣ/", "xn--mxa9ab"),  # not the final sigma str.lower() gives, xn--mxa8ab
         ("https://a\u200db.example/", None),  # curl gives xn--ab-m1t on macOS, ab on Linux
         ("http://localhost./", "localhost."),  # curl keeps the trailing dot
+        ("http:///path", None),
     ],
 )
 def test_cookie_hosts_are_named_as_curl_matches_them(url: str, host: str | None) -> None:
@@ -171,6 +175,13 @@ async def test_request_cookies_stay_on_an_international_host(server: CookieServe
         ("xn--fa-hia.localhost", ["a=1"]),
         ("fass.localhost", []),  # another host
     ]
+
+
+async def test_request_cookies_reach_a_percent_encoded_host(server: CookieServer) -> None:
+    async with HTTPFetcher() as fetcher:  # through a proxy, as the network guard reads the host undecoded
+        await fetcher.fetch(Request("http://faß%2Elocalhost/", cookies={"a": "1"}, proxy=server.proxy))
+
+    assert [(hop.host, hop.cookies) for hop in server.received] == [("xn--fa-hia.localhost", ["a=1"])]
 
 
 async def test_request_cookies_stay_on_the_host_curl_connects_to(server: CookieServer) -> None:
