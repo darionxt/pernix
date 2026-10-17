@@ -63,8 +63,8 @@ class InlineFetch:
     attempt waits for its slot in the Throttle, waiting out a cooldown in place, and
     goes through the download chain. The retry policy judges every attempt, as for
     Requests from the Frontier, but a retry waits in place for its delay, emitting
-    `RequestRetried`. With a Session Pool, each attempt leases a Session, waiting
-    for one in place. A Request without a Session continues the Session of the fetch
+    `RequestRetried`. With a Session Pool, each attempt leases a Session first,
+    waiting for one in place, then waits for its slot. A Request without a Session continues the Session of the fetch
     it is nested in, or of the Request being handled, if it has one; a fetch nested
     in another of the same Session, in the same task, shares its Lease.
 
@@ -129,7 +129,7 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            async with self._holding(slot), sending_with(self._sessions, request, wait=None) as sending:
+            async with sending_with(self._sessions, request, wait=None) as sending, self._holding(slot):
                 outcome = await self._attempt(sending, slot, None)
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
@@ -163,8 +163,8 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            # Through the block too, whose fetches share the slot and the Session.
-            async with self._holding(slot), sending_with(self._sessions, request, wait=None) as sending:
+            # The Session first, so the slot paces the download however long it took; both through the block too.
+            async with sending_with(self._sessions, request, wait=None) as sending, self._holding(slot):
                 streams = Streams(max_bytes)
                 try:
                     outcome = await self._attempt(sending, slot, streams)

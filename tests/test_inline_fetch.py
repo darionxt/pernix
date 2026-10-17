@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -15,7 +16,7 @@ from pernix.fetchers import FetcherDispatch, StreamedResponse
 from pernix.inline_fetch import InlineFetch, handling
 from pernix.middlewares import build_download_chain
 from pernix.retry_policy import Decision, DefaultRetryPolicy
-from pernix.sessions import MemorySessionPool
+from pernix.sessions import MemorySessionPool, Outcome
 from pernix.sessions.session_leasing import SessionLeasing
 from pernix.settings import DomainSettings, RetrySettings, SessionSettings
 from pernix.stats import Stats
@@ -484,3 +485,25 @@ async def test_tasks_started_inside_a_fetch_wait_for_slots_of_their_own() -> Non
         await _read(streamed)
 
     assert most == 1  # the stream holds one slot of two; the tasks share the other
+
+
+async def test_the_domain_paces_fetches_once_the_session_they_waited_for_frees_up() -> None:
+    starts: list[float] = []
+    site = _site({"/a": [b""]})
+
+    async def timed(request: Request) -> Response:
+        starts.append(time.monotonic())
+        return await site.fetch(request)
+
+    pool = MemorySessionPool(size=1)
+    leasing = SessionLeasing(pool, SessionSettings(enabled=True), stats=Stats())
+    inline = _inline(timed, domain=DomainSettings(delay=0.1, delay_jitter=0.0), sessions=leasing)
+    busy = await pool.acquire()  # the only Session, held for a while
+    assert busy is not None
+
+    fetches = [asyncio.create_task(inline.fetch(Request(f"{SITE}/a?n={number}"))) for number in range(3)]
+    await asyncio.sleep(0.3)
+    await pool.release(busy, Outcome("ok"))
+    await asyncio.gather(*fetches)
+
+    assert min(later - earlier for earlier, later in itertools.pairwise(starts)) >= 0.09

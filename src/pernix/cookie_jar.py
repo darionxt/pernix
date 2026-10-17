@@ -91,7 +91,8 @@ class CookieJar:
 
     `receive()` applies the `Set-Cookie` headers of a response, and `matching()` gives
     the cookies a browser would send to a URL. Iterating gives the cookies in the
-    order they were first set.
+    order they were first set. `removals` tells when the cookies a response removed
+    were removed, so changes made elsewhere meanwhile can be merged.
     """
 
     def __init__(self, cookies: Iterable[Cookie] = ()) -> None:
@@ -101,6 +102,7 @@ class CookieJar:
             cookies: Cookies to keep, as `set()` keeps them.
         """
         self._cookies: dict[CookieKey, Cookie] = {}
+        self._removed: dict[CookieKey, float] = {}
         for cookie in cookies:
             self.set(cookie)
 
@@ -113,13 +115,20 @@ class CookieJar:
     def __repr__(self) -> str:
         return f"CookieJar({len(self)} cookies)"
 
+    @property
+    def removals(self) -> dict[CookieKey, float]:
+        """When each cookie a response removed was removed, in seconds since the epoch, unless it was set again."""
+        return dict(self._removed)
+
     def set(self, cookie: Cookie) -> None:
         """Keep a cookie as it is, replacing the one with its name, domain, host-only flag, and path.
 
         Args:
             cookie: The cookie.
         """
-        self._cookies[cookie_key(cookie)] = cookie
+        key = cookie_key(cookie)
+        self._cookies[key] = cookie
+        self._removed.pop(key, None)
 
     def receive(self, url: str, set_cookie_headers: Iterable[str], *, now: float | None = None) -> None:
         """Apply the `Set-Cookie` headers of a response to the jar, in order, as a browser would.
@@ -194,9 +203,11 @@ class CookieJar:
             return
         key = (domain, host_only, path, parsed.name)
         if parsed.expired(dt.datetime.fromtimestamp(now, dt.UTC)):
-            self._cookies.pop(key, None)
+            if self._cookies.pop(key, None) is not None:
+                self._removed[key] = now
             return
         replaced = self._cookies.get(key)
+        self._removed.pop(key, None)
         self._cookies[key] = Cookie(
             name=parsed.name,
             value=parsed.value,

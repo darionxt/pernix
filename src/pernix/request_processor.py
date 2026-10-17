@@ -69,14 +69,15 @@ type Settlement = Done | Again | Dead
 class RequestProcessor:
     """Makes one attempt at a claimed Request and tells how to settle its Lease.
 
-    The Request waits for its slot in the Throttle; a slot cooling down sends it back
-    to the Frontier without counting an attempt. With a Session Pool, it then leases
-    a Session, the one it names or any, waiting a moment for a busy one; when every
-    Session that fits is busy or cooling down, it goes back to the Frontier the same
-    way, until one stops cooling down, and a Request no Session can ever be leased
-    for fails. It is fetched through the download chain while holding the slot, and
-    its Session, and the Response is handled through the spider chain, which ends in
-    the Callback. The outputs are dispatched as they come:
+    With a Session Pool, the Request first leases a Session, the one it names or any,
+    waiting a moment for a busy one; when every Session that fits is busy or cooling
+    down, it goes back to the Frontier without counting an attempt, until one stops
+    cooling down, and a Request no Session can ever be leased for fails. It then
+    waits for its slot in the Throttle; a slot cooling down sends it back to the
+    Frontier the same way. It is fetched through the download chain while holding
+    its Session and the slot, and the Response is handled through the spider chain,
+    which ends in the Callback. Callbacks, errbacks, and Events get the Request as it
+    was sent, naming its Session. The outputs are dispatched as they come:
     Requests are scheduled, and Items, recognized with `pernix.items.is_item()`, are
     handed to `put_item`.
 
@@ -136,31 +137,32 @@ class RequestProcessor:
         Returns:
             How to settle the Lease.
         """
-        request = lease.request
-        if not await self._throttle.acquire(lease.slot):
-            # The domain is cooling down: wait in the Frontier, not in a worker.
-            return Again(self._throttle.cooldown_left(lease.slot), "domain cooling down", count_attempt=False)
+        sent = _Sent(lease.request)
         try:
-            response = await self._fetch(lease)
+            response = await self._fetch(lease, sent)
         except NoSessionYet as wait:
             return Again(wait.delay, "no Session available", count_attempt=False)
         except SessionError as exc:
-            logger.error("Cannot send %r: %s", request, exc)
-            return await self._fail(request, exc)
+            logger.error("Cannot send %r: %s", sent.request, exc)
+            return await self._fail(sent.request, exc)
         except IgnoreRequest as exc:
-            logger.debug("Ignored %r: %s", request, exc.reason)
-            await self._events.emit(RequestIgnored(request, exc.reason))
+            logger.debug("Ignored %r: %s", sent.request, exc.reason)
+            await self._events.emit(RequestIgnored(sent.request, exc.reason))
             return Done()
         except Exception as exc:
-            decision = self._decide(request, exc, lease.attempt)
+            decision = self._decide(sent.request, exc, lease.attempt)
             if decision.action is Action.ACCEPT:
-                logger.error("Fetching %r failed", request, exc_info=exc)
-                return await self._fail(request, exc)
-            return await self._retry_or_give_up(lease, decision, cause=exc)
+                logger.error("Fetching %r failed", sent.request, exc_info=exc)
+                return await self._fail(sent.request, exc)
+            return await self._retry_or_give_up(lease, sent.request, decision, cause=exc)
+        if response is None:
+            # The domain is cooling down: wait in the Frontier, not in a worker.
+            return Again(self._throttle.cooldown_left(lease.slot), "domain cooling down", count_attempt=False)
 
+        request = sent.request  # naming its Session, for the Callback and the errback
         decision = self._decide(request, response, lease.attempt)
         if decision.action is not Action.ACCEPT:
-            return await self._retry_or_give_up(lease, decision, response=response)
+            return await self._retry_or_give_up(lease, request, decision, response=response)
         await self._events.emit(ResponseReceived(response))
         error = await self._handle_response(request, response)
         if error is None:
@@ -168,23 +170,30 @@ class RequestProcessor:
         if isinstance(error, Retry):
             decision = self._decide(request, error, lease.attempt)
             if decision.action is not Action.ACCEPT:
-                return await self._retry_or_give_up(lease, decision, cause=error)
+                return await self._retry_or_give_up(lease, request, decision, cause=error)
         return await self._fail(request, error)
 
-    async def _fetch(self, lease: Lease) -> Response:
-        """Fetch through the download chain in the slot `acquire()` gave the Lease, under its Session, then free the slot."""
-        try:
-            with self._throttle.holding(lease.slot):  # Inline Fetches a Middleware makes share it
-                async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
+    async def _fetch(self, lease: Lease, sent: _Sent) -> Response | None:
+        """Fetch through the download chain under its Session, then in its slot; `None` if the slot is cooling down.
+
+        The Session is leased first, so the delay, the rate, and a cooldown are
+        checked just before the download, however long the Session took to free up.
+        """
+        async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
+            sent.request = sending.request
+            if not await self._throttle.acquire(lease.slot):
+                return None
+            try:
+                with self._throttle.holding(lease.slot):  # Inline Fetches a Middleware makes share it
                     response = expect_response(
                         await self._download(sending.request), f"the download chain for {lease.request!r}"
                     )
                     sending.response = response
-            statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
-            self._throttle.observe(lease.slot, response, statuses=statuses)
-            return response
-        finally:
-            self._throttle.release(lease.slot)
+                statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
+                self._throttle.observe(lease.slot, response, statuses=statuses)
+            finally:
+                self._throttle.release(lease.slot)
+        return response
 
     def _decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
         return consult(self._retry_policy, request, outcome, attempt)
@@ -192,12 +201,12 @@ class RequestProcessor:
     async def _retry_or_give_up(
         self,
         lease: Lease,
+        request: Request,
         decision: Decision,
         *,
         response: Response | None = None,
         cause: Exception | None = None,
     ) -> Settlement:
-        request = lease.request
         if decision.action is Action.RETRY:
             logger.info(
                 "Retrying %r in %.2f s after attempt %d: %s", request, decision.delay, lease.attempt, decision.reason
@@ -258,6 +267,13 @@ class RequestProcessor:
                 await self._put_item(output, ItemContext(request, response))
             case _:
                 logger.warning("Ignoring unsupported output %r produced for %r", output, request)
+
+
+@dataclass(slots=True)
+class _Sent:
+    """The Request one attempt sends: the claimed one, naming its Session once one is leased."""
+
+    request: Request
 
 
 def _describe(error: Exception) -> str:

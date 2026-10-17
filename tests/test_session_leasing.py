@@ -9,11 +9,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
-from pernix import Request, Session
+from pernix import Cookie, Request, Session
 from pernix.errors import ConnectError, ProxyError, SessionError
 from pernix.fetchers import FetcherDispatch
 from pernix.fetchers.fetcher_dispatch import sending_as
-from pernix.sessions import MemorySessionPool
+from pernix.sessions import MemorySessionPool, Outcome, StateDelta
 from pernix.sessions.session_leasing import NoSessionYet, SessionLeasing, sending_session, sending_with
 from pernix.settings import SessionSettings
 from pernix.stats import Stats
@@ -243,3 +243,37 @@ async def test_a_fetcher_without_a_session_parameter_refuses_requests_under_one(
     with sending_as(Session("a")), pytest.raises(SessionError, match="'plain' cannot send"):
         await dispatch(Request(f"{SITE}/"))
     assert (await dispatch(Request(f"{SITE}/"))).status == 200
+
+
+async def test_a_429_a_nested_fetch_got_cools_the_session_down() -> None:
+    leasing, pool, stats, _ = _leasing()
+
+    async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0) as outer:
+        async with leasing.sending(Request(f"{SITE}/token", session="a"), wait=0) as nested:
+            nested.response = make_response(f"{SITE}/token", status=429, headers=[("Retry-After", "60")])
+        outer.response = make_response(f"{SITE}/")  # the outer fetch handled it
+
+    assert pool.health("a") == "cooldown"
+    assert await pool.ready_in(session="a") == pytest.approx(60, abs=1)
+    assert (stats.get("sessions.outcomes.ok"), stats.get("sessions.outcomes.rate_limited")) == (1, 1)
+    assert stats.get("sessions.cooldowns") == 1
+
+
+async def test_a_removal_is_timed_as_the_jar_removed_the_cookie() -> None:
+    leasing, pool, _, clock = _leasing(max_concurrency=2)
+    pool.add(Session("s", cookies=[Cookie(name="sid", value="old", domain="site.example", created=NOW, modified=NOW)]))
+
+    async with leasing.sending(Request(f"{SITE}/", session="s"), wait=0) as first:
+        assert first.session is not None
+        clock.now = NOW + 1
+        first.session.cookies.receive(f"{SITE}/", ["sid=; Max-Age=0"], now=clock.now)
+        other = await pool.acquire(session="s")  # another fetch sets the cookie again, later
+        assert other is not None
+        renewed = Cookie(name="sid", value="new", domain="site.example", created=NOW, modified=NOW + 2)
+        assert await pool.save_state(other, StateDelta(cookies=[renewed]))
+        await pool.release(other, Outcome("ok"))
+        clock.now = NOW + 4  # the first fetch ends after that
+
+    lease = await pool.acquire(session="s")
+    assert lease is not None
+    assert [cookie.value for cookie in (await pool.load_state(lease)).cookies] == ["new"]

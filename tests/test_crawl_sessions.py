@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, ClassVar
+
+import pytest
 
 from pernix import Request, Response, Spider, middleware
 from pernix.testing import Reply, crawl
@@ -218,3 +221,34 @@ async def test_without_a_session_pool_requests_stay_independent(server: Loopback
         "enabled; enable one with sessions.enabled"
     ]
     assert not any(key.startswith("sessions.") for key in report.stats)
+
+
+@pytest.mark.parametrize("failing", ["callback", "download"])
+async def test_an_errback_continues_the_session_of_the_failed_request(server: LoopbackServer, failing: str) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as closed:
+        unreachable = f"http://127.0.0.1:{closed.getsockname()[1]}/"
+    server.route("/page", "page")
+    server.route("/echo", "echo")
+
+    class Failing(Spider):
+        settings: ClassVar[Mapping[str, Any]] = {**POOL, "sessions.size": 2, "sessions.eager": True, "retry.times": 0}
+
+        def __init__(self, url: str, echo: str) -> None:
+            self.url = url
+            self.echo = echo
+
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(self.url, errback=self.failed)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            raise ValueError("broken")
+            yield
+
+        async def failed(self, request: Request, error: Exception) -> AsyncIterator[Any]:
+            inline = await self.fetch(self.echo)
+            yield {"failed": request.session, "inline": inline.session}
+
+    url = server.url("/page") if failing == "callback" else unreachable
+    report = await crawl(Failing, url=url, echo=server.url("/echo"))
+
+    assert report.items == [{"failed": "default-1", "inline": "default-1"}]

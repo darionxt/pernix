@@ -10,8 +10,9 @@ import msgspec
 from pernix.cookie_jar import Cookie, cookie_key
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Mapping
 
+    from pernix.cookie_jar import CookieKey
     from pernix.session import SessionState
 
 __all__ = ["CookieRemoval", "Outcome", "OutcomeKind", "SessionLease", "SessionPool", "StateDelta"]
@@ -86,18 +87,28 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
     local_storage: dict[str, dict[str, str]] = msgspec.field(default_factory=dict[str, dict[str, str]])
 
     @classmethod
-    def between(cls, before: SessionState, after: SessionState, *, now: float) -> Self:
+    def between(
+        cls,
+        before: SessionState,
+        after: SessionState,
+        *,
+        now: float,
+        removed_at: Mapping[CookieKey, float] | None = None,
+    ) -> Self:
         """Return the changes that turned one state of a Session into another.
 
         Args:
             before: The state the fetch started with.
             after: The state it ended with.
             now: When the changes are recorded, in seconds since the epoch: the time
-                of the cookies removed.
+                of the cookies removed that `removed_at` does not time.
+            removed_at: When cookies were removed, by key, such as the `removals`
+                of the Session's cookie jar.
 
         Returns:
             The delta; empty when nothing changed.
         """
+        removed_at = removed_at or {}
         old = {cookie_key(cookie): cookie for cookie in before.cookies}
         new = {cookie_key(cookie): cookie for cookie in after.cookies}
         storage = {
@@ -107,9 +118,11 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
         return cls(
             cookies=[cookie for key, cookie in new.items() if old.get(key) != cookie],
             removed=[
-                CookieRemoval(name=name, domain=domain, host_only=host_only, path=path, removed=now)
-                for (domain, host_only, path, name) in old
-                if (domain, host_only, path, name) not in new
+                CookieRemoval(
+                    name=key[3], domain=key[0], host_only=key[1], path=key[2], removed=removed_at.get(key, now)
+                )
+                for key in old
+                if key not in new
             ],
             local_storage=storage,
         )

@@ -8,14 +8,14 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pernix.errors import IgnoreRequest, ProxyError, SessionError
 from pernix.fetchers.fetcher_dispatch import BROWSER_FETCHER, sending_as
 from pernix.retry_policy import retry_after_seconds
 from pernix.session import Session, SessionState
-from pernix.sessions.session_pool import Outcome, StateDelta
+from pernix.sessions.session_pool import Outcome, OutcomeKind, StateDelta
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -31,10 +31,22 @@ __all__ = ["NoSessionYet", "Sending", "SessionLeasing", "sending_session", "send
 
 logger = logging.getLogger(__name__)
 
-_held: ContextVar[tuple[tuple[SessionLeasing, Session, asyncio.Task[Any] | None], ...]] = ContextVar(
-    "pernix_held_sessions", default=()
-)
-"""The Sessions held by the fetches the current code runs inside of, innermost last, with the task holding each."""
+_SEVERITY: tuple[OutcomeKind, ...] = ("rate_limited", "blocked", "auth_expired", "proxy_failed", "error", "ok")
+"""The outcomes, the one a Lease is released with first, when the fetches sharing it fared differently."""
+
+
+@dataclass(slots=True)
+class _Held:
+    """A Session a fetch holds, and the outcomes of the fetches nested in it that share its Lease."""
+
+    leasing: SessionLeasing
+    session: Session
+    task: asyncio.Task[Any] | None
+    nested: list[Outcome] = field(default_factory=list[Outcome])
+
+
+_held: ContextVar[tuple[_Held, ...]] = ContextVar("pernix_held_sessions", default=())
+"""The Sessions held by the fetches the current code runs inside of, innermost last."""
 
 
 class NoSessionYet(Exception):
@@ -85,7 +97,8 @@ class SessionLeasing:
     `sessions.cooldown_max`; `proxy_failed` for a `ProxyError`; `error` for other
     exceptions; and `ok` otherwise. A fetch nested in another of the same Session,
     in the same task, such as one a download Middleware makes, shares the outer
-    fetch's Lease and Session.
+    fetch's Lease and Session; the Lease is released with the most severe outcome of
+    them all, so a 429 one of them got cools the Session down.
     """
 
     def __init__(
@@ -134,10 +147,18 @@ class SessionLeasing:
             with sending_as(None):
                 yield Sending(request)
             return
-        held = _held_session(self, request.session)
+        held = _held_by(self, request.session)
         if held is not None:
-            with sending_as(held):
-                yield Sending(request, held)
+            shared = Sending(request, held.session)
+            failure: BaseException | None = None
+            try:
+                with sending_as(held.session):
+                    yield shared
+            except BaseException as exc:
+                failure = exc
+                raise
+            finally:
+                held.nested.append(self._outcome(shared.response, failure or shared.error))
             return
         lease = await self.pool.acquire(session=request.session, timeout=wait)
         if lease is None:
@@ -151,7 +172,8 @@ class SessionLeasing:
         session = Session.from_state(lease.session, before)
         sending = Sending(request.replace(session=lease.session), session)
         renewing = asyncio.create_task(self._renew(lease))
-        token = _held.set((*_held.get(), (self, session, asyncio.current_task())))
+        holding = _Held(self, session, asyncio.current_task())
+        token = _held.set((*_held.get(), holding))
         error: BaseException | None = None
         try:
             with sending_as(session):
@@ -162,17 +184,24 @@ class SessionLeasing:
         finally:
             _held.reset(token)
             renewing.cancel()
-            await self._finish(lease, before, sending, session, error)
+            outcomes = [self._outcome(sending.response, error or sending.error), *holding.nested]
+            await self._finish(lease, before, sending, session, outcomes)
 
     async def _finish(
-        self, lease: SessionLease, before: SessionState, sending: Sending, session: Session, error: BaseException | None
+        self, lease: SessionLease, before: SessionState, sending: Sending, session: Session, outcomes: list[Outcome]
     ) -> None:
-        """Save the changes the fetch made to its Session, then release the Lease with its outcome."""
-        delta = StateDelta.between(before, session.state(), now=self._clock())
+        """Save the changes the fetches made to their Session, then release the Lease with the most telling outcome.
+
+        The cookies removed are timed as the jar removed them, so a cookie another
+        fetch set later is kept.
+        """
+        now = self._clock()
+        delta = StateDelta.between(before, session.state(), now=now, removed_at=session.cookies.removals)
         saved = delta.empty or await self.pool.save_state(lease, delta)
-        outcome = self._outcome(sending.response, error or sending.error)
+        outcome = _most_telling(outcomes)
         released = await self.pool.release(lease, outcome)
-        self._stats.inc(f"sessions.outcomes.{outcome.kind}")
+        for each in outcomes:
+            self._stats.inc(f"sessions.outcomes.{each.kind}")
         if outcome.kind == "rate_limited":
             self._stats.inc("sessions.cooldowns")
         if not (saved and released):
@@ -209,7 +238,7 @@ def sending_session() -> str | None:
         The id of the innermost one.
     """
     task = asyncio.current_task()
-    return next((session.id for _, session, holder in reversed(_held.get()) if holder is task), None)
+    return next((held.session.id for held in reversed(_held.get()) if held.task is task), None)
 
 
 def sending_with(
@@ -245,7 +274,7 @@ async def _without_session(request: Request) -> AsyncGenerator[Sending]:
     yield Sending(request)
 
 
-def _held_session(leasing: SessionLeasing, session: str | None) -> Session | None:
+def _held_by(leasing: SessionLeasing, session: str | None) -> _Held | None:
     """The Session a fetch the current task runs inside of holds under `session`, if any."""
     if session is None:
         return None
@@ -253,11 +282,18 @@ def _held_session(leasing: SessionLeasing, session: str | None) -> Session | Non
     return next(
         (
             held
-            for owner, held, holder in reversed(_held.get())
-            if owner is leasing and held.id == session and holder is task
+            for held in reversed(_held.get())
+            if held.leasing is leasing and held.session.id == session and held.task is task
         ),
         None,
     )
+
+
+def _most_telling(outcomes: list[Outcome]) -> Outcome:
+    """The outcome to release a Lease with: the most severe, with the latest cooldown among those rate limited."""
+    first = min(outcomes, key=lambda outcome: _SEVERITY.index(outcome.kind))
+    untils = [outcome.until for outcome in outcomes if outcome.kind == first.kind and outcome.until is not None]
+    return Outcome(first.kind, until=max(untils) if untils else None)
 
 
 def _rendered(request: Request) -> bool:
