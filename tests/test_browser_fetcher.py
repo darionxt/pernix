@@ -188,6 +188,17 @@ async def test_request_cookies_go_to_its_host_in_the_order_given(server: Loopbac
     ]
 
 
+async def test_prefixed_request_cookies_are_held_as_secure_ones(server: LoopbackServer) -> None:
+    server.route("/echo", handler=_cookie_echo)
+    cookies = {"__Host-sid": "1", "__secure-pref": "22", "plain": "333"}
+
+    async with BrowserFetcher() as fetcher:
+        response = await fetcher.fetch(_render(server.url("/echo"), cookies=cookies))
+
+    # the browser takes these prefixes only on Secure cookies, sent over loopback HTTP as over HTTPS
+    assert response.css("p::text").get() == "__Host-sid=1; __secure-pref=22; plain=333"
+
+
 async def test_rendered_requests_are_independent(server: LoopbackServer) -> None:
     server.route("/login", "<p>in</p>", headers=[("Content-Type", "text/html"), ("Set-Cookie", "auth=ok")])
     server.route("/echo", handler=_cookie_echo)

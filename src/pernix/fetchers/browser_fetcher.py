@@ -54,6 +54,9 @@ _ENCODING_HEADERS = frozenset({"content-encoding", "content-length"})
 
 _NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
+_SECURE_PREFIXES = ("__secure-", "__host-")
+"""Cookie name prefixes the browser takes only on Secure cookies, matched in any case."""
+
 _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 """Headers the browser would send on to every host a redirect leads to."""
 
@@ -94,8 +97,9 @@ class BrowserFetcher:
 
     Each Request gets a fresh browser context, closed after the fetch, so rendered
     Requests are independent as on the HTTP side (ADR 0011): a context holds only the
-    Request's cookies, as host-only cookies of its host, and the cookies set while
-    the page loads. The page is loaded until its `load` event, within
+    Request's cookies, as host-only cookies of its host, Secure only for the names
+    that need it (`__Secure-` and `__Host-`), and the cookies set while the page
+    loads. The page is loaded until its `load` event, within
     `browser.timeout` (or `request.timeout`); `browser.deadline` limits the whole
     fetch. A Request other than a plain GET, or with headers, changes the first
     request of the page accordingly. The browser keeps those headers on the
@@ -427,10 +431,21 @@ def _merged(browser_headers: Iterable[NameValue], own: list[tuple[str, str]]) ->
 
 
 def _host_cookies(url: str, cookies: dict[str, str]) -> list[SetCookieParam]:
-    """Cookies held for the host of a URL only, for every path, sent in the order given."""
-    host = urlsplit(url).hostname or ""
-    origin = f"http://[{host}]/" if ":" in host else f"http://{host}/"  # over HTTPS as well, as they are not Secure
-    return [{"name": name, "value": value, "url": origin} for name, value in cookies.items()]
+    """Cookies held for the host of a URL only, for every path, sent in the order given.
+
+    They are not Secure, so they go over HTTP as well as HTTPS, except those whose
+    names have a prefix the browser takes only on Secure cookies.
+    """
+    hostname = urlsplit(url).hostname or ""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    return [
+        {
+            "name": name,
+            "value": value,
+            "url": f"https://{host}/" if name.lower().startswith(_SECURE_PREFIXES) else f"http://{host}/",
+        }
+        for name, value in cookies.items()
+    ]
 
 
 async def _headers(response: PageResponse) -> Headers:
