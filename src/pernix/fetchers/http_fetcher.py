@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 from urllib.parse import urlsplit
 
+from ada_url import URL
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
 
@@ -369,23 +370,35 @@ def _cookie_lines(request: Request) -> list[str]:
     without a dot, which curl then never sends them to. Among names of one length,
     curl sends the newest cookie first, so the lines go in reverse. Names with a
     prefix browsers take only on Secure cookies are Secure, as curl requires too.
+    A host that cannot be named as curl names it holds none, as there is no telling
+    which host they would go to.
     """
     host = _cookie_host(request.url)
+    if host is None:
+        return []
     return [
         "\t".join((host, "FALSE", "/", "TRUE" if requires_secure(name) else "FALSE", "0", name, value))
         for name, value in reversed(list(request.cookies.items()))
     ]
 
 
-def _cookie_host(url: str) -> str:
-    """The host of a URL as curl matches cookies to it: lower-cased, IPv6 without brackets, and in ASCII."""
+def _cookie_host(url: str) -> str | None:
+    """The host of a URL as curl matches cookies to it: lower-cased, IPv6 without brackets, and in ASCII.
+
+    A host that is not ASCII is converted as a WHATWG URL converts it, without the
+    transitional IDNA mappings, as curl does too: `faß` is `xn--fa-hia`, not `fass`.
+
+    Returns:
+        The host, or `None` for one that WHATWG URLs reject, which curl converts
+        differently on each platform.
+    """
     host = urlsplit(url).hostname or ""
     if host.isascii():
         return host
     try:
-        return host.encode("idna").decode("ascii")
-    except UnicodeError:  # such as an empty label; curl then fails the transfer anyway
-        return host
+        return URL(url).hostname  # from the URL as given: lower-casing first would turn a final Σ into ς
+    except ValueError:
+        return None
 
 
 def _http_version(url: str) -> CurlHttpVersion | None:

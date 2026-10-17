@@ -89,10 +89,13 @@ async def test_request_cookies_reach_any_host_in_the_order_given(
         ("http://Example.COM/a", "example.com"),
         ("http://[::1]:8080/", "::1"),
         ("https://bücher.example/", "xn--bcher-kva.example"),
+        ("https://faß.example/", "xn--fa-hia.example"),  # not fass.example
+        ("https://ΣΑΣ/", "xn--mxa9ab"),  # not the final sigma str.lower() gives, xn--mxa8ab
+        ("https://a\u200db.example/", None),  # curl gives xn--ab-m1t on macOS, ab on Linux
         ("http://localhost./", "localhost."),  # curl keeps the trailing dot
     ],
 )
-def test_cookie_hosts_are_named_as_curl_matches_them(url: str, host: str) -> None:
+def test_cookie_hosts_are_named_as_curl_matches_them(url: str, host: str | None) -> None:
     assert _cookie_host(url) == host
 
 
@@ -153,6 +156,18 @@ async def test_request_cookies_never_follow_a_redirect_to_another_host(
     assert [(hop.protocol, hop.host.split(":")[0], _sent(hop.cookies)) for hop in server.received] == [
         (protocol, "127.0.0.1", ["a=1", "b=2"]),
         (protocol, "localhost", []),
+    ]
+
+
+async def test_request_cookies_stay_on_an_international_host(server: CookieServer) -> None:
+    server.routes["/start"] = [("Location", server.url("/end", host="fass.localhost"))]
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(_request(server, "faß.localhost", "/start", "http", {"a": "1"}))
+
+    assert [(hop.host.split(":")[0], hop.cookies) for hop in server.received] == [
+        ("xn--fa-hia.localhost", ["a=1"]),
+        ("fass.localhost", []),  # another host
     ]
 
 
