@@ -185,9 +185,9 @@ class CookieJar:
             return
         domain, host_only = scope
         path = parsed.path or _default_path(origin.path)
-        if not _allowed(parsed, origin, host_only=host_only, path=path):
+        if not _allowed(parsed, origin, host_only=host_only):
             return
-        if not origin.secure and not parsed.secure and self._shadows_secure(parsed.name, domain, path):
+        if not origin.secure and not parsed.secure and self._shadows_secure(parsed.name, domain, path, now):
             return
         key = (domain, host_only, path, parsed.name)
         if parsed.expired(dt.datetime.fromtimestamp(now, dt.UTC)):
@@ -208,11 +208,12 @@ class CookieJar:
             modified=now,
         )
 
-    def _shadows_secure(self, name: str, domain: str, path: str) -> bool:
-        """Whether an insecure cookie would overwrite a Secure one of that name: RFC 6265bis §5.7, step 16."""
+    def _shadows_secure(self, name: str, domain: str, path: str, now: float) -> bool:
+        """Whether an insecure cookie would overwrite a live Secure one of that name: RFC 6265bis §5.7, step 16."""
         return any(
             cookie.name == name
             and cookie.secure
+            and not _expired(cookie, now)
             and (_domain_matches(cookie.domain, domain) or _domain_matches(domain, cookie.domain))
             and _path_matches(path, cookie.path)
             for cookie in self._cookies.values()
@@ -285,15 +286,18 @@ def _scope(attribute: str | None, host: str) -> tuple[str, bool] | None:
     return (domain, False) if _domain_matches(host, domain) else None
 
 
-def _allowed(parsed: SetCookie, origin: _Origin, *, host_only: bool, path: str) -> bool:
-    """Whether a cookie meets the rules of Secure, `SameSite=None`, and the name prefixes."""
+def _allowed(parsed: SetCookie, origin: _Origin, *, host_only: bool) -> bool:
+    """Whether a cookie meets the rules of Secure, `SameSite=None`, and the name prefixes.
+
+    A `__Host-` cookie needs an explicit `Path=/`: the default path does not do.
+    """
     if parsed.secure and not origin.secure:
         return False
     if parsed.same_site == "none" and not parsed.secure:
         return False
     if requires_secure(parsed.name) and not parsed.secure:
         return False
-    return not parsed.name.lower().startswith("__host-") or (host_only and path == "/")
+    return not parsed.name.lower().startswith("__host-") or (host_only and parsed.path == "/")
 
 
 def _expiry(parsed: SetCookie, now: float) -> float | None:

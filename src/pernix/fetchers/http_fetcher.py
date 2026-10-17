@@ -116,7 +116,8 @@ class HTTPFetcher:
 
     A Request sent under a Session (`session=`) also sends the Session's cookies that
     match each hop, and the cookies set during the fetch, on redirects included, are
-    kept in the Session; the Request's own cookies are not. The Session's proxy and
+    kept in the Session as the headers of each hop arrive, even if a later hop fails;
+    the Request's own cookies are not. The Session's proxy and
     Profile apply unless the Request names its own, and each Session has curl
     sessions of its own, so two Sessions never share a connection.
 
@@ -295,8 +296,6 @@ class HTTPFetcher:
         if result.status_code == 407 and proxy is not None:
             await _discard(result)
             raise ProxyError(f"the proxy refused {request.url}: 407 Proxy Authentication Required")
-        if session is not None:
-            _keep_cookies(session, result)
         return result, transfer
 
     async def _request(
@@ -319,6 +318,7 @@ class HTTPFetcher:
                 headers=request.headers.items(),
                 data=request.body,
                 cookie_lines=_cookie_lines(request, session),
+                on_headers=None if session is None else session.cookies.receive,
                 discard_cookies=True,
                 proxy=proxy,
                 impersonate=cast("Any", profile),
@@ -421,13 +421,6 @@ def _cookie_lines(request: Request, session: Session | None) -> list[str]:
         for name, value in own.items()
     ]
     return lines[::-1]
-
-
-def _keep_cookies(session: Session, result: curl_cffi.Response) -> None:
-    """Apply the `Set-Cookie` headers of every hop to the Session, in order, once the headers arrived, as browsers do."""
-    now = time.time()
-    for hop in [*result.history, result]:
-        session.cookies.receive(hop.url, _set_cookies(hop), now=now)
 
 
 def _set_cookies(response: curl_cffi.Response) -> list[str]:

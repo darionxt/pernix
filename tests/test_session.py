@@ -68,6 +68,21 @@ def test_cookies_storage_and_proxy_credentials_never_appear_in_a_repr(described:
     )
 
 
+@pytest.mark.parametrize(
+    ("proxy", "shown"),
+    [
+        ("alice:pa55@proxy.example:8080", "***@proxy.example:8080"),
+        ("socks5://alice:pa55@proxy.example:1080", "socks5://***@proxy.example:1080"),
+        ("http://proxy.example:8080", "http://proxy.example:8080"),
+    ],
+)
+def test_proxy_credentials_are_masked_with_or_without_a_scheme(proxy: str, shown: str) -> None:
+    session = Session("s", proxy=proxy)
+
+    assert f"proxy={shown!r}" in repr(session)
+    assert f"proxy={shown!r}" in repr(session.state())
+
+
 def test_logging_a_session_shows_none_of_its_secrets(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO):
         logging.getLogger("pernix.test").info("sent as %r", _session())

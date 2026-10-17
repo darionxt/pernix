@@ -8,14 +8,12 @@ from typing import TYPE_CHECKING, Self
 import msgspec
 
 from pernix.cookie_jar import Cookie, CookieJar
-from pernix.logs.redaction import Redactor
+from pernix.logs.redaction import MASK
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
 __all__ = ["Session", "SessionState"]
-
-_REDACTOR = Redactor()
 
 
 class SessionState(msgspec.Struct, kw_only=True):
@@ -133,9 +131,18 @@ def _described(
     """What a `repr` shows of a Session: counts, and the proxy without its credentials."""
     parts = [f"cookies={cookies}", f"local_storage={len(local_storage)} origins"]
     if proxy is not None:
-        parts.append(f"proxy={_REDACTOR.redact(proxy)!r}")
+        parts.append(f"proxy={_without_credentials(proxy)!r}")
     if profile is not None:
         parts.append(f"profile={profile!r}")
     if account is not None:
         parts.append(f"account={account!r}")
     return ", ".join(parts)
+
+
+def _without_credentials(proxy: str) -> str:
+    """A proxy address with whatever precedes its host masked, with or without a scheme."""
+    authority, at, host = proxy.rpartition("@")
+    if not at:
+        return proxy
+    scheme, separator, _ = authority.rpartition("://")
+    return f"{scheme}{separator}{MASK}@{host}"

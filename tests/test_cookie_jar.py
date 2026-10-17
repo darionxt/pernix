@@ -151,6 +151,13 @@ def test_a_secure_cookie_from_plain_http_is_refused() -> None:
     assert len(_received("http://example.com/", "a=1; Secure")) == 0
 
 
+def test_plain_http_can_replace_a_secure_cookie_once_it_expired() -> None:
+    jar = _received("https://example.com/", "a=old; Secure; Max-Age=1")
+    jar.receive("http://example.com/", ["a=new"], now=NOW + 2)
+
+    assert [(cookie.value, cookie.secure) for cookie in jar] == [("new", False)]
+
+
 def test_plain_http_cannot_replace_a_secure_cookie() -> None:
     jar = _received("https://example.com/", "a=secure; Secure")
     jar.receive("http://example.com/", ["a=insecure", "a=sub; Domain=example.com", "b=2"], now=NOW)
@@ -165,7 +172,8 @@ def test_plain_http_cannot_replace_a_secure_cookie() -> None:
         ("__Secure-a=1", False),
         ("__secure-a=1", False),  # prefixes match in any case
         ("__Host-a=1; Secure; Path=/", True),
-        ("__Host-a=1; Secure", True),  # the default path of / is /
+        ("__Host-a=1; Secure", False),  # the default path does not do, though it is /
+        ("__Host-a=1; Secure; Path=/docs; Path=/", True),
         ("__Host-a=1; Path=/", False),
         ("__Host-a=1; Secure; Path=/docs", False),
         ("__Host-a=1; Secure; Path=/; Domain=example.com", False),

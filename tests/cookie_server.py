@@ -60,12 +60,17 @@ class CookieServer:
     Attributes:
         address: The loopback address to listen on.
         routes: Response headers by path; a `Location` header makes the response a 302.
+        early_hints: The headers of a 103 Early Hints response sent first, by path,
+            over HTTP/1.1.
+        connect_headers: The headers of the answer to `CONNECT`.
         received: The requests received, in order.
     """
 
     ca: trustme.CA
     address: str = "127.0.0.1"
     routes: dict[str, list[tuple[str, str]]] = field(default_factory=dict[str, list[tuple[str, str]]])
+    early_hints: dict[str, list[tuple[str, str]]] = field(default_factory=dict[str, list[tuple[str, str]]])
+    connect_headers: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
     received: list[Received] = field(default_factory=list[Received])
 
     def __post_init__(self) -> None:
@@ -144,7 +149,8 @@ class CookieServer:
         request_line, *lines = head.split(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")
         method, target, _ = request_line.split(" ")
         if tunnel and method == "CONNECT":
-            connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            fields = "".join(f"{name}: {value}\r\n" for name, value in self.connect_headers)
+            connection.sendall(f"HTTP/1.1 200 Connection established\r\n{fields}\r\n".encode())
             self._answer_tls(connection, peer)
             return
         headers = [(name.strip(), value.strip()) for name, _, value in (line.partition(":") for line in lines)]
@@ -156,6 +162,9 @@ class CookieServer:
             )
         )
         path = urlsplit(target).path
+        if hints := self.early_hints.get(path):
+            fields = "".join(f"{name}: {value}\r\n" for name, value in hints)
+            connection.sendall(f"HTTP/1.1 103 Early Hints\r\n{fields}\r\n".encode())
         reply = self.routes.get(path, [])
         status = "302 Found" if any(name.lower() == "location" for name, _ in reply) else "200 OK"
         fields = "".join(f"{name}: {value}\r\n" for name, value in reply)

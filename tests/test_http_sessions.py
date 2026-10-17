@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import socket
+import time
 from typing import TYPE_CHECKING
 
 import curl_cffi.aio
@@ -10,7 +12,7 @@ import trustme
 
 from cookie_server import CookieServer
 from pernix import Cookie, Request, Session
-from pernix.errors import Timeout
+from pernix.errors import ConnectError, Timeout
 from pernix.fetchers import HTTPFetcher, HTTPSettings
 from pernix.testing import Reply
 from scripted_server import ScriptedServer
@@ -239,3 +241,58 @@ async def test_session_cookies_a_cookie_line_cannot_carry_are_left_out(cookie_se
         await fetcher.fetch(Request(cookie_server.url("/")), session=session)
 
     assert cookie_server.received[0].cookies == ["ok=1"]
+
+
+async def test_cookies_set_before_a_failing_hop_are_kept(server: LoopbackServer) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as closed:
+        port = closed.getsockname()[1]
+    server.route("/login", status=302, headers=[("Location", f"http://127.0.0.1:{port}/"), ("Set-Cookie", "sid=abc")])
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        with pytest.raises(ConnectError):
+            await fetcher.fetch(Request(server.url("/login")), session=session)
+
+    assert [cookie.name for cookie in session.cookies] == ["sid"]
+
+
+async def test_a_redirect_cookie_expires_from_when_its_hop_arrived(server: LoopbackServer) -> None:
+    def slow(request: ReceivedRequest) -> Reply:
+        time.sleep(1.5)
+        return Reply(body="done")
+
+    server.route("/start", status=302, headers=[("Location", "/slow"), ("Set-Cookie", "brief=1; Max-Age=1")])
+    server.route("/slow", handler=slow)
+    session = Session()
+    started = time.time()
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(server.url("/start")), session=session)
+
+    [brief] = session.cookies
+    assert brief.expires is not None
+    assert brief.expires < started + 1.4  # not 1 s after the last hop
+    assert session.cookies.matching(server.url("/")) == []
+
+
+async def test_a_proxys_answer_to_connect_sets_no_cookies(cookie_server: CookieServer) -> None:
+    cookie_server.connect_headers = [("Set-Cookie", "proxy=1")]
+    cookie_server.routes["/"] = [("Set-Cookie", "origin=1")]
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request("https://intranet/", proxy=cookie_server.proxy), session=session)
+
+    assert [(cookie.name, cookie.domain) for cookie in session.cookies] == [("origin", "intranet")]
+
+
+async def test_informational_responses_set_no_cookies(cookie_server: CookieServer) -> None:
+    cookie_server.early_hints["/"] = [("Link", "</style.css>; rel=preload"), ("Set-Cookie", "early=1")]
+    cookie_server.routes["/"] = [("Set-Cookie", "final=1")]
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        response = await fetcher.fetch(Request(cookie_server.url("/")), session=session)
+
+    assert response.status == 200
+    assert [cookie.name for cookie in session.cookies] == ["final"]
