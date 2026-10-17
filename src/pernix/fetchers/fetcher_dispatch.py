@@ -6,19 +6,20 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
-from pernix.errors import ComponentError, SettingsError
+from pernix.errors import ComponentError, SessionError, SettingsError
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.response import expect_response
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Mapping
+    from collections.abc import Callable, Generator, Mapping
     from contextlib import AbstractAsyncContextManager
 
     from pernix.fetchers.fetcher import Fetcher, StreamingFetcher
     from pernix.request import Request
     from pernix.response import Response
+    from pernix.session import Session
 
-__all__ = ["BROWSER_FETCHER", "FetcherDispatch", "Streams", "streaming_into"]
+__all__ = ["BROWSER_FETCHER", "FetcherDispatch", "Streams", "sending_as", "streaming_into"]
 
 BROWSER_FETCHER = "browser"
 """The name of the Fetcher that renders Requests with `render` set."""
@@ -96,6 +97,27 @@ def streaming_into(streams: Streams | None) -> Generator[None]:
         _streams.reset(token)
 
 
+_session: ContextVar[Session | None] = ContextVar("pernix_session", default=None)
+"""The Session the download chain the current task runs sends its Request under, if any."""
+
+
+@contextmanager
+def sending_as(session: Session | None) -> Generator[None]:
+    """Make the download chain called inside the block send its Request under a Session, or under none.
+
+    Args:
+        session: The Session, which the Fetcher gets as `session=`; `None` for none.
+
+    Yields:
+        Nothing; the block runs with the Session in effect.
+    """
+    token = _session.set(session)
+    try:
+        yield
+    finally:
+        _session.reset(token)
+
+
 class FetcherDispatch:
     """The innermost step of the download chain: fetches each Request with its Fetcher.
 
@@ -105,7 +127,9 @@ class FetcherDispatch:
 
     Inside `streaming_into()`, a Fetcher with `stream()` opens its transfer in the
     given `Streams`, and the Response it gives, still without its body, is marked
-    `streamed`. Other Fetchers fetch the whole Response.
+    `streamed`. Other Fetchers fetch the whole Response. Inside `sending_as()`, the
+    Fetcher gets the Session as `session=`; one without that parameter refuses the
+    Request.
     """
 
     def __init__(self, fetchers: Mapping[str, object]) -> None:
@@ -148,18 +172,26 @@ class FetcherDispatch:
             LookupError: No registered Fetcher fits the Request.
             TypeError: The Fetcher returned something other than a Response, or
                 streamed something other than a StreamedResponse.
+            pernix.errors.SessionError: The Request is sent under a Session, which
+                the Fetcher cannot take.
         """
         name = self._select(request)
         fetcher = self._fetchers[name]
+        session = _session.get()
+        options = {} if session is None else {"session": session}
         streams = _streams.get()
-        if streams is not None and callable(getattr(fetcher, "stream", None)):
-            transfer = cast("StreamingFetcher", fetcher).stream(request, max_bytes=streams.max_bytes)
+        streaming = streams is not None and callable(getattr(fetcher, "stream", None))
+        method: Callable[..., object] = getattr(fetcher, "stream" if streaming else "fetch")
+        if session is not None and not _takes_session(method):
+            raise SessionError(f"the Fetcher {name!r} cannot send {request!r} under a Session")
+        if streams is not None and streaming:
+            transfer = cast("StreamingFetcher", fetcher).stream(request, max_bytes=streams.max_bytes, **options)
             streamed = await streams.open(transfer, f"the Fetcher {name!r}")
             response = expect_response(streamed.response, f"the Fetcher {name!r}")
             if not response.streamed:
                 response = response.replace(streamed=True)
         else:
-            response = expect_response(await fetcher.fetch(request), f"the Fetcher {name!r}")
+            response = expect_response(await fetcher.fetch(request, **options), f"the Fetcher {name!r}")
         return response if response.fetcher == name else response.replace(fetcher=name)
 
     def _select(self, request: Request) -> str:
@@ -179,3 +211,9 @@ class FetcherDispatch:
                 f"no registered Fetcher fetches {scheme!r} URLs such as {request!r}; register one with the "
                 "fetchers setting, or name one with Request(fetcher=...)"
             ) from None
+
+
+def _takes_session(method: Callable[..., object]) -> bool:
+    """Whether a Fetcher's method takes the `session` keyword."""
+    parameters = inspect.signature(method).parameters.values()
+    return any(parameter.name == "session" or parameter.kind is parameter.VAR_KEYWORD for parameter in parameters)

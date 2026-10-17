@@ -194,7 +194,7 @@ async def parse_report(self, response):
 - Semantics:
   - Goes through the same download Middleware chain and the same rate limiting: each attempt waits for its domain's slot, and waits out a Cooldown in place. It runs in the task of the Request being handled and takes no worker of its own, so Inline Fetches run concurrently, such as with `asyncio.gather`, are limited by `domain.concurrency` alone.
   - A fetch nested in another for the same domain, in the same task, such as one a download Middleware makes to get a token, shares the outer fetch's place in the slot instead of waiting for another, which the outer fetch could hold forever. It still waits for the domain's delay and rate, and waits out a Cooldown. Tasks the outer fetch starts need places of their own.
-  - Uses the current Request's Session if it has one, unless it names its own; otherwise it is independent like any Request and sends only the cookies passed to it.
+  - Uses the Session of the fetch it is nested in, such as one a download Middleware makes, or of the current Request, if it has one, unless it names its own; otherwise it leases one like any Request when a Session Pool is enabled, and without one it is independent and sends only the cookies passed to it.
   - **Does not enter the Frontier, is not deduplicated, and is not persisted.**
   - The retry policy judges each attempt as usual, but a retry waits in place for its delay, emitting `RequestRetried`. The Response is returned whatever its status, unless the policy retries it. Once the retries run out, `RetriesExhausted` is raised, holding the last Response or caused by the last exception, as errbacks receive it; an exception the policy does not retry, such as a `TLSError`, or `IgnoreRequest` from a Middleware, is raised as it is. Uncaught, it fails the Callback (§4.5).
   - It is counted in `downloads.*`, but not emitted as `ResponseReceived`, which is for Responses handed to Callbacks, nor as `RequestFailed`: the error goes to the caller. Its log records carry the `request_id` of the Request being handled.
@@ -575,9 +575,14 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
   - Cookies go longer paths first, then the earliest created first. `SameSite` is kept for the browser but not applied to HTTP fetches, each of which is a navigation of its own; the number of cookies per domain is not limited.
   - Each cookie's modification time lets Session state be merged per cookie, by the Session Pool.
 - **Session Pool**: no Session is used by default; Requests are independent (ADR 0011). A Session Pool is opt-in, enabled at the Spider level; once enabled, a Request leases a Session from it by default. This includes Requests created in a Callback: they do not inherit the Session of the page they were found on. `Request(session="xxx")` pins a specific Session; to continue with the current page's Session, pass `session=response.session`. Inline Fetch is the exception: it continues the current Request's Session by default (see §4.6).
+  - **Enabling**: `sessions.enabled = true`, usually in `Spider.settings`. The in-process pool (`MemorySessionPool`) belongs to one Run and is named `sessions.pool`. It creates Sessions as Requests need them, when none is free, up to `sessions.size` (8), or all at the start with `sessions.eager`; a Request naming a Session it does not hold yet has it created under that id while there is room, and fails with `SessionError` once the pool is full. Each Session takes `sessions.max_concurrency` (1) fetches at once, and the least recently leased of the free ones is leased first. A Request naming a Session while no pool is enabled fails with `SessionError`.
+  - **Leasing a fetch**: a fetch takes its place in its domain slot (§6.3), then leases its Session, then waits for the slot's delay and rate, so it never holds a Session while it waits for a place, which a fetch nested in the one holding the place may need, and holds a place while it waits for a busy Session only for a second at a time, as a fetch nested in the one holding the Session may need the place; the delay, the rate, and a cooldown are checked just before the download, however long the Session took to free up. It holds both until the Response arrives; a streamed Inline Fetch holds them until it is closed. The Request goes down the download chain naming the Session it is sent under, so `response.request.session` and `response.session` name it, and the Fetcher gets the Session as `session=`. The Session is built from the state the pool holds; afterwards, the changes the fetch made are saved as a `StateDelta`, merged per cookie by modification time, removals included, timed as the jar last removed them, whether it held them or not, and the Lease is released with the fetch's outcome. A fetch nested in another of the same Session, in the same task, such as one a download Middleware makes, shares its Lease, and an Inline Fetch made there continues that Session; the Lease is released with the most severe outcome of them all, so a 429 a nested fetch got cools the Session down. Callbacks, errbacks, and Events get the Request as it was sent, naming its Session, so an Inline Fetch in an errback continues it too. Rendered Requests do not lease Sessions until the browser takes them; one naming a Session fails.
+  - **Waiting for a Session**: a Request from the Frontier waits a second for a busy Session, then goes back to the Frontier without counting an attempt; it does too while every Session that fits cools down, until the first stops. Inline Fetches wait in place, giving up their place in the slot after each second until the Session frees up. A Request no Session can ever be leased for, as when the one it names is Retired, fails.
 - **Health management**:
   - There are three states: available, in Cooldown, and Retired.
-  - When Rate Limited (429), a Session only enters Cooldown and is not Retired.
+  - When Rate Limited (429), a Session only enters Cooldown and is not Retired: until its `Retry-After`, or for `sessions.cooldown` (30 s) without one, at most `sessions.cooldown_max` (300 s). Its domain keeps fetching with the other Sessions (§6.3).
+  - Leases carry a token and expire after `sessions.lease_ttl` (300 s) unless renewed, which happens every third of it while their fetch runs; a release or a save from an expired or released Lease is rejected, counted as `sessions.stale`.
+  - Stats: `sessions.created`, `sessions.leased`, `sessions.outcomes.<outcome>`, `sessions.cooldowns`, and `sessions.stale`.
   - When judged Blocked, the Session is Retired and the Request is retried with another Session; Session switches have their own budget and do not consume ordinary retries.
 - **Login**: an `async def login(self, session)` method. A given Session logs in only once at a time (single-flight), and can log in again automatically when the Session becomes invalid.
 - **Proxy sources**: a static list, a file, a refreshable API, or a custom `ProxyProvider`. A proxy's key includes its username and password, so different sticky sessions on the same gateway are not merged into one.
@@ -587,9 +592,12 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 ```python
 class SessionPool(Protocol):
-    async def acquire(self, *, tags: Collection[str] = (), timeout: float | None = None) -> SessionLease: ...
+    name: str
+    async def acquire(self, *, session: str | None = None, tags: Collection[str] = (),
+                      timeout: float | None = None) -> SessionLease | None: ...
+    async def ready_in(self, *, session: str | None = None, tags: Collection[str] = ()) -> float: ...
     async def renew(self, lease: SessionLease) -> bool: ...
-    async def release(self, lease: SessionLease, outcome: Outcome) -> None: ...
+    async def release(self, lease: SessionLease, outcome: Outcome) -> bool: ...
     async def load_state(self, lease: SessionLease) -> SessionState: ...
     async def save_state(self, lease: SessionLease, delta: StateDelta) -> bool: ...
 
@@ -626,7 +634,7 @@ class SessionPool(Protocol):
 **Pacing**
 
 - Concurrency and delay (with jitter) are set per domain, `Retry-After` is honored, and a `429`/`503` with `Retry-After` makes the whole domain back off together (§6.3).
-- Concurrency slots are computed along two dimensions: "domain × Session" (from M1; the domain alone before Sessions exist).
+- Concurrency slots are computed along two dimensions, domain and Session: a fetch takes its domain's slot, whose concurrency, delay, rate, and cooldown apply to all Sessions together, and a Lease on its Session, within the Session's `max_concurrency`; a 429 cools only its Session down (§5.3).
 
 **Handling Blocked responses**
 
@@ -697,7 +705,7 @@ Engine integration:
   - Requests that are backing off go back to the Frontier to wait and do not occupy concurrency slots.
 - **Delay**: `domain.delay` seconds between the starts of two fetches from one domain, randomized within ± `domain.delay_jitter` (50 % by default).
 - **Rate limiting**: the GCRA algorithm on a monotonic clock, `domain.rate` fetches per second with bursts of `domain.burst`, off by default. In distributed mode a shared rate-limiting backend is used instead, and permit times follow the backend clock.
-- **Cooldown**: a `429` or `503` with `Retry-After` pauses its whole domain for that long, up to `domain.cooldown_max` (300 s), while other domains continue; the Request itself is retried under the retry policy (§6.4). A Request claimed for a domain that starts cooling down before its fetch goes back to the Frontier until the cooldown ends, without counting an attempt.
+- **Cooldown**: a `429` or `503` with `Retry-After` pauses its whole domain for that long, up to `domain.cooldown_max` (300 s), while other domains continue; with a Session Pool, a `429` cools its Session down instead, and only a `503` pauses the domain (§5.3); the Request itself is retried under the retry policy (§6.4). A Request claimed for a domain that starts cooling down before its fetch goes back to the Frontier until the cooldown ends, without counting an attempt.
 - **Offsite**: `Spider.allowed_domains` (subdomains included) admits only Requests to those hosts. The built-in `OffsiteFilter` Extension, enabled by default, vetoes the others at admission, emitting `RequestDropped` with the reason `offsite`; `dont_filter` does not bypass it.
 - **robots.txt** (not obeyed by default, confirmed; enable with `robots.obey = true`). Behavior when enabled:
   - Cached per origin for 24 hours; concurrent Requests to the same origin fetch robots.txt only once.

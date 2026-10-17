@@ -79,6 +79,22 @@ class Shop(Spider):
 
 `render=True` sends a Request to the browser Fetcher, which loads the page in Chrome until its `load` event; the Response's body is the page as its scripts left it. Rendered and HTTP Requests mix freely in one Spider. The browser starts with the first rendered Request, so a Run that renders nothing never starts it. Each rendered Request gets a fresh browser context, carrying only the cookies the Request passes, as over HTTP. See [`docs/design.md`](docs/design.md) §5.2.
 
+## Sessions
+
+```python
+class Account(Spider):
+    start_urls = ["https://example.com/"]
+    settings = {"sessions.enabled": True, "sessions.size": 4}
+
+    async def parse(self, response: Response):
+        yield Request("/login", data={"user": "me"}, session="me", callback=self.parse_home)
+
+    async def parse_home(self, response: Response):
+        yield Request("/orders", session=response.session)  # the login's cookies come along
+```
+
+Requests are independent by default: each sends only the cookies it carries. With `sessions.enabled`, every Request leases a Session from the Run's Session Pool instead, and sends the Session's cookies, which keep those set during its fetches. Sessions are created as Requests need them, up to `sessions.size`, and each takes `sessions.max_concurrency` fetches at once. `Request(session="me")` leases the Session of that id, created on first use, and `session=response.session` continues the Session of a page; a Request a Callback yields without one leases whichever Session is free. Inline Fetches continue the Session of the Request being handled. A 429 cools only its Session down, so the others keep fetching from the domain. Rendered Requests do not lease Sessions yet. See [`docs/design.md`](docs/design.md) §5.3.
+
 ## Running and stopping
 
 ```python
@@ -164,7 +180,13 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
 | `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |
 | `domain.rate` / `domain.burst` | `None` / `1` | Fetches per second per domain (GCRA), and how many may start at once |
-| `domain.cooldown_max` | `300.0` | The longest a 429 or 503 with `Retry-After` pauses its domain |
+| `domain.cooldown_max` | `300.0` | The longest a 429 or 503 with `Retry-After` pauses its domain; with a Session Pool, a 429 cools its Session down instead |
+| `sessions.enabled` | `false` | Whether Requests lease Sessions from a Session Pool |
+| `sessions.pool` | `"default"` | The pool's name |
+| `sessions.size` / `sessions.eager` | `8` / `false` | Sessions the pool holds at most, created as Requests need them, or all at the start with `eager` |
+| `sessions.max_concurrency` | `1` | Fetches in progress at once per Session |
+| `sessions.cooldown` / `sessions.cooldown_max` | `30.0` / `300.0` | Seconds a 429 without `Retry-After` cools its Session down, and the longest any 429 does |
+| `sessions.lease_ttl` | `300.0` | Seconds a Session stays leased without renewal; leases are renewed while their fetch runs |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -371,6 +393,10 @@ src/pernix/
 ├── middlewares/
 │   ├── middleware.py    download Middleware, NodeMiddleware, the download chain
 │   └── spider_middleware.py spider Middleware and their chain
+├── sessions/
+│   ├── session_pool.py  SessionPool protocol, SessionLease, Outcome, StateDelta
+│   ├── memory_session_pool.py MemorySessionPool: the in-process pool of a Run
+│   └── session_leasing.py leases a Session per fetch, reports how it fared, saves its changes
 ├── stats/
 │   ├── stats.py         Stats, the counters and values of a Run
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items

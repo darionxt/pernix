@@ -26,6 +26,7 @@ __all__ = [
     "LogSettings",
     "ResponseSettings",
     "RetrySettings",
+    "SessionSettings",
     "ShutdownSettings",
     "StatsSettings",
 ]
@@ -104,6 +105,37 @@ class DomainSettings(Section):
     rate: Annotated[float, msgspec.Meta(gt=0)] | None = None
     burst: Annotated[int, msgspec.Meta(ge=1)] = 1
     cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
+
+
+class SessionSettings(Section):
+    """Settings of the Session Pool that Requests lease Sessions from.
+
+    It is off by default, as Requests are independent (ADR 0011). Once enabled,
+    every Request leases a Session, except those rendered in the browser.
+
+    Attributes:
+        enabled: Whether Requests lease Sessions.
+        pool: The pool's name.
+        size: Sessions the pool holds at most. They are created as Requests need
+            them, or under the id a Request names.
+        eager: Create all `size` Sessions when the Run starts.
+        max_concurrency: Fetches in progress at once per Session.
+        cooldown: Seconds a 429 without `Retry-After` cools its Session down.
+        cooldown_max: The longest a 429 cools its Session down.
+        lease_ttl: Seconds a Session stays leased without renewal; leases are
+            renewed every third of it while their fetch runs.
+    """
+
+    __prefix__ = "sessions"
+
+    enabled: bool = False
+    pool: str = "default"
+    size: Annotated[int, msgspec.Meta(ge=1)] = 8
+    eager: bool = False
+    max_concurrency: Annotated[int, msgspec.Meta(ge=1)] = 1
+    cooldown: Annotated[float, msgspec.Meta(ge=0)] = 30.0
+    cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
+    lease_ttl: Annotated[float, msgspec.Meta(gt=0)] = 300.0
 
 
 class ResponseSettings(Section):
@@ -364,6 +396,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FingerprintSettings,
     RetrySettings,
     DomainSettings,
+    SessionSettings,
     ItemSettings,
     FeedSettings,
     LogSettings,

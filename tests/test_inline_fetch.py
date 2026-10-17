@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -10,12 +11,14 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from pernix import IgnoreRequest, Request, Response, events
-from pernix.errors import ConnectError, ResponseTooLarge, RetriesExhausted, TLSError
+from pernix.errors import ConnectError, ResponseTooLarge, RetriesExhausted, SessionError, TLSError
 from pernix.fetchers import FetcherDispatch, StreamedResponse
 from pernix.inline_fetch import InlineFetch, handling
 from pernix.middlewares import build_download_chain
 from pernix.retry_policy import Decision, DefaultRetryPolicy
-from pernix.settings import DomainSettings, RetrySettings
+from pernix.sessions import MemorySessionPool, Outcome
+from pernix.sessions.session_leasing import SessionLeasing
+from pernix.settings import DomainSettings, RetrySettings, SessionSettings
 from pernix.stats import Stats
 from pernix.testing import FakeFetcher, make_response
 from pernix.throttle import Throttle
@@ -61,6 +64,7 @@ def _inline(
     retry_policy: RetryPolicy | None = None,
     bus: events.EventBus | None = None,
     stats: Stats | None = None,
+    sessions: SessionLeasing | None = None,
 ) -> InlineFetch:
     return InlineFetch(
         download=download,
@@ -68,7 +72,13 @@ def _inline(
         retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings(delay_scale=0)),
         events=bus or events.EventBus(timeout=5),
         stats=stats or Stats(),
+        sessions=sessions,
     )
+
+
+def _leasing() -> SessionLeasing:
+    settings = SessionSettings(enabled=True)
+    return SessionLeasing(MemorySessionPool(), settings, stats=Stats())
 
 
 async def test_a_fetch_returns_the_response_whatever_its_status() -> None:
@@ -192,14 +202,29 @@ async def test_a_cooling_slot_is_waited_out_in_place() -> None:
 
 async def test_a_request_continues_the_session_of_the_request_being_handled() -> None:
     site = _site({"/a": [b""]})
-    inline = _inline(site.fetch)
+    inline = _inline(site.fetch, sessions=_leasing())
 
     with handling(Request(f"{SITE}/page", session="first")):
         await inline.fetch(Request(f"{SITE}/a"))
         await inline.fetch(Request(f"{SITE}/a", session="own"))
     await inline.fetch(Request(f"{SITE}/a"))
 
-    assert [request.session for request in site.requests] == ["first", "own", None]
+    continued, own, leased = (request.session for request in site.requests)
+    assert (continued, own) == ("first", "own")
+    assert leased is not None  # one the pool gives
+
+
+async def test_naming_a_session_without_a_session_pool_fails() -> None:
+    site = _site({"/a": [b""]})
+    inline = _inline(site.fetch)
+
+    with pytest.raises(SessionError, match="no Session Pool is enabled"):
+        await inline.fetch(Request(f"{SITE}/a", session="alice"))
+    with handling(Request(f"{SITE}/page")):
+        response = await inline.fetch(Request(f"{SITE}/a"))
+
+    assert response.request.session is None
+    assert len(site.requests) == 1
 
 
 class Files:
@@ -460,3 +485,78 @@ async def test_tasks_started_inside_a_fetch_wait_for_slots_of_their_own() -> Non
         await _read(streamed)
 
     assert most == 1  # the stream holds one slot of two; the tasks share the other
+
+
+async def test_the_domain_paces_fetches_once_the_session_they_waited_for_frees_up() -> None:
+    starts: list[float] = []
+    site = _site({"/a": [b""]})
+
+    async def timed(request: Request) -> Response:
+        starts.append(time.monotonic())
+        return await site.fetch(request)
+
+    pool = MemorySessionPool(size=1)
+    leasing = SessionLeasing(pool, SessionSettings(enabled=True), stats=Stats())
+    inline = _inline(timed, domain=DomainSettings(delay=0.1, delay_jitter=0.0), sessions=leasing)
+    busy = await pool.acquire()  # the only Session, held for a while
+    assert busy is not None
+
+    fetches = [asyncio.create_task(inline.fetch(Request(f"{SITE}/a?n={number}"))) for number in range(3)]
+    await asyncio.sleep(0.3)
+    await pool.release(busy, Outcome("ok"))
+    await asyncio.gather(*fetches)
+
+    assert min(later - earlier for earlier, later in itertools.pairwise(starts)) >= 0.09
+
+
+async def test_a_fetch_waiting_for_a_place_holds_no_session_a_nested_fetch_needs() -> None:
+    site = _site({"/outer": [b"outer"], "/inner": [b"inner"], "/other": [b"other"]})
+    downloading = asyncio.Event()
+    inline: InlineFetch
+
+    async def download(request: Request) -> Response:
+        if request.url.endswith("/outer"):
+            downloading.set()
+            await asyncio.sleep(0.05)  # the other fetch arrives meanwhile, and waits for the place
+            await inline.fetch(Request(f"{SITE}/inner", session="b"))  # nested, in the same domain
+        return await site.fetch(request)
+
+    pool = MemorySessionPool(size=2)
+    leasing = SessionLeasing(pool, SessionSettings(enabled=True), stats=Stats())
+    inline = _inline(download, domain=DomainSettings(concurrency=1), sessions=leasing)
+
+    outer = asyncio.create_task(inline.fetch(Request(f"{SITE}/outer", session="a")))
+    await downloading.wait()
+    other = asyncio.create_task(inline.fetch(Request(f"{SITE}/other", session="b")))
+
+    async with asyncio.timeout(5):
+        responses = await asyncio.gather(outer, other)
+
+    assert [response.body for response in responses] == [b"outer", b"other"]
+
+
+async def test_a_fetch_waiting_for_a_session_gives_up_its_place_to_a_nested_fetch_of_another_domain() -> None:
+    other_site = "https://other.example"
+    site = FakeFetcher({f"{SITE}/outer": b"outer", f"{other_site}/nested": b"nested", f"{other_site}/rival": b"rival"})
+    downloading = asyncio.Event()
+    inline: InlineFetch
+
+    async def download(request: Request) -> Response:
+        if request.url.endswith("/outer"):
+            downloading.set()
+            await asyncio.sleep(0.05)  # the rival takes the other domain's place meanwhile, and waits for "s"
+            await inline.fetch(Request(f"{other_site}/nested"))  # continues "s", in the other domain
+        return await site.fetch(request)
+
+    leasing = SessionLeasing(MemorySessionPool(size=1), SessionSettings(enabled=True), stats=Stats())
+    inline = _inline(download, domain=DomainSettings(concurrency=1), sessions=leasing)
+
+    outer = asyncio.create_task(inline.fetch(Request(f"{SITE}/outer", session="s")))
+    await downloading.wait()
+    rival = asyncio.create_task(inline.fetch(Request(f"{other_site}/rival", session="s")))
+
+    async with asyncio.timeout(5):
+        responses = await asyncio.gather(outer, rival)
+
+    assert [response.body for response in responses] == [b"outer", b"rival"]
+    assert [request.url.rsplit("/", 1)[-1] for request in site.requests] == ["nested", "outer", "rival"]

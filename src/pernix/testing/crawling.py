@@ -26,9 +26,10 @@ _TEST_SETTINGS: Mapping[str, Any] = MappingProxyType(
         "domain.delay": 0,
         "domain.rate": None,
         "domain.cooldown_max": 0,
+        "sessions.cooldown_max": 0,
     }
 )
-"""Settings that would only make a test wait: periodic stats, retry delays, and per-domain pacing."""
+"""Settings that would only make a test wait: periodic stats, retry delays, per-domain pacing, and cooldowns."""
 
 
 @dataclass(frozen=True, slots=True)

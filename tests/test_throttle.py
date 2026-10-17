@@ -9,7 +9,7 @@ import pytest
 from pernix import Request, Response
 from pernix.settings import DomainSettings
 from pernix.testing.frontier import FakeClock
-from pernix.throttle import Throttle
+from pernix.throttle import SESSION_COOLDOWN_STATUSES, Throttle
 
 A = "a.example"
 B = "b.example"
@@ -142,6 +142,15 @@ def test_only_429_and_503_with_retry_after_cool_down_up_to_the_cap(
     assert throttle.cooldown_left(A) == cooldown
 
 
+@pytest.mark.parametrize(("status", "cooldown"), [(429, 0.0), (503, 30.0)])
+def test_under_a_session_only_503_cools_the_domain_down(status: int, cooldown: float) -> None:
+    throttle = _throttle(FakeClock(), cooldown_max=60.0)
+
+    throttle.observe(A, _response(status, "30"), statuses=SESSION_COOLDOWN_STATUSES)
+
+    assert throttle.cooldown_left(A) == cooldown
+
+
 async def test_wait_returns_when_a_fetch_ends() -> None:
     throttle = _throttle(FakeClock(), concurrency=1)
     await throttle.acquire(A)
@@ -175,3 +184,18 @@ async def test_waiting_for_a_slot_is_counted() -> None:
 
     assert throttle.stats.waits == 1
     assert throttle.stats.wait_seconds >= 0.04
+
+
+async def test_an_acquire_cancelled_while_it_waits_for_the_delay_takes_no_place() -> None:
+    throttle = Throttle(DomainSettings(concurrency=1, delay=30.0, delay_jitter=0.0))
+    assert await throttle.acquire(A)
+    throttle.release(A)
+
+    waiting = asyncio.create_task(throttle.acquire(A))  # it holds a place while waiting for the delay
+    await asyncio.sleep(0.01)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    async with asyncio.timeout(1):
+        assert await throttle.admit(A)  # the place is free again

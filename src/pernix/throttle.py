@@ -26,15 +26,18 @@ from typing import TYPE_CHECKING, Any
 from pernix.retry_policy import retry_after_seconds
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Collection, Generator
 
     from pernix.response import Response
     from pernix.settings import DomainSettings
 
-__all__ = ["COOLDOWN_STATUSES", "Throttle", "ThrottleStats"]
+__all__ = ["COOLDOWN_STATUSES", "SESSION_COOLDOWN_STATUSES", "Throttle", "ThrottleStats"]
 
 COOLDOWN_STATUSES = frozenset({429, 503})
 """Statuses whose `Retry-After` pauses the whole slot."""
+
+SESSION_COOLDOWN_STATUSES = frozenset({503})
+"""Statuses whose `Retry-After` pauses the whole slot of a fetch under a Session: a 429 cools the Session down."""
 
 _held: ContextVar[frozenset[tuple[Throttle, str, asyncio.Task[Any] | None]]] = ContextVar(
     "pernix_held_slots", default=frozenset()
@@ -47,7 +50,8 @@ class ThrottleStats:
     """Counters of a Throttle.
 
     Attributes:
-        waits: Fetches that waited for their slot after their Request was claimed.
+        waits: Times fetches waited for their slot after their Request was claimed:
+            for a place, and for the delay or the rate.
         wait_seconds: The total time those fetches waited.
         cooldowns: Times a slot started or extended a cooldown.
         refused: Fetches refused because their slot was cooling down.
@@ -119,7 +123,7 @@ class Throttle:
         return 0.0 if state is None else max(0.0, state.cool_until - self._clock())
 
     async def acquire(self, slot: str, *, shared: bool = False) -> bool:
-        """Start a fetch in a slot, waiting until the slot admits it.
+        """Start a fetch in a slot, waiting until the slot admits it: `admit()`, then `pace()`.
 
         Args:
             slot: The slot of the Request.
@@ -131,25 +135,74 @@ class Throttle:
             `True` once the fetch may start; `False` at once if the slot is cooling
             down, so the caller can return the Request instead of holding it.
         """
+        if not await self.admit(slot, shared=shared):
+            return False
+        try:
+            paced = await self.pace(slot)
+        except BaseException:
+            if not shared:
+                self.release(slot)  # a cancelled wait took no place
+            raise
+        if not paced and not shared:
+            self.release(slot)
+        return paced
+
+    async def admit(self, slot: str, *, shared: bool = False) -> bool:
+        """Take a place in a slot for a fetch, waiting until one is free; the delay and the rate come with `pace()`.
+
+        A fetch that waits for something else before it starts, such as a Session,
+        takes its place first and is paced just before it starts, so it never holds
+        what another fetch waits for while it waits for a place, and its delay is
+        measured from its actual start.
+
+        Args:
+            slot: The slot of the Request.
+            shared: The fetch shares the place of a fetch it is nested in: it takes
+                none, and must not `release()` the slot.
+
+        Returns:
+            `True` once it holds a place; `False` at once if the slot is cooling down.
+        """
         started = self._clock()
         waited = False
         while True:
             state = self._slots.setdefault(slot, _Slot())  # blocked() may forget idle slots meanwhile
+            if state.cool_until > self._clock():
+                self.stats.refused += 1
+                return False
+            if shared or state.active < self._settings.concurrency:
+                break
+            waited = True
+            await self._wait(None)
+        if not shared:
+            state.active += 1
+        self._count_wait(waited, started)
+        return True
+
+    async def pace(self, slot: str) -> bool:
+        """Wait until a slot's delay and rate let a fetch that holds a place there start, and start it.
+
+        Args:
+            slot: The slot of the Request.
+
+        Returns:
+            `True` once the fetch may start; `False` at once if the slot is cooling
+            down, when the caller still holds its place and must `release()` it.
+        """
+        started = self._clock()
+        waited = False
+        while True:
+            state = self._slots.setdefault(slot, _Slot())
             now = self._clock()
             if state.cool_until > now:
                 self.stats.refused += 1
                 return False
             ready_at = self._ready_at(state)
-            full = not shared and state.active >= self._settings.concurrency
-            if not full and ready_at <= now:
+            if ready_at <= now:
                 break
             waited = True
-            await self._wait(None if full else ready_at - now)
-        if waited:
-            self.stats.waits += 1
-            self.stats.wait_seconds += now - started
-        if not shared:
-            state.active += 1
+            await self._wait(ready_at - now)
+        self._count_wait(waited, started)
         state.next_start = now + self._delay()
         if self._interval:
             state.tat = max(state.tat, now) + self._interval
@@ -198,14 +251,17 @@ class Throttle:
         self._slots[slot].active -= 1
         self._notify()
 
-    def observe(self, slot: str, response: Response) -> None:
+    def observe(self, slot: str, response: Response, *, statuses: Collection[int] = COOLDOWN_STATUSES) -> None:
         """Cool a slot down if a Response asks its domain to wait.
 
         Args:
             slot: The slot the Response was fetched in.
-            response: The Response; a 429 or 503 with `Retry-After` starts the cooldown.
+            response: The Response; one of `statuses` with `Retry-After` starts the
+                cooldown.
+            statuses: The statuses that pause the whole slot; under a Session, a 429
+                cools only the Session down, so only 503 pauses the slot.
         """
-        if response.status not in COOLDOWN_STATUSES:
+        if response.status not in statuses:
             return
         seconds = retry_after_seconds(response.headers.get("Retry-After"), now=dt.datetime.now(dt.UTC))
         if seconds is None or seconds <= 0:
@@ -228,6 +284,11 @@ class Throttle:
     def _ready_at(self, slot: _Slot) -> float:
         """When the slot may start a fetch, concurrency aside."""
         return max(slot.next_start, slot.tat - self._tolerance, slot.cool_until)
+
+    def _count_wait(self, waited: bool, started: float) -> None:
+        if waited:
+            self.stats.waits += 1
+            self.stats.wait_seconds += self._clock() - started
 
     def _delay(self) -> float:
         delay, jitter = self._settings.delay, self._settings.delay_jitter

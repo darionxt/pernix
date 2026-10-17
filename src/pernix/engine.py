@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.request_processor import Settlement
     from pernix.retry_policy import RetryPolicy
+    from pernix.sessions.session_leasing import SessionLeasing
     from pernix.spider import Spider
 
 __all__ = ["Engine", "PutItem"]
@@ -72,6 +73,7 @@ class Engine:
         retry_policy: RetryPolicy | None = None,
         throttle: Throttle | None = None,
         worker_id: str | None = None,
+        sessions: SessionLeasing | None = None,
     ) -> None:
         """Wire the Engine to its collaborators.
 
@@ -94,6 +96,8 @@ class Engine:
                 `DomainSettings`.
             worker_id: Identifies this Worker to the Frontier; defaults to the host
                 name and process id.
+            sessions: Leases Sessions from the Session Pool; `None` without one,
+                when Requests are independent.
 
         Raises:
             ValueError: `concurrency` is less than 1, or `lease_ttl` is not positive.
@@ -119,6 +123,7 @@ class Engine:
             events=events,
             retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings()),
             throttle=self._throttle,
+            sessions=sessions,
         )
 
     async def run(self) -> None:

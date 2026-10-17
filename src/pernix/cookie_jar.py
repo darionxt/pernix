@@ -30,7 +30,7 @@ from pernix.urls import is_loopback_host
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
-__all__ = ["Cookie", "CookieJar", "cookie_host"]
+__all__ = ["Cookie", "CookieJar", "CookieKey", "cookie_host", "cookie_key"]
 
 _MAX_SIZE = 4096
 """Bytes a cookie's name and value may have together, as browsers take at most."""
@@ -40,6 +40,9 @@ _MAX_LIFETIME = 400 * 24 * 3600
 
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 """The control characters a cookie may not hold: all but the tab (RFC 6265bis §5.6)."""
+
+type CookieKey = tuple[str, bool, str, str]
+"""What tells a cookie from the others in a jar: its domain, host-only flag, path, and name."""
 
 _COOKIE_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 _SECURE_SCHEMES = frozenset({"https", "wss"})
@@ -88,7 +91,8 @@ class CookieJar:
 
     `receive()` applies the `Set-Cookie` headers of a response, and `matching()` gives
     the cookies a browser would send to a URL. Iterating gives the cookies in the
-    order they were first set.
+    order they were first set. `removals` tells when the cookies a response removed
+    were removed, so changes made elsewhere meanwhile can be merged.
     """
 
     def __init__(self, cookies: Iterable[Cookie] = ()) -> None:
@@ -97,7 +101,8 @@ class CookieJar:
         Args:
             cookies: Cookies to keep, as `set()` keeps them.
         """
-        self._cookies: dict[tuple[str, bool, str, str], Cookie] = {}
+        self._cookies: dict[CookieKey, Cookie] = {}
+        self._removed: dict[CookieKey, float] = {}
         for cookie in cookies:
             self.set(cookie)
 
@@ -110,13 +115,23 @@ class CookieJar:
     def __repr__(self) -> str:
         return f"CookieJar({len(self)} cookies)"
 
+    @property
+    def removals(self) -> dict[CookieKey, float]:
+        """When a response last removed each cookie, in seconds since the epoch, unless one set it again.
+
+        A removal counts whether the jar held the cookie or not.
+        """
+        return dict(self._removed)
+
     def set(self, cookie: Cookie) -> None:
         """Keep a cookie as it is, replacing the one with its name, domain, host-only flag, and path.
 
         Args:
             cookie: The cookie.
         """
-        self._cookies[_key(cookie)] = cookie
+        key = cookie_key(cookie)
+        self._cookies[key] = cookie
+        self._removed.pop(key, None)
 
     def receive(self, url: str, set_cookie_headers: Iterable[str], *, now: float | None = None) -> None:
         """Apply the `Set-Cookie` headers of a response to the jar, in order, as a browser would.
@@ -192,8 +207,10 @@ class CookieJar:
         key = (domain, host_only, path, parsed.name)
         if parsed.expired(dt.datetime.fromtimestamp(now, dt.UTC)):
             self._cookies.pop(key, None)
+            self._removed[key] = now  # even one held no more, which another fetch of the Session may have set
             return
         replaced = self._cookies.get(key)
+        self._removed.pop(key, None)
         self._cookies[key] = Cookie(
             name=parsed.name,
             value=parsed.value,
@@ -270,7 +287,15 @@ class _Origin:
         return on_host and _path_matches(self.path, cookie.path)
 
 
-def _key(cookie: Cookie) -> tuple[str, bool, str, str]:
+def cookie_key(cookie: Cookie) -> CookieKey:
+    """Return what tells a cookie from the others in a jar.
+
+    Args:
+        cookie: The cookie.
+
+    Returns:
+        Its domain, host-only flag, path, and name.
+    """
     return (cookie.domain, cookie.host_only, cookie.path, cookie.name)
 
 

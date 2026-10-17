@@ -211,9 +211,10 @@ class Crawler:
         Callback runs for it. Nested in another fetch for the same domain, in the
         same task, such as from a download Middleware, it shares that fetch's place
         in the slot, though it still waits for the delay, the rate, and a cooldown. The retry policy judges it as usual, and a retry waits
-        in place. A Request without a Session continues the Session of the Request
-        whose Callback or errback is running; otherwise, as any Request, it sends
-        only the cookies it carries. Cancelling the caller, as a Force Stop does,
+        in place. A Request without a Session continues the Session of the fetch it
+        is nested in, or of the Request whose Callback or errback is running;
+        otherwise, as any Request, it leases one when a Session Pool is enabled, and
+        without one it sends only the cookies it carries. Cancelling the caller, as a Force Stop does,
         cancels the fetch.
 
         It works while the Run runs, from `SpiderOpened` to `SpiderClosed`: in
