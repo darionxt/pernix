@@ -81,10 +81,10 @@ class Redactor:
       the end of the line;
     - every occurrence of the given secret values, such as those of `Secret` settings.
 
-    Names match case-insensitively. Once secret values are masked, every rule looks at
-    the same text, and values that several rules find, overlapping or side by side, are
-    masked as one. Masking is heuristic: it errs toward masking too much rather than
-    too little.
+    Names match case-insensitively. Every rule looks at the text as given, and again
+    with the secret values starred out, and values that several rules find, overlapping
+    or side by side, are masked as one. Masking is heuristic: it errs toward masking too
+    much rather than too little.
 
     Example:
         >>> Redactor().redact("via http://alice:pw@proxy:8080/?token=abc")
@@ -120,9 +120,14 @@ class Redactor:
         Returns:
             The masked text.
         """
-        if self._secrets is not None:  # first, so that a name right after a secret value stands apart
-            text = self._secrets.sub(MASK, text)
-        return _masked(text, self._sensitive_spans(text))
+        spans = self._sensitive_spans(text)
+        if self._secrets is not None:
+            spans += [match.span() for match in self._secrets.finditer(text)]
+            # Once more with the secret values starred out, which keeps every offset: a name right after one then
+            # stands apart, while one that overlaps it was found above.
+            starred = self._secrets.sub(lambda match: "*" * len(match[0]), text)
+            spans += self._sensitive_spans(starred)
+        return _masked(text, spans)
 
     def _sensitive_spans(self, text: str) -> list[tuple[int, int]]:
         # Every rule looks at the same text, so that masking a value never hides another from a rule.

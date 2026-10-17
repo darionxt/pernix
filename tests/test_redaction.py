@@ -128,7 +128,20 @@ def test_secret_values_are_masked_wherever_they_occur() -> None:
     redactor = Redactor(secrets=["sk-live-123", "sk-live-123456", ""])
 
     assert redactor.redact("key sk-live-123456 and sk-live-123.") == "key *** and ***."
-    assert redactor.redact("sk-live-123'password': 'hunter2'") == "***'password': '***'"
+
+
+@pytest.mark.parametrize(
+    ("secret", "text", "redacted"),
+    [
+        ("pass", "password=hunter2", "***word=***"),
+        ("alice:", "alice:pa55@proxy:8080", "***@proxy:8080"),
+        ("@proxy", "alice:pa55@proxy:8080", "***:8080"),
+        ("sk-live-123", "sk-live-123'password': 'hunter2'", "***'password': '***'"),
+        ("sk-live-123", "sk-live-123Cookie: sid=1", "***Cookie: ***"),
+    ],
+)
+def test_secret_values_hide_no_other_value(secret: str, text: str, redacted: str) -> None:
+    assert Redactor(secrets=[secret]).redact(text) == redacted
 
 
 def test_secrets_are_found_inside_the_settings_values() -> None:
