@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 from urllib.parse import urlsplit
 
-from ada_url import URL
+from ada_url import idna_to_ascii
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
 
@@ -385,20 +385,21 @@ def _cookie_lines(request: Request) -> list[str]:
 def _cookie_host(url: str) -> str | None:
     """The host of a URL as curl matches cookies to it: lower-cased, IPv6 without brackets, and in ASCII.
 
-    A host that is not ASCII is converted as a WHATWG URL converts it, without the
+    The host is the one curl connects to, after the last `@` of the authority, even
+    where WHATWG URLs would end the authority earlier, such as at a backslash. One
+    that is not ASCII is converted as WHATWG URLs convert hosts, without the
     transitional IDNA mappings, as curl does too: `faß` is `xn--fa-hia`, not `fass`.
 
     Returns:
         The host, or `None` for one that WHATWG URLs reject, which curl converts
         differently on each platform.
     """
-    host = urlsplit(url).hostname or ""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
     if host.isascii():
         return host
-    try:
-        return URL(url).hostname  # from the URL as given: lower-casing first would turn a final Σ into ς
-    except ValueError:
-        return None
+    written = parts.netloc.rpartition("@")[2].partition(":")[0]  # as given: lower-casing turns a final Σ into ς
+    return idna_to_ascii(written).decode("ascii") or None
 
 
 def _http_version(url: str) -> CurlHttpVersion | None:
