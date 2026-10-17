@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import textwrap
@@ -8,6 +9,9 @@ from typing import TYPE_CHECKING
 import pytest
 
 import netguard
+from pernix.errors import ComponentError
+from pernix.fetchers import BrowserSettings
+from pernix.fetchers.launched_browser import launch_browser
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -16,6 +20,9 @@ if TYPE_CHECKING:
     from pernix.testing import LoopbackServer
 
 pytest_plugins = ["pytester"]
+
+_LAUNCH_TIMEOUT = 60
+"""Seconds the browser may take to start for the tests, before they fail with its log."""
 
 
 @pytest.fixture(autouse=True)
@@ -63,3 +70,31 @@ def write_spider(tmp_path: Path) -> Iterator[Callable[[str, str], Path]]:
         module = sys.modules.get(name)
         if module is not None and str(getattr(module, "__file__", "")).startswith(str(tmp_path)):
             del sys.modules[name]  # never a module of the same name loaded from elsewhere
+
+
+@pytest.fixture(scope="session")
+def browser_engine() -> None:
+    """Launch the browser once, for the tests that need it.
+
+    Where patchright or the browser engine is not installed, they are skipped, and
+    fail on CI, which installs them; a browser that does not start fails them.
+    """
+    problem, installed = asyncio.run(_launch_once())
+    if problem is None:
+        return
+    if installed or os.environ.get("CI"):
+        pytest.fail(problem)
+    pytest.skip(problem)
+
+
+async def _launch_once() -> tuple[str | None, bool]:
+    """Launch the browser and close it: the problem, if any, and whether the browser is installed."""
+    settings = BrowserSettings(launch_options={"timeout": _LAUNCH_TIMEOUT * 1000})
+    try:
+        launched = await launch_browser(settings)  # under the network guard, which is on during setup
+    except ComponentError as exc:
+        return str(exc), False
+    except Exception as exc:  # reported as the reason the tests fail
+        return f"the browser does not start: {exc}", True
+    await launched.close()
+    return None, True

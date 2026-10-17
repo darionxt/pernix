@@ -45,7 +45,8 @@ class CoreSettings(Section):
         spider_middlewares: Spider Middleware, as `{middleware: order}`; lower orders
             are further out.
         fetchers: Fetchers by name, as `{name: fetcher}`; `Request(fetcher=name)`
-            selects one by that name.
+            selects one by that name. The HTTP Fetcher is `http`, and the browser
+            Fetcher, which renders Requests with `render` set, is `browser`.
         pipelines: Item Pipelines, as `{pipeline: order}`; lower orders run first.
         failed_pipelines: Pipelines that receive each `FailedItem`, the Items a
             Pipeline failed on, as `{pipeline: order}`. The built-in
@@ -59,7 +60,9 @@ class CoreSettings(Section):
     addons: tuple[Any, ...] = ()
     middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     spider_middlewares: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
-    fetchers: NamedComponents = msgspec.field(default_factory=lambda: {"http": "pernix.fetchers.HTTPFetcher"})
+    fetchers: NamedComponents = msgspec.field(
+        default_factory=lambda: {"http": "pernix.fetchers.HTTPFetcher", "browser": "pernix.fetchers.BrowserFetcher"}
+    )
     pipelines: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     failed_pipelines: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.items.FailedItemsFile": 100})
     run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None

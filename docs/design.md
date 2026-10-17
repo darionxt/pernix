@@ -474,7 +474,7 @@ Keyword arguments of `run()`, `crawl()`, and `stream_items()` are Spider argumen
 - Every command takes `-s KEY=VALUE`, the highest settings layer (§4.11). `run` and `check` take `-a KEY=VALUE` Spider arguments. Results go to stdout; messages and logs go to stderr.
 - TARGET is a `.py` file, imported under its stem with its directory first on `sys.path`, or an import path such as `myproject.spiders.books`. As with `python -m`, the working directory comes first on `sys.path`, so the project's own modules, Spiders and components alike, import without being installed. `:Name` picks a Spider by class name or `Spider.name`; it may be left out when the module defines exactly one Spider, not counting those it imports.
 - Exit codes are those of `run()`: 0 completed, 1 failed, 2 configuration error (including invalid options, and a TARGET that cannot be found), 130 stopped by a signal.
-- `fetch` and `shell` fetch through the download Middleware and the Fetchers of the project settings, without retries, a Frontier, or Pipelines. `--fetcher` names a registered Fetcher, `browser` once it exists; otherwise the URL scheme picks one. Impersonation is on by default with the pinned Profile (§5.4); `-s http.impersonate=...` changes it.
+- `fetch` and `shell` fetch through the download Middleware and the Fetchers of the project settings, without retries, a Frontier, or Pipelines. `--fetcher` names a registered Fetcher, such as `browser`; otherwise the URL scheme picks one. Impersonation is on by default with the pinned Profile (§5.4); `-s http.impersonate=...` changes it.
 - `fetch` writes the status line, the redirects, and the headers to stderr, and the body to stdout: decoded text for text media types, raw bytes otherwise, though never to a terminal. `-o FILE` writes the body byte for byte. It exits with 0 for any Response, whatever its status, and 1 when fetching failed.
 - `fetch --json` writes one JSON object instead: `url` (requested), `final_url`, `status`, `http_version`, `headers` as `[name, value]` pairs in order, `encoding`, `elapsed` in seconds, `redirects` as `{url, status}` objects, `fetcher`, `body` (the decoded text, or `null` for a binary body or one written with `-o`), and `body_bytes`. A failure is `{"url": ..., "error": {"type": ..., "message": ..., "code": ...}}`, where `code` is the transport's error code, such as libcurl's.
 - In `shell`, `await fetch(url_or_request)` returns the Response and rebinds `request` and `response`; Ctrl-C cancels what is being awaited, and Ctrl-D leaves.
@@ -482,7 +482,7 @@ Keyword arguments of `run()`, `crawl()`, and `stream_items()` are Spider argumen
 
 ## 5. Fetching layer
 
-A Fetcher is a component with `async def fetch(self, request) -> Response` and a `schemes` attribute, the URL schemes it fetches by default. It may also have `stream(request, *, max_bytes)`, an async context manager giving a `StreamedResponse`, for streamed Inline Fetches (§4.6). Fetchers are registered by name with the `fetchers` setting, `{"http": HTTPFetcher}` by default; registering another component under a built-in name replaces it, and `None` (`false`) disables one. The innermost step of the download chain picks the Fetcher: the one named by `Request(fetcher=...)`, otherwise `browser` if the Request needs rendering, otherwise the one whose `schemes` include the URL's scheme. No two Fetchers may claim the same scheme, and a Request no Fetcher fits fails. `Response.fetcher` records the name. Like other components, Fetchers get services injected and are opened and closed with the Run.
+A Fetcher is a component with `async def fetch(self, request) -> Response` and a `schemes` attribute, the URL schemes it fetches by default. It may also have `stream(request, *, max_bytes)`, an async context manager giving a `StreamedResponse`, for streamed Inline Fetches (§4.6). Fetchers are registered by name with the `fetchers` setting, `{"http": HTTPFetcher, "browser": BrowserFetcher}` by default; registering another component under a built-in name replaces it, and `None` (`false`) disables one. The innermost step of the download chain picks the Fetcher: the one named by `Request(fetcher=...)`, otherwise `browser` if the Request needs rendering, otherwise the one whose `schemes` include the URL's scheme. No two Fetchers may claim the same scheme, and a Request no Fetcher fits fails. `Response.fetcher` records the name. Like other components, Fetchers get services injected and are opened and closed with the Run.
 
 ### 5.1 HTTP Fetcher (curl-cffi)
 
@@ -522,8 +522,18 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 **Topology**
 
-- patchright is started once per process; it launches one browser with `launch()` and creates multiple contexts, one per Session. Without a Session, each rendered Request gets a fresh context, so Requests stay independent as on the HTTP side.
-- A context's proxy, storage state, locale, and time zone are set once at creation and never modified afterward; switching proxies means creating a new context.
+- The browser Fetcher starts patchright with the first Request that needs rendering, and it launches one browser with `launch()`, so a Run that renders nothing never starts them; both are closed with the Run. Without `pernix[browser]` installed, or without the browser engine, that Request fails with a `ComponentError` naming the command that installs it, and so do the later ones, at once.
+- The browser is the Chrome for Testing build bundled with the pinned patchright, never the headless shell. It creates multiple contexts, one per Session. Without a Session, each rendered Request gets a fresh context, closed after the fetch, so Requests stay independent as on the HTTP side.
+- A context's proxy, storage state, locale, and time zone are set once at creation and never modified afterward; switching proxies means creating a new context. `Request(proxy=...)` is the proxy of its context, for every request of it, loopback ones included.
+
+**Loading a page**
+
+- A page is loaded until its `load` event, within `browser.timeout` (30 s), or `Request(timeout=...)`; `browser.deadline` (180 s) limits the whole fetch, starting the browser included. A fetch that is cancelled or times out closes its context in a task of its own, which closing the Fetcher waits for.
+- The cookies a Request carries (`cookies=` or a `Cookie` header) are added to its context as host-only cookies of its host, for every path, in the order given: they go to every redirect hop on that host and to no other host, and cookies set while the page loads flow as in the browser. The browser takes cookies named with the `__Secure-` or `__Host-` prefix only as Secure ones, so those go over HTTPS, and to loopback hosts, only.
+- A Request other than a plain GET, or with headers, changes the first request of the page: its method, body, and headers. The browser keeps those headers on the redirects that follow, to any host, as the HTTP Fetcher does, so the browser Fetcher refuses `Authorization` and `Proxy-Authorization` headers, which the HTTP Fetcher drops on the way to another host. The method and body follow the browser's redirect rules, and the page's own requests are untouched.
+- The body of an HTML or XHTML document is its rendered DOM, encoded as UTF-8 and decoded as UTF-8, without the `Content-Length` and `Content-Encoding` that describe the body sent. Chrome shows other documents, such as JSON, text, or images, in a viewer page of its own, so their body is the one received. A document the browser downloads instead of showing fails with a `FetchError`, and a 204 or 205 gives an empty body.
+- `status` and `headers` are those of the document as the browser reports them: every value is kept, but not their wire order. `history` holds the redirects of the navigation, `cookies` those the context holds for its URLs, `ip_address` the server's address; the browser does not report `http_version`.
+- Chrome's network errors (`net::ERR_*`) map onto `Timeout`, `ConnectError`, `ProxyError`, `TLSError`, and `TooManyRedirects`, and others onto `FetchError`, with `code` 0 and the error's name in the message.
 
 **Capacity**
 
@@ -540,7 +550,8 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 **Defaults**
 
-- `headless=True`, using the new headless mode; the UA is not overridden.
+- `headless=True` (`browser.headless`), using the new headless mode; the UA is not overridden.
+- `browser.launch_options` are passed to patchright's `launch()` as they are, over the defaults, for control the settings do not give, such as `executable_path` or `args`.
 - A `stealth` preset is also provided: system Chrome, headed mode, no viewport set.
 - Resource blocking is off by default.
 
@@ -825,7 +836,7 @@ async def test_parse():
 - **Responses**: `make_response(url, body, status=, headers=, json=, request=, encoding=)` builds a Response as a Fetcher would: a `str` body is UTF-8 HTML unless the headers say otherwise, `json=` makes a JSON body, and `request` (by default `Request(url)`) carries the Callback, `kwargs`, and `meta`.
 - **Running**: `crawl(Spider, fetcher=..., settings=..., **args)` runs a Spider to completion and returns a `CrawlReport` with the Items that passed every Pipeline, the final stats, the reason, and the `run_id`. It runs without periodic stats, retry delays, or per-domain delay, rate, and cooldowns, as those only make a test wait; `settings` override that. `run_callback(spider, response)` runs one Callback as a Run would, the Request's or `parse`, with its `kwargs`, resolving relative URLs against the Response, and returns its outputs; spider Middleware do not run, and Inline Fetches need `crawl()`.
 - **Local server**: `LoopbackServer` serves on 127.0.0.1: routes registered with `route()` or given up front (a body, a `Reply`, or a handler of the `ReceivedRequest`), then the files of a `directory`. It records every request with its headers in wire order.
-- **Network guard**: while `blocking_network()` is in effect, the Fetchers reach only loopback hosts (loopback addresses, `localhost`, `*.localhost`), or any host through a proxy on one; others raise `NetworkBlocked`, a `FetchError`, and are recorded in the guard. The HTTP Fetcher checks the URL before connecting, and each redirect's `Location` before curl follows it, as urllib and as WHATWG read it, since the two can name different hosts; a `Location` that cannot be parsed is refused. This layer is necessary: curl-cffi does not go through Python's socket, so the usual network-blocking plugins cannot stop it.
+- **Network guard**: while `blocking_network()` is in effect, the Fetchers reach only loopback hosts (loopback addresses, `localhost`, `*.localhost`), or any host through a proxy on one; others raise `NetworkBlocked`, a `FetchError`, and are recorded in the guard. The HTTP Fetcher checks the URL before connecting, and each redirect's `Location` before curl follows it, as urllib and as WHATWG read it, since the two can name different hosts; a `Location` that cannot be parsed is refused. A browser launched while the guard is on sends everything but loopback traffic to a proxy that refuses it, set at launch so that the browser's own requests, which belong to no page, are stopped too; a Request's loopback proxy takes its context's requests instead. The requests its pages make to other hosts, redirects and WebSockets included, are recorded, the browser's own are not, and a refused document raises `NetworkBlocked`. A browser launched while the network was open refuses to render under the guard. This layer is necessary: curl-cffi and the browser do not go through Python's socket, so the usual network-blocking plugins cannot stop them.
 - **pytest plugin**, loaded as `pernix` once Pernix is installed (`-p no:pernix` disables it): the network guard is on while each test is set up, run, and torn down, fixtures of every scope included, and the phase during which it refused a URL fails, even when the refusal happened inside a Run, which only logs a failed fetch. `@pytest.mark.pernix_network` lets a test use the network, and the ini option `pernix_network = allow` lets every test. The `loopback_server` fixture gives a started `LoopbackServer`.
 - `pernix.testing` itself does not need pytest; the plugin and the Frontier conformance suite (`pernix.testing.frontier`) do.
 - **Capture and replay** (planned): unified for HTTP and the browser, with capture, replay, and mixed modes.
@@ -840,7 +851,7 @@ async def test_parse():
   - Multiple processes are handled by an optional launcher or by the Platform.
   - uvloop is an optional extra.
 - **Core dependencies**: curl-cffi, parsel (lxml), msgspec, orjson, protego, charset-normalizer, and a WHATWG URL parsing library.
-- **Optional extras**: `browser` (patchright), `redis`, `postgres`, `mysql`, `mongo`, `kafka`, `prometheus`, `otel`, `selectolax`.
+- **Optional extras**: `browser` (patchright, pinned), `redis`, `postgres`, `mysql`, `mongo`, `kafka`, `prometheus`, `otel`, `selectolax`.
   - The core package imports fully without any extra installed.
   - Using an extra that is not installed produces a clear installation hint.
 

@@ -2,7 +2,7 @@
 
 An asyncio crawling framework for Python. HTTP (curl-cffi) and the browser (patchright) are peer ways of fetching, selectable per request. The kernel is minimal; retries, deduplication, rate limiting, sessions, and output are replaceable components, extended through Middleware and Events.
 
-> Status: pre-alpha. The API is not stable yet, and only the HTTP crawl loop is implemented so far.
+> Status: pre-alpha. The API is not stable yet; the HTTP crawl loop and basic rendering in the browser are implemented so far.
 
 ## Installation
 
@@ -12,7 +12,12 @@ Pernix is not published yet. Install it from a checkout:
 uv add git+https://github.com/darionxt/pernix
 ```
 
-Requires Python 3.13 or newer.
+Requires Python 3.13 or newer. Rendering pages in the browser needs the `browser` extra and the browser engine:
+
+```bash
+uv add "pernix[browser] @ git+https://github.com/darionxt/pernix"
+uv run patchright install chromium
+```
 
 ## Quick start
 
@@ -56,6 +61,23 @@ class Account(Spider):
 ```
 
 `await self.fetch()` is an Inline Fetch: the Request goes through the download Middleware and the per-domain limits, and is retried in place, but it skips the Frontier, so it is neither deduplicated nor stored, and no Callback runs for it. Once its retries run out it raises `RetriesExhausted`. It sends only the cookies you pass, unless the Request being handled has a Session. `self.stream()` reads a body as it arrives: a slow reader keeps about 1 MiB of it in memory, and the transfer holds its domain's slot until the block ends. A Force Stop cancels Inline Fetches with the Request they belong to. See [`docs/design.md`](docs/design.md) §4.6.
+
+## Rendering in the browser
+
+```python
+class Shop(Spider):
+    async def start(self):
+        yield Request("https://shop.example/", render=True)  # loaded in the browser, its scripts run
+
+    async def parse(self, response: Response):
+        for href in response.css("#books a::attr(href)").getall():
+            yield Request(href, callback=self.parse_book)  # fetched over HTTP
+
+    async def parse_book(self, response: Response):
+        yield {"title": response.css("h1::text").get()}
+```
+
+`render=True` sends a Request to the browser Fetcher, which loads the page in Chrome until its `load` event; the Response's body is the page as its scripts left it. Rendered and HTTP Requests mix freely in one Spider. The browser starts with the first rendered Request, so a Run that renders nothing never starts it. Each rendered Request gets a fresh browser context, carrying only the cookies the Request passes, as over HTTP. See [`docs/design.md`](docs/design.md) §5.2.
 
 ## Running and stopping
 
@@ -171,6 +193,10 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `http.max_redirects` | `20` | Redirects followed at most |
 | `http.max_body_size` | `104857600` | Bytes a body may have at most (100 MiB); `0` for no limit |
 | `http.pool_size` / `http.pool_idle` | `8` / `300.0` | curl sessions kept, one per Profile, and seconds one is kept unused |
+| `browser.headless` | `true` | Runs the browser without a window, in Chrome's new headless mode |
+| `browser.timeout` | `30.0` | Seconds a page may take to load; `Request(timeout=...)` overrides it |
+| `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included |
+| `browser.launch_options` | `{}` | Options passed as they are to patchright's `launch()`, such as `executable_path` or `args` |
 | `shutdown.grace` | `20.0` | Seconds a Drain may take before it turns into a Force Stop |
 | `shutdown.close_timeout` | `5.0` | Seconds each component may take to close after a Force Stop; `0` for no limit |
 
@@ -251,7 +277,7 @@ async def test_parse():
 
 `pernix.testing` runs Spiders without a network. `FakeFetcher` answers Requests from canned bodies, Responses, exceptions, or functions, by URL or pattern. `crawl()` runs a Spider to completion and reports its Items and stats, without the delays that would only make a test wait, and `run_callback()` runs one Callback as a Run would. `LoopbackServer`, also the `loopback_server` fixture, serves routes or a directory on 127.0.0.1 for tests that fetch for real.
 
-Installing Pernix adds a pytest plugin that keeps the Fetchers off the network while each test and its fixtures run: only loopback hosts can be reached, redirects included, and a test during which another host was refused fails. curl does not use Python's sockets, so other network-blocking plugins cannot do this. Mark a test with `@pytest.mark.pernix_network` to let it reach the network, or set `pernix_network = allow` in the pytest configuration. See [`docs/design.md`](docs/design.md) §9.
+Installing Pernix adds a pytest plugin that keeps the Fetchers off the network while each test and its fixtures run: only loopback hosts can be reached, redirects and the requests of rendered pages included, and a test during which another host was refused fails. curl and the browser do not use Python's sockets, so other network-blocking plugins cannot do this. Mark a test with `@pytest.mark.pernix_network` to let it reach the network, or set `pernix_network = allow` in the pytest configuration. See [`docs/design.md`](docs/design.md) §9.
 
 ## Documentation
 
@@ -330,6 +356,10 @@ src/pernix/
 │   ├── fetcher_dispatch.py picks the Fetcher of each Request; opens streamed transfers
 │   ├── http_fetcher.py  curl-cffi HTTP Fetcher
 │   ├── http_settings.py the http.* settings and the pinned Profile
+│   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
+│   ├── browser_settings.py the browser.* settings
+│   ├── launched_browser.py starts patchright and its browser, under the network guard if on
+│   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
 │   └── streamed_response.py a Response whose body is read as it arrives
@@ -371,6 +401,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
+uv run patchright install chromium   # for the tests that render; they are skipped without it
 uv run pytest
 uv run ruff check
 uv run ruff format --check

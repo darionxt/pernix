@@ -33,6 +33,7 @@ def settings(tmp_path: Path) -> Settings:
 
 
 HTTP_KEYS = ("impersonate", "timeout", "deadline", "max_redirects", "max_body_size", "pool_size", "pool_idle")
+BROWSER_KEYS = ("headless", "timeout", "deadline", "launch_options")
 
 
 def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
@@ -50,6 +51,7 @@ def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
         "run_id",
         "test.plugins",
         *(f"http.{name}" for name in HTTP_KEYS),  # registered by the default HTTP Fetcher
+        *(f"browser.{name}" for name in BROWSER_KEYS),  # and by the default browser Fetcher
     }
 
     with pytest.raises(TypeError):

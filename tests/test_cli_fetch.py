@@ -144,7 +144,7 @@ def test_the_project_settings_and_middleware_apply(site: LoopbackServer, capsys:
 @pytest.mark.parametrize(
     ("argv", "problem"),
     [
-        (["--fetcher", "browser"], "no Fetcher named 'browser' is registered; registered: 'http'"),
+        (["--fetcher", "ftp"], "no Fetcher named 'ftp' is registered; registered: 'browser', 'http'"),
         (["-s", "concurency=2"], "unknown setting 'concurency' from -s concurency; did you mean 'concurrency'?"),
     ],
 )

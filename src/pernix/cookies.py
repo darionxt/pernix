@@ -18,7 +18,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-__all__ = ["SetCookie", "merge_set_cookies", "parse_cookie_header", "parse_set_cookie"]
+    from pernix.request import Request
+
+__all__ = ["SetCookie", "merge_set_cookies", "parse_cookie_header", "parse_set_cookie", "request_cookies"]
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,22 @@ def parse_cookie_header(header: str) -> dict[str, str]:
         if separator and name:
             cookies[name] = value.strip()
     return cookies
+
+
+def request_cookies(request: Request) -> dict[str, str]:
+    """Return the cookies a Request carries, whether as `cookies=` or as `Cookie` headers.
+
+    Args:
+        request: The Request.
+
+    Returns:
+        The cookies by name, in the order the Request gives them.
+    """
+    sent: dict[str, str] = {}
+    for header in request.headers.get_all("Cookie"):
+        sent.update(parse_cookie_header(header))
+    sent.update(request.cookies)
+    return sent
 
 
 def merge_set_cookies(
