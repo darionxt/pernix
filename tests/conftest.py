@@ -4,19 +4,25 @@ import asyncio
 import os
 import sys
 import textwrap
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 import netguard
+from pernix.errors import ComponentError
+from pernix.fetchers import BrowserSettings
+from pernix.fetchers.launched_browser import launch_browser
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
     from pernix.testing import LoopbackServer
 
 pytest_plugins = ["pytester"]
+
+_LAUNCH_TIMEOUT = 60
+"""Seconds the browser may take to start for the tests, before they fail with its log."""
 
 
 @pytest.fixture(autouse=True)
@@ -68,23 +74,27 @@ def write_spider(tmp_path: Path) -> Iterator[Callable[[str, str], Path]]:
 
 @pytest.fixture(scope="session")
 def browser_engine() -> None:
-    """Skip a test that needs the browser engine where it is not installed; fail it on CI, which installs it."""
-    missing = _missing_browser_engine()
-    if missing is not None:
-        if os.environ.get("CI"):
-            pytest.fail(missing)
-        pytest.skip(missing)
+    """Launch the browser once, for the tests that need it.
+
+    Where patchright or the browser engine is not installed, they are skipped, and
+    fail on CI, which installs them; a browser that does not start fails them.
+    """
+    problem, installed = asyncio.run(_launch_once())
+    if problem is None:
+        return
+    if installed or os.environ.get("CI"):
+        pytest.fail(problem)
+    pytest.skip(problem)
 
 
-def _missing_browser_engine() -> str | None:
+async def _launch_once() -> tuple[str | None, bool]:
+    """Launch the browser and close it: the problem, if any, and whether the browser is installed."""
+    settings = BrowserSettings(launch_options={"timeout": _LAUNCH_TIMEOUT * 1000})
     try:
-        from patchright.async_api import async_playwright
-    except ImportError:
-        return "patchright is not installed"
-
-    async def executable() -> str:
-        async with async_playwright() as playwright:
-            return playwright.chromium.executable_path
-
-    path = asyncio.run(executable())
-    return None if Path(path).exists() else f"the browser engine is not installed: patchright install chromium ({path})"
+        launched = await launch_browser(settings)  # under the network guard, which is on during setup
+    except ComponentError as exc:
+        return str(exc), False
+    except Exception as exc:  # reported as the reason the tests fail
+        return f"the browser does not start: {exc}", True
+    await launched.close()
+    return None, True
