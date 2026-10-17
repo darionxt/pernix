@@ -277,3 +277,27 @@ async def test_a_removal_is_timed_as_the_jar_removed_the_cookie() -> None:
     lease = await pool.acquire(session="s")
     assert lease is not None
     assert [cookie.value for cookie in (await pool.load_state(lease)).cookies] == ["new"]
+
+
+@pytest.mark.parametrize("held_at_start", [True, False])
+async def test_a_removal_after_another_fetch_set_the_cookie_again_removes_it(held_at_start: bool) -> None:
+    leasing, pool, _, clock = _leasing(max_concurrency=2)
+    old = Cookie(name="sid", value="old", domain="site.example", created=NOW, modified=NOW)
+    pool.add(Session("s", cookies=[old] if held_at_start else []))
+
+    async with leasing.sending(Request(f"{SITE}/", session="s"), wait=0) as first:
+        assert first.session is not None
+        if held_at_start:
+            clock.now = NOW + 1
+            first.session.cookies.receive(f"{SITE}/", ["sid=; Max-Age=0"], now=clock.now)
+        other = await pool.acquire(session="s")  # another fetch sets the cookie, later
+        assert other is not None
+        renewed = Cookie(name="sid", value="new", domain="site.example", created=NOW, modified=NOW + 2)
+        assert await pool.save_state(other, StateDelta(cookies=[renewed]))
+        await pool.release(other, Outcome("ok"))
+        clock.now = NOW + 3  # then a response of the first fetch removes it
+        first.session.cookies.receive(f"{SITE}/", ["sid=; Max-Age=0"], now=clock.now)
+
+    lease = await pool.acquire(session="s")
+    assert lease is not None
+    assert (await pool.load_state(lease)).cookies == []

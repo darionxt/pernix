@@ -50,3 +50,12 @@ def test_deltas_round_trip_through_msgspec() -> None:
     )
 
     assert msgspec.json.decode(msgspec.json.encode(delta), type=StateDelta) == delta
+
+
+def test_a_delta_holds_every_removal_timed_even_of_cookies_the_fetch_started_without() -> None:
+    key = ("example.com", True, "/", "sid")
+    before = SessionState(cookies=[_cookie("kept", "1")])
+
+    delta = StateDelta.between(before, before, now=NOW + 9, removed_at={key: NOW + 3})
+
+    assert delta.removed == [CookieRemoval(name="sid", domain="example.com", host_only=True, path="/", removed=NOW + 3)]

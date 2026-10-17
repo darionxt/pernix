@@ -63,8 +63,9 @@ class InlineFetch:
     attempt waits for its slot in the Throttle, waiting out a cooldown in place, and
     goes through the download chain. The retry policy judges every attempt, as for
     Requests from the Frontier, but a retry waits in place for its delay, emitting
-    `RequestRetried`. With a Session Pool, each attempt leases a Session first,
-    waiting for one in place, then waits for its slot. A Request without a Session continues the Session of the fetch
+    `RequestRetried`. Each attempt takes its place in its slot, then, with a Session
+    Pool, leases a Session, waiting for one in place, then waits for the slot's delay
+    and rate. A Request without a Session continues the Session of the fetch
     it is nested in, or of the Request being handled, if it has one; a fetch nested
     in another of the same Session, in the same task, shares its Lease.
 
@@ -129,7 +130,8 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            async with sending_with(self._sessions, request, wait=None) as sending, self._holding(slot):
+            async with self._placed(slot), sending_with(self._sessions, request, wait=None) as sending:
+                await self._paced(slot)
                 outcome = await self._attempt(sending, slot, None)
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
@@ -163,8 +165,9 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            # The Session first, so the slot paces the download however long it took; both through the block too.
-            async with sending_with(self._sessions, request, wait=None) as sending, self._holding(slot):
+            # A place, the Session, then the pace; the place and the Session through the block too.
+            async with self._placed(slot), sending_with(self._sessions, request, wait=None) as sending:
+                await self._paced(slot)
                 streams = Streams(max_bytes)
                 try:
                     outcome = await self._attempt(sending, slot, streams)
@@ -178,25 +181,27 @@ class InlineFetch:
             attempt += 1
 
     @asynccontextmanager
-    async def _holding(self, slot: str) -> AsyncGenerator[None]:
-        """Hold a slot for a fetch, or share the place of the fetch it is nested in, pacing it either way."""
+    async def _placed(self, slot: str) -> AsyncGenerator[None]:
+        """Hold a place in a slot for a fetch, or share the place of the fetch it is nested in, waiting out a cooldown."""
         if self._throttle.holds(slot):
-            await self._acquire(slot, shared=True)
             yield
             return
-        await self._acquire(slot, shared=False)
+        while True:
+            if await self._throttle.admit(slot):
+                break
+            # The Throttle refuses a cooling slot rather than wait, as Frontier Requests wait in the Frontier.
+            await asyncio.sleep(self._throttle.cooldown_left(slot))
         try:
             with self._throttle.holding(slot):
                 yield
         finally:
             self._throttle.release(slot)
 
-    async def _acquire(self, slot: str, *, shared: bool) -> None:
-        """Start a fetch in its slot, waiting out a cooldown in place."""
+    async def _paced(self, slot: str) -> None:
+        """Wait for a slot's delay and rate, and a cooldown, then start the fetch."""
         while True:
-            if await self._throttle.acquire(slot, shared=shared):
+            if await self._throttle.pace(slot):
                 return
-            # The Throttle refuses a cooling slot rather than wait, as Frontier Requests wait in the Frontier.
             await asyncio.sleep(self._throttle.cooldown_left(slot))
 
     async def _attempt(self, sending: Sending, slot: str, streams: Streams | None) -> Response | Exception:

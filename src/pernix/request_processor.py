@@ -69,12 +69,12 @@ type Settlement = Done | Again | Dead
 class RequestProcessor:
     """Makes one attempt at a claimed Request and tells how to settle its Lease.
 
-    With a Session Pool, the Request first leases a Session, the one it names or any,
-    waiting a moment for a busy one; when every Session that fits is busy or cooling
-    down, it goes back to the Frontier without counting an attempt, until one stops
-    cooling down, and a Request no Session can ever be leased for fails. It then
-    waits for its slot in the Throttle; a slot cooling down sends it back to the
-    Frontier the same way. It is fetched through the download chain while holding
+    The Request takes its place in its slot in the Throttle; a slot cooling down
+    sends it back to the Frontier without counting an attempt. With a Session Pool,
+    it then leases a Session, the one it names or any, waiting a moment for a busy
+    one; when every Session that fits is busy or cooling down, it goes back to the
+    Frontier the same way, until one stops cooling down, and a Request no Session can
+    ever be leased for fails. It then waits for the slot's delay and rate. It is fetched through the download chain while holding
     its Session and the slot, and the Response is handled through the spider chain,
     which ends in the Callback. Callbacks, errbacks, and Events get the Request as it
     was sent, naming its Session. The outputs are dispatched as they come:
@@ -174,16 +174,20 @@ class RequestProcessor:
         return await self._fail(request, error)
 
     async def _fetch(self, lease: Lease, sent: _Sent) -> Response | None:
-        """Fetch through the download chain under its Session, then in its slot; `None` if the slot is cooling down.
+        """Fetch through the download chain in its slot, under its Session; `None` if the slot is cooling down.
 
-        The Session is leased first, so the delay, the rate, and a cooldown are
-        checked just before the download, however long the Session took to free up.
+        The fetch takes its place in the slot, then leases its Session, then waits
+        for the slot's delay and rate: it never holds a Session while it waits for a
+        place, and its delay counts from the download, however long the Session took
+        to free up.
         """
-        async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
-            sent.request = sending.request
-            if not await self._throttle.acquire(lease.slot):
-                return None
-            try:
+        if not await self._throttle.admit(lease.slot):
+            return None
+        try:
+            async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
+                sent.request = sending.request
+                if not await self._throttle.pace(lease.slot):
+                    return None
                 with self._throttle.holding(lease.slot):  # Inline Fetches a Middleware makes share it
                     response = expect_response(
                         await self._download(sending.request), f"the download chain for {lease.request!r}"
@@ -191,8 +195,8 @@ class RequestProcessor:
                     sending.response = response
                 statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
                 self._throttle.observe(lease.slot, response, statuses=statuses)
-            finally:
-                self._throttle.release(lease.slot)
+        finally:
+            self._throttle.release(lease.slot)
         return response
 
     def _decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:

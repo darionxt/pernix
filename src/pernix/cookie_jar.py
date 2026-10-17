@@ -117,7 +117,10 @@ class CookieJar:
 
     @property
     def removals(self) -> dict[CookieKey, float]:
-        """When each cookie a response removed was removed, in seconds since the epoch, unless it was set again."""
+        """When a response last removed each cookie, in seconds since the epoch, unless one set it again.
+
+        A removal counts whether the jar held the cookie or not.
+        """
         return dict(self._removed)
 
     def set(self, cookie: Cookie) -> None:
@@ -203,8 +206,8 @@ class CookieJar:
             return
         key = (domain, host_only, path, parsed.name)
         if parsed.expired(dt.datetime.fromtimestamp(now, dt.UTC)):
-            if self._cookies.pop(key, None) is not None:
-                self._removed[key] = now
+            self._cookies.pop(key, None)
+            self._removed[key] = now  # even one held no more, which another fetch of the Session may have set
             return
         replaced = self._cookies.get(key)
         self._removed.pop(key, None)

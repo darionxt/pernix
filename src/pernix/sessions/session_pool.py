@@ -103,7 +103,8 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
             now: When the changes are recorded, in seconds since the epoch: the time
                 of the cookies removed that `removed_at` does not time.
             removed_at: When cookies were removed, by key, such as the `removals`
-                of the Session's cookie jar.
+                of the Session's cookie jar; each is a removal, whether `before` held
+                the cookie or not, as another fetch may have set it meanwhile.
 
         Returns:
             The delta; empty when nothing changed.
@@ -121,7 +122,7 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
                 CookieRemoval(
                     name=key[3], domain=key[0], host_only=key[1], path=key[2], removed=removed_at.get(key, now)
                 )
-                for key in old
+                for key in dict.fromkeys([*old, *removed_at])
                 if key not in new
             ],
             local_storage=storage,

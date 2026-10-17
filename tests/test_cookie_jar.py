@@ -287,10 +287,11 @@ def test_cookie_values_never_appear_in_a_repr() -> None:
     assert repr(jar) == "CookieJar(1 cookies)"
 
 
-def test_removals_tell_when_a_response_removed_a_cookie_until_it_is_set_again() -> None:
+def test_removals_tell_when_a_response_last_removed_a_cookie_until_it_is_set_again() -> None:
     jar = _received("https://example.com/", "a=1", "b=1")
     jar.receive("https://example.com/", ["a=; Max-Age=0", "never=; Max-Age=0"], now=NOW + 5)
+    jar.receive("https://example.com/", ["a=; Max-Age=0"], now=NOW + 7)  # held no more, but removed again
 
-    assert jar.removals == {("example.com", True, "/", "a"): NOW + 5}
-    jar.receive("https://example.com/", ["a=2"], now=NOW + 6)
-    assert jar.removals == {}
+    assert jar.removals == {("example.com", True, "/", "a"): NOW + 7, ("example.com", True, "/", "never"): NOW + 5}
+    jar.receive("https://example.com/", ["a=2"], now=NOW + 8)
+    assert jar.removals == {("example.com", True, "/", "never"): NOW + 5}

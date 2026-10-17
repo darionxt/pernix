@@ -507,3 +507,29 @@ async def test_the_domain_paces_fetches_once_the_session_they_waited_for_frees_u
     await asyncio.gather(*fetches)
 
     assert min(later - earlier for earlier, later in itertools.pairwise(starts)) >= 0.09
+
+
+async def test_a_fetch_waiting_for_a_place_holds_no_session_a_nested_fetch_needs() -> None:
+    site = _site({"/outer": [b"outer"], "/inner": [b"inner"], "/other": [b"other"]})
+    downloading = asyncio.Event()
+    inline: InlineFetch
+
+    async def download(request: Request) -> Response:
+        if request.url.endswith("/outer"):
+            downloading.set()
+            await asyncio.sleep(0.05)  # the other fetch arrives meanwhile, and waits for the place
+            await inline.fetch(Request(f"{SITE}/inner", session="b"))  # nested, in the same domain
+        return await site.fetch(request)
+
+    pool = MemorySessionPool(size=2)
+    leasing = SessionLeasing(pool, SessionSettings(enabled=True), stats=Stats())
+    inline = _inline(download, domain=DomainSettings(concurrency=1), sessions=leasing)
+
+    outer = asyncio.create_task(inline.fetch(Request(f"{SITE}/outer", session="a")))
+    await downloading.wait()
+    other = asyncio.create_task(inline.fetch(Request(f"{SITE}/other", session="b")))
+
+    async with asyncio.timeout(5):
+        responses = await asyncio.gather(outer, other)
+
+    assert [response.body for response in responses] == [b"outer", b"other"]
