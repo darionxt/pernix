@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 
 import msgspec
 
+from pernix.account import ACCOUNT_FILE_SUFFIXES, Account
 from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.text_decoding import codec_for
 
@@ -111,19 +112,27 @@ class SessionSettings(Section):
     """Settings of the Session Pool that Requests lease Sessions from.
 
     It is off by default, as Requests are independent (ADR 0011). Once enabled,
-    every Request leases a Session, except those rendered in the browser.
+    every Request leases a Session, except those rendered in the browser. With
+    Accounts, the pool holds one Session per Account, and no other.
 
     Attributes:
         enabled: Whether Requests lease Sessions.
         pool: The pool's name.
-        size: Sessions the pool holds at most. They are created as Requests need
-            them, or under the id a Request names.
-        eager: Create all `size` Sessions when the Run starts.
-        max_concurrency: Fetches in progress at once per Session.
-        cooldown: Seconds a 429 without `Retry-After` cools its Session down.
+        size: Sessions the pool holds at most, without Accounts. They are created
+            as Requests need them, or under the id a Request names.
+        eager: Create all `size` Sessions when the Run starts, without Accounts.
+        max_concurrency: Fetches in progress at once per Session, but for those
+            bound to an Account, which have their own.
+        cooldown: Seconds a 429 without `Retry-After`, or a failed login, cools
+            its Session down.
         cooldown_max: The longest a 429 cools its Session down.
         lease_ttl: Seconds a Session stays leased without renewal; leases are
             renewed every third of it while their fetch runs.
+        accounts: Accounts to bind Sessions to, as tables with the fields of an
+            `pernix.Account`.
+        accounts_file: A JSON Lines or CSV file of more Accounts, read when the
+            Run starts; see `pernix.account.read_accounts()`.
+        login_attempts: Failed logins in a row after which a Session is Retired.
     """
 
     __prefix__ = "sessions"
@@ -136,6 +145,21 @@ class SessionSettings(Section):
     cooldown: Annotated[float, msgspec.Meta(ge=0)] = 30.0
     cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
     lease_ttl: Annotated[float, msgspec.Meta(gt=0)] = 300.0
+    accounts: tuple[Account, ...] = ()
+    accounts_file: PurePath | None = None
+    login_attempts: Annotated[int, msgspec.Meta(ge=1)] = 3
+
+    def __post_init__(self) -> None:
+        if (self.accounts or self.accounts_file is not None) and not self.enabled:
+            raise ValueError(
+                f"{self.key('accounts')}: Accounts are bound to the Sessions of a Session Pool; "
+                f"enable one with {self.key('enabled')}"
+            )
+        if self.accounts_file is not None and self.accounts_file.suffix.lower() not in ACCOUNT_FILE_SUFFIXES:
+            raise ValueError(
+                f"{self.key('accounts_file')}: Accounts are read from "
+                f"{', '.join(sorted(ACCOUNT_FILE_SUFFIXES))} files, not {self.accounts_file.name!r}"
+            )
 
 
 class ResponseSettings(Section):

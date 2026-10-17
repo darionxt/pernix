@@ -6,6 +6,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from pernix.account import collect_accounts
 from pernix.addons import addon_settings, load_addons
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
@@ -21,6 +22,7 @@ from pernix.settings import (
     EventSettings,
     LogSettings,
     Section,
+    SessionSettings,
     Settings,
     ShutdownSettings,
     load_settings,
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
 
+    from pernix.account import Account
     from pernix.engine import Engine
     from pernix.feeds import Feed
     from pernix.fetchers import StreamedResponse
@@ -340,7 +343,8 @@ class Crawler:
                     raise
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
-        run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet)
+        accounts = await self._accounts(run_log)
+        run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet, accounts=accounts)
         self._shutdown.attach(run.engine)
         try:
             async with ComponentLifecycle() as lifecycle:
@@ -357,6 +361,14 @@ class Crawler:
                     await run.frontier.close()
         finally:
             self._shutdown.end()
+
+    async def _accounts(self, run_log: RunLog) -> tuple[Account, ...]:
+        """The Accounts the Spider gives, their credentials masked in the log from now on; none without a Session Pool."""
+        if not self.settings.section(SessionSettings).enabled:
+            return ()
+        accounts = await collect_accounts(self.spider.accounts())
+        run_log.mask(revealed_secrets(accounts))
+        return accounts
 
     async def _open(self, lifecycle: ComponentLifecycle, components: Sequence[object], feeds: Sequence[Feed]) -> None:
         """Subscribe and open the components, then open the Feeds."""

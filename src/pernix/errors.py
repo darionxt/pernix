@@ -15,6 +15,7 @@ __all__ = [
     "FeedError",
     "FetchError",
     "IgnoreRequest",
+    "LoginExpired",
     "NetworkBlocked",
     "PernixError",
     "ProxyError",
@@ -219,6 +220,26 @@ class Retry(_ControlFlow):
         """
         super().__init__(reason)
         self.delay = delay
+
+
+class LoginExpired(Retry):
+    """The Response shows that the Session it was fetched under is logged out, as `Spider.is_logged_out()` judges.
+
+    The Session logs in again before its next fetch, and the Request is retried at
+    once, as for `Retry`, while the retry policy allows.
+
+    Attributes:
+        response: The Response.
+    """
+
+    def __init__(self, response: Response) -> None:
+        """Create the exception.
+
+        Args:
+            response: The Response that shows the Session logged out.
+        """
+        super().__init__(f"the Session {response.session!r} is logged out", delay=0)
+        self.response = response
 
 
 class DropItem(_ControlFlow):

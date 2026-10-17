@@ -9,17 +9,20 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
-from pernix import Cookie, Request, Session
-from pernix.errors import ConnectError, ProxyError, SessionError
+from pernix import Account, Cookie, Request, Session
+from pernix.errors import ConnectError, LoginExpired, ProxyError, SessionError
 from pernix.fetchers import FetcherDispatch
 from pernix.fetchers.fetcher_dispatch import sending_as
 from pernix.sessions import MemorySessionPool, Outcome, StateDelta
 from pernix.sessions.session_leasing import NoSessionYet, SessionLeasing, sending_session, sending_with
+from pernix.sessions.session_login import SessionLogin
 from pernix.settings import SessionSettings
 from pernix.stats import Stats
 from pernix.testing import make_response
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from pernix import Response
 
 SITE = "https://site.example"
@@ -56,20 +59,36 @@ class Site:
         )
 
 
-def _leasing(*, clock: Clock | None = None, **settings: Any) -> tuple[SessionLeasing, MemorySessionPool, Stats, Clock]:
+def _leasing(
+    *, clock: Clock | None = None, login: SessionLogin | None = None, **settings: Any
+) -> tuple[SessionLeasing, MemorySessionPool, Stats, Clock]:
     clock, stats = clock or Clock(), Stats()
     config = SessionSettings(enabled=True, **settings)
     pool = MemorySessionPool(
-        size=config.size, max_concurrency=config.max_concurrency, lease_ttl=config.lease_ttl, stats=stats, clock=clock
+        size=config.size,
+        max_concurrency=config.max_concurrency,
+        lease_ttl=config.lease_ttl,
+        logs_in=login is not None,
+        login_attempts=config.login_attempts,
+        stats=stats,
+        clock=clock,
     )
-    return SessionLeasing(pool, config, stats=stats, clock=clock), pool, stats, clock
+    return SessionLeasing(pool, config, stats=stats, login=login, clock=clock), pool, stats, clock
 
 
 async def _send(leasing: SessionLeasing, dispatch: FetcherDispatch, request: Request) -> Response:
     async with leasing.sending(request, wait=0) as sending:
         response = await dispatch(sending.request)
-        sending.response = response
+        sending.received(response)
     return response
+
+
+def _login(
+    log_in: Callable[[Session, Account | None], Awaitable[None]],
+    is_logged_out: Callable[[Response], bool] = lambda response: response.status == 401,
+    accounts: tuple[Account, ...] = (),
+) -> SessionLogin:
+    return SessionLogin(log_in, is_logged_out, accounts=accounts)
 
 
 async def test_a_request_is_sent_under_the_session_leased_for_it() -> None:
@@ -301,3 +320,159 @@ async def test_a_removal_after_another_fetch_set_the_cookie_again_removes_it(hel
     lease = await pool.acquire(session="s")
     assert lease is not None
     assert (await pool.load_state(lease)).cookies == []
+
+
+async def test_a_session_logs_in_before_its_first_fetch_with_its_account_sharing_the_lease() -> None:
+    dispatch = FetcherDispatch({"site": Site(headers=[("Set-Cookie", "sid=1")])})
+    logins: list[tuple[str | None, str | None]] = []
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        logins.append((sending_session(), None if account is None else account.username))
+        await _send(leasing, dispatch, Request(f"{SITE}/login", session=session.id))
+
+    alice = Account(username="alice@shop.example", password="pw", id="alice")  # type: ignore[arg-type]
+    leasing, pool, stats, _ = _leasing(login=_login(log_in, accounts=(alice,)), max_concurrency=2)
+    pool.add(Session("alice", account="alice"))
+
+    async with leasing.sending(Request(f"{SITE}/page"), wait=0) as sending:
+        other = await pool.acquire(session="alice", timeout=0)  # the login ended, and its cookie was saved
+        assert other is not None
+        assert [cookie.name for cookie in (await pool.load_state(other)).cookies] == ["sid"]
+        assert sending.request.session == "alice"
+    await _send(leasing, dispatch, Request(f"{SITE}/page", session="alice"))
+
+    assert logins == [("alice", "alice@shop.example")]
+    assert (stats.get("sessions.logins"), stats.get("sessions.leased")) == (1, 2)  # the login shared its Lease
+
+
+async def test_a_failed_login_cools_its_session_down_and_the_fetch_waits_for_another(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        raise RuntimeError("wrong password")
+
+    leasing, pool, stats, _ = _leasing(login=_login(log_in))
+
+    with (
+        caplog.at_level(logging.ERROR, logger="pernix.sessions.session_leasing"),
+        pytest.raises(NoSessionYet) as waiting,
+    ):
+        async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+            pytest.fail("the fetch went on without a login")
+
+    assert waiting.value.delay == pytest.approx(30)
+    assert pool.health("a") == "cooldown"
+    assert (stats.get("sessions.login_failures"), stats.get("sessions.outcomes.login_failed")) == (1, 1)
+    assert caplog.messages == ["Logging in the Session 'a' failed"]
+
+
+async def test_a_session_retired_for_its_failed_logins_fails_the_requests_naming_it() -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        raise RuntimeError("wrong password")
+
+    leasing, _, _, clock = _leasing(login=_login(log_in), login_attempts=2)
+    with pytest.raises(NoSessionYet):
+        async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+            pass
+    clock.now += 30
+
+    with pytest.raises(SessionError, match="retired"):
+        async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+            pass
+
+
+async def test_a_response_logged_out_raises_login_expired_and_has_the_session_log_in_again() -> None:
+    logins: list[str] = []
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        logins.append(session.id)
+
+    site = Site()
+    leasing, pool, stats, _ = _leasing(login=_login(log_in))
+    dispatch = FetcherDispatch({"site": site})
+    await _send(leasing, dispatch, Request(f"{SITE}/", session="a"))
+    site.status = 401
+
+    with pytest.raises(LoginExpired) as expired:
+        await _send(leasing, dispatch, Request(f"{SITE}/", session="a"))
+
+    assert expired.value.response.status == 401
+    assert expired.value.delay == 0
+    assert stats.get("sessions.outcomes.auth_expired") == 1
+    lease = await pool.acquire(session="a", timeout=0)
+    assert lease is not None
+    assert lease.must_log_in
+    assert logins == ["a"]
+
+
+async def test_a_fetch_logged_out_right_after_its_login_counts_a_failed_login(caplog: pytest.LogCaptureFixture) -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        pass
+
+    leasing, pool, stats, _ = _leasing(login=_login(log_in))
+
+    with caplog.at_level(logging.WARNING, logger="pernix.sessions.session_leasing"), pytest.raises(LoginExpired):
+        await _send(leasing, FetcherDispatch({"site": Site(401)}), Request(f"{SITE}/", session="a"))
+
+    assert pool.health("a") == "cooldown"
+    assert (stats.get("sessions.logins"), stats.get("sessions.login_failures")) == (1, 1)
+    assert "the login counts as failed" in caplog.text
+
+
+async def test_the_responses_of_a_login_are_not_judged() -> None:
+    dispatch = FetcherDispatch({"site": Site(401)})
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        response = await _send(leasing, dispatch, Request(f"{SITE}/login", session=session.id))
+        assert response.status == 401
+
+    leasing, _, stats, _ = _leasing(login=_login(log_in))
+
+    async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+        pass
+
+    assert stats.get("sessions.logins") == 1
+    assert stats.get("sessions.outcomes.auth_expired") is None
+
+
+async def test_a_judgment_that_raises_is_logged_and_the_session_taken_as_logged_in(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        pass
+
+    def is_logged_out(response: Response) -> bool:
+        raise ValueError("broken")
+
+    leasing, _, stats, _ = _leasing(login=_login(log_in, is_logged_out))
+
+    with caplog.at_level(logging.ERROR, logger="pernix.sessions.session_login"):
+        response = await _send(leasing, FetcherDispatch({"site": Site()}), Request(f"{SITE}/", session="a"))
+
+    assert response.status == 200
+    assert stats.get("sessions.outcomes.ok") == 1
+    assert "Judging whether the Session of" in caplog.text
+
+
+async def test_a_cancelled_login_leaves_the_session_to_log_in() -> None:
+    started = asyncio.Event()
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    leasing, pool, _, _ = _leasing(login=_login(log_in))
+
+    async def send() -> None:
+        async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+            pass
+
+    task = asyncio.create_task(send())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    lease = await pool.acquire(session="a", timeout=0)
+    assert lease is not None
+    assert lease.must_log_in

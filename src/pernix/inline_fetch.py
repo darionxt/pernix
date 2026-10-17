@@ -8,7 +8,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from pernix.errors import IgnoreRequest, RetriesExhausted, SessionError
+from pernix.errors import IgnoreRequest, LoginExpired, RetriesExhausted, SessionError
 from pernix.events import RequestRetried
 from pernix.fetchers import StreamedResponse
 from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
@@ -71,9 +71,12 @@ class InlineFetch:
     Requests from the Frontier, but a retry waits in place for its delay, emitting
     `RequestRetried`. Each attempt takes its place in its slot, then, with a Session
     Pool, leases a Session, waiting for one in place, but giving up its place now and
-    then meanwhile, then waits for the slot's delay and rate. A Request without a Session continues the Session of the fetch
-    it is nested in, or of the Request being handled, if it has one; a fetch nested
-    in another of the same Session, in the same task, shares its Lease.
+    then meanwhile, then waits for the slot's delay and rate; a Session that must log
+    in does so first, in the fetch's place. A Request without a Session continues
+    the Session of the fetch it is nested in, or of the Request being handled, if it
+    has one; a fetch nested in another of the same Session, in the same task, shares
+    its Lease. A Response that shows the Session logged out is retried as for
+    `Retry`, once the Session logged in again.
 
     A fetch nested in another of the same slot, in the same task, such as one a
     download Middleware makes, shares the outer fetch's place instead of waiting for
@@ -239,9 +242,12 @@ class InlineFetch:
         except Exception as exc:
             sending.error = exc
             return exc
-        sending.response = response
         statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
         self._throttle.observe(slot, response, statuses=statuses)
+        try:
+            sending.received(response)
+        except LoginExpired as exc:  # retried, once the Session logged in again
+            return exc
         return response
 
     async def _retry_later(

@@ -67,7 +67,8 @@ class RunLog:
         """
         self._settings = settings
         self._run = run
-        self._redactor = Redactor(names=settings.redact, secrets=secrets)
+        self._secrets = frozenset(secrets)
+        self._redactor = Redactor(names=settings.redact, secrets=self._secrets)
         self._drain_timeout = drain_timeout
         self._records: queue.Queue[logging.LogRecord] = queue.Queue(settings.queue_size)
         self.handler = RunQueueHandler(self._records, run, owns_unattributed=lambda: _PERNIX.first_open() is self)
@@ -78,6 +79,19 @@ class RunLog:
     def counts(self) -> LogCounts:
         """Counters of the records logged for the Run, including the dropped ones."""
         return self.handler.counts
+
+    def mask(self, secrets: Iterable[str]) -> None:
+        """Mask more values wherever they occur, in the records written from now on.
+
+        Args:
+            secrets: Values learned once the Run started, such as the credentials of
+                the Accounts a Spider imports.
+        """
+        added = frozenset(secrets) - self._secrets
+        if added:
+            self._secrets |= added
+            # The writer thread takes the attribute once per record, so a record is masked by one or the other.
+            self._redactor = Redactor(names=self._settings.redact, secrets=self._secrets)
 
     @property
     def level(self) -> int | None:
@@ -132,14 +146,14 @@ class RunLog:
                 self.handler.handleError(record)
 
     def _redact(self, record: logging.LogRecord) -> None:
-        redact = self._redactor.redact
-        record.msg = redact(str(record.msg))
+        redactor = self._redactor
+        record.msg = redactor.redact(str(record.msg))
         if record.exc_text:
-            record.exc_text = redact(record.exc_text)
+            record.exc_text = redactor.redact(record.exc_text)
         if record.stack_info:
-            record.stack_info = redact(record.stack_info)
+            record.stack_info = redactor.redact(record.stack_info)
         for name, value in record_extras(record).items():
-            record.__dict__[name] = self._redactor.redact_value(value)
+            record.__dict__[name] = redactor.redact_value(value)
 
 
 class _StreamOutput:

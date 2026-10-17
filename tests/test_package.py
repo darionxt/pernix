@@ -9,6 +9,7 @@ def test_package_exposes_installed_version() -> None:
 
 def test_package_exports_public_api() -> None:
     assert set(pernix.__all__) == {
+        "Account",
         "Cookie",
         "CookieJar",
         "DropItem",

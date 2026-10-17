@@ -95,6 +95,27 @@ class Account(Spider):
 
 Requests are independent by default: each sends only the cookies it carries. With `sessions.enabled`, every Request leases a Session from the Run's Session Pool instead, and sends the Session's cookies, which keep those set during its fetches. Sessions are created as Requests need them, up to `sessions.size`, and each takes `sessions.max_concurrency` fetches at once. `Request(session="me")` leases the Session of that id, created on first use, and `session=response.session` continues the Session of a page; a Request a Callback yields without one leases whichever Session is free. Inline Fetches continue the Session of the Request being handled. A 429 cools only its Session down, so the others keep fetching from the domain. Rendered Requests do not lease Sessions yet. See [`docs/design.md`](docs/design.md) §5.3.
 
+### Logging in with Accounts
+
+```python
+class Shop(Spider):
+    start_urls = ["https://shop.example/orders"]
+    settings = {"sessions.enabled": True, "sessions.accounts_file": "accounts.csv"}  # id,username,password
+
+    async def login(self, session: Session, account: Account | None):
+        data = {"user": account.username, "password": account.password.reveal()}
+        page = await self.fetch(Request("https://shop.example/login", data=data))
+        if page.css(".error"):
+            raise RuntimeError(f"cannot log in as {account.id}")
+
+    def is_logged_out(self, response: Response) -> bool:
+        return "/login" in response.url  # the site sends logged-out visitors to its login page
+```
+
+With Accounts, the pool holds one Session per Account, under its id, and no other; each takes one fetch at a time, unless the Account's `max_concurrency` says otherwise. Accounts come from `sessions.accounts`, tables with a `username`, a `password`, and optionally an `id`, `extra` credentials, and `max_concurrency`; from `sessions.accounts_file`, a JSON Lines or CSV file; and from `Spider.accounts()`, which yields both, and which a Spider overrides to import Accounts from elsewhere, such as a database. Passwords and `extra` credentials are `Secret`s, masked in the logs.
+
+`login()` runs before a Session is first used, in the fetch that leases it, and fetches that want the same Session wait for it to finish, so each Session logs in once at a time; the Inline Fetches it makes are sent under the Session. Sessions without an Account log in too, with `account=None`. A Response that `is_logged_out()`, a 401 by default, has its Session log in again, and the Request is retried at once, counting as a retry. A login that raises cools its Session down for `sessions.cooldown` and is tried again; after `sessions.login_attempts` failures in a row the Session is Retired. Logins are over HTTP until Sessions reach the browser. See [`docs/design.md`](docs/design.md) §5.3.
+
 ## Running and stopping
 
 ```python
@@ -183,10 +204,12 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `domain.cooldown_max` | `300.0` | The longest a 429 or 503 with `Retry-After` pauses its domain; with a Session Pool, a 429 cools its Session down instead |
 | `sessions.enabled` | `false` | Whether Requests lease Sessions from a Session Pool |
 | `sessions.pool` | `"default"` | The pool's name |
-| `sessions.size` / `sessions.eager` | `8` / `false` | Sessions the pool holds at most, created as Requests need them, or all at the start with `eager` |
-| `sessions.max_concurrency` | `1` | Fetches in progress at once per Session |
-| `sessions.cooldown` / `sessions.cooldown_max` | `30.0` / `300.0` | Seconds a 429 without `Retry-After` cools its Session down, and the longest any 429 does |
+| `sessions.size` / `sessions.eager` | `8` / `false` | Sessions the pool holds at most without Accounts, created as Requests need them, or all at the start with `eager` |
+| `sessions.max_concurrency` | `1` | Fetches in progress at once per Session, but for those bound to an Account, which have their own |
+| `sessions.cooldown` / `sessions.cooldown_max` | `30.0` / `300.0` | Seconds a 429 without `Retry-After`, or a failed login, cools its Session down, and the longest any 429 does |
 | `sessions.lease_ttl` | `300.0` | Seconds a Session stays leased without renewal; leases are renewed while their fetch runs |
+| `sessions.accounts` / `sessions.accounts_file` | `()` / none | Accounts to bind Sessions to, and a JSON Lines or CSV file of more |
+| `sessions.login_attempts` | `3` | Failed logins in a row after which a Session is Retired |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -315,6 +338,7 @@ src/pernix/
 ├── __init__.py          public API: Spider, Request, Response, Middleware, Extension, ...
 ├── spider.py            Spider base class, Inline Fetch, and the run()/crawl()/stream_items() entry points
 ├── spider_arguments.py  checks and converts Spider arguments
+├── spider_hooks.py      tells the Spider hooks a subclass overrides from those it inherits
 ├── crawler.py           Crawler: runs one Run, builds components with injection, stops it
 ├── run_assembly.py      which components a Run has, built and wired before opening; the download chain
 ├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
@@ -335,6 +359,8 @@ src/pernix/
 ├── cookies.py           checks cookies, parses Set-Cookie headers, and applies them to cookies held by name
 ├── cookie_jar.py        Cookie, CookieJar: full cookie records, stored and matched as browsers do
 ├── session.py           Session, SessionState: cookies, storage, proxy, Profile, and Account
+├── account.py           Account: login credentials; reading them from JSON Lines and CSV files
+├── secret.py            Secret, a value redacted in logs and reprs
 ├── urls.py              URL clean-up, joining, normalization, and hosts as clients connect to them
 ├── text_decoding.py     decoding bodies: encoding declarations, labels, detection
 ├── fingerprint.py       Fingerprints of Requests
@@ -396,7 +422,8 @@ src/pernix/
 ├── sessions/
 │   ├── session_pool.py  SessionPool protocol, SessionLease, Outcome, StateDelta
 │   ├── memory_session_pool.py MemorySessionPool: the in-process pool of a Run
-│   └── session_leasing.py leases a Session per fetch, reports how it fared, saves its changes
+│   ├── session_leasing.py leases a Session per fetch, logs it in, reports how it fared, saves its changes
+│   └── session_login.py logs Sessions in with the Spider's login, judges logged-out Responses
 ├── stats/
 │   ├── stats.py         Stats, the counters and values of a Run
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items
@@ -409,8 +436,7 @@ src/pernix/
 │   ├── settings.py      Settings, the immutable result
 │   ├── section.py       Section base class, ComponentMap, NamedComponents
 │   ├── core_settings.py the Sections every Crawler registers
-│   ├── conversion.py    validates values, converting strings from the environment
-│   └── secret.py        Secret, a redacted value
+│   └── conversion.py    validates values, converting strings from the environment
 └── testing/
     ├── fake_fetcher.py  FakeFetcher: canned answers by URL or pattern
     ├── responses.py     make_response(), Responses for tests

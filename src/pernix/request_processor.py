@@ -74,9 +74,11 @@ class RequestProcessor:
     it then leases a Session, the one it names or any, waiting a moment for a busy
     one; when every Session that fits is busy or cooling down, it goes back to the
     Frontier the same way, until one stops cooling down, and a Request no Session can
-    ever be leased for fails. It then waits for the slot's delay and rate. It is fetched through the download chain while holding
-    its Session and the slot, and the Response is handled through the spider chain,
-    which ends in the Callback. Callbacks, errbacks, and Events get the Request as it
+    ever be leased for fails. A Session that must log in does so first, in the
+    Request's place. It then waits for the slot's delay and rate. It is fetched
+    through the download chain while holding its Session and the slot, and the
+    Response is handled through the spider chain, which ends in the Callback. A
+    Response that shows the Session logged out raises `LoginExpired`, a `Retry`. Callbacks, errbacks, and Events get the Request as it
     was sent, naming its Session. The outputs are dispatched as they come:
     Requests are scheduled, and Items, recognized with `pernix.items.is_item()`, are
     handed to `put_item`.
@@ -176,25 +178,29 @@ class RequestProcessor:
     async def _fetch(self, lease: Lease, sent: _Sent) -> Response | None:
         """Fetch through the download chain in its slot, under its Session; `None` if the slot is cooling down.
 
-        The fetch takes its place in the slot, then leases its Session, then waits
-        for the slot's delay and rate: it never holds a Session while it waits for a
-        place, and its delay counts from the download, however long the Session took
-        to free up.
+        The fetch takes its place in the slot, then leases its Session, logging it in
+        if it must, then waits for the slot's delay and rate: it never holds a
+        Session while it waits for a place, and its delay counts from the download,
+        however long the Session took to free up. The fetches a login or a download
+        Middleware makes share its place.
+
+        Raises:
+            pernix.errors.LoginExpired: The Response shows the Session logged out.
         """
         if not await self._throttle.admit(lease.slot):
             return None
         try:
-            async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
-                sent.request = sending.request
-                if not await self._throttle.pace(lease.slot):
-                    return None
-                with self._throttle.holding(lease.slot):  # Inline Fetches a Middleware makes share it
+            with self._throttle.holding(lease.slot):  # Inline Fetches a login or a Middleware makes share it
+                async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
+                    sent.request = sending.request
+                    if not await self._throttle.pace(lease.slot):
+                        return None
                     response = expect_response(
                         await self._download(sending.request), f"the download chain for {lease.request!r}"
                     )
-                    sending.response = response
-                statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
-                self._throttle.observe(lease.slot, response, statuses=statuses)
+                    statuses = COOLDOWN_STATUSES if sending.session is None else SESSION_COOLDOWN_STATUSES
+                    self._throttle.observe(lease.slot, response, statuses=statuses)
+                    sending.received(response)
         finally:
             self._throttle.release(lease.slot)
         return response

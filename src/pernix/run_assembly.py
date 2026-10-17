@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -19,8 +20,10 @@ from pernix.items import ItemProcessor
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.retry_policy import DefaultRetryPolicy
+from pernix.session import Session
 from pernix.sessions import MemorySessionPool
 from pernix.sessions.session_leasing import SessionLeasing
+from pernix.sessions.session_login import SessionLogin
 from pernix.settings import (
     CoreSettings,
     DomainSettings,
@@ -33,6 +36,7 @@ from pernix.settings import (
     SessionSettings,
     StatsSettings,
 )
+from pernix.spider_hooks import overrides
 from pernix.stats import CoreStats, StatsReporter
 from pernix.throttle import Throttle
 
@@ -40,15 +44,19 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
     from pathlib import Path
 
+    from pernix.account import Account
     from pernix.crawler import Crawler
     from pernix.frontiers import Frontier
     from pernix.logs import RunLog
     from pernix.middlewares import Download
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
+    from pernix.spider import Spider
     from pernix.stats import Gauge, Stats, StatsSink
 
 __all__ = ["DownloadAssembly", "RunAssembly"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +132,7 @@ class RunAssembly:
         *,
         output: str | os.PathLike[str] | None = None,
         outlet: Callable[[Any], Awaitable[None]] | None = None,
+        accounts: Sequence[Account] = (),
     ) -> RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
@@ -140,6 +149,8 @@ class RunAssembly:
             run_log: The log of the Run, whose counts are reported in the stats.
             output: A Feed for the Items besides the `feeds` setting.
             outlet: Receives every Item that passes the Pipelines, after the Feeds.
+            accounts: The Accounts the Spider gave, whose Sessions the Session Pool
+                holds, if one is enabled.
 
         Returns:
             The assembly.
@@ -188,7 +199,7 @@ class RunAssembly:
         core_stats = CoreStats(crawler.stats)
         frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
-        sessions = _session_leasing(settings.section(SessionSettings), crawler.stats)
+        sessions = _session_leasing(settings.section(SessionSettings), crawler.stats, crawler.spider, accounts)
         download = core_stats.count_downloads(downloading.download)
         engine = Engine(
             crawler.spider,
@@ -233,19 +244,45 @@ class RunAssembly:
         )
 
 
-def _session_leasing(settings: SessionSettings, stats: Stats) -> SessionLeasing | None:
-    """The leasing of the Run's Session Pool, held in this process; `None` when Requests are independent."""
+def _session_leasing(
+    settings: SessionSettings, stats: Stats, spider: Spider, accounts: Sequence[Account]
+) -> SessionLeasing | None:
+    """The leasing of the Run's Session Pool, held in this process; `None` when Requests are independent.
+
+    With Accounts, the pool holds one Session per Account, under its id, and no
+    other. Sessions log in if the Spider defines `login()`.
+    """
+    logs_in = overrides(spider.login)
     if not settings.enabled:
+        hooks = [f"{name}()" for name in ("accounts", "login") if overrides(getattr(spider, name))]
+        if hooks:
+            logger.warning(
+                "%s defines %s, but no Session Pool is enabled, so no Session is used; enable one with %s",
+                type(spider).__name__,
+                " and ".join(hooks),
+                SessionSettings.key("enabled"),
+            )
         return None
+    if accounts and not logs_in:
+        logger.warning(
+            "%s defines no login(), so the Sessions bound to its %d Accounts never log in",
+            type(spider).__name__,
+            len(accounts),
+        )
     pool = MemorySessionPool(
         settings.pool,
-        size=settings.size,
+        size=len(accounts) or settings.size,
         max_concurrency=settings.max_concurrency,
         lease_ttl=settings.lease_ttl,
-        eager=settings.eager,
+        eager=settings.eager and not accounts,
+        logs_in=logs_in,
+        login_attempts=settings.login_attempts,
         stats=stats,
     )
-    return SessionLeasing(pool, settings, stats=stats)
+    for account in accounts:
+        pool.add(Session(account.id, account=account.id), max_concurrency=account.max_concurrency)
+    login = SessionLogin(spider.login, spider.is_logged_out, accounts=accounts) if logs_in else None
+    return SessionLeasing(pool, settings, stats=stats, login=login)
 
 
 class _Problems:
