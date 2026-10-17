@@ -160,17 +160,16 @@ async def test_an_error_recorded_inside_the_block_is_the_outcome() -> None:
     assert stats.get("sessions.outcomes.proxy_failed") == 1
 
 
-async def test_rendered_requests_are_sent_without_a_session() -> None:
-    leasing, pool, stats, _ = _leasing()
+async def test_rendered_requests_lease_sessions_too() -> None:
+    leasing, _, stats, _ = _leasing()
 
     async with leasing.sending(Request(f"{SITE}/", render=True), wait=0) as sending:
-        assert sending.session is None
-        assert sending_session() is None
-    with pytest.raises(SessionError, match="renders no Request under a Session"):
-        async with leasing.sending(Request(f"{SITE}/", render=True, session="a"), wait=0):
-            pass
+        assert sending.session is not None
+        assert sending_session() == sending.session.id
+    async with leasing.sending(Request(f"{SITE}/", render=True, session="a"), wait=0) as named:
+        assert named.request.session == "a"
 
-    assert (len(pool), stats.get("sessions.leased")) == (0, None)
+    assert stats.get("sessions.leased") == 2
 
 
 async def test_a_fetch_nested_in_one_of_the_same_session_shares_its_lease() -> None:

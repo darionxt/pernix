@@ -44,9 +44,12 @@ class Session:
 
     The HTTP Fetcher sends a Request under a Session with the Session's cookies that
     match each redirect hop, together with the Request's own `cookies`, and keeps the
-    cookies set during the fetch, while the Request's own are not kept. The Session's
-    proxy and Profile apply unless the Request names its own. Cookie values and
-    storage never appear in a `repr`.
+    cookies set during the fetch, while the Request's own are not kept. The browser
+    Fetcher loads it in a browser context kept for the Session, which it makes hold
+    the Session's cookies first, and keeps in the Session the cookies and the
+    localStorage the page changed. The Session's proxy applies unless the Request
+    names its own, and so does its Profile over HTTP. Cookie values and storage
+    never appear in a `repr`.
 
     Attributes:
         id: The Session's identifier, as `Request.session` and `Response.session`

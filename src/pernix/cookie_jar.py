@@ -133,6 +133,18 @@ class CookieJar:
         self._cookies[key] = cookie
         self._removed.pop(key, None)
 
+    def discard(self, key: CookieKey, *, now: float | None = None) -> None:
+        """Remove a cookie, as an expired one would, recording the removal whether the jar held it or not.
+
+        Args:
+            key: The cookie's name, domain, host-only flag, and path, as
+                `cookie_key()` gives them.
+            now: When it was removed, in seconds since the epoch; the system clock's
+                by default.
+        """
+        self._cookies.pop(key, None)
+        self._removed[key] = time.time() if now is None else now
+
     def receive(self, url: str, set_cookie_headers: Iterable[str], *, now: float | None = None) -> None:
         """Apply the `Set-Cookie` headers of a response to the jar, in order, as a browser would.
 

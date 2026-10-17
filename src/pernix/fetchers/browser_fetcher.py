@@ -5,10 +5,11 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Self
 from urllib.parse import urlsplit
 
-from pernix.cookies import request_cookies, requires_secure
+from pernix.cookies import request_cookies
 from pernix.errors import (
     ComponentError,
     ConnectError,
@@ -20,12 +21,15 @@ from pernix.errors import (
     TLSError,
     TooManyRedirects,
 )
+from pernix.fetchers.browser_cookies import request_cookie
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
+from pernix.fetchers.session_contexts import SessionContexts
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
 from pernix.settings import ResponseSettings, Section
+from pernix.urls import url_host
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Iterable
@@ -37,6 +41,7 @@ if TYPE_CHECKING:
 
     from pernix.crawler import Crawler
     from pernix.fetchers.network_guard import NetworkGuard
+    from pernix.fetchers.session_contexts import SessionContext
     from pernix.request import Request
     from pernix.session import Session
 
@@ -93,11 +98,30 @@ class BrowserFetcher:
     or without the browser engine, that Request fails with a `ComponentError` saying
     how to install them.
 
-    Each Request gets a fresh browser context, closed after the fetch, so rendered
-    Requests are independent as on the HTTP side (ADR 0011): a context holds only the
-    Request's cookies, as host-only cookies of its host, Secure only for the names
-    that need it (`__Secure-` and `__Host-`), and the cookies set while the page
-    loads. The page is loaded until its `load` event, within
+    A Request without a Session gets a fresh browser context, closed after the
+    fetch, so rendered Requests are independent as on the HTTP side (ADR 0011): a
+    context holds only the Request's cookies, as host-only cookies of its host,
+    Secure only for the names that need it (`__Secure-` and `__Host-`), and the
+    cookies set while the page loads.
+
+    A Request under a Session is loaded in a context kept for that Session, which
+    one fetch uses at a time; concurrent fetches of a Session get one each. It is
+    created with the Session's localStorage and the proxy of the Request or of the
+    Session, which never change afterwards: a Session whose proxy or localStorage
+    changed elsewhere gets a new one. Before each fetch, the context is made to hold
+    the Session's cookies, with the Request's own, and after it its pages are
+    closed, those the page opened included, and the cookies the page changed, and
+    the localStorage of the page's origin, are kept in the Session, whether the page
+    loaded or not, but not when the fetch is cancelled. Attributes
+    the browser does not tell, such as an unspecified SameSite or when a cookie was
+    first set, are kept from the Session's cookie jar; a cookie the page made without
+    SameSite is held as Lax, as the browser reports it. The localStorage of frames
+    from other sites, which the browser partitions, is not kept. At most
+    `browser.max_idle_contexts` contexts are kept idle between fetches, and one is
+    closed once idle for `browser.context_idle` seconds; a Retired Session is
+    never leased again, so its context goes that way too.
+
+    The page is loaded until its `load` event, within
     `browser.timeout` (or `request.timeout`); `browser.deadline` limits the whole
     fetch. A Request other than a plain GET, or with headers, changes the first
     request of the page accordingly. The browser keeps those headers on the
@@ -141,6 +165,12 @@ class BrowserFetcher:
         self._launch: asyncio.Task[LaunchedBrowser] | None = None
         self._unavailable: ComponentError | None = None
         self._closing: set[asyncio.Task[None]] = set()
+        self._contexts = SessionContexts(
+            kept=self._settings.max_idle_contexts,
+            idle=self._settings.context_idle,
+            new_context=_session_context,
+            discard=self._discard,
+        )
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -166,6 +196,7 @@ class BrowserFetcher:
     async def __aexit__(self, *_exc: object) -> None:
         self._open = False
         launch, self._launch = self._launch, None
+        self._contexts.close()
         try:
             if self._closing:
                 await asyncio.wait(self._closing)
@@ -178,10 +209,12 @@ class BrowserFetcher:
 
         Args:
             request: The Request to load.
-            session: Refused: the browser does not load pages under a Session.
+            session: The Session to load it under, in a context kept for it, whose
+                cookies and localStorage the fetch updates; `None` for a fresh
+                context.
 
         Returns:
-            The Response, whatever its status code.
+            The Response, whatever its status code, naming the Session.
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
@@ -191,30 +224,31 @@ class BrowserFetcher:
             pernix.errors.FetchError: The page did not load; a subclass names the kind
                 of failure.
             ValueError: The Request has an `Authorization` or `Proxy-Authorization`
-                header, or a Session.
+                header.
         """
         if not self._open:
             raise RuntimeError("BrowserFetcher must be entered with 'async with' before fetching")
-        if session is not None:
-            raise ValueError(f"the browser Fetcher cannot render {request!r} under a Session; fetch it over HTTP")
         credentials = sorted({name for name, _ in request.headers if name.lower() in _CREDENTIAL_HEADERS})
         if credentials:
             raise ValueError(
                 f"{request!r} has a {' and '.join(credentials)} header, which the browser would send on to any host a "
                 "redirect leads to; render it without, or fetch it over HTTP"
             )
+        proxy = request.proxy or (session.proxy if session is not None else None)
         guard = current_guard()
         if guard is not None:
-            guard.check(request.url, proxy=request.proxy)
+            guard.check(request.url, proxy=proxy)
         async with self._deadline(request):
             try:
-                return await self._fetch(request, guard)
+                return await self._fetch(request, guard, proxy, session)
             except PernixError:
                 raise
             except Exception as exc:  # the browser's own errors
                 raise _fetch_error(exc, request) from exc
 
-    async def _fetch(self, request: Request, guard: NetworkGuard | None) -> Response:
+    async def _fetch(
+        self, request: Request, guard: NetworkGuard | None, proxy: str | None, session: Session | None
+    ) -> Response:
         launched = await self._browser()
         if guard is not None and not launched.guarded:
             guard.blocked.append(request.url)
@@ -223,11 +257,15 @@ class BrowserFetcher:
                 "so it cannot be kept on loopback hosts"
             )
         started = time.monotonic()
-        context = await launched.new_context(proxy=request.proxy)
-        try:
-            return await self._load(context, request, guarded=launched.guarded, started=started)
-        finally:
-            await self._close_soon(context)
+        load = _Load(request, proxy=proxy, guarded=launched.guarded, started=started)
+        if session is None:
+            context = await launched.new_context(proxy=proxy)
+            try:
+                return await self._load(context, load)
+            finally:
+                await self._close_soon(context)
+        async with self._contexts.using(launched, session, proxy=proxy) as kept:
+            return await self._load(kept.context, load, kept=kept, session=session)
 
     async def _browser(self) -> LaunchedBrowser:
         """The browser, launched by the first fetch that needs it while the others wait."""
@@ -246,12 +284,37 @@ class BrowserFetcher:
                 self._launch = None  # a later fetch launches again
             raise
 
-    async def _load(self, context: BrowserContext, request: Request, *, guarded: bool, started: float) -> Response:
+    async def _load(
+        self,
+        context: BrowserContext,
+        load: _Load,
+        *,
+        kept: SessionContext | None = None,
+        session: Session | None = None,
+    ) -> Response:
+        """Load a Request in a page of its own, keeping what it changed in its Session, if any."""
         page = await context.new_page()
-        load = _PageLoad(page, request, guarded=guarded)
-        cookies = request_cookies(request)
-        if cookies:
-            await context.add_cookies(_host_cookies(request.url, cookies))
+        watch = _PageLoad(page, proxy=load.proxy, guarded=load.guarded)
+        try:
+            response = await self._loaded(page, watch, load, kept, session)
+        except asyncio.CancelledError:
+            watch.stop()
+            raise  # a kept context is closed, with the page
+        except BaseException:
+            await self._done(page, watch, kept, session)
+            raise
+        await self._done(page, watch, kept, session)
+        return response
+
+    async def _loaded(
+        self, page: Page, watch: _PageLoad, load: _Load, kept: SessionContext | None, session: Session | None
+    ) -> Response:
+        request = load.request
+        own = _own_cookies(request)
+        if kept is not None and session is not None:
+            await kept.sync(session, own, now=time.time())
+        elif own:
+            await page.context.add_cookies(own)
         rewrite = _FirstRequest.of(page, request)
         if rewrite is not None:
             await page.route("**/*", rewrite)
@@ -259,46 +322,62 @@ class BrowserFetcher:
         try:
             document = await page.goto(request.url, wait_until="load", timeout=timeout * 1000)
         except Exception as exc:
-            return await self._failed_load(exc, load, request, started)
+            return await self._failed_load(exc, watch, load, session)
         if document is None:
             raise FetchError(f"loading {request.url} gave no document")
-        return await self._response(page, document, request, started)
+        return await self._response(page, document, load, session)
 
-    async def _failed_load(self, error: Exception, load: _PageLoad, request: Request, started: float) -> Response:
+    async def _done(self, page: Page, watch: _PageLoad, kept: SessionContext | None, session: Session | None) -> None:
+        """End a fetch: in a kept context, close its pages and keep what it changed in its Session."""
+        watch.stop()
+        if kept is None or session is None:
+            return  # its context is closed, with the pages
+        try:
+            await kept.merge(page, session, now=time.time())
+        except Exception:
+            kept.broken = True
+            logger.warning(
+                "Keeping what a rendered fetch changed in the Session %r failed; its browser context is closed",
+                session.id,
+                exc_info=True,
+            )
+
+    async def _failed_load(self, error: Exception, watch: _PageLoad, load: _Load, session: Session | None) -> Response:
         """Turn a page that did not load into the Response it still had, or the error it is."""
         from patchright.async_api import TimeoutError as PageTimeout  # imported once a browser runs
 
-        if load.refused is not None:
+        request = load.request
+        if watch.refused is not None:
             raise NetworkBlocked(
-                f"the network guard refused {load.refused}, on the way to {request.url}: only loopback hosts, "
+                f"the network guard refused {watch.refused}, on the way to {request.url}: only loopback hosts, "
                 "such as 127.0.0.1 and localhost, may be reached while it is on"
             ) from None
         if isinstance(error, PageTimeout):
             seconds = request.timeout or self._settings.timeout
             raise Timeout(f"{request.url} did not load within {seconds} s") from None
-        document = load.document
+        document = watch.document
         if document is not None and document.status in _NO_CONTENT:
-            return await self._built(request, load.page, document, url=document.url, body=b"", started=started)
+            return await self._built(load, watch.page, document, url=document.url, body=b"", session=session)
         if "Download is starting" in str(error):
             raise FetchError(f"the browser downloads {request.url} instead of showing it; fetch it without render")
         raise _fetch_error(error, request) from error
 
-    async def _response(self, page: Page, document: PageResponse, request: Request, started: float) -> Response:
+    async def _response(self, page: Page, document: PageResponse, load: _Load, session: Session | None) -> Response:
         if await page.evaluate("document.contentType") in _RENDERED_TYPES:
             body = (await page.content()).encode()
-            return await self._built(request, page, document, url=page.url, body=body, started=started, rendered=True)
+            return await self._built(load, page, document, url=page.url, body=body, session=session, rendered=True)
         body = await document.body()
-        return await self._built(request, page, document, url=document.url, body=body, started=started)
+        return await self._built(load, page, document, url=document.url, body=body, session=session)
 
     async def _built(
         self,
-        request: Request,
+        load: _Load,
         page: Page,
         document: PageResponse,
         *,
         url: str,
         body: bytes,
-        started: float,
+        session: Session | None,
         rendered: bool = False,
     ) -> Response:
         headers = await _headers(document)
@@ -312,14 +391,15 @@ class BrowserFetcher:
             status=document.status,
             headers=headers,
             body=body,
-            request=request,
+            request=load.request,
             cookies={cookie.get("name", ""): cookie.get("value", "") for cookie in held},
             encoding="utf-8" if rendered else None,
             default_encoding=self._default_encoding,
             history=history,
-            elapsed=time.monotonic() - started,
+            elapsed=time.monotonic() - load.started,
             ip_address=address["ipAddress"] if address else None,
             fetcher="browser",
+            session=None if session is None else session.id,
         )
 
     @asynccontextmanager
@@ -337,10 +417,24 @@ class BrowserFetcher:
 
     async def _close_soon(self, context: BrowserContext) -> None:
         """Close a context in a task of its own, which a cancelled fetch leaves running and closing the fetcher waits for."""
+        await asyncio.shield(self._discard(context))
+
+    def _discard(self, context: BrowserContext) -> asyncio.Task[None]:
+        """Start closing a context in a task of its own, which closing the fetcher waits for."""
         closing = asyncio.create_task(_quietly(context.close(), "closing a browser context"))
         self._closing.add(closing)
         closing.add_done_callback(self._closing.discard)
-        await asyncio.shield(closing)
+        return closing
+
+
+@dataclass(frozen=True, slots=True)
+class _Load:
+    """A Request on its way to the browser, with the proxy it goes through."""
+
+    request: Request
+    proxy: str | None
+    guarded: bool
+    started: float
 
 
 class _PageLoad:
@@ -353,15 +447,22 @@ class _PageLoad:
             refused, if any.
     """
 
-    def __init__(self, page: Page, request: Request, *, guarded: bool) -> None:
+    def __init__(self, page: Page, *, proxy: str | None, guarded: bool) -> None:
         self.page = page
         self.document: PageResponse | None = None
         self.refused: str | None = None
-        self._proxy = request.proxy
+        self._proxy = proxy
+        self._guarded = guarded
         page.on("response", self._on_response)
         if guarded:
             page.context.on("request", self._on_request)
             page.on("websocket", self._on_websocket)
+
+    def stop(self) -> None:
+        """Stop watching, as the context may outlive the page."""
+        if self._guarded:
+            page_context = self.page.context
+            page_context.remove_listener("request", self._on_request)
 
     def _on_response(self, response: PageResponse) -> None:
         if response.request.is_navigation_request() and response.frame == self.page.main_frame:
@@ -431,22 +532,11 @@ def _merged(browser_headers: Iterable[NameValue], own: list[tuple[str, str]]) ->
     return merged
 
 
-def _host_cookies(url: str, cookies: dict[str, str]) -> list[SetCookieParam]:
-    """Cookies held for the host of a URL only, for every path, sent in the order given.
-
-    They are not Secure, so they go over HTTP as well as HTTPS, except those whose
-    names have a prefix the browser takes only on Secure cookies.
-    """
-    hostname = urlsplit(url).hostname or ""
-    host = f"[{hostname}]" if ":" in hostname else hostname
-    return [
-        {
-            "name": name,
-            "value": value,
-            "url": f"https://{host}/" if requires_secure(name) else f"http://{host}/",
-        }
-        for name, value in cookies.items()
-    ]
+def _own_cookies(request: Request) -> list[SetCookieParam]:
+    """The cookies a Request carries, held for its host only, for every path, sent in the order given."""
+    cookies = request_cookies(request)
+    host = url_host(request.url) or urlsplit(request.url).hostname or ""
+    return [request_cookie(host, name, value) for name, value in cookies.items()] if cookies else []
 
 
 async def _headers(response: PageResponse) -> Headers:
@@ -494,3 +584,8 @@ async def _close_launched(launch: asyncio.Task[LaunchedBrowser]) -> None:
     if launch.cancelled() or launch.exception() is not None:
         return  # a launch that failed or was stopped cleaned up after itself
     await launch.result().close()
+
+
+async def _session_context(launched: LaunchedBrowser, session: Session, proxy: str | None) -> BrowserContext:
+    """A context for a Session, with its localStorage, and a proxy."""
+    return await launched.new_context(proxy=proxy, local_storage=session.local_storage)

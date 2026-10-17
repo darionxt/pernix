@@ -12,6 +12,9 @@ from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.refusing_proxy import RefusingProxy
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from patchright._impl._api_structures import StorageState
     from patchright.async_api import Browser, BrowserContext, Playwright, ProxySettings
     from patchright.async_api._context_manager import PlaywrightContextManager
 
@@ -43,19 +46,26 @@ class LaunchedBrowser:
     guarded: bool
     refusing_proxy: RefusingProxy | None
 
-    async def new_context(self, *, proxy: str | None = None) -> BrowserContext:
-        """Create a context of its own for one fetch.
+    async def new_context(
+        self, *, proxy: str | None = None, local_storage: Mapping[str, Mapping[str, str]] | None = None
+    ) -> BrowserContext:
+        """Create a context, for one fetch or for the fetches of a Session.
 
         Args:
             proxy: The proxy URL every request of the context goes through, loopback
                 ones included; without one, the browser's own applies.
+            local_storage: The localStorage the context starts with, by origin, then
+                by key.
 
         Returns:
             The context, without pages.
         """
-        if not proxy:
-            return await self.browser.new_context()
-        return await self.browser.new_context(proxy=_proxy_settings(proxy))
+        options: dict[str, Any] = {}
+        if proxy:
+            options["proxy"] = _proxy_settings(proxy)
+        if local_storage:
+            options["storage_state"] = _storage_state(local_storage)
+        return await self.browser.new_context(**options)
 
     async def close(self) -> None:
         """Close the browser, stop the driver, and stop the refusing proxy."""
@@ -130,6 +140,17 @@ async def _start(manager: PlaywrightContextManager) -> Playwright:
         if not starting.cancelled() and starting.exception() is None:
             await starting.result().stop()
         raise
+
+
+def _storage_state(local_storage: Mapping[str, Mapping[str, str]]) -> StorageState:
+    """The storage state patchright starts a context with: no cookies, and localStorage by origin."""
+    return {
+        "cookies": [],
+        "origins": [
+            {"origin": origin, "localStorage": [{"name": name, "value": value} for name, value in items.items()]}
+            for origin, items in local_storage.items()
+        ],
+    }
 
 
 def _proxy_settings(proxy: str) -> ProxySettings:
