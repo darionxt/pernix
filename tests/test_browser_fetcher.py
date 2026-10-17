@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pernix import Request
+from pernix import Request, Session
 from pernix.errors import ConnectError, FetchError, NetworkBlocked, Timeout
 from pernix.fetchers import BrowserFetcher, BrowserSettings
 from pernix.fetchers.launched_browser import LOOPBACK_BYPASS
@@ -308,6 +308,16 @@ async def test_a_fetcher_must_be_entered() -> None:
 # The network guard: the pytest plugin keeps it on while each test runs, so the browser
 # of every test here is launched under it; `blocking_network()` records what one fetch
 # refused.
+
+
+async def test_a_session_is_refused(server: LoopbackServer) -> None:
+    async with BrowserFetcher() as fetcher:
+        with pytest.raises(ValueError, match="under a Session"):
+            await fetcher.fetch(_render(server.url("/")), session=Session())
+        launched = fetcher._launch  # pyright: ignore[reportPrivateUsage]
+
+    assert server.received == []
+    assert launched is None
 
 
 async def test_requests_a_page_makes_to_other_hosts_are_refused_and_recorded(server: LoopbackServer) -> None:

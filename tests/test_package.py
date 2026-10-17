@@ -9,6 +9,8 @@ def test_package_exposes_installed_version() -> None:
 
 def test_package_exports_public_api() -> None:
     assert set(pernix.__all__) == {
+        "Cookie",
+        "CookieJar",
         "DropItem",
         "Extension",
         "FailedItem",
@@ -22,6 +24,7 @@ def test_package_exports_public_api() -> None:
         "Response",
         "Retry",
         "RunResult",
+        "Session",
         "Spider",
         "SpiderMiddleware",
         "__version__",

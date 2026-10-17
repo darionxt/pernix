@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urljoin, urlsplit, uses_relative
 
 from ada_url import URL
 
-__all__ = ["clean_url", "document_base", "is_absolute", "join_url", "normalize_url"]
+__all__ = ["clean_url", "document_base", "is_absolute", "is_loopback_host", "join_url", "normalize_url"]
 
 _C0_CONTROL_OR_SPACE = "".join(chr(code) for code in range(0x21))
 _TAB_OR_NEWLINE = str.maketrans("", "", "\t\n\r")
@@ -100,3 +101,21 @@ def normalize_url(url: str, *, sort_query: bool = True) -> str:
         parameters = parsed.search.removeprefix("?").split("&")
         parsed.search = "&".join(sorted(parameters, key=lambda parameter: parameter.partition("=")[0]))
     return parsed.href
+
+
+def is_loopback_host(host: str) -> bool:
+    """Whether a host name is a loopback one: a loopback IP address, `localhost`, or a `.localhost` name.
+
+    Args:
+        host: The host, as in a URL; IPv6 addresses may be bracketed.
+
+    Returns:
+        Whether connecting to it stays on this machine.
+    """
+    name = host.strip("[]").rstrip(".").lower()
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False

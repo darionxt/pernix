@@ -283,7 +283,10 @@ class _Entry:
 
 
 class CurlSessionPool:
-    """Keeps one curl session per Profile, so connections are reused but never shared between Profiles.
+    """Keeps one curl session per Profile and owner, so connections are reused but never shared between them.
+
+    The owner is the Session Requests are sent under, if any, so two Sessions never
+    share a connection.
 
     A session is created on first use, inside the running event loop, with curl's own
     retries off, proxies from the environment ignored, `NO_PROXY` included, and HTTP/2
@@ -306,27 +309,29 @@ class CurlSessionPool:
         self._size = size
         self._idle = idle
         self._max_clients = max_clients
-        self._entries: dict[str, _Entry] = {}  # least recently used first
+        self._entries: dict[tuple[str, str | None], _Entry] = {}  # least recently used first
         self._closing: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
-    async def session(self, profile: str) -> AsyncGenerator[CurlSession]:
-        """Use the session of a Profile, creating it if needed.
+    async def session(self, profile: str, *, owner: str | None = None) -> AsyncGenerator[CurlSession]:
+        """Use the session of a Profile and owner, creating it if needed.
 
         Args:
             profile: The Profile, already checked.
+            owner: The id of the Session Requests are sent under; `None` for none.
 
         Yields:
             The session; it stays open while in use.
         """
         now = time.monotonic()
-        entry = self._entries.pop(profile, None)
+        key = (profile, owner)
+        entry = self._entries.pop(key, None)
         if entry is not None and entry.users == 0 and now - entry.last_used > self._idle:
             self._retire(entry.session)
             entry = None
         if entry is None:
             entry = _Entry(self._new_session(profile))
-        self._entries[profile] = entry
+        self._entries[key] = entry
         entry.users += 1
         for evicted in self._detach_evicted(now):
             self._retire(evicted)
@@ -362,12 +367,10 @@ class CurlSessionPool:
 
     def _detach_evicted(self, now: float) -> list[CurlSession]:
         """Remove the sessions to close: the least recently used beyond `size`, and the idle ones."""
-        unused = [profile for profile, entry in self._entries.items() if entry.users == 0]
+        unused = [key for key, entry in self._entries.items() if entry.users == 0]
         excess = max(0, len(self._entries) - self._size)
-        evicted = unused[:excess] + [
-            profile for profile in unused[excess:] if now - self._entries[profile].last_used > self._idle
-        ]
-        return [self._entries.pop(profile).session for profile in evicted]
+        evicted = unused[:excess] + [key for key in unused[excess:] if now - self._entries[key].last_used > self._idle]
+        return [self._entries.pop(key).session for key in evicted]
 
 
 async def _close(session: AsyncSession) -> None:

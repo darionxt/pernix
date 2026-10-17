@@ -7,13 +7,13 @@ and before following a redirect.
 
 from __future__ import annotations
 
-import ipaddress
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from pernix.errors import NetworkBlocked
+from pernix.urls import is_loopback_host
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -95,24 +95,6 @@ def admitted(url: str, *, proxy: str | None = None) -> bool:
 def current_guard() -> NetworkGuard | None:
     """Return the network guard in effect, or `None` if the network is open."""
     return _guard
-
-
-def is_loopback_host(host: str) -> bool:
-    """Whether a host name is a loopback one: a loopback IP address, `localhost`, or a `.localhost` name.
-
-    Args:
-        host: The host, as in a URL; IPv6 addresses may be bracketed.
-
-    Returns:
-        Whether connecting to it stays on this machine.
-    """
-    name = host.strip("[]").rstrip(".").lower()
-    if name == "localhost" or name.endswith(".localhost"):
-        return True
-    try:
-        return ipaddress.ip_address(name).is_loopback
-    except ValueError:
-        return False
 
 
 def _host(url: str) -> str:

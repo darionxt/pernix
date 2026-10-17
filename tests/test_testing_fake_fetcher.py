@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from pernix import Request
+from pernix import Request, Session
 from pernix.errors import Timeout
 from pernix.testing import FakeFetcher, make_response
 
@@ -29,6 +29,16 @@ async def test_routes_match_urls_exactly_or_patterns_fully_and_the_first_added_a
     assert await _body(fake, f"{SHOP}/book/22") == b"any book"
     assert (await fake.fetch(Request(f"{SHOP}/book/1?"))).status == 404  # exact means exact
     assert [request.url for request in fake.unmatched] == [f"{SHOP}/book/1?"]
+
+
+async def test_responses_name_the_session_a_request_was_sent_under() -> None:
+    fake = FakeFetcher({f"{SHOP}/": "ok"})
+
+    under = await fake.fetch(Request(f"{SHOP}/"), session=Session("s1"))
+    unmatched = await fake.fetch(Request("https://other.example/"), session=Session("s2"))
+    without = await fake.fetch(Request(f"{SHOP}/"))
+
+    assert (under.session, unmatched.session, without.session) == ("s1", "s2", None)
 
 
 async def test_a_route_may_answer_only_one_method() -> None:

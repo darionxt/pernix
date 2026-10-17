@@ -754,6 +754,7 @@ dependencies = [
     { name = "orjson" },
     { name = "packaging" },
     { name = "parsel" },
+    { name = "publicsuffixlist" },
 ]
 
 [package.optional-dependencies]
@@ -786,6 +787,7 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "parsel", specifier = ">=1.12" },
     { name = "patchright", marker = "extra == 'browser'", specifier = "==1.62.3" },
+    { name = "publicsuffixlist", specifier = ">=1.0" },
 ]
 provides-extras = ["browser"]
 
@@ -811,6 +813,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "publicsuffixlist"
+version = "1.1.0.20261017"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/b5/a921b5b669241f5a0b55b097f9adc646b6e56eac522926b99d8421b83527/publicsuffixlist-1.1.0.20261017.tar.gz", hash = "sha256:eb1e5896671b10d57b3c14cf4e48be5a9c920879b5e91c234a8e158c0730504b", size = 106617, upload-time = "2026-10-17T07:41:59.224Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/79/76/8364493b415c9a18b4c4e11f61e6492d275ae0c1ed03b8605dd866b0c34c/publicsuffixlist-1.1.0.20261017-py3-none-any.whl", hash = "sha256:416a455ca61a3c0795924bc8319f58795759adc2d02154bc3248f3a27bf3a209", size = 109376, upload-time = "2026-10-17T07:41:57.949Z" },
 ]
 
 [[package]]

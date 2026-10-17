@@ -10,8 +10,8 @@ import trustme
 
 from cookie_server import CookieServer
 from pernix import Request
+from pernix.cookie_jar import cookie_host
 from pernix.fetchers import HTTPFetcher
-from pernix.fetchers.http_fetcher import _cookie_host  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -102,7 +102,7 @@ async def test_request_cookies_reach_any_host_in_the_order_given(
     ],
 )
 def test_cookie_hosts_are_named_as_curl_matches_them(url: str, host: str | None) -> None:
-    assert _cookie_host(url) == host
+    assert cookie_host(url) == host
 
 
 @PROTOCOLS

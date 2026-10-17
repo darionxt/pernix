@@ -37,16 +37,37 @@ def test_expired_cookies_are_removed() -> None:
 
 
 @pytest.mark.parametrize(
-    "header",
+    ("header", "cookie"),
     [
-        "auth=ok; Partitioned; Secure; Path=/",
-        "auth=ok; Priority=High",
-        "auth=ok; SameSite=None; Secure; Domain=example.com; HttpOnly",
+        ("auth=ok; Partitioned; Secure; Path=/", SetCookie("auth", "ok", path="/", secure=True)),
+        ("auth=ok; Priority=High", SetCookie("auth", "ok")),
     ],
 )
-def test_unknown_attributes_are_ignored(header: str) -> None:
-    assert parse_set_cookie(header) == SetCookie("auth", "ok")
+def test_unknown_attributes_are_ignored(header: str, cookie: SetCookie) -> None:
+    assert parse_set_cookie(header) == cookie
     assert merge_set_cookies({}, [header], now=NOW) == {"auth": "ok"}
+
+
+def test_the_attributes_of_a_cookie_jar_are_read() -> None:
+    header = "auth=ok; SameSite=None; Secure; Domain=.Example.COM; HttpOnly; Path=/account"
+
+    assert parse_set_cookie(header) == SetCookie(
+        "auth", "ok", domain="example.com", path="/account", secure=True, http_only=True, same_site="none"
+    )
+
+
+@pytest.mark.parametrize(
+    ("header", "cookie"),
+    [
+        ("a=1; Domain=", SetCookie("a", "1")),  # an empty Domain is ignored
+        ("a=1; Domain=one.example; Domain=", SetCookie("a", "1", domain="one.example")),
+        ("a=1; Path=/x; Path=relative", SetCookie("a", "1")),  # a Path not starting with / means the default
+        ("a=1; SameSite=Lax; SameSite=sometimes", SetCookie("a", "1")),
+        ("a=1; samesite=STRICT", SetCookie("a", "1", same_site="strict")),
+    ],
+)
+def test_the_last_occurrence_of_an_attribute_wins(header: str, cookie: SetCookie) -> None:
+    assert parse_set_cookie(header) == cookie
 
 
 def test_attributes_after_unknown_ones_still_apply() -> None:
@@ -62,7 +83,7 @@ def test_max_age_takes_precedence_over_expires_and_the_last_valid_value_wins() -
 
 
 def test_values_are_kept_exactly_as_sent() -> None:
-    assert parse_set_cookie('token="a b=c"; Path=/') == SetCookie("token", '"a b=c"')
+    assert parse_set_cookie('token="a b=c"; Path=/') == SetCookie("token", '"a b=c"', path="/")
     assert parse_set_cookie("empty=") == SetCookie("empty", "")
 
 

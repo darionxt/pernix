@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from pernix.crawler import Crawler
     from pernix.fetchers.network_guard import NetworkGuard
     from pernix.request import Request
+    from pernix.session import Session
 
 __all__ = ["BrowserFetcher"]
 
@@ -172,11 +173,12 @@ class BrowserFetcher:
             if launch is not None:
                 await _close_launched(launch)
 
-    async def fetch(self, request: Request) -> Response:
+    async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
         """Load a Request in the browser.
 
         Args:
             request: The Request to load.
+            session: Refused: the browser does not load pages under a Session.
 
         Returns:
             The Response, whatever its status code.
@@ -189,10 +191,12 @@ class BrowserFetcher:
             pernix.errors.FetchError: The page did not load; a subclass names the kind
                 of failure.
             ValueError: The Request has an `Authorization` or `Proxy-Authorization`
-                header.
+                header, or a Session.
         """
         if not self._open:
             raise RuntimeError("BrowserFetcher must be entered with 'async with' before fetching")
+        if session is not None:
+            raise ValueError(f"the browser Fetcher cannot render {request!r} under a Session; fetch it over HTTP")
         credentials = sorted({name for name, _ in request.headers if name.lower() in _CREDENTIAL_HEADERS})
         if credentials:
             raise ValueError(

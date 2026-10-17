@@ -1,9 +1,10 @@
 """Cookies held by name, as `Request.cookies` and `Response.cookies` carry them.
 
-Parsing follows RFC 6265 §5.2 for `Set-Cookie` and §5.4 for `Cookie`, reduced to what
-a name → value snapshot needs: domain and path are not tracked, and of the cookie
-attributes only `Max-Age` and `Expires` are interpreted. Cookie values never appear
-in log messages.
+Parsing follows RFC 6265 §5.2 for `Set-Cookie` and §5.4 for `Cookie`. A parsed
+`Set-Cookie` holds every attribute a cookie jar (`pernix.cookie_jar`) needs, while
+the name → value snapshot of `merge_set_cookies()` tracks neither domain nor path,
+and interprets only `Max-Age` and `Expires`. Cookie values never appear in log
+messages.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import logging
 import re
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
     from pernix.request import Request
 
 __all__ = [
+    "SameSite",
     "SetCookie",
     "check_cookies",
     "merge_set_cookies",
@@ -41,6 +43,11 @@ _NOT_IN_VALUE = re.compile(r"[\x00-\x1f\x7f;]")
 
 _SECURE_PREFIXES = ("__secure-", "__host-")
 
+type SameSite = Literal["strict", "lax", "none"]
+"""The `SameSite` attribute of a cookie, lower-cased."""
+
+_SAME_SITE: dict[str, SameSite] = {"strict": "strict", "lax": "lax", "none": "none"}
+
 
 @dataclass(frozen=True, slots=True)
 class SetCookie:
@@ -51,12 +58,25 @@ class SetCookie:
         value: The cookie value, exactly as sent, including any quotes.
         max_age: Seconds until the cookie expires, if `Max-Age` was given.
         expires: When the cookie expires, if a parsable `Expires` was given.
+        domain: The `Domain` attribute, without its leading dot and lower-cased;
+            `None` without one.
+        path: The `Path` attribute; `None` without one, or for one that does not
+            start with `/`, which means the default path.
+        secure: Whether the cookie is `Secure`.
+        http_only: Whether the cookie is `HttpOnly`.
+        same_site: The `SameSite` attribute; `None` without one, or for an unknown
+            value.
     """
 
     name: str
     value: str
     max_age: int | None = None
     expires: dt.datetime | None = None
+    domain: str | None = None
+    path: str | None = None
+    secure: bool = False
+    http_only: bool = False
+    same_site: SameSite | None = None
 
     def expired(self, now: dt.datetime) -> bool:
         """Whether the server asked to remove the cookie. `Max-Age` takes precedence over `Expires`.
@@ -91,16 +111,23 @@ def parse_set_cookie(header: str) -> SetCookie | None:
     name, value = name.strip(), value.strip()
     if not separator or not name:
         return None
-    max_age: int | None = None
-    expires: dt.datetime | None = None
+    fields: dict[str, Any] = {}
     for attribute in attributes.split(";"):
         key, _, attribute_value = attribute.partition("=")
         key, attribute_value = key.strip().lower(), attribute_value.strip()
         if key == "max-age" and _MAX_AGE.fullmatch(attribute_value):
-            max_age = _bounded_seconds(attribute_value)
+            fields["max_age"] = _bounded_seconds(attribute_value)
         elif key == "expires" and (parsed := _parse_date(attribute_value)) is not None:
-            expires = parsed
-    return SetCookie(name, value, max_age, expires)
+            fields["expires"] = parsed
+        elif key == "domain" and attribute_value:  # an empty one is ignored
+            fields["domain"] = attribute_value.removeprefix(".").lower()
+        elif key == "path":
+            fields["path"] = attribute_value if attribute_value.startswith("/") else None
+        elif key in ("secure", "httponly"):
+            fields["secure" if key == "secure" else "http_only"] = True
+        elif key == "samesite":
+            fields["same_site"] = _SAME_SITE.get(attribute_value.lower())
+    return SetCookie(name, value, **fields)
 
 
 def parse_cookie_header(header: str) -> dict[str, str]:

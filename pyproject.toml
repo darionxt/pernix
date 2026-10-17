@@ -14,6 +14,7 @@ dependencies = [
     "orjson>=3.12",
     "packaging>=24",
     "parsel>=1.12",
+    "publicsuffixlist>=1.0",
 ]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",

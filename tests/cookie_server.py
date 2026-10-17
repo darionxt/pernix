@@ -35,12 +35,16 @@ class Received:
         host: The `Host` header, or the `:authority` pseudo-header.
         path: The path, without the query.
         cookies: Each `Cookie` header (HTTP/1.1), or each `cookie` field (HTTP/2), in wire order.
+        peer: The client's port, which tells connections apart.
+        user_agent: The `User-Agent` header.
     """
 
     protocol: str
     host: str
     path: str
     cookies: list[str]
+    peer: int = 0
+    user_agent: str = ""
 
 
 @dataclass
@@ -114,22 +118,23 @@ class CookieServer:
     def _answer(self, connection: socket.socket) -> None:
         try:
             with connection:
+                peer = connection.getpeername()[1]
                 first = connection.recv(1, socket.MSG_PEEK)
                 if first and first[0] == _TLS_HANDSHAKE:
-                    self._answer_tls(connection)
+                    self._answer_tls(connection, peer)
                 elif first:
-                    self._answer_http(connection, tunnel=True)
+                    self._answer_http(connection, peer, tunnel=True)
         except (OSError, h2.exceptions.ProtocolError):
             return  # the client went away
 
-    def _answer_tls(self, connection: socket.socket) -> None:
+    def _answer_tls(self, connection: socket.socket, peer: int) -> None:
         with self._tls.wrap_socket(connection, server_side=True) as tls:
             if tls.selected_alpn_protocol() == "h2":
-                self._answer_h2(tls)
+                self._answer_h2(tls, peer)
             else:
-                self._answer_http(tls, tunnel=False)
+                self._answer_http(tls, peer, tunnel=False)
 
-    def _answer_http(self, connection: socket.socket, *, tunnel: bool) -> None:
+    def _answer_http(self, connection: socket.socket, peer: int, *, tunnel: bool) -> None:
         head = b""
         while b"\r\n\r\n" not in head:
             chunk = connection.recv(65536)
@@ -140,20 +145,23 @@ class CookieServer:
         method, target, _ = request_line.split(" ")
         if tunnel and method == "CONNECT":
             connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            self._answer_tls(connection)
+            self._answer_tls(connection, peer)
             return
         headers = [(name.strip(), value.strip()) for name, _, value in (line.partition(":") for line in lines)]
-        host = next((value for name, value in headers if name.lower() == "host"), "")
-        path = urlsplit(target).path
+        fields = {name.lower(): value for name, value in headers}
+        cookies = [value for name, value in headers if name.lower() == "cookie"]
         self.received.append(
-            Received("HTTP/1.1", host, path, [value for name, value in headers if name.lower() == "cookie"])
+            Received(
+                "HTTP/1.1", fields.get("host", ""), urlsplit(target).path, cookies, peer, fields.get("user-agent", "")
+            )
         )
+        path = urlsplit(target).path
         reply = self.routes.get(path, [])
         status = "302 Found" if any(name.lower() == "location" for name, _ in reply) else "200 OK"
         fields = "".join(f"{name}: {value}\r\n" for name, value in reply)
         connection.sendall(f"HTTP/1.1 {status}\r\n{fields}Content-Length: 0\r\nConnection: close\r\n\r\n".encode())
 
-    def _answer_h2(self, connection: ssl.SSLSocket) -> None:
+    def _answer_h2(self, connection: ssl.SSLSocket, peer: int) -> None:
         config = h2.config.H2Configuration(
             client_side=False, header_encoding="utf-8", normalize_inbound_headers=False
         )  # keeps each cookie field apart
@@ -164,19 +172,21 @@ class CookieServer:
             for event in h2_connection.receive_data(data):
                 if isinstance(event, h2.events.RequestReceived) and event.stream_id is not None:
                     headers = [(str(name), str(value)) for name, value in event.headers or []]
-                    self._answer_stream(h2_connection, event.stream_id, headers)
+                    self._answer_stream(h2_connection, event.stream_id, headers, peer)
                 elif isinstance(event, h2.events.ConnectionTerminated):
                     return
             connection.sendall(h2_connection.data_to_send())
 
     def _answer_stream(
-        self, connection: h2.connection.H2Connection, stream_id: int, headers: Iterable[tuple[str, str]]
+        self, connection: h2.connection.H2Connection, stream_id: int, headers: Iterable[tuple[str, str]], peer: int
     ) -> None:
         pairs = list(headers)
         fields = dict(pairs)
         path = urlsplit(fields.get(":path", "")).path
         cookies = [value for name, value in pairs if name == "cookie"]
-        self.received.append(Received("HTTP/2", fields.get(":authority", ""), path, cookies))
+        self.received.append(
+            Received("HTTP/2", fields.get(":authority", ""), path, cookies, peer, fields.get("user-agent", ""))
+        )
         reply = [(name.lower(), value) for name, value in self.routes.get(path, [])]
         status = "302" if any(name == "location" for name, _ in reply) else "200"
         connection.send_headers(stream_id, [(":status", status), *reply, ("content-length", "0")], end_stream=True)
