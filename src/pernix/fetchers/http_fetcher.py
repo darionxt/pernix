@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
 
-from pernix.cookie_jar import Cookie, cookie_host
 from pernix.cookies import merge_set_cookies, request_cookies, requires_secure
 from pernix.errors import (
     ConnectError,
@@ -28,6 +27,7 @@ from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
 from pernix.settings import CoreSettings, ResponseSettings, Section
+from pernix.urls import url_host, with_ascii_host
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Mapping
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
 
+    from pernix.cookie_jar import Cookie
     from pernix.crawler import Crawler
     from pernix.request import Request
     from pernix.session import Session
@@ -114,6 +115,13 @@ class HTTPFetcher:
     first, and names of one length in the order given: one `Cookie` header over
     HTTP/1.1, a `cookie` field each over HTTP/2.
 
+    curl converts international hosts to ASCII itself, differently on each platform,
+    so before curl sees a Request's URL, a host that is not ASCII, or holds percent
+    escapes, is converted as WHATWG URLs convert hosts (`pernix.urls.with_ascii_host()`).
+    Every platform then reaches the host a browser does, and `Response.url` names it
+    in ASCII. A host WHATWG URLs reject fails the fetch with a `FetchError`, as
+    browsers refuse such a URL. The hosts of redirects are still converted by curl.
+
     A Request sent under a Session (`session=`) also sends the Session's cookies that
     match each hop, and the cookies set during the fetch, on redirects included, are
     kept in the Session as the headers of each hop arrive, even if a later hop fails;
@@ -192,8 +200,9 @@ class HTTPFetcher:
             RuntimeError: The fetcher was not entered with `async with`.
             ValueError: The Profile to use is not a pinned one, or `request.session`
                 names another Session.
-            pernix.errors.FetchError: The transfer failed; a subclass names the kind of
-                failure, and `code` is libcurl's error code, or 0.
+            pernix.errors.FetchError: The transfer failed, or WHATWG URLs reject the
+                host; a subclass names the kind of failure, and `code` is libcurl's
+                error code, or 0.
         """
         pool, profile = self._pool_and_profile(request, session)
         limit = self._settings.max_body_size or None
@@ -238,7 +247,8 @@ class HTTPFetcher:
             RuntimeError: The fetcher was not entered with `async with`.
             ValueError: The Profile to use is not a pinned one, or `request.session`
                 names another Session.
-            pernix.errors.FetchError: The transfer failed before the headers arrived.
+            pernix.errors.FetchError: The transfer failed before the headers arrived, or
+                WHATWG URLs reject the host.
         """
         pool, profile = self._pool_and_profile(request, session)
         limit = (self._settings.max_body_size if max_bytes is None else max_bytes) or None
@@ -308,13 +318,14 @@ class HTTPFetcher:
         curl_timeout: float,
         limit: int | None,
     ) -> tuple[curl_cffi.Response, Transfer]:
+        url = _curl_url(request)
         guard = current_guard()
         if guard is not None:
-            guard.check(request.url, proxy=proxy)
+            guard.check(url, proxy=proxy)
         try:
             return await curl.start(
                 cast("HttpMethod", request.method),
-                request.url,
+                url,
                 headers=request.headers.items(),
                 data=request.body,
                 cookie_lines=_cookie_lines(request, session),
@@ -324,7 +335,7 @@ class HTTPFetcher:
                 impersonate=cast("Any", profile),
                 timeout=curl_timeout,
                 max_redirects=self._settings.max_redirects,
-                http_version=_http_version(request.url),
+                http_version=_http_version(url),
                 body_limit=limit,
                 guard=None if proxy else guard,  # a loopback proxy takes every hop
             )
@@ -406,13 +417,13 @@ def _cookie_lines(request: Request, session: Session | None) -> list[str]:
     Request's host only, for every path, replacing a Session cookie held so; curl-cffi
     would instead hold them for a host of its own, with `.local` appended to names
     without a dot, which curl then never sends them to. Names with a prefix browsers
-    take only on Secure cookies are Secure, as curl requires too. A host that cannot
-    be named as curl names it holds none, as there is no telling which host they
-    would go to. Session cookies with control characters, which the format cannot
-    carry, are left out. Among cookies whose paths, domains, and names are as long,
-    curl sends the newest first, so the lines go in reverse.
+    take only on Secure cookies are Secure, as curl requires too. A URL that names no
+    host, such as `http:///path`, which curl reads otherwise, holds none. Session
+    cookies with control characters, which the format cannot carry, are left out.
+    Among cookies whose paths, domains, and names are as long, curl sends the newest
+    first, so the lines go in reverse.
     """
-    host = cookie_host(request.url)
+    host = url_host(request.url)
     own: Mapping[str, str] = request.cookies if host is not None else {}
     kept = [] if session is None else [cookie for cookie in session.cookies if not _replaced(cookie, host, own)]
     lines = [_cookie_line(cookie) for cookie in kept if not _NOT_IN_LINE.search(_line_fields(cookie))]
@@ -421,6 +432,14 @@ def _cookie_lines(request: Request, session: Session | None) -> list[str]:
         for name, value in own.items()
     ]
     return lines[::-1]
+
+
+def _curl_url(request: Request) -> str:
+    """The URL curl is given: the Request's, with its host converted as WHATWG URLs convert it, if needed."""
+    try:
+        return with_ascii_host(request.url)
+    except ValueError as exc:
+        raise FetchError(str(exc), code=CurlECode.URL_MALFORMAT) from exc
 
 
 def _set_cookies(response: curl_cffi.Response) -> list[str]:

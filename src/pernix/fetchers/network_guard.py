@@ -10,10 +10,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
 
 from pernix.errors import NetworkBlocked
-from pernix.urls import is_loopback_host
+from pernix.urls import is_loopback_host, url_host
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -82,6 +81,9 @@ def blocking_network() -> Generator[NetworkGuard]:
 def admitted(url: str, *, proxy: str | None = None) -> bool:
     """Whether a network guard admits a URL: it, or the proxy it goes through, is on a loopback host.
 
+    The host is read as `pernix.urls.url_host()` reads it, so `localhost` written in
+    full-width letters, or as `local%68ost`, is a loopback host too.
+
     Args:
         url: The URL to connect to.
         proxy: The proxy the connection goes through, if any.
@@ -89,16 +91,12 @@ def admitted(url: str, *, proxy: str | None = None) -> bool:
     Returns:
         Whether the URL may be fetched while a guard is on.
     """
-    return is_loopback_host(_host(proxy if proxy else url))
+    target = proxy if proxy else url
+    if "://" not in target:
+        target = f"//{target}"  # a proxy may leave out its scheme
+    return is_loopback_host(url_host(target) or "")
 
 
 def current_guard() -> NetworkGuard | None:
     """Return the network guard in effect, or `None` if the network is open."""
     return _guard
-
-
-def _host(url: str) -> str:
-    try:
-        return urlsplit(url if "://" in url else f"//{url}").hostname or ""  # a proxy may leave out its scheme
-    except ValueError:  # such as an unclosed IPv6 bracket
-        return ""

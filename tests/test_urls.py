@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from pernix.urls import clean_url, document_base, is_absolute, join_url, normalize_url
+from pernix.urls import clean_url, document_base, is_absolute, join_url, normalize_url, url_host, with_ascii_host
+
+
+def _full_width(text: str) -> str:
+    """ASCII text in its full-width forms, which IDNA maps back to ASCII."""
+    return "".join(chr(ord(character) + 0xFEE0) for character in text)
 
 
 def test_clean_url_removes_what_browsers_ignore() -> None:
@@ -64,3 +69,60 @@ def test_urls_are_serialized_by_whatwg_rules_without_fragments_with_sorted_queri
 
 def test_query_sorting_can_be_turned_off() -> None:
     assert normalize_url("https://example.com/?b=2&a=1#x", sort_query=False) == "https://example.com/?b=2&a=1"
+
+
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("http://Example.COM/a", "example.com"),
+        ("http://[::1]:8080/", "::1"),
+        ("https://bücher.example/", "xn--bcher-kva.example"),
+        ("https://faß.example/", "xn--fa-hia.example"),  # not fass.example
+        ("https://Faß.Example:8443/", "xn--fa-hia.example"),
+        ("http://other.example\\@faß.example/", "xn--fa-hia.example"),  # the host curl connects to
+        ("http://faß%2Eexample/", "xn--fa-hia.example"),  # percent-decoded first, as curl does
+        ("http://fa%C3%9F.example/", "xn--fa-hia.example"),
+        ("http://Local%48ost/", "localhost"),
+        (f"http://{_full_width('localhost')}/", "localhost"),
+        (
+            f"http://{_full_width('127.0.0.1')}:8080/",
+            "127.0.0.1",
+        ),  # in dotted decimal, as WHATWG URLs give IPv4 addresses
+        ("//faß.example/", "xn--fa-hia.example"),
+        ("https://ΣΑΣ/", "xn--mxa9ab"),  # not the final sigma str.lower() gives, xn--mxa8ab
+        ("https://a\u200db.example/", None),  # curl gives xn--ab-m1t on macOS, ab on Linux
+        ("http://localhost./", "localhost."),  # curl keeps the trailing dot
+        ("http:///path", None),
+        ("http://a%2Fb.example/", None),  # a slash, once decoded
+        ("http://faß\\x.example/", None),  # WHATWG URLs would end the host at the backslash
+        ("http://[::1/", None),
+    ],
+)
+def test_hosts_are_named_as_clients_connect_to_them(url: str, host: str | None) -> None:
+    assert url_host(url) == host
+
+
+@pytest.mark.parametrize(
+    ("url", "converted"),
+    [
+        ("https://Faß.Example:8443/Faß?q=ß#ß", "https://xn--fa-hia.example:8443/Faß?q=ß#ß"),  # the host only
+        ("http://user:pä@other.example\\@ẞ.example/", "http://user:pä@other.example\\@xn--zca.example/"),
+        ("http://local%68ost/", "http://localhost/"),
+        (f"http://{_full_width('127.0.0.1')}/", "http://127.0.0.1/"),
+        ("http://Example.COM/", "http://Example.COM/"),  # an ASCII host is left to the client
+        ("http://[::1]:8080/ß", "http://[::1]:8080/ß"),
+        ("http:///ß", "http:///ß"),
+        ("data:text/plain,ß", "data:text/plain,ß"),
+    ],
+)
+def test_hosts_that_are_not_ascii_or_hold_percent_escapes_are_converted(url: str, converted: str) -> None:
+    assert with_ascii_host(url) == converted
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://a\u200db.example/", "http://aא.example/", "http://a%20b.example/", "http://faß\\x.example/"],
+)
+def test_a_host_whatwg_urls_reject_is_not_converted(url: str) -> None:
+    with pytest.raises(ValueError, match="WHATWG URLs reject it"):
+        with_ascii_host(url)
