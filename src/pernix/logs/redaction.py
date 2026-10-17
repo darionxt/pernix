@@ -56,11 +56,11 @@ SENSITIVE_NAMES = HEADER_NAMES | {
 }
 """Names whose values are masked in `name=value` pairs and in quoted `'name': value` pairs."""
 
-_USERINFO = re.compile(r"(?<=://)[^\s/?#@'\"<>]+@")
+_USERINFO = re.compile(r"(?<=://)[^\s/?#@'\"<>]+(?=@)")
 # Without a scheme, only a user and a password joined by a colon count, either possibly empty: the colon tells them
 # from an e-mail address, whose local part has none. A mailto: address is the exception. The user takes the characters
 # of the password but the colon, so it is masked whole, with whatever is joined to it.
-_BARE_USERINFO = re.compile(r"(?<![^\s/?#@'\"<>:])(?!(?i:mailto):)[^\s/?#@'\"<>:]*:[^\s/?#@'\"<>]*@(?=[\w\[])")
+_BARE_USERINFO = re.compile(r"(?<![^\s/?#@'\"<>:])(?!(?i:mailto):)[^\s/?#@'\"<>:]*:[^\s/?#@'\"<>]*(?=@[\w\[])")
 
 
 class Redactor:
@@ -81,8 +81,9 @@ class Redactor:
       the end of the line;
     - every occurrence of the given secret values, such as those of `Secret` settings.
 
-    Names match case-insensitively. Masking is heuristic: it errs toward masking too
-    much rather than too little.
+    Names match case-insensitively. Every rule looks at the text as given, and values
+    that several rules find, overlapping or side by side, are masked as one. Masking is
+    heuristic: it errs toward masking too much rather than too little.
 
     Example:
         >>> Redactor().redact("via http://alice:pw@proxy:8080/?token=abc")
@@ -118,14 +119,28 @@ class Redactor:
         Returns:
             The masked text.
         """
+        return _masked(text, self._sensitive_spans(text))
+
+    def _sensitive_spans(self, text: str) -> list[tuple[int, int]]:
+        # Every rule looks at the text as given, so that masking a value never hides another from a rule.
+        spans: list[tuple[int, int]] = []
         if self._secrets is not None:
-            text = self._secrets.sub(MASK, text)
-        text = _USERINFO.sub(f"{MASK}@", text)
-        text = self._quoted.sub(_mask_quoted, text)
-        text = self._assignments.sub(rf"\g<1>{MASK}", text)
-        text = self._headers.sub(rf"\g<1>{MASK}", text)
-        # Last, so that a header name, or the colon after a quoted name, is not taken for a user.
-        return _BARE_USERINFO.sub(f"{MASK}@", text)
+            spans.extend(match.span() for match in self._secrets.finditer(text))
+        spans.extend(match.span() for match in _USERINFO.finditer(text))
+        spans.extend((match.end(1), match.end()) for match in self._assignments.finditer(text))
+        headers = list(self._headers.finditer(text))
+        spans.extend((match.end(1), match.end()) for match in headers)
+        quoted = list(self._quoted.finditer(text))
+        spans.extend(map(_quoted_value, quoted))
+        # A header name or quoted name that a user without a scheme starts in is kept.
+        names = [match.span(1) for match in headers] + [match.span("key") for match in quoted]
+        for match in _BARE_USERINFO.finditer(text):
+            start, end = match.span()
+            for name_start, name_end in names:
+                if name_start <= start < name_end:
+                    start = min(name_end, end)
+            spans.append((start, end))
+        return spans
 
     def redact_value(self, value: object) -> object:
         """Return `value` with the strings in it masked, including inside containers.
@@ -194,7 +209,22 @@ def _alternation(names: Iterable[str]) -> str:
     return "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
 
 
-def _mask_quoted(match: re.Match[str]) -> str:
-    value = match["value"]
-    quote = value[0] if value[0] in "'\"" else ""
-    return f"{match['key']}{quote}{MASK}{quote}"
+def _quoted_value(match: re.Match[str]) -> tuple[int, int]:
+    start, end = match.span("value")
+    return (start + 1, end - 1) if match["value"][0] in "'\"" else (start, end)
+
+
+def _masked(text: str, spans: Iterable[tuple[int, int]]) -> str:
+    merged: list[list[int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:  # overlapping or side by side, masked as one
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    parts: list[str] = []
+    position = 0
+    for start, end in merged:
+        parts += (text[position:start], MASK)
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)

@@ -57,6 +57,18 @@ def test_sensitive_names_are_not_taken_for_proxy_users(text: str, redacted: str)
 @pytest.mark.parametrize(
     "text",
     [
+        "alice:s3cret;token=abc@proxy:8080",
+        "alice:s3cret;Cookie:x@proxy:8080",
+        "a;Cookie:email=a@b.example; csrftoken=s3cret",
+    ],
+)
+def test_values_that_several_rules_find_are_masked_as_one(text: str) -> None:
+    assert Redactor().redact(text) == "***"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "https://example.com/path?email=a@b.example",
         "mail me at someone@example.com",
         "https://example.com:8443/a",
