@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
@@ -15,7 +15,7 @@ from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
 from pernix.frontiers import host_slot
 from pernix.response import Response, expect_response
 from pernix.retry_policy import Action, consult
-from pernix.sessions.session_leasing import sending_session, sending_with
+from pernix.sessions.session_leasing import NoSessionYet, sending_session, sending_with
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
@@ -32,6 +32,12 @@ if TYPE_CHECKING:
 __all__ = ["InlineFetch", "handling"]
 
 logger = logging.getLogger(__name__)
+
+_SESSION_WAIT = 1.0
+"""Seconds a fetch holds its place in a slot while it waits for a busy Session."""
+
+_SESSION_RETRY = 0.05
+"""Seconds a fetch waits without its place before it takes the place again and waits for the Session anew."""
 
 _handled: ContextVar[Request | None] = ContextVar("pernix_handled_request", default=None)
 """The Request whose Callback or errback is running, if any."""
@@ -64,8 +70,8 @@ class InlineFetch:
     goes through the download chain. The retry policy judges every attempt, as for
     Requests from the Frontier, but a retry waits in place for its delay, emitting
     `RequestRetried`. Each attempt takes its place in its slot, then, with a Session
-    Pool, leases a Session, waiting for one in place, then waits for the slot's delay
-    and rate. A Request without a Session continues the Session of the fetch
+    Pool, leases a Session, waiting for one in place, but giving up its place now and
+    then meanwhile, then waits for the slot's delay and rate. A Request without a Session continues the Session of the fetch
     it is nested in, or of the Request being handled, if it has one; a fetch nested
     in another of the same Session, in the same task, shares its Lease.
 
@@ -130,8 +136,7 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            async with self._placed(slot), sending_with(self._sessions, request, wait=None) as sending:
-                await self._paced(slot)
+            async with self._sending(request, slot) as sending:
                 outcome = await self._attempt(sending, slot, None)
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
@@ -165,9 +170,7 @@ class InlineFetch:
         attempt = 1
         while True:
             slot = self._slot_of(request)
-            # A place, the Session, then the pace; the place and the Session through the block too.
-            async with self._placed(slot), sending_with(self._sessions, request, wait=None) as sending:
-                await self._paced(slot)
+            async with self._sending(request, slot) as sending:  # through the block too
                 streams = Streams(max_bytes)
                 try:
                     outcome = await self._attempt(sending, slot, streams)
@@ -179,6 +182,27 @@ class InlineFetch:
                     await streams.close()
             await self._retry_later(request, outcome, decision, attempt)
             attempt += 1
+
+    @asynccontextmanager
+    async def _sending(self, request: Request, slot: str) -> AsyncGenerator[Sending]:
+        """Hold a place in a slot and the Request's Session, then wait for the slot's pace.
+
+        The place is held while waiting for a busy Session only so long: then it is
+        given up while the Session frees up, and taken again, as a fetch nested in
+        the one holding the Session may need the place.
+        """
+        while True:
+            async with AsyncExitStack() as held:
+                await held.enter_async_context(self._placed(slot))
+                try:
+                    sending = await held.enter_async_context(sending_with(self._sessions, request, wait=_SESSION_WAIT))
+                except NoSessionYet as busy:
+                    later = busy.delay
+                else:
+                    await self._paced(slot)
+                    yield sending
+                    return
+            await asyncio.sleep(max(later, _SESSION_RETRY))
 
     @asynccontextmanager
     async def _placed(self, slot: str) -> AsyncGenerator[None]:

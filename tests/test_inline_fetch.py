@@ -533,3 +533,30 @@ async def test_a_fetch_waiting_for_a_place_holds_no_session_a_nested_fetch_needs
         responses = await asyncio.gather(outer, other)
 
     assert [response.body for response in responses] == [b"outer", b"other"]
+
+
+async def test_a_fetch_waiting_for_a_session_gives_up_its_place_to_a_nested_fetch_of_another_domain() -> None:
+    other_site = "https://other.example"
+    site = FakeFetcher({f"{SITE}/outer": b"outer", f"{other_site}/nested": b"nested", f"{other_site}/rival": b"rival"})
+    downloading = asyncio.Event()
+    inline: InlineFetch
+
+    async def download(request: Request) -> Response:
+        if request.url.endswith("/outer"):
+            downloading.set()
+            await asyncio.sleep(0.05)  # the rival takes the other domain's place meanwhile, and waits for "s"
+            await inline.fetch(Request(f"{other_site}/nested"))  # continues "s", in the other domain
+        return await site.fetch(request)
+
+    leasing = SessionLeasing(MemorySessionPool(size=1), SessionSettings(enabled=True), stats=Stats())
+    inline = _inline(download, domain=DomainSettings(concurrency=1), sessions=leasing)
+
+    outer = asyncio.create_task(inline.fetch(Request(f"{SITE}/outer", session="s")))
+    await downloading.wait()
+    rival = asyncio.create_task(inline.fetch(Request(f"{other_site}/rival", session="s")))
+
+    async with asyncio.timeout(5):
+        responses = await asyncio.gather(outer, rival)
+
+    assert [response.body for response in responses] == [b"outer", b"rival"]
+    assert [request.url.rsplit("/", 1)[-1] for request in site.requests] == ["nested", "outer", "rival"]

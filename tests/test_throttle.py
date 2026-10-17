@@ -184,3 +184,18 @@ async def test_waiting_for_a_slot_is_counted() -> None:
 
     assert throttle.stats.waits == 1
     assert throttle.stats.wait_seconds >= 0.04
+
+
+async def test_an_acquire_cancelled_while_it_waits_for_the_delay_takes_no_place() -> None:
+    throttle = Throttle(DomainSettings(concurrency=1, delay=30.0, delay_jitter=0.0))
+    assert await throttle.acquire(A)
+    throttle.release(A)
+
+    waiting = asyncio.create_task(throttle.acquire(A))  # it holds a place while waiting for the delay
+    await asyncio.sleep(0.01)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    async with asyncio.timeout(1):
+        assert await throttle.admit(A)  # the place is free again

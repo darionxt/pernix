@@ -137,11 +137,15 @@ class Throttle:
         """
         if not await self.admit(slot, shared=shared):
             return False
-        if await self.pace(slot):
-            return True
-        if not shared:
+        try:
+            paced = await self.pace(slot)
+        except BaseException:
+            if not shared:
+                self.release(slot)  # a cancelled wait took no place
+            raise
+        if not paced and not shared:
             self.release(slot)
-        return False
+        return paced
 
     async def admit(self, slot: str, *, shared: bool = False) -> bool:
         """Take a place in a slot for a fetch, waiting until one is free; the delay and the rate come with `pace()`.
