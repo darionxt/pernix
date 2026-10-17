@@ -123,6 +123,23 @@ async def test_each_redirect_hop_gets_the_session_cookies_matching_it(cookie_ser
     ]  # sorted, as curl orders them by domain length too, unlike a browser
 
 
+async def test_the_cookies_of_an_international_host_go_back_to_it_however_it_is_written(
+    cookie_server: CookieServer,
+) -> None:
+    cookie_server.routes["/set"] = [("Set-Cookie", "a=1")]
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:  # through the server as a proxy, for any host name
+        await fetcher.fetch(Request("http://STRAẞE.de/set", proxy=cookie_server.proxy), session=session)
+        await fetcher.fetch(Request("http://straße.de/get", proxy=cookie_server.proxy), session=session)
+
+    assert [cookie.domain for cookie in session.cookies] == ["xn--strae-oqa.de"]
+    assert [(hop.host, hop.cookies) for hop in cookie_server.received] == [
+        ("xn--strae-oqa.de", []),  # not strasse.de, where curl's conversion on Linux led
+        ("xn--strae-oqa.de", ["a=1"]),
+    ]
+
+
 async def test_cookies_set_on_every_hop_are_kept_in_the_session(cookie_server: CookieServer) -> None:
     cookie_server.routes["/start"] = [
         ("Location", "http://www.example.test/end"),

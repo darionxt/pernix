@@ -18,19 +18,19 @@ import time
 from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Self
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 import msgspec
 from ada_url import idna_to_ascii
 from publicsuffixlist import PublicSuffixList
 
 from pernix.cookies import SameSite, SetCookie, parse_set_cookie, requires_secure
-from pernix.urls import is_loopback_host
+from pernix.urls import is_loopback_host, url_host
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
-__all__ = ["Cookie", "CookieJar", "CookieKey", "cookie_host", "cookie_key"]
+__all__ = ["Cookie", "CookieJar", "CookieKey", "cookie_key"]
 
 _MAX_SIZE = 4096
 """Bytes a cookie's name and value may have together, as browsers take at most."""
@@ -237,32 +237,6 @@ class CookieJar:
         )
 
 
-def cookie_host(url: str) -> str | None:
-    """Return the host of a URL as cookies are matched to it: lower-cased, IPv6 without brackets, and in ASCII.
-
-    The host is the one curl connects to: after the last `@` of the authority, even
-    where WHATWG URLs would end the authority earlier, such as at a backslash, and
-    percent-decoded. One that is not ASCII is then converted as WHATWG URLs convert
-    hosts, without the transitional IDNA mappings, as curl does too: `faß` is
-    `xn--fa-hia`, not `fass`.
-
-    Args:
-        url: The URL.
-
-    Returns:
-        The host, or `None` for none, or for one that WHATWG URLs reject, which curl
-        converts differently on each platform.
-    """
-    parts = urlsplit(url)
-    authority = parts.netloc.rpartition("@")[2]
-    if authority.startswith("["):
-        return parts.hostname  # an IPv6 address
-    host = unquote(authority.partition(":")[0])  # not lower-cased yet, which would turn a final Σ into ς
-    if host.isascii():
-        return host.lower() or None
-    return _ascii(host)
-
-
 @dataclass(frozen=True, slots=True)
 class _Origin:
     """What matching a cookie needs of a URL."""
@@ -274,7 +248,7 @@ class _Origin:
     @classmethod
     def of(cls, url: str) -> Self | None:
         scheme = urlsplit(url).scheme.lower()
-        host = cookie_host(url)
+        host = url_host(url)
         if scheme not in _COOKIE_SCHEMES or host is None:
             return None
         return cls(host, urlsplit(url).path or "/", scheme in _SECURE_SCHEMES or is_loopback_host(host))

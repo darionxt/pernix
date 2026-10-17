@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -16,6 +17,11 @@ if TYPE_CHECKING:
     from pernix.testing import LoopbackServer
 
 PUBLIC = "http://192.0.2.1/"  # TEST-NET-1: never routed, so a broken guard times out rather than reaches a host
+
+
+def _full_width(text: str) -> str:
+    """ASCII text in its full-width forms, which IDNA maps back to ASCII."""
+    return "".join(chr(ord(character) + 0xFEE0) for character in text)
 
 
 @pytest.mark.parametrize(
@@ -52,6 +58,17 @@ def test_the_guard_admits_loopback_urls_and_loopback_proxies() -> None:
     assert guard.blocked == ["https://example.com/"]
 
 
+@pytest.mark.parametrize(
+    "host", [_full_width("localhost"), "local%68ost", "LOCAL%48OST", _full_width("127.0.0.1"), "%31%32%37.0.0.1"]
+)
+def test_the_guard_reads_hosts_as_whatwg_urls_convert_them(host: str) -> None:
+    guard = NetworkGuard()
+
+    assert guard.admits(f"http://{host}:8080/")
+    assert guard.admits("https://example.com/", proxy=f"http://{host}:3128")
+    assert not guard.admits(f"http://{host}.example/")
+
+
 def test_guards_nest_and_end_with_their_block() -> None:
     outer_before = current_guard()
     with blocking_network() as outer:
@@ -75,6 +92,23 @@ async def test_the_http_fetcher_refuses_other_hosts_without_connecting(url: str)
 
     assert time.monotonic() - started < 1
     assert guard.blocked == [url, url]
+
+
+@pytest.mark.parametrize(
+    ("host", "ascii_host"), [(_full_width("localhost"), "localhost"), (_full_width("127.0.0.") + "%31", "127.0.0.1")]
+)
+async def test_the_http_fetcher_reaches_loopback_hosts_however_they_are_written(
+    server: LoopbackServer, host: str, ascii_host: str
+) -> None:
+    server.route("/page", "page")
+    port = urlsplit(server.base_url).port
+
+    async with HTTPFetcher() as fetcher:
+        with blocking_network() as guard:
+            response = await fetcher.fetch(Request(f"http://{host}:{port}/page"))
+
+    assert (response.url, response.body) == (f"http://{ascii_host}:{port}/page", b"page")
+    assert guard.blocked == []
 
 
 async def test_redirects_to_other_hosts_are_refused_before_curl_follows_them(server: LoopbackServer) -> None:

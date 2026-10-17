@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING
 import curl_cffi.aio
 import pytest
 import trustme
+from curl_cffi import CurlECode
 
 from cookie_server import CookieServer
 from pernix import Request
-from pernix.cookie_jar import cookie_host
+from pernix.errors import FetchError
 from pernix.fetchers import HTTPFetcher
 
 if TYPE_CHECKING:
@@ -81,28 +82,6 @@ async def test_request_cookies_reach_any_host_in_the_order_given(
     [received] = server.received
     expected = ["c=3; a=1; b=2"] if protocol == "HTTP/1.1" else ["c=3", "a=1", "b=2"]  # one field each, as Chrome
     assert (received.protocol, received.cookies) == (protocol, expected)
-
-
-@pytest.mark.parametrize(
-    ("url", "host"),
-    [
-        ("http://Example.COM/a", "example.com"),
-        ("http://[::1]:8080/", "::1"),
-        ("https://bücher.example/", "xn--bcher-kva.example"),
-        ("https://faß.example/", "xn--fa-hia.example"),  # not fass.example
-        ("https://Faß.Example:8443/", "xn--fa-hia.example"),
-        ("http://other.example\\@faß.example/", "xn--fa-hia.example"),  # the host curl connects to
-        ("http://faß%2Eexample/", "xn--fa-hia.example"),  # percent-decoded first, as curl does
-        ("http://fa%C3%9F.example/", "xn--fa-hia.example"),
-        ("http://Local%48ost/", "localhost"),
-        ("https://ΣΑΣ/", "xn--mxa9ab"),  # not the final sigma str.lower() gives, xn--mxa8ab
-        ("https://a\u200db.example/", None),  # curl gives xn--ab-m1t on macOS, ab on Linux
-        ("http://localhost./", "localhost."),  # curl keeps the trailing dot
-        ("http:///path", None),
-    ],
-)
-def test_cookie_hosts_are_named_as_curl_matches_them(url: str, host: str | None) -> None:
-    assert cookie_host(url) == host
 
 
 @PROTOCOLS
@@ -194,6 +173,41 @@ async def test_request_cookies_stay_on_the_host_curl_connects_to(server: CookieS
         ("xn--fa-hia.localhost", ["a=1"]),
         ("other.localhost", []),
     ]
+
+
+@pytest.mark.parametrize(
+    ("host", "ascii_host"),
+    [
+        ("STRAẞE.de", "xn--strae-oqa.de"),  # strasse.de with curl's conversion on Linux
+        ("👍ß.example", "xn--zca1286w.example"),  # xn--ss-cm72a.example on Linux
+        ("♥ς.example", "xn--3xa748o.example"),  # xn--4xa548o.example on Linux
+    ],
+)
+async def test_international_hosts_are_reached_as_browsers_reach_them(
+    server: CookieServer, host: str, ascii_host: str
+) -> None:
+    async with HTTPFetcher() as fetcher:  # through the server as a proxy, which records the host it is asked for
+        response = await fetcher.fetch(Request(f"http://{host}/page", cookies={"a": "1"}, proxy=server.proxy))
+
+    assert [(hop.host, hop.cookies) for hop in server.received] == [(ascii_host, ["a=1"])]
+    assert response.url == f"http://{ascii_host}/page"
+
+
+@pytest.mark.parametrize("host", ["a\u200db.example", "aא.example", "a%20b.example"])
+async def test_a_host_whatwg_urls_reject_fails_the_fetch_before_connecting(server: CookieServer, host: str) -> None:
+    request = Request(f"http://{host}/", cookies={"a": "1"}, proxy=server.proxy)  # ab.example, ... on Linux
+
+    async with HTTPFetcher() as fetcher:
+        with pytest.raises(FetchError, match="WHATWG URLs reject it") as fetched:
+            await fetcher.fetch(request)
+        with pytest.raises(FetchError, match="WHATWG URLs reject it") as streamed:
+            async with fetcher.stream(request):
+                pass
+
+    assert [(type(error.value), error.value.code) for error in (fetched, streamed)] == [
+        (FetchError, CurlECode.URL_MALFORMAT)
+    ] * 2  # not retried
+    assert server.received == []
 
 
 @PROTOCOLS

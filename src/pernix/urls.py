@@ -1,16 +1,29 @@
-"""URL clean-up, joining, and normalization shared by Requests, Responses, and Fingerprints."""
+"""URL clean-up, joining, normalization, and hosts, shared by Requests, Responses, Fingerprints, and Fetchers."""
 
 from __future__ import annotations
 
 import ipaddress
+import re
 from urllib.parse import urljoin, urlsplit, uses_relative
 
 from ada_url import URL
 
-__all__ = ["clean_url", "document_base", "is_absolute", "is_loopback_host", "join_url", "normalize_url"]
+__all__ = [
+    "clean_url",
+    "document_base",
+    "is_absolute",
+    "is_loopback_host",
+    "join_url",
+    "normalize_url",
+    "url_host",
+    "with_ascii_host",
+]
 
 _C0_CONTROL_OR_SPACE = "".join(chr(code) for code in range(0x21))
 _TAB_OR_NEWLINE = str.maketrans("", "", "\t\n\r")
+
+_AUTHORITY = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]*:)?//(?P<authority>[^/?#]*)")
+"""The authority of a URL, as curl and urllib end it: at the first `/`, `?`, or `#`."""
 
 
 def clean_url(url: str) -> str:
@@ -119,3 +132,91 @@ def is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(name).is_loopback
     except ValueError:
         return False
+
+
+def url_host(url: str) -> str | None:
+    """Return the host a client connects to for a URL: lower-cased, IPv6 without brackets, and in ASCII.
+
+    The host is the one curl connects to: after the last `@` of the authority, even
+    where WHATWG URLs would end the authority earlier, such as at a backslash. One
+    that is not ASCII, or holds percent escapes, is converted as WHATWG URLs convert
+    hosts: percent-decoded, without the transitional IDNA mappings, so `faß` is
+    `xn--fa-hia`, not `fass`, and with IPv4 addresses in dotted decimal, whatever
+    digits they were written in.
+
+    Args:
+        url: The URL.
+
+    Returns:
+        The host, or `None` for none, or for one that WHATWG URLs reject.
+    """
+    url = clean_url(url)
+    span = _host_span(url)
+    if span is None:
+        return None
+    host = url[span[0] : span[1]]
+    if host.startswith("["):
+        return host[1:-1].lower() or None  # an IPv6 address
+    return _whatwg_host(host) if _converted(host) else host.lower() or None
+
+
+def with_ascii_host(url: str) -> str:
+    """Return a URL with the host `url_host()` names in place of one that is not ASCII or holds percent escapes.
+
+    Clients that convert hosts themselves, such as curl, then reach the host a
+    browser does, whatever IDNA conversion their platform has. The rest of the URL is
+    kept as it is.
+
+    Args:
+        url: A cleaned URL.
+
+    Returns:
+        The URL, with its host converted if needed.
+
+    Raises:
+        ValueError: WHATWG URLs reject the host.
+    """
+    span = _host_span(url)
+    if span is None:
+        return url
+    start, end = span
+    host = url[start:end]
+    if host.startswith("[") or not _converted(host):
+        return url
+    converted = _whatwg_host(host)
+    if converted is None:
+        raise ValueError(f"the host of {url} is not valid: WHATWG URLs reject it, as browsers do")
+    return url[:start] + converted + url[end:]
+
+
+def _host_span(url: str) -> tuple[int, int] | None:
+    """Where the host curl connects to is in a cleaned URL: after the last `@` of the authority, without the port."""
+    match = _AUTHORITY.match(url)
+    if match is None:
+        return None
+    authority = match["authority"]
+    at = authority.rfind("@") + 1
+    host_and_port = authority[at:]
+    if host_and_port.startswith("["):
+        length = host_and_port.find("]") + 1
+        if not length:
+            return None  # an unclosed IPv6 bracket
+    else:
+        length = len(host_and_port.partition(":")[0])
+    start = match.start("authority") + at
+    return start, start + length
+
+
+def _converted(host: str) -> bool:
+    """Whether a host is converted before use: one that is not ASCII, or holds percent escapes."""
+    return not host.isascii() or "%" in host
+
+
+def _whatwg_host(host: str) -> str | None:
+    """A host as WHATWG URLs convert it; `None` for one they reject."""
+    if "\\" in host:
+        return None  # WHATWG URLs would end the host there
+    try:
+        return URL(f"http://{host}/").hostname
+    except ValueError:
+        return None
