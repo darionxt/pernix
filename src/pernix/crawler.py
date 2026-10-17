@@ -190,9 +190,10 @@ class Crawler:
         Frontier without counting an attempt, discards the Items not processed yet,
         counting them as `items.discarded`, and closes the components, each within
         `shutdown.close_timeout` seconds. The Feeds are closed either way, keeping
-        the Items written. A Force Stop while the components open cancels the
-        opening and ends the Run before it starts, closing the components already
-        open; one while they close limits the close in progress too.
+        the Items written. A Force Stop while the Spider's Accounts are imported, or
+        while the components open, cancels that and ends the Run before it starts,
+        closing the components already open; one while they close limits the close
+        in progress too.
 
         It may be called from a Callback, a component, or another task, and before
         the Run starts. A Force Stop requested during a Drain escalates it; anything
@@ -302,7 +303,8 @@ class Crawler:
         """Run the Spider to completion.
 
         The `pernix.*` log records of the Run are delivered through a `RunLog`, and
-        carry its `run_id`. Every component is built and wired, as
+        carry its `run_id`. With a Session Pool, the Spider's Accounts are imported
+        first, with `Spider.accounts()`. Every component is built and wired, as
         `pernix.run_assembly.RunAssembly.build()` describes, before anything is
         opened. The components are subscribed and opened in order, then the Feeds,
         and `SpiderOpened` is emitted. The Engine
@@ -343,16 +345,23 @@ class Crawler:
                     raise
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
-        accounts = await self._accounts(run_log)
-        run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet, accounts=accounts)
-        self._shutdown.attach(run.engine)
         try:
             async with ComponentLifecycle() as lifecycle:
                 self._shutdown.begin(lifecycle)
+                accounts: tuple[Account, ...] = ()
+
+                async def import_accounts() -> None:
+                    nonlocal accounts
+                    accounts = await self._accounts(run_log)
+
+                # The Accounts come before the components are built, as they make up the Session Pool.
+                if await self._shutdown.run_stage(import_accounts()):
+                    return self._forced_before_start()
+                run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet, accounts=accounts)
+                self._shutdown.attach(run.engine)
                 try:
                     if await self._shutdown.run_stage(self._open(lifecycle, run.components, run.feeds)):
-                        self.stats.set("run.reason", "forced")  # as the reporter records it once a Run started
-                        return RunResult(self.run_id, "forced", self.stats.snapshot())
+                        return self._forced_before_start()
                     return await self._run(run)
                 except asyncio.CancelledError:
                     lifecycle.limit_closing(self._close_timeout)
@@ -361,6 +370,10 @@ class Crawler:
                     await run.frontier.close()
         finally:
             self._shutdown.end()
+
+    def _forced_before_start(self) -> RunResult:
+        self.stats.set("run.reason", "forced")  # as the reporter records it once a Run started
+        return RunResult(self.run_id, "forced", self.stats.snapshot())
 
     async def _accounts(self, run_log: RunLog) -> tuple[Account, ...]:
         """The Accounts the Spider gives, their credentials masked in the log from now on; none without a Session Pool."""

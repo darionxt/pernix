@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl
 import orjson
 import pytest
 
-from pernix import Account, Request, Response, Session, Spider
+from pernix import Account, Middleware, Request, Response, Session, Spider
 from pernix.crawler import Crawler
 from pernix.errors import SessionError
 from pernix.settings import Secret
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
     from pathlib import Path
 
+    from pernix.middlewares import Download
+    from pernix.shutdown import StopMode
     from pernix.testing import LoopbackServer, ReceivedRequest
 
 PASSWORD = "s3cr3t-Pw-0451"
@@ -287,6 +289,49 @@ async def test_an_inline_fetch_logs_its_session_in_again_in_place(server: Loopba
         {"first": "hello alice@shop.example", "again": "hello alice@shop.example", "session": "alice"}
     ]
     assert len(site.logins) == 2
+
+
+async def test_a_fetch_nested_in_a_middleware_has_the_page_fetch_log_in_again(server: LoopbackServer) -> None:
+    site = LoginSite(server, lifetime=2)
+
+    class Peek(Middleware):
+        """Fetches each page once more first, sharing the Lease of the page fetch."""
+
+        def __init__(self, crawler: Crawler) -> None:
+            self.crawler = crawler
+
+        async def __call__(self, request: Request, call_next: Download) -> Response:
+            if "/page" in request.url and "peek" not in request.url:
+                await self.crawler.fetch(f"{request.url}&peek=1")
+            return await call_next(request)
+
+    report = await crawl(Shop, base=_base(server), pages=3, settings={**POOL, "middlewares": {Peek: 100}})
+
+    assert report.items == [{"session": "alice", "text": "hello alice@shop.example"}] * 3
+    assert len(site.logins) == 3  # the peeks the logins expired on were not retried under the expired login
+    assert report.stats["requests.failed"] == 0
+
+
+@pytest.mark.parametrize("mode", ["force", "drain"])
+async def test_a_stop_ends_a_run_whose_accounts_take_forever_to_import(mode: StopMode) -> None:
+    importing = asyncio.Event()
+
+    class Hanging(Spider):
+        settings: ClassVar[Mapping[str, Any]] = {"sessions.enabled": True, "shutdown.grace": 0.05}
+
+        async def accounts(self) -> AsyncIterator[Account]:
+            importing.set()
+            await asyncio.Event().wait()  # a database that never answers
+            yield Account(username="alice", password=Secret(PASSWORD))
+
+    crawler = Crawler.from_spider(Hanging)
+    run = asyncio.create_task(crawler.crawl())
+    await importing.wait()
+    crawler.stop(mode)  # a Drain turns into a Force Stop once its grace is over
+
+    result = await asyncio.wait_for(run, timeout=5)
+
+    assert result.reason == "forced"
 
 
 async def test_session_hooks_without_a_session_pool_are_warned_about(

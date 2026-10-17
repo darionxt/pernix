@@ -106,11 +106,12 @@ class MemorySessionPool:
 
     With `logs_in`, a Session logs in before it is first used: its first Lease must
     log it in, and no other is given on it until the holder reports `logged_in()`.
-    An `auth_expired` outcome has it log in again, unless it logged in since that
-    Lease was given. A `login_failed` outcome cools it down until the time it gives,
-    then has it log in again, and Retires it after `login_attempts` in a row; a
-    login counts as having worked once the Lease that made it is released with
-    another outcome. The other outcomes leave a Session as it is.
+    An `auth_expired` outcome has it log in again. A `login_failed` outcome cools it
+    down until the time it gives, then has it log in again, and Retires it after
+    `login_attempts` in a row; a login counts as having worked once the Lease that
+    made it is released with another outcome. Either changes nothing if the Session
+    logged in again since the Lease was given, or since its holder logged it in, as
+    it tells of a login replaced since. The other outcomes leave a Session as it is.
 
     Attributes:
         name: The pool's name.
@@ -311,18 +312,26 @@ class MemorySessionPool:
         claim = entry.leases.pop(lease.token)
         if entry.logging_in == lease.token:
             entry.logging_in = None  # the login was given up; another Lease logs the Session in
-        if outcome.kind in ("rate_limited", "login_failed") and outcome.until is not None:
+        if outcome.kind == "rate_limited" and outcome.until is not None:
             entry.cool_until = max(entry.cool_until, outcome.until)
-        if outcome.kind == "auth_expired" and claim.login == entry.logins:
-            entry.logged_in = False
-        elif outcome.kind == "login_failed":
-            entry.logged_in = False
-            entry.login_failures += 1
-            entry.retired = entry.retired or entry.login_failures >= self._login_attempts
+        if outcome.kind in ("auth_expired", "login_failed"):
+            # Unless it tells of a login the Session replaced since.
+            if claim.login == entry.logins:
+                self._logged_out(entry, outcome)
         elif claim.logged_in:
             entry.login_failures = 0  # its fetch, after the login, went on logged in
         self._notify()
         return True
+
+    def _logged_out(self, entry: _Entry, outcome: Outcome) -> None:
+        """Have a Session log in again; after a failed login, once it cooled down, and Retire it after too many."""
+        entry.logged_in = False
+        if outcome.kind != "login_failed":
+            return
+        if outcome.until is not None:
+            entry.cool_until = max(entry.cool_until, outcome.until)
+        entry.login_failures += 1
+        entry.retired = entry.retired or entry.login_failures >= self._login_attempts
 
     async def load_state(self, lease: SessionLease) -> SessionState:
         """Return the state of a leased Session.

@@ -76,7 +76,9 @@ class InlineFetch:
     the Session of the fetch it is nested in, or of the Request being handled, if it
     has one; a fetch nested in another of the same Session, in the same task, shares
     its Lease. A Response that shows the Session logged out is retried as for
-    `Retry`, once the Session logged in again.
+    `Retry`, once the Session logged in again; for a fetch that shares the Lease of
+    the one it is nested in, `LoginExpired` is raised instead, so that the outer
+    fetch, which the Session logs in again for, is retried.
 
     A fetch nested in another of the same slot, in the same task, such as one a
     download Middleware makes, shares the outer fetch's place instead of waiting for
@@ -132,6 +134,8 @@ class InlineFetch:
             pernix.errors.IgnoreRequest: A download Middleware dropped the Request.
             pernix.errors.SessionError: No Session can ever be leased for the
                 Request, or it names one while no Session Pool is enabled.
+            pernix.errors.LoginExpired: The fetch shares the Lease of the fetch it
+                is nested in, and the Response shows the Session logged out.
             Exception: Fetching raised what the policy does not retry, such as a
                 `FetchError`.
         """
@@ -166,6 +170,8 @@ class InlineFetch:
             pernix.errors.IgnoreRequest: A download Middleware dropped the Request.
             pernix.errors.SessionError: No Session can ever be leased for the
                 Request, or it names one while no Session Pool is enabled.
+            pernix.errors.LoginExpired: The fetch shares the Lease of the fetch it
+                is nested in, and the Response shows the Session logged out.
             Exception: Fetching raised what the policy does not retry, such as a
                 `FetchError`.
         """
@@ -246,8 +252,10 @@ class InlineFetch:
         self._throttle.observe(slot, response, statuses=statuses)
         try:
             sending.received(response)
-        except LoginExpired as exc:  # retried, once the Session logged in again
-            return exc
+        except LoginExpired as exc:
+            if sending.nested:
+                raise  # retrying under the expired login is futile; the fetch holding the Lease retries
+            return exc  # retried, once the Session logged in again
         return response
 
     async def _retry_later(

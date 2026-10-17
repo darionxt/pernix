@@ -25,8 +25,8 @@ class Shutdown:
 
     Between `begin()` and `end()`, a Drain makes the Engine stop claiming Requests
     and starts the grace period; once it is over, the Drain turns into a Force Stop.
-    A Force Stop cancels the stage of the Run in progress, opening the components or
-    doing the work, if run with `run_stage()`, and limits each step of closing the
+    A Force Stop cancels the stage of the Run in progress, importing the Accounts,
+    opening the components, or doing the work, if run with `run_stage()`, and limits each step of closing the
     components to `close_timeout` seconds, the step in progress included. A request
     made before `begin()` takes effect then; one made after `end()` does nothing. A
     Drain requested during a Force Stop changes nothing, and a Force Stop requested

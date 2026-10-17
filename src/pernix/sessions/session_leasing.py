@@ -90,6 +90,9 @@ class Sending:
             inside the block, which tells how the Session fared too.
         is_logged_out: Whether a Response shows the Session logged out; `None`
             when no Response is judged, as without a login, or during one.
+        nested: Whether the fetch shares the Lease of a fetch it is nested in, such
+            as one a download Middleware makes. Its Session logs in again only once
+            that fetch ends, so a `LoginExpired` is for that fetch to retry.
     """
 
     request: Request
@@ -97,6 +100,7 @@ class Sending:
     response: Response | None = None
     error: BaseException | None = None
     is_logged_out: Callable[[Response], bool] | None = field(default=None, repr=False)
+    nested: bool = False
 
     def received(self, response: Response) -> None:
         """Record the Response the fetch got.
@@ -193,7 +197,7 @@ class SessionLeasing:
             return
         held = _held_by(self, request.session)
         if held is not None:
-            shared = Sending(request, held.session, is_logged_out=self._judge(held))
+            shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
                 with sending_as(held.session):

@@ -225,9 +225,10 @@ class SessionPool(Protocol):
         """End a Lease, reporting how its Session fared.
 
         A `rate_limited` outcome cools the Session down. In a pool whose Sessions
-        log in, `auth_expired` has the Session log in again, unless it logged in
-        since the Lease was given; `login_failed` has it log in again too, once it
-        cooled down, and Retires it after too many in a row. A Lease that was to log
+        log in, `auth_expired` has the Session log in again; `login_failed` has it
+        log in again too, once it cooled down, and Retires it after too many in a
+        row. Neither changes anything if the Session logged in again since the Lease
+        was given, or since its holder logged it in. A Lease that was to log
         its Session in and is released before `logged_in()` lets another Lease log
         it in.
 

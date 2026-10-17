@@ -374,3 +374,23 @@ async def test_without_logins_no_lease_logs_its_session_in() -> None:
 
     assert lease is not None
     assert not lease.must_log_in
+
+
+async def test_a_failed_login_of_a_login_replaced_since_changes_nothing() -> None:
+    pool, _ = _pool(max_concurrency=3, logs_in=True, login_attempts=1)
+    first = await pool.acquire(session="s")
+    assert first is not None
+    await pool.logged_in(first)  # its fetch is still in flight
+    other = await pool.acquire(session="s")
+    assert other is not None
+    await pool.release(other, Outcome("auth_expired"))
+    relogin = await pool.acquire(session="s")
+    assert relogin is not None
+    await pool.logged_in(relogin)
+
+    await pool.release(first, Outcome("login_failed", until=NOW + 30))  # logged out, under the replaced login
+    after = await pool.acquire(session="s", timeout=0)
+
+    assert pool.health("s") == "available"
+    assert after is not None
+    assert not after.must_log_in
