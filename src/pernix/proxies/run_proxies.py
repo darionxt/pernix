@@ -151,7 +151,9 @@ class RunProxies:
         return proxy
 
     async def bind(self, session: str, current: str | None, *, account: Account | None = None) -> str:
-        """Bind a Session to the proxy the binding policy picks, and return it.
+        """Bind a Session to the proxy the binding policy picks for one of its Leases, and return it.
+
+        The Lease holds the proxy until `release()`.
 
         Args:
             session: The Session's id.
@@ -190,6 +192,15 @@ class RunProxies:
             self._waiting.add(session)
             logger.warning("No proxy fits the Session %r now; its Requests wait for one", session)
         raise NoProxyYet(_UNFIT_WAIT, "no proxy fits the Session")
+
+    async def release(self, session: str, proxy: str) -> None:
+        """End the hold on a proxy of a Lease that `bind()` bound a Session to it for, once the Lease ends.
+
+        Args:
+            session: The Session's id.
+            proxy: The proxy the Lease was bound to.
+        """
+        await self._pool.release(session, proxy)
 
     async def unbind(self, session: str) -> None:
         """Release the binding of a Session, such as one Retired, so it no longer counts toward its proxy's Sessions.

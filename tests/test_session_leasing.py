@@ -738,6 +738,27 @@ async def test_with_max_sessions_1_no_two_sessions_share_a_proxy_and_those_that_
     ]
 
 
+async def test_with_max_sessions_1_a_proxy_an_overlapping_lease_left_is_not_given_to_another_until_it_ends() -> None:
+    every_lease = DefaultBindingPolicy(ProxySettings(rebind="every_lease"))
+    proxy_pool = MemoryProxyPool(max_sessions=1)
+    proxies = await _proxies(proxy_pool, PROXY_A, PROXY_B, policy=every_lease)
+    leasing, _, _, _ = _leasing(proxies=proxies, max_concurrency=2)
+    site = FetcherDispatch({"site": Site()})
+
+    async with leasing.sending(Request(f"{SITE}/first", session="a"), wait=0) as first:
+        await asyncio.create_task(_send(leasing, site, Request(f"{SITE}/second", session="a")))  # through B
+        with pytest.raises(NoProxyYet, match="no proxy fits the Session"):
+            await _send(leasing, site, Request(f"{SITE}/", session="b"))
+        assert first.session is not None
+        assert first.session.proxy == PROXY_A
+    await _send(leasing, site, Request(f"{SITE}/", session="b"))
+
+    assert [candidate.sessions for candidate in await proxy_pool.candidates()] == [
+        frozenset({"a"}),
+        frozenset({"b"}),
+    ]
+
+
 async def test_with_every_lease_each_lease_goes_through_the_next_proxy_and_its_fetches_through_one() -> None:
     every_lease = DefaultBindingPolicy(ProxySettings(rebind="every_lease"))
     leasing, pool, _, _ = _leasing(proxies=await _proxies(MemoryProxyPool(), PROXY_A, PROXY_B, policy=every_lease))

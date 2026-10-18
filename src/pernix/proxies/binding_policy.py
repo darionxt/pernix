@@ -47,12 +47,15 @@ class Binding:
 
     @property
     def open(self) -> tuple[ProxyCandidate, ...]:
-        """The candidates the Session can be bound to: available, with room for it, least recently used first."""
+        """The candidates the Session can be bound to: available, with room for it, least recently used first.
+
+        A candidate has room while fewer than `max_sessions` other Sessions occupy it.
+        """
         return tuple(
             candidate
             for candidate in self.candidates
             if candidate.health == "available"
-            and (self.max_sessions is None or len(candidate.sessions - {self.session}) < self.max_sessions)
+            and (self.max_sessions is None or len(candidate.occupants - {self.session}) < self.max_sessions)
         )
 
     def __repr__(self) -> str:
@@ -102,8 +105,8 @@ class DefaultBindingPolicy:
 
     With `proxies.rebind` set to `every_lease`, each Lease binds the Session to
     another open proxy, if there is one, so its Leases go through the proxies in
-    turn. Among the open proxies with the fewest other Sessions, the least recently
-    used is bound, so Sessions bound while enough proxies are available get one
+    turn. Among the open proxies with the fewest other Sessions occupying them, the
+    least recently used is bound, so Sessions bound while enough proxies are available get one
     each. With none open, the Session waits.
     """
 
@@ -128,5 +131,5 @@ class DefaultBindingPolicy:
         choices = [candidate for candidate in open_ if candidate.url != binding.current]
         if len(choices) < len(open_) and (self._rebind == "unavailable" or not choices):
             return binding.current  # it is open
-        fewest = min(choices, key=lambda candidate: len(candidate.sessions - {binding.session}), default=None)
+        fewest = min(choices, key=lambda candidate: len(candidate.occupants - {binding.session}), default=None)
         return None if fewest is None else fewest.url

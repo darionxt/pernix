@@ -70,6 +70,20 @@ async def test_with_no_proxy_open_the_session_waits() -> None:
     assert await _picked(binding) is None
 
 
+def test_sessions_leaving_a_proxy_take_its_room_until_their_leases_end() -> None:
+    leaving = ProxyCandidate(A, sessions=frozenset({"two"}), leaving=frozenset({"three"}))
+
+    assert leaving.occupants == {"two", "three"}
+    assert _binding(leaving, max_sessions=2).open == ()
+    assert _binding(leaving, max_sessions=3).open == (leaving,)
+
+
+async def test_the_fewest_sessions_count_those_leaving() -> None:
+    binding = _binding(ProxyCandidate(A, leaving=frozenset({"two"})), _candidate(B), reason="new")
+
+    assert await _picked(binding) == B
+
+
 def test_the_open_candidates_are_those_available_with_room_for_the_session() -> None:
     binding = _binding(
         _candidate(A, "one", "two"),  # its own, with room for it

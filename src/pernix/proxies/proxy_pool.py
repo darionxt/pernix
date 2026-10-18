@@ -44,6 +44,8 @@ class ProxyCandidate:
         tags: Its tags, as its source gave them.
         health: Whether it can be used now.
         sessions: The ids of the Sessions bound to it.
+        leaving: The ids of the Sessions bound to another proxy since, whose
+            Leases still go through this one.
         failures: Its failures in a row.
         expires: When it stops working, as its source tells, in seconds since the
             epoch; `None` if it does not tell.
@@ -53,8 +55,14 @@ class ProxyCandidate:
     tags: frozenset[str] = frozenset()
     health: ProxyHealth = "available"
     sessions: frozenset[str] = frozenset()
+    leaving: frozenset[str] = frozenset()
     failures: int = 0
     expires: float | None = None
+
+    @property
+    def occupants(self) -> frozenset[str]:
+        """The Sessions that count toward its `max_sessions`: those bound to it, and those leaving it."""
+        return self.sessions | self.leaving
 
     def __repr__(self) -> str:
         return f"ProxyCandidate({proxy_address(self.url)!r}, health={self.health!r}, sessions={len(self.sessions)})"
@@ -68,7 +76,8 @@ class ProxyPool(Protocol):
     cools down, longer with each failure in a row, and is Retired after too many.
     Sessions are bound to proxies as a binding policy picks among the
     `candidates()`, and the pool holds each binding, binding no more than
-    `max_sessions` Sessions to a proxy. Proxies are URLs as
+    `max_sessions` Sessions to a proxy; a Session bound to another counts toward a
+    proxy until the Leases that went through it end. Proxies are URLs as
     `pernix.proxies.proxy_url()` gives them. The in-process implementation is
     `pernix.proxies.MemoryProxyPool`; one shared by several processes keeps the
     same protocol.
@@ -110,12 +119,14 @@ class ProxyPool(Protocol):
         ...
 
     async def bind(self, session: str, proxy: str) -> bool:
-        """Bind a Session to a proxy, in place of the one it was bound to, if the proxy is available and has room for it.
+        """Bind a Session to a proxy for one of its Leases, in place of the one it was bound to, if the proxy has room.
 
-        A proxy has room for a Session bound to it already, and for another while
-        fewer than `max_sessions` are. The pool holds the binding of each Session,
-        so that Leases of one Session that overlap go through the same proxy,
-        though each loaded its state before the other saved it.
+        A proxy has room for a Session while it is available, and while fewer than
+        `max_sessions` other Sessions occupy it: those bound to it, and those bound
+        to another since whose Leases still go through it. The Lease holds the
+        proxy until `release()`. The pool holds the binding of each Session, so
+        that Leases of one Session that overlap go through the same proxy, though
+        each loaded its state before the other saved it.
 
         Args:
             session: The Session's id.
@@ -128,8 +139,19 @@ class ProxyPool(Protocol):
         """
         ...
 
+    async def release(self, session: str, proxy: str) -> None:
+        """End the hold on a proxy of a Lease that `bind()` bound a Session to it for.
+
+        Args:
+            session: The Session's id.
+            proxy: The proxy the Lease was bound to.
+        """
+        ...
+
     async def unbind(self, session: str) -> None:
         """Release the binding of a Session, such as one Retired, so it no longer counts toward its proxy's Sessions.
+
+        It still counts toward the proxy until its Leases that went through it end.
 
         Args:
             session: The Session's id; one bound to no proxy is ignored.

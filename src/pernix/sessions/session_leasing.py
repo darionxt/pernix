@@ -58,8 +58,8 @@ class _Held:
     task: asyncio.Task[Any] | None
     logging_in: bool = False
     """Whether the fetch is logging the Session in, so the Responses of the fetches nested in it are not judged."""
-    proxy_settled: bool = False
-    """Whether the Lease settled the Session's proxy, which its later fetches keep."""
+    proxy: str | None = None
+    """The proxy the Lease bound its Session to, which its later fetches keep, and which it holds until it ends."""
     nested: list[Outcome] = field(default_factory=list[Outcome])
 
 
@@ -99,9 +99,10 @@ class SessionLeasing:
     binds it to, by default the one it is bound to while that is available. Each
     Lease settles the Session's proxy once, before its first fetch that goes through
     it, which may be one of its login or one nested in another, and its later
-    fetches keep it, so each is reported against the proxy it went through; the
-    binding is saved with the Session's state, and released once the pool Retires
-    the Session. A Request with a proxy of its own goes through that, and needs none
+    fetches keep it, so each is reported against the proxy it went through. The
+    Lease holds the proxy until it ends, so a Session an overlapping Lease bound to
+    another still counts toward it meanwhile. The binding is saved with the
+    Session's state, and released once the pool Retires the Session. A Request with a proxy of its own goes through that, and needs none
     of the Run's. When no proxy is available, or none fits the Session, the Lease is
     released, and the Request waits elsewhere; a nested fetch waits as its caller
     does.
@@ -174,8 +175,8 @@ class SessionLeasing:
         """
         held = _held_by(self, request.session)
         if held is not None:
-            if not held.proxy_settled:
-                held.proxy_settled = await self._bind_proxy(held.session, request)
+            if held.proxy is None:
+                held.proxy = await self._bind_proxy(held.session, request)
             shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
@@ -195,12 +196,12 @@ class SessionLeasing:
         try:
             before = await self.pool.load_state(lease)
             session = Session.from_state(lease.session, before)
-            settled = await self._bind_proxy(session, request)
+            bound = await self._bind_proxy(session, request)
         except BaseException:
             await self.pool.release(lease, Outcome("ok"))
             raise
         renewing = asyncio.create_task(self._renew(lease))
-        holding = _Held(self, session, asyncio.current_task(), logging_in=lease.must_log_in, proxy_settled=settled)
+        holding = _Held(self, session, asyncio.current_task(), logging_in=lease.must_log_in, proxy=bound)
         token = _held.set((*_held.get(), holding))
         try:
             if lease.must_log_in:
@@ -220,6 +221,8 @@ class SessionLeasing:
         finally:
             _held.reset(token)
             renewing.cancel()
+            if self._proxies is not None and holding.proxy is not None:
+                await self._proxies.release(session.id, holding.proxy)
 
     async def _log_in(
         self, lease: SessionLease, before: SessionState, holding: _Held, request: Request
@@ -305,18 +308,18 @@ class SessionLeasing:
                 await self._proxies.unbind(lease.session)
         return released
 
-    async def _bind_proxy(self, session: Session, request: Request) -> bool:
-        """Bind a Session to a proxy, unless the Request goes through its own; return whether it did.
+    async def _bind_proxy(self, session: Session, request: Request) -> str | None:
+        """Bind a Session to a proxy for its Lease, unless the Request goes through its own; return the proxy bound.
 
         Raises:
             pernix.proxies.run_proxies.NoProxyYet: No proxy is available, or none
                 fits the Session.
         """
         if self._proxies is None or request.proxy is not None:
-            return False
+            return None
         account = None if session.account is None else self._accounts.get(session.account)
         session.proxy = await self._proxies.bind(session.id, session.proxy, account=account)
-        return True
+        return session.proxy
 
     def _reporting(self, sending: Sending) -> AbstractAsyncContextManager[None]:
         """Report how a fetch went through its Session's proxy, unless the Request names its own."""

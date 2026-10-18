@@ -403,6 +403,7 @@ async def test_sessions_no_proxy_fits_wait_counted_and_logged_once_until_bound(
             with pytest.raises(NoProxyYet) as waiting:
                 await proxies.bind("three", None)
             waits.append(waiting.value)
+        await proxies.release("one", A)  # its Lease ended
         await proxies.unbind("one")
         bound = await proxies.bind("three", None)
 

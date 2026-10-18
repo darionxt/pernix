@@ -6,7 +6,7 @@ import itertools
 import logging
 import math
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -57,9 +57,12 @@ class MemoryProxyPool:
     the proxies take turns. Sessions are bound as a binding policy picks among the
     `candidates()`, listed least recently used first; a Session is bound only to a
     proxy that is available and has room for it, with fewer than `max_sessions`
-    other Sessions, so bindings made at once cannot exceed it. The pool holds the
-    binding of each Session, so Leases of one Session that overlap, which loaded
-    its state before either saved it, are given the same proxy. A failure cools its
+    other Sessions, so bindings made at once cannot exceed it. A Session bound to
+    another proxy still counts toward the one its Leases went through until they
+    end, so that two Sessions never go through one proxy at once beyond the limit.
+    The pool holds the binding of each Session, so Leases of one Session that
+    overlap, which loaded its state before either saved it, are given the same
+    proxy. A failure cools its
     proxy down for `cooldown` seconds, doubled with each failure in a row, at most
     `cooldown_max`, and Retires it after `max_failures` in a row; a fetch that got
     through ends the row. A proxy that is no longer listed keeps its health, should
@@ -100,6 +103,8 @@ class MemoryProxyPool:
         self._entries: dict[str, _Entry] = {}
         self._bound: dict[str, str] = {}
         """The proxy each Session is bound to, by its id."""
+        self._leases: Counter[tuple[str, str]] = Counter()
+        """The Leases going through each proxy, by the id of their Session and the proxy."""
         self._uses = itertools.count(1)
 
     def health(self, proxy: str) -> ProxyHealth | None:
@@ -173,6 +178,10 @@ class MemoryProxyPool:
         bound: defaultdict[str, set[str]] = defaultdict(set)
         for session, url in self._bound.items():
             bound[url].add(session)
+        leaving: defaultdict[str, set[str]] = defaultdict(set)
+        for session, url in self._leases:
+            if self._bound.get(session) != url:
+                leaving[url].add(session)
         listed = sorted((entry for entry in self._entries.values() if entry.listed), key=lambda entry: entry.used)
         return tuple(
             ProxyCandidate(
@@ -180,6 +189,7 @@ class MemoryProxyPool:
                 tags=entry.tags,
                 health=entry.health(now),
                 sessions=frozenset(bound[entry.url]),
+                leaving=frozenset(leaving[entry.url]),
                 failures=entry.failures,
                 expires=entry.expires,
             )
@@ -187,7 +197,7 @@ class MemoryProxyPool:
         )
 
     async def bind(self, session: str, proxy: str) -> bool:
-        """Bind a Session to a proxy, in place of the one it was bound to, if the proxy is available and has room for it.
+        """Bind a Session to a proxy for one of its Leases, in place of the one it was bound to, if the proxy has room.
 
         Args:
             session: The Session's id.
@@ -200,17 +210,28 @@ class MemoryProxyPool:
         entry = self._entries.get(proxy)
         if entry is None or not entry.usable(self._clock()):
             return False
-        if self._bound.get(session) == proxy:
-            return True
-        if self.max_sessions is not None and sum(url == proxy for url in self._bound.values()) >= self.max_sessions:
+        if self.max_sessions is not None and len(self._occupants(proxy) - {session}) >= self.max_sessions:
             return False
-        entry.used = next(self._uses)
-        self._bound[session] = proxy
-        self._count("proxies.bindings")
+        if self._bound.get(session) != proxy:
+            entry.used = next(self._uses)
+            self._bound[session] = proxy
+            self._count("proxies.bindings")
+        self._leases[session, proxy] += 1
         return True
 
+    async def release(self, session: str, proxy: str) -> None:
+        """End the hold on a proxy of a Lease that `bind()` bound a Session to it for.
+
+        Args:
+            session: The Session's id.
+            proxy: The proxy the Lease was bound to.
+        """
+        self._leases[session, proxy] -= 1
+        if self._leases[session, proxy] <= 0:
+            del self._leases[session, proxy]
+
     async def unbind(self, session: str) -> None:
-        """Release the binding of a Session, so it no longer counts toward its proxy's Sessions.
+        """Release the binding of a Session, so it no longer counts toward its proxy's Sessions once its Leases end.
 
         Args:
             session: The Session's id; one bound to no proxy is ignored.
@@ -257,6 +278,12 @@ class MemoryProxyPool:
         if not waiting:
             return math.inf
         return max(0.0, min(waiting) - self._clock())
+
+    def _occupants(self, proxy: str) -> set[str]:
+        """The Sessions that count toward a proxy's `max_sessions`: bound to it, or with Leases through it."""
+        occupants = {session for session, url in self._bound.items() if url == proxy}
+        occupants.update(session for session, url in self._leases if url == proxy)
+        return occupants
 
     def _count(self, key: str) -> None:
         if self._stats is not None:

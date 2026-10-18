@@ -77,13 +77,30 @@ async def test_a_session_is_bound_only_to_a_proxy_available_with_room_for_it() -
     assert await _sessions(pool) == {A: frozenset({"one"}), B: frozenset()}
 
 
-async def test_a_session_unbound_no_longer_counts_toward_its_proxy() -> None:
+async def test_a_session_bound_to_another_counts_toward_the_proxy_its_leases_still_go_through() -> None:
+    pool = await _pool(A, B, max_sessions=1)
+    await pool.bind("one", A)
+    await pool.bind("one", B)  # an overlapping Lease rebinds it, while the first still goes through A
+
+    refused = await pool.bind("two", A)
+    leaving = [candidate.leaving for candidate in await pool.candidates()]
+    await pool.release("one", A)  # the first Lease ended
+
+    assert not refused
+    assert leaving == [frozenset({"one"}), frozenset()]
+    assert await pool.bind("two", A)
+
+
+async def test_a_session_unbound_no_longer_counts_toward_its_proxy_once_its_leases_end() -> None:
     pool = await _pool(A, max_sessions=1)
     await pool.bind("one", A)
+    await pool.release("one", A)
+    still_bound = await pool.bind("two", A)
 
     await pool.unbind("one")
     await pool.unbind("never bound")
 
+    assert not still_bound
     assert await pool.bind("two", A)
     assert await _sessions(pool) == {A: frozenset({"two"})}
 
