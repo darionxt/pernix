@@ -64,6 +64,48 @@ async def test_with_every_lease_each_lease_binds_another_proxy_while_there_is_on
     assert await _picked(_binding(_candidate(A, "one"), current=A), rebind="every_lease") == A
 
 
+GONE: list[tuple[BindingReason, ProxyHealth | None]] = [
+    ("cooldown", "cooldown"),
+    ("retired", "retired"),
+    ("unlisted", None),
+]
+"""Why a Session bound to A is bound again, and the health of A then; `None` once A is no longer listed."""
+
+
+def _gone(reason: BindingReason, health: ProxyHealth | None) -> Binding:
+    """The binding of a Session whose proxy, A, is gone as `reason` says, while B is open."""
+    candidates = () if health is None else (_candidate(A, "one", health=health),)
+    return _binding(*candidates, _candidate(B), current=A, reason=reason)
+
+
+@pytest.mark.parametrize(("reason", "health"), GONE)
+async def test_by_default_a_session_whose_proxy_is_gone_is_bound_to_another(
+    reason: BindingReason, health: ProxyHealth | None
+) -> None:
+    assert await _picked(_gone(reason, health)) == B
+
+
+@pytest.mark.parametrize(("reason", "health"), GONE)
+async def test_with_retired_a_session_waits_for_its_proxy_and_is_bound_to_another_once_it_is_gone(
+    reason: BindingReason, health: ProxyHealth | None
+) -> None:
+    assert await _picked(_gone(reason, health), rebind="retired") == (A if reason == "cooldown" else B)
+
+
+@pytest.mark.parametrize(("reason", "health"), [("lease", "available"), *GONE])
+async def test_with_never_a_session_keeps_its_proxy_whatever_becomes_of_it(
+    reason: BindingReason, health: ProxyHealth | None
+) -> None:
+    assert await _picked(_gone(reason, health), rebind="never") == A  # to wait for it, or to be Retired with it
+
+
+@pytest.mark.parametrize("rebind", ["retired", "never"])
+async def test_with_retired_or_never_a_new_session_is_bound_as_by_default(rebind: str) -> None:
+    binding = _binding(_candidate(A, "two"), _candidate(B), reason="new")
+
+    assert await _picked(binding, rebind=rebind) == B
+
+
 async def test_with_no_proxy_open_the_session_waits() -> None:
     binding = _binding(_candidate(A, "two"), _candidate(B, health="retired"), reason="new", max_sessions=1)
 
@@ -101,9 +143,10 @@ def test_the_open_candidates_are_those_available_with_room_for_the_session() -> 
     [
         (Proxy("http://user:pw@gate.example:7777", tags=frozenset({"us"})), "Proxy('http://***@gate.example:7777'"),
         (ProxyCandidate("http://user:pw@gate.example:7777"), "ProxyCandidate('http://***@gate.example:7777'"),
+        (ProxyCandidate("http://user:pw@own.example:7777", own=True), "ProxyCandidate('http://***@own.example:7777'"),
         (Binding("one", current="http://user:pw@gate.example:7777"), "current='http://***@gate.example:7777'"),
     ],
-    ids=["proxy", "candidate", "binding"],
+    ids=["proxy", "candidate", "own candidate", "binding"],
 )
 def test_records_show_their_proxies_without_credentials(record: object, shown: str) -> None:
     assert shown in repr(record)

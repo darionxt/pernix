@@ -98,6 +98,30 @@ def test_a_binding_policy_of_ones_own_is_built_and_opened_before_the_proxies() -
     assert run.components[1] is policy
 
 
+class Sticky:
+    async def bind(self, binding: Binding) -> str | None:
+        return None
+
+
+def test_a_binding_policy_without_a_source_gives_the_sessions_of_a_pool_their_proxies() -> None:
+    run = _build({"sessions.enabled": True, "proxies.binding": Sticky})
+
+    assert [type(component) for component in run.components[1:3]] == [Sticky, RunProxies]
+
+
+def test_a_binding_policy_without_a_source_or_a_session_pool_fails_the_build() -> None:
+    with pytest.raises(SettingsError, match=r"proxies\.binding: without a source of proxies") as refused:
+        _build({"proxies.binding": Sticky})
+
+    assert "enable one with sessions.enabled" in str(refused.value)
+
+
+def test_never_rebinding_while_refreshes_replace_the_proxies_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
+    _build({"proxies.urls": ["a.example:1"], "proxies.rebind": "never", "proxies.refresh": 60})
+
+    assert "proxies.rebind is never and proxies.refresh is set" in caplog.text
+
+
 def test_a_binding_policy_without_bind_fails_the_build() -> None:
     with pytest.raises(ComponentError, match=r"proxies\.binding must have bind\(binding\)"):
         _build({"proxies.urls": ["a.example:1"], "proxies.binding": object()})

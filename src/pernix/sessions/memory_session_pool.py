@@ -108,6 +108,10 @@ class MemorySessionPool:
     release or a save from one that expired or was released is rejected. States are
     merged per cookie, by modification time.
 
+    An outcome with an `until`, such as `rate_limited`, cools its Session down
+    until then, and `proxy_retired` Retires it. Each Session Retired is counted as
+    `sessions.retirements`, whatever the reason.
+
     With `logs_in`, a Session logs in before it is first used: its first Lease must
     log it in, and no other is given on it until the holder reports `logged_in()`.
     An `auth_expired` outcome has it log in again. A `login_failed` outcome cools it
@@ -145,7 +149,8 @@ class MemorySessionPool:
             eager: Create all `size` Sessions now.
             logs_in: Whether Sessions log in before they are used.
             login_attempts: Failed logins in a row after which a Session is Retired.
-            stats: Where created Sessions are counted, as `sessions.created`.
+            stats: Where created and Retired Sessions are counted, as
+                `sessions.created` and `sessions.retirements`.
             clock: The current time, in seconds since the epoch.
         """
         self.name = name
@@ -205,7 +210,7 @@ class MemorySessionPool:
         Raises:
             KeyError: The pool does not hold it.
         """
-        self._entries[session].retired = True
+        self._retire(self._entries[session])
         self._notify()
 
     def __len__(self) -> int:
@@ -301,7 +306,7 @@ class MemorySessionPool:
         return True
 
     async def release(self, lease: SessionLease, outcome: Outcome) -> bool:
-        """End a Lease, cooling its Session down, or having it log in again, as its outcome says.
+        """End a Lease, cooling its Session down, having it log in again, or Retiring it, as its outcome says.
 
         Args:
             lease: The Lease.
@@ -316,26 +321,36 @@ class MemorySessionPool:
         claim = entry.leases.pop(lease.token)
         if entry.logging_in == lease.token:
             entry.logging_in = None  # the login was given up; another Lease logs the Session in
-        if outcome.kind == "rate_limited" and outcome.until is not None:
+        logging_out = outcome.kind in ("auth_expired", "login_failed")
+        replaced = claim.login != entry.logins  # the outcome tells of a login the Session replaced since
+        if outcome.until is not None and not (logging_out and replaced):
             entry.cool_until = max(entry.cool_until, outcome.until)
-        if outcome.kind in ("auth_expired", "login_failed"):
-            # Unless it tells of a login the Session replaced since.
-            if claim.login == entry.logins:
+        if logging_out:
+            if not replaced:
                 self._logged_out(entry, outcome)
         elif claim.logged_in:
             entry.login_failures = 0  # its fetch, after the login, went on logged in
+        if outcome.kind == "proxy_retired":
+            self._retire(entry)
         self._notify()
         return True
 
     def _logged_out(self, entry: _Entry, outcome: Outcome) -> None:
-        """Have a Session log in again; after a failed login, once it cooled down, and Retire it after too many."""
+        """Have a Session log in again, and Retire it after too many failed logins in a row."""
         entry.logged_in = False
         if outcome.kind != "login_failed":
             return
-        if outcome.until is not None:
-            entry.cool_until = max(entry.cool_until, outcome.until)
         entry.login_failures += 1
-        entry.retired = entry.retired or entry.login_failures >= self._login_attempts
+        if entry.login_failures >= self._login_attempts:
+            self._retire(entry)
+
+    def _retire(self, entry: _Entry) -> None:
+        """Take a Session out of use for good, counting it once."""
+        if entry.retired:
+            return
+        entry.retired = True
+        if self._stats is not None:
+            self._stats.inc("sessions.retirements")
 
     async def load_state(self, lease: SessionLease) -> SessionState:
         """Return the state of a leased Session.

@@ -56,7 +56,7 @@ A named set of Sessions that multiple Workers and Spiders can share.
 _Avoid_: account pool, cookie pool (they are special cases of a Session Pool)
 
 **Proxy Pool**:
-The proxies a Run sends Requests through, from its sources, with the health of each and the Sessions bound to each. A Session is bound to one proxy, as the Run's binding policy picks it, by default keeping it while that is available; a Request without a Session goes through the next one in turn.
+The proxies a Run sends Requests through, from its sources, with the health of each and the Sessions bound to each. A Session is bound to one proxy, as the Run's binding policy picks it, by default keeping it while that is available; the policy may keep it on its proxy whatever happens, so the Session follows it, or give it a proxy of its own, which no other Session goes through. A Request without a Session goes through the next one in turn.
 _Avoid_: proxy list, rotator
 
 **Profile**:
@@ -80,10 +80,10 @@ A time-limited claim on a Session or a Request. It carries a token and becomes i
 _Avoid_: lock, checkout
 
 **Cooldown**:
-A period during which a Session or a proxy is paused: a Session because it was Rate Limited or its Login failed, a proxy because it failed. It ends automatically.
+A period during which a Session or a proxy is paused: a Session because it was Rate Limited, its Login failed, or it waits for its proxy, which cools down; a proxy because it failed. It ends automatically.
 
 **Retired**:
-The state of a Session or a proxy that has been permanently taken out of use: a Session because it was Blocked or otherwise invalid, a proxy because it failed too many times in a row.
+The state of a Session or a proxy that has been permanently taken out of use: a Session because it was Blocked or otherwise invalid, or with the proxy it follows; a proxy because it failed too many times in a row.
 _Avoid_: banned, dead
 
 **Blocked**:

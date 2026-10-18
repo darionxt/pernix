@@ -10,12 +10,12 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pernix.proxies.proxy import Proxy
 from pernix.proxies.proxy_pool import ProxyCandidate, ProxyCounts
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection
 
-    from pernix.proxies.proxy import Proxy
     from pernix.proxies.proxy_pool import ProxyHealth
     from pernix.stats import Stats
 
@@ -26,12 +26,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class _Entry:
-    """A proxy as the pool holds it: whether it is listed, and its health."""
+    """A proxy as the pool holds it: whether it is listed or a Session's own, and its health."""
 
     url: str
     tags: frozenset[str] = frozenset()
     expires: float | None = None
     listed: bool = True
+    owner: str | None = None
+    """The Session last given it as its own, which holds it while it is bound to it, or its Leases go through it."""
     failures: int = 0
     """Failures in a row."""
     failed_at: float = -math.inf
@@ -41,8 +43,8 @@ class _Entry:
     used: int = 0
     """When it was last taken or bound, as a count of those, so it goes to the back of the line."""
 
-    def usable(self, now: float) -> bool:
-        return self.listed and not self.retired and self.cool_until <= now
+    def available(self, now: float) -> bool:
+        return not self.retired and self.cool_until <= now
 
     def health(self, now: float) -> ProxyHealth:
         if self.retired:
@@ -62,11 +64,14 @@ class MemoryProxyPool:
     end, so that two Sessions never go through one proxy at once beyond the limit.
     The pool holds the binding of each Session, so Leases of one Session that
     overlap, which loaded its state before either saved it, are given the same
-    proxy. A failure cools its
-    proxy down for `cooldown` seconds, doubled with each failure in a row, at most
-    `cooldown_max`, and Retires it after `max_failures` in a row; a fetch that got
-    through ends the row. A proxy that is no longer listed keeps its health, should
-    it be listed again, and a Retired one stays Retired.
+    proxy. A Session given a proxy of its own holds it while it is bound to it, or
+    its Leases go through it: no fetch takes it, no other Session sees it among
+    the candidates or is bound to it, even should a source list it, and
+    `max_sessions` does not apply. A failure cools its proxy down for `cooldown`
+    seconds, doubled with each failure in a row, at most `cooldown_max`, and
+    Retires it after `max_failures` in a row; a fetch that got through ends the
+    row. A proxy that is no longer listed, or held, keeps its health, should it be
+    listed or held again, and a Retired one stays Retired.
 
     Attributes:
         max_sessions: Sessions a proxy is bound to at most; `None` for no limit.
@@ -114,27 +119,28 @@ class MemoryProxyPool:
             proxy: The proxy.
 
         Returns:
-            Its health, or `None` if the pool does not list it.
+            Its health, or `None` if the pool neither lists it nor holds it as a
+            Session's own.
         """
         entry = self._entries.get(proxy)
-        if entry is None or not entry.listed:
+        if entry is None or not self._in_use(entry):
             return None
         return entry.health(self._clock())
 
     def counts(self) -> ProxyCounts:
-        """Return how many of the proxies listed are in each state.
+        """Return how many of the proxies listed, and of the Sessions' own in use, are in each state.
 
         Returns:
             The counts.
         """
         now = self._clock()
-        listed = [entry for entry in self._entries.values() if entry.listed]
-        retired = sum(entry.retired for entry in listed)
-        available = sum(entry.usable(now) for entry in listed)
-        return ProxyCounts(available=available, cooldown=len(listed) - retired - available, retired=retired)
+        used = [entry for entry in self._entries.values() if self._in_use(entry)]
+        retired = sum(entry.retired for entry in used)
+        available = sum(entry.available(now) for entry in used)
+        return ProxyCounts(available=available, cooldown=len(used) - retired - available, retired=retired)
 
     def __len__(self) -> int:
-        return sum(entry.listed for entry in self._entries.values())
+        return sum(self._in_use(entry) for entry in self._entries.values())
 
     async def replace(self, proxies: Collection[Proxy]) -> None:
         """List the proxies the sources gave, in place of those listed before.
@@ -155,68 +161,101 @@ class MemoryProxyPool:
             entry.tags, entry.expires = proxy.tags, proxy.expires
 
     async def take(self) -> str | None:
-        """Take a proxy for one fetch: the available one used least recently.
+        """Take a proxy for one fetch: the available one used least recently, of those listed and no Session's own.
 
         Returns:
             The proxy, or `None` if none is available now.
         """
         now = self._clock()
-        usable = [entry for entry in self._entries.values() if entry.usable(now)]
+        usable = [entry for entry in self._entries.values() if self._shared(entry) and entry.available(now)]
         if not usable:
             return None
         entry = min(usable, key=lambda entry: entry.used)
         entry.used = next(self._uses)
         return entry.url
 
-    async def candidates(self) -> tuple[ProxyCandidate, ...]:
-        """Return the proxies listed, as a binding policy sees them, least recently used first.
+    async def candidates(self, session: str | None = None) -> tuple[ProxyCandidate, ...]:
+        """Return the proxies a Session may be bound to, as a binding policy sees them, least recently used first.
+
+        Args:
+            session: The id of the Session, whose own proxy, if it holds one, is
+                among them; `None` for the proxies listed only.
 
         Returns:
-            Every proxy listed, whatever its health.
+            Every proxy listed, whatever its health, but the other Sessions' own, and
+            the Session's own.
         """
         now = self._clock()
         bound: defaultdict[str, set[str]] = defaultdict(set)
-        for session, url in self._bound.items():
-            bound[url].add(session)
+        for each, url in self._bound.items():
+            bound[url].add(each)
         leaving: defaultdict[str, set[str]] = defaultdict(set)
-        for session, url in self._leases:
-            if self._bound.get(session) != url:
-                leaving[url].add(session)
-        listed = sorted((entry for entry in self._entries.values() if entry.listed), key=lambda entry: entry.used)
-        return tuple(
-            ProxyCandidate(
-                entry.url,
-                tags=entry.tags,
-                health=entry.health(now),
-                sessions=frozenset(bound[entry.url]),
-                leaving=frozenset(leaving[entry.url]),
-                failures=entry.failures,
-                expires=entry.expires,
+        for each, url in self._leases:
+            if self._bound.get(each) != url:
+                leaving[url].add(each)
+        candidates: list[ProxyCandidate] = []
+        for entry in sorted(self._entries.values(), key=lambda entry: entry.used):
+            holder = self._holder(entry)
+            if not (entry.listed if holder is None else holder == session):
+                continue  # not listed, or another Session's own
+            health = entry.health(now)
+            candidates.append(
+                ProxyCandidate(
+                    entry.url,
+                    tags=entry.tags,
+                    health=health,
+                    sessions=frozenset(bound[entry.url]),
+                    leaving=frozenset(leaving[entry.url]),
+                    failures=entry.failures,
+                    expires=entry.expires,
+                    until=entry.cool_until if health == "cooldown" else None,
+                    own=holder is not None,
+                )
             )
-            for entry in listed
-        )
+        return tuple(candidates)
 
-    async def bind(self, session: str, proxy: str) -> bool:
+    async def bind(self, session: str, proxy: str | Proxy) -> bool:
         """Bind a Session to a proxy for one of its Leases, in place of the one it was bound to, if the proxy has room.
 
         Args:
             session: The Session's id.
-            proxy: The proxy.
+            proxy: The URL of one of its candidates, or a `Proxy` record of its own.
 
         Returns:
             Whether the Session is bound to the proxy now; `False`, changing nothing,
-            if the proxy is not listed, not available, or has no room.
+            if the proxy is not one of its candidates, not available, or has no
+            room, or for a record, if the pool lists the proxy, holds it for
+            another Session, or other Sessions still occupy it.
         """
-        entry = self._entries.get(proxy)
-        if entry is None or not entry.usable(self._clock()):
+        own = isinstance(proxy, Proxy)
+        url = proxy.url if isinstance(proxy, Proxy) else proxy
+        entry = self._entries.get(url)
+        holder = None if entry is None else self._holder(entry)
+        if holder not in (None, session):
             return False
-        if self.max_sessions is not None and len(self._occupants(proxy) - {session}) >= self.max_sessions:
+        if entry is None:
+            if not own:
+                return False
+            entry = _Entry(url, listed=False)
+        elif holder is None and entry.listed == own:
+            return False  # a record of a proxy the pool lists, or a URL it neither lists nor holds for the Session
+        elif own and holder is None and self._occupants(url) - {session}:
+            return False  # Sessions bound to it while it was listed still go through it
+        if not entry.available(self._clock()):
             return False
-        if self._bound.get(session) != proxy:
+        shared = holder is None and not own
+        if shared and self.max_sessions is not None and len(self._occupants(url) - {session}) >= self.max_sessions:
+            return False
+        if isinstance(proxy, Proxy):
+            entry.owner, entry.tags, entry.expires = session, proxy.tags, proxy.expires
+            self._entries.setdefault(url, entry)
+        elif shared:
+            entry.owner = None  # a Session that held it as its own before shares it now, as the others do
+        if self._bound.get(session) != url:
             entry.used = next(self._uses)
-            self._bound[session] = proxy
+            self._bound[session] = url
             self._count("proxies.bindings")
-        self._leases[session, proxy] += 1
+        self._leases[session, url] += 1
         return True
 
     async def release(self, session: str, proxy: str) -> None:
@@ -268,13 +307,13 @@ class MemoryProxyPool:
         self._count("proxies.cooldowns")
 
     async def ready_in(self) -> float:
-        """Return how long the proxies listed are all cooling down for.
+        """Return how long the proxies listed, which no Session holds as its own, are all cooling down for.
 
         Returns:
             Seconds until one is available; 0 if one is, and `math.inf` if none ever
             will be, as every one listed is Retired, or none is.
         """
-        waiting = [entry.cool_until for entry in self._entries.values() if entry.listed and not entry.retired]
+        waiting = [entry.cool_until for entry in self._entries.values() if self._shared(entry) and not entry.retired]
         if not waiting:
             return math.inf
         return max(0.0, min(waiting) - self._clock())
@@ -284,6 +323,21 @@ class MemoryProxyPool:
         occupants = {session for session, url in self._bound.items() if url == proxy}
         occupants.update(session for session, url in self._leases if url == proxy)
         return occupants
+
+    def _holder(self, entry: _Entry) -> str | None:
+        """The Session holding a proxy as its own: the one last given it, while it is bound to it or goes through it."""
+        owner = entry.owner
+        if owner is not None and (self._bound.get(owner) == entry.url or (owner, entry.url) in self._leases):
+            return owner
+        return None
+
+    def _shared(self, entry: _Entry) -> bool:
+        """Whether a proxy is the pool's to give: listed, and held by no Session as its own."""
+        return entry.listed and self._holder(entry) is None
+
+    def _in_use(self, entry: _Entry) -> bool:
+        """Whether a proxy is listed, or held by a Session as its own."""
+        return entry.listed or self._holder(entry) is not None
 
     def _count(self, key: str) -> None:
         if self._stats is not None:
