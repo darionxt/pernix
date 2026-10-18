@@ -194,11 +194,28 @@ class ProxySettings(Section):
             skipped. See `pernix.proxies.read_proxies()`.
         api: The URL of an API answering with more proxies, one per line, fetched
             when the Run starts and at each refresh, as a proxy vendor's does.
+            `{count}` in it is replaced by how many proxies are wanted.
         provider: A `pernix.proxies.ProxyProvider` giving more proxies, as an
             object, a class building one, or an import path.
         refresh: Seconds between loads of the file, the API, and the provider,
-            whose proxies then replace those they gave before; `None` to load them
-            once, when the Run starts.
+            whose proxies then replace those they gave before, or are added to them
+            as `supply` says; `None` to load them once, when the Run starts.
+        supply: How each load lists the proxies the sources give: `replace` those
+            listed before, or `add` to them, keeping each until it expires, as for
+            an API that answers with new short-lived proxies each time, so that
+            Sessions keep theirs.
+        api_lifetime: Seconds each proxy of `api` works for, as an answer of one
+            per line tells no expiry; `None` for no expiry. Providers set their
+            records' `expires`.
+        min_available: With `supply = "add"`, extract more proxies from the API
+            and the provider while fewer than this many are available, and when a
+            fetch finds none; `None` to extract only at the loads.
+        extract_interval: Seconds at least between two extractions on demand.
+        max_extracted: Proxies the API and the provider give at most in a Run, as
+            extracting them costs; `None` for no limit.
+        extract_attempts: Extractions in a row that give no proxy, after which no
+            more are made on demand, so that a Run whose proxies can no longer be
+            used drains.
         cooldown: Seconds a proxy cools down after it failed, doubled with each
             failure in a row.
         cooldown_max: The longest a proxy cools down.
@@ -229,6 +246,12 @@ class ProxySettings(Section):
     max_sessions: Annotated[int, msgspec.Meta(ge=1)] | None = None
     rebind: Literal["unavailable", "every_lease", "retired", "never"] = "unavailable"
     binding: Any = None
+    supply: Literal["replace", "add"] = "replace"
+    api_lifetime: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    min_available: Annotated[int, msgspec.Meta(ge=1)] | None = None
+    extract_interval: Annotated[float, msgspec.Meta(ge=0)] = 1.0
+    max_extracted: Annotated[int, msgspec.Meta(ge=1)] | None = None
+    extract_attempts: Annotated[int, msgspec.Meta(ge=1)] = 3
 
     def __post_init__(self) -> None:
         problems: list[str] = []
@@ -237,6 +260,19 @@ class ProxySettings(Section):
                 proxy_url(url if isinstance(url, str) else url.url)
             except ValueError as exc:
                 problems.append(f"{self.key('urls')}[{index}]: {exc}")
+        if self.supply != "add":
+            add = f'{self.key("supply")} = "add"'
+            extracting = [field for field in ("min_available", "max_extracted") if getattr(self, field) is not None]
+            problems.extend(f"{self.key(field)}: proxies are extracted with {add} alone" for field in extracting)
+        if self.min_available is not None and self.api is None and self.provider is None:
+            problems.append(
+                f"{self.key('min_available')}: proxies are extracted from {self.key('api')} "
+                f"or {self.key('provider')}, and neither is set"
+            )
+        if self.api_lifetime is not None and self.api is None:
+            problems.append(
+                f"{self.key('api_lifetime')}: it is the lifetime of the proxies of {self.key('api')}, unset"
+            )
         if problems:
             raise ValueError("; ".join(problems))
 

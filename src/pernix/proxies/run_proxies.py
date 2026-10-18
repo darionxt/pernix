@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import time
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
@@ -27,7 +29,7 @@ if TYPE_CHECKING:
     from pernix.sending import Sending
     from pernix.stats import Stats
 
-__all__ = ["FollowedProxy", "NoProxyYet", "RunProxies"]
+__all__ = ["FollowedProxy", "NoProxyYet", "ProxySupply", "RunProxies"]
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +37,44 @@ _EXHAUSTED_WAIT = 5.0
 """Seconds a Request waits for a proxy once none ever will be, while the Run drains."""
 _UNFIT_WAIT = 1.0
 """Seconds a Request waits when no proxy fits its Session, though some are available."""
+_EXTRACTION_WAIT = 0.5
+"""Seconds a Request waits for an extraction under way, beyond the time until it may start."""
 _BIND_ATTEMPTS = 3
 """Times the binding policy is asked for one binding, while the proxies it picks are taken first."""
-_GONE: dict[BindingReason, str] = {"cooldown": "is cooling down", "retired": "is retired", "unlisted": "is not listed"}
+_GONE: dict[BindingReason, str] = {
+    "cooldown": "is cooling down",
+    "retired": "is retired",
+    "expired": "has expired",
+    "unlisted": "is not listed",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ProxySupply:
+    """How the proxies of a Run are supplied: whether loads add or replace them, and extracting more on demand.
+
+    Attributes:
+        add: Whether each load adds the proxies the sources give to those listed,
+            which stay until they expire, rather than replace them.
+        extracting: The names of the sources that extract proxies, such as
+            `proxies.api`: they are told how many are wanted, loaded on demand, and
+            what they give counts against `max_extracted`.
+        min_available: Extract on demand while fewer proxies are available, and when
+            a fetch finds none; `None` to extract only at the loads.
+        interval: Seconds at least between the starts of two extractions on demand,
+            or after a load.
+        max_extracted: Proxies the extracting sources give at most in the Run;
+            `None` for no limit.
+        attempts: Extractions in a row that bring no proxy, after which no more are
+            made on demand.
+    """
+
+    add: bool = False
+    extracting: frozenset[str] = frozenset()
+    min_available: int | None = None
+    interval: float = 1.0
+    max_extracted: int | None = None
+    attempts: int = 3
 
 
 class NoProxyYet(NotYet):
@@ -54,14 +91,14 @@ class NoProxyYet(NotYet):
 
 
 class FollowedProxy(NotYet):
-    """The binding policy keeps a Session on its proxy, which cools down, is Retired, or is no longer listed.
+    """The binding policy keeps a Session on its proxy, which cools down, is Retired, expired, or is no longer listed.
 
     The Session follows its proxy: it cools down with it until `until`, or, once
-    the proxy is Retired or no longer listed, it is Retired with it.
+    the proxy is Retired, expired, or no longer listed, it is Retired with it.
 
     Attributes:
         until: When the proxy stops cooling down, in seconds since the epoch;
-            `None` once it is Retired, or no longer listed.
+            `None` once it is Retired, expired, or no longer listed.
     """
 
     def __init__(self, until: float | None, *, now: float) -> None:
@@ -98,6 +135,15 @@ class RunProxies:
     When the policy finds no proxy for a Session, though some are available, or no
     source is set, its fetch waits a second, which is counted as
     `proxies.binding_waits` and logged once until the Session is bound again.
+
+    As `supply` says, each load adds the proxies the sources give rather than
+    replace them, and the sources that extract proxies are told how many are
+    wanted. While fewer than `supply.min_available` proxies are available, or when
+    a fetch finds none, they are extracted on demand, one extraction at a time and
+    `supply.interval` seconds at least apart, until they have given
+    `supply.max_extracted` proxies, or `supply.attempts` extractions in a row gave
+    none; the Run is stopped for want of proxies only then. Extractions are counted
+    as `proxies.extractions`, and the proxies they gave as `proxies.extracted`.
     """
 
     def __init__(
@@ -110,6 +156,7 @@ class RunProxies:
         stats: Stats,
         stop: Callable[[], None],
         mask: Callable[[Iterable[str]], None],
+        supply: ProxySupply | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """Wire the proxies to their pool and sources.
@@ -121,11 +168,15 @@ class RunProxies:
             policy: Picks the proxy each Session is bound to.
             refresh: Seconds between loads of the sources after the first; `None` to
                 load them once.
-            stats: Where refreshes, their failures, and the bindings that wait are
-                counted, as `proxies.refreshes`, `proxies.refresh_failures`, and
+            stats: Where refreshes, extractions, their failures, and the bindings
+                that wait are counted, as `proxies.refreshes`,
+                `proxies.refresh_failures`, `proxies.extractions`,
+                `proxies.extracted`, `proxies.extraction_failures`, and
                 `proxies.binding_waits`.
             stop: Stops the Run, draining it.
             mask: Masks values in the Run's log from now on.
+            supply: Whether loads add the proxies or replace them, and how more are
+                extracted; replaced, and none extracted on demand, when `None`.
             clock: The current time, in seconds since the epoch.
         """
         self._pool = pool
@@ -136,8 +187,18 @@ class RunProxies:
         self._stop = stop
         self._mask = mask
         self._clock = clock
+        self._supply = supply or ProxySupply()
         self._listed: frozenset[str] | None = None
         """The proxies listed by the last load; `None` before the first."""
+        self._seen: set[str] = set()
+        """The proxies the sources gave, whose passwords are masked."""
+        self._extracted = 0
+        """The proxies the extracting sources gave."""
+        self._fruitless = 0
+        """Extractions in a row that gave no proxy."""
+        self._last_extraction = -math.inf
+        """When the last extraction started."""
+        self._extracting: asyncio.Task[None] | None = None
         self._next_load = math.inf
         self._refreshing: asyncio.Task[None] | None = None
         self._exhausted = False
@@ -161,12 +222,13 @@ class RunProxies:
             self._refreshing = asyncio.create_task(self._refreshed(self._refresh), name="pernix-proxy-refresh")
 
     async def close(self) -> None:
-        """Stop refreshing."""
-        refreshing, self._refreshing = self._refreshing, None
-        if refreshing is not None:
-            refreshing.cancel()
-            with suppress(asyncio.CancelledError):
-                await refreshing
+        """Stop refreshing, and extracting."""
+        for task in (self._refreshing, self._extracting):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._refreshing = self._extracting = None
 
     async def take(self) -> str:
         """Take a proxy for one fetch.
@@ -180,6 +242,8 @@ class RunProxies:
         proxy = await self._pool.take()
         if proxy is None:
             raise NoProxyYet(await self._unavailable())
+        if self._supply.min_available is not None:
+            self._keep_level(await self._available())
         return proxy
 
     async def bind(self, session: str, current: str | None, *, account: Account | None = None) -> str:
@@ -218,9 +282,11 @@ class RunProxies:
             if followed is not None:
                 raise followed
             if await self._pool.bind(session, picked):
+                self._keep_level(sum(each.health == "available" and not each.own for each in candidates))
                 return self._bound(binding, picked)
         if self._sources and not any(candidate.health == "available" and not candidate.own for candidate in candidates):
             raise NoProxyYet(await self._unavailable(binding=True))
+        self._extract()  # none fits it
         self._stats.inc("proxies.binding_waits")
         if session not in self._waiting:
             self._waiting.add(session)
@@ -342,7 +408,7 @@ class RunProxies:
         if url != binding.current or binding.reason not in _GONE:
             return None
         held = next((candidate for candidate in binding.candidates if candidate.url == url), None)
-        if held is None and isinstance(picked, Proxy):
+        if isinstance(picked, Proxy) and (held is None or (binding.reason == "expired" and self._lasts(picked))):
             return None
         if binding.reason == "cooldown":
             until = self._clock() + _UNFIT_WAIT if held is None or held.until is None else held.until
@@ -377,13 +443,21 @@ class RunProxies:
                 return True
         return False
 
+    def _lasts(self, proxy: Proxy) -> bool:
+        """Whether a proxy has not expired, as a record gives it."""
+        return proxy.expires is None or proxy.expires > self._clock()
+
     async def _unavailable(self, *, binding: bool = False) -> float:
         """Seconds a fetch is to wait for a proxy; when none ever will be, stop the Run, once.
 
+        While proxies can be extracted on demand, one is, and the fetch waits for it.
         A Session being bound waits as when no proxy fits it, rather than stop the
         Run, while other Sessions go through proxies of their own.
         """
         delay = await self._pool.ready_in()
+        if self._extract():
+            wait = max(self._last_extraction + self._supply.interval - self._clock(), 0.0) + _EXTRACTION_WAIT
+            return min(delay, wait)
         if delay < math.inf:
             return delay
         if self._refresh is not None:
@@ -393,11 +467,57 @@ class RunProxies:
         if not self._exhausted:
             self._exhausted = True
             logger.error(
-                "No proxy can be used: %s, and none are loaded again; stopping the Run",
-                "every proxy is retired" if self._listed else "the sources gave none",
+                "No proxy can be used: %s, and %s; stopping the Run",
+                "every proxy is retired or expired" if self._seen else "the sources gave none",
+                "no more can be extracted" if self._supply.min_available is not None else "none are loaded again",
             )
             self._stop()
         return _EXHAUSTED_WAIT
+
+    def _keep_level(self, available: int) -> None:
+        """Extract on demand while fewer proxies than the level are available."""
+        level = self._supply.min_available
+        if level is not None and available < level:
+            self._extract(needed=False)
+
+    def _extract(self, *, needed: bool = True) -> bool:
+        """Extract proxies on demand, unless an extraction is under way; whether one is, or may still bring proxies.
+
+        Args:
+            needed: Whether a fetch found no proxy, so that at least one is wanted,
+                however many are available.
+        """
+        if not self._may_extract(on_demand=True):
+            return False
+        if self._extracting is None or self._extracting.done():
+            self._extracting = asyncio.create_task(self._extraction(needed=needed), name="pernix-proxy-extraction")
+        return True
+
+    def _may_extract(self, *, on_demand: bool) -> bool:
+        """Whether the extracting sources may be loaded: within the limit, and on demand, until they give none."""
+        supply = self._supply
+        if not supply.extracting or (supply.max_extracted is not None and self._extracted >= supply.max_extracted):
+            return False
+        if on_demand:
+            return supply.min_available is not None and self._fruitless < supply.attempts
+        return True
+
+    async def _extraction(self, *, needed: bool) -> None:
+        """Extract proxies, once the interval since the last extraction passed, unless enough are available by then."""
+        await asyncio.sleep(max(self._last_extraction + self._supply.interval - self._clock(), 0.0))
+        level = self._supply.min_available or 0
+        available = await self._available()
+        if not needed and available >= level:
+            return
+        try:
+            await self._load(wanted=max(level - available, 1))
+        except Exception as exc:
+            self._stats.inc("proxies.extraction_failures")
+            logger.error("Extracting proxies failed", exc_info=exc)
+
+    async def _available(self) -> int:
+        """How many of the proxies listed, which no Session holds as its own, are available."""
+        return sum(candidate.health == "available" for candidate in await self._pool.candidates())
 
     async def _refreshed(self, interval: float) -> None:
         """Load the sources every `interval` seconds, keeping the proxies when that fails."""
@@ -414,28 +534,90 @@ class RunProxies:
                 if await self._pool.ready_in() == math.inf:
                     logger.warning("No proxy can be used; Requests wait for the next refresh, in %.0f s", interval)
 
-    async def _load(self) -> None:
-        """List the proxies of every source in the pool, masking their passwords first."""
-        proxies: dict[str, Proxy] = {}
-        for name, source in self._sources:
-            for proxy in _valid(name, await source.proxies()):
-                proxies.setdefault(proxy.url, proxy)
-        listed = frozenset(proxies)
-        before = self._listed or frozenset()
-        self._mask(secret for proxy in listed - before for secret in proxy_credentials(proxy))
-        await self._pool.replace(list(proxies.values()))
-        if self._listed is None:
-            logger.info("Loaded %d proxies", len(listed))
+    async def _load(self, *, wanted: int | None = None) -> None:
+        """List the proxies the sources give in the pool, adding or replacing them, masking their passwords first.
+
+        Args:
+            wanted: How many proxies to extract, on demand, from the extracting
+                sources alone; `None` to load every source, the extracting ones
+                within the limit, told the level.
+        """
+        on_demand = wanted is not None
+        proxies, extracted = await self._given(on_demand=on_demand, wanted=wanted or self._supply.min_available)
+        given = frozenset(proxies)
+        new = given - self._seen
+        self._mask(secret for proxy in new for secret in proxy_credentials(proxy))
+        self._seen |= new
+        if self._supply.add:
+            await self._pool.add(list(proxies.values()))
         else:
+            await self._pool.replace(list(proxies.values()))
+        if extracted is not None:
+            self._extracted_now(extracted)
+        if on_demand:
+            logger.info("Extracted %d proxies, %d of them new", len(given), len(new))
+        elif self._listed is None:
+            logger.info("Loaded %d proxies", len(given))
+        elif self._supply.add:
+            logger.info("Refreshed the proxies: %d added, %d of them new", len(given), len(new))
+        else:
+            before = self._listed
             logger.info(
                 "Refreshed the proxies: %d, %d of them new, and %d no longer listed",
-                len(listed),
-                len(listed - before),
-                len(before - listed),
+                len(given),
+                len(given - before),
+                len(before - given),
             )
-        self._listed = listed
-        if self._refresh is not None:
-            self._next_load = self._clock() + self._refresh
+        if not on_demand:
+            self._listed = given
+            if self._refresh is not None:
+                self._next_load = self._clock() + self._refresh
+
+    async def _given(self, *, on_demand: bool, wanted: int | None) -> tuple[dict[str, Proxy], int | None]:
+        """The proxies the sources give, without duplicates, and how many the extracting ones gave, if they were asked.
+
+        The extracting sources are asked for `wanted` proxies, within the limit; on
+        demand, only they are.
+        """
+        supply = self._supply
+        extracting = self._may_extract(on_demand=on_demand)
+        if extracting and wanted is not None and supply.max_extracted is not None:
+            wanted = min(wanted, supply.max_extracted - self._extracted)
+        proxies: dict[str, Proxy] = {}
+        extracted: int | None = None
+        for name, source in self._sources:
+            if name in supply.extracting:
+                if not extracting:
+                    continue
+                self._last_extraction = self._clock()
+                try:
+                    given = _valid(name, await _extract(source, wanted))
+                except Exception:
+                    self._extracted_now(0)
+                    raise
+                extracted = (extracted or 0) + len(given)
+            elif on_demand:
+                continue
+            else:
+                given = _valid(name, await source.proxies())
+            for proxy in given:
+                proxies.setdefault(proxy.url, proxy)
+        return proxies, extracted
+
+    def _extracted_now(self, count: int) -> None:
+        """Count an extraction and the proxies it gave, warning once no more can be extracted on demand."""
+        supply = self._supply
+        self._stats.inc("proxies.extractions")
+        self._stats.inc("proxies.extracted", count)
+        self._extracted += count
+        self._fruitless = 0 if count else self._fruitless + 1
+        if self._fruitless == supply.attempts and supply.min_available is not None:
+            logger.warning("%d extractions in a row gave no proxy; no more are made on demand", self._fruitless)
+        limit = supply.max_extracted
+        if count and limit is not None and self._extracted >= limit > self._extracted - count:
+            logger.warning(
+                "The sources extracted %d proxies, reaching the limit; no more are extracted", self._extracted
+            )
 
 
 def _binding(
@@ -469,6 +651,26 @@ def _reason(current: str | None, held: ProxyCandidate | None) -> BindingReason:
     if held is None:
         return "unlisted"
     return "lease" if held.health == "available" else held.health
+
+
+async def _extract(source: ProxyProvider, wanted: int | None) -> Iterable[object]:
+    """What a source that extracts proxies gives, told how many are wanted if it takes `wanted`."""
+    if wanted is not None and _takes_wanted(source):
+        return await cast("Any", source).proxies(wanted=wanted)
+    return await source.proxies()
+
+
+def _takes_wanted(source: ProxyProvider) -> bool:
+    """Whether a source's `proxies()` takes a `wanted` keyword."""
+    try:
+        parameters = inspect.signature(source.proxies).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (parameter.name == "wanted" and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY)
+        for parameter in parameters
+    )
 
 
 def _valid(source: str, proxies: Iterable[object]) -> list[Proxy]:

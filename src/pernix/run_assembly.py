@@ -21,7 +21,7 @@ from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies
-from pernix.proxies.run_proxies import RunProxies
+from pernix.proxies.run_proxies import ProxySupply, RunProxies
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.sending import IndependentSending
 from pernix.session import Session
@@ -303,7 +303,9 @@ def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
     if options.file is not None:
         sources.append((ProxySettings.key("file"), ProxyFile(options.file)))
     if options.api is not None:
-        api = ProxyAPI(options.api, HTTPFetcher(_http_settings(crawler)))
+        api = ProxyAPI(
+            options.api, HTTPFetcher(_http_settings(crawler)), lifetime=options.api_lifetime, mask=run_log.mask
+        )
         sources.append((ProxySettings.key("api"), api))
         opened.append(api)
     if options.provider is not None:
@@ -330,8 +332,23 @@ def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
         stats=crawler.stats,
         stop=crawler.stop,
         mask=run_log.mask,
+        supply=_supply(options),
     )
     return _Proxying(proxies, pool, (*opened, policy, proxies))
+
+
+def _supply(options: ProxySettings) -> ProxySupply:
+    """How the proxies are supplied: with `proxies.supply = "add"`, added, the API and the provider extracting them."""
+    if options.supply != "add":
+        return ProxySupply()
+    return ProxySupply(
+        add=True,
+        extracting=frozenset({ProxySettings.key("api"), ProxySettings.key("provider")}),
+        min_available=options.min_available,
+        interval=options.extract_interval,
+        max_extracted=options.max_extracted,
+        attempts=options.extract_attempts,
+    )
 
 
 def _http_settings(crawler: Crawler) -> HTTPSettings:

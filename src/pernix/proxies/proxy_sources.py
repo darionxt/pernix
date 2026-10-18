@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from pernix.errors import FetchError, SettingsError
+from pernix.proxies.proxy import Proxy
 from pernix.proxies.proxy_url import proxy_url
 from pernix.request import Request
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Collection, Iterable
+    from collections.abc import Callable, Collection, Iterable
 
     from pernix.fetchers import HTTPFetcher
-    from pernix.proxies.proxy import Proxy
     from pernix.secret import Secret
 
 __all__ = ["ProxyAPI", "ProxyFile", "ProxyProvider", "StaticProxies", "proxy_lines", "read_proxies"]
@@ -25,11 +26,15 @@ class ProxyProvider(Protocol):
     """Gives the proxies to send Requests through, such as from a database; set one as `proxies.provider`.
 
     `proxies()` is called when the Run starts, and again every `proxies.refresh`
-    seconds, if set; the proxies it gives then replace those it gave before. They
-    are URLs such as `http://user:password@proxy:8080`, or `proxy:8080` for HTTP,
-    or `pernix.proxies.Proxy` records, to tag them; those that are not valid are
-    skipped, with a warning. Like other components, a provider gets services
-    injected, and is opened and closed with the Run.
+    seconds, if set; the proxies it gives then replace those it gave before, or,
+    with `proxies.supply = "add"`, are added to them, and it is called on demand
+    too, as the proxies run low. A provider whose `proxies()` takes a `wanted`
+    keyword is told how many proxies are wanted, when that is known, such as to
+    extract that many from an API. They are URLs such as
+    `http://user:password@proxy:8080`, or `proxy:8080` for HTTP, or
+    `pernix.proxies.Proxy` records, to tag them or tell when they expire; those
+    that are not valid are skipped, with a warning. Like other components, a
+    provider gets services injected, and is opened and closed with the Run.
 
     Example:
         >>> class FromDatabase:
@@ -94,19 +99,36 @@ class ProxyAPI:
     """The proxies an API answers with, one per line, such as a proxy vendor's, fetched anew each time.
 
     The API is fetched over HTTP with a fetcher of its own, opened and closed with
-    the Run, and never through a proxy. Blank lines and those starting with `#` are
-    skipped.
+    the Run, and never through a proxy. `{count}` in its URL is replaced by how many
+    proxies are wanted, or 1 when that is not known. Blank lines and those starting
+    with `#` are skipped. With a lifetime, each proxy it gives expires that long
+    after it answered, as an answer of one per line tells no expiry.
     """
 
-    def __init__(self, url: Secret, fetcher: HTTPFetcher) -> None:
+    def __init__(
+        self,
+        url: Secret,
+        fetcher: HTTPFetcher,
+        *,
+        lifetime: float | None = None,
+        mask: Callable[[Iterable[str]], None] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         """Name the API.
 
         Args:
             url: The API's URL, a `Secret` as it often holds a key.
             fetcher: The fetcher to fetch it with, not opened yet.
+            lifetime: Seconds each proxy it gives works for; `None` for no expiry.
+            mask: Masks values in the Run's log from now on, given each URL fetched,
+                whose count the `Secret` does not hold.
+            clock: The current time, in seconds since the epoch.
         """
         self._url = url
         self._fetcher = fetcher
+        self._lifetime = lifetime
+        self._mask = mask
+        self._clock = clock
 
     async def open(self) -> None:
         """Open the fetcher."""
@@ -116,20 +138,32 @@ class ProxyAPI:
         """Close the fetcher."""
         await self._fetcher.__aexit__(None, None, None)
 
-    async def proxies(self) -> list[str]:
+    async def proxies(self, wanted: int | None = None) -> list[str | Proxy]:
         """Fetch the proxies the API answers with.
 
+        Args:
+            wanted: How many proxies are wanted, for `{count}` in the URL; 1 when
+                `None`.
+
         Returns:
-            The lines of the answer that are not blank or comments, in order.
+            The lines of the answer that are not blank or comments, in order, as
+            records expiring after the lifetime, if set.
 
         Raises:
             pernix.errors.FetchError: The API could not be fetched, or answered with
                 a status other than 2xx.
         """
-        response = await self._fetcher.fetch(Request(self._url.reveal()))
+        url = self._url.reveal().replace("{count}", str(wanted or 1))
+        if self._mask is not None:
+            self._mask([url])
+        response = await self._fetcher.fetch(Request(url))
         if not 200 <= response.status < 300:
             raise FetchError(f"the proxy API answered with the status {response.status}")
-        return [proxy for _, proxy in proxy_lines(response.text)]
+        lines = [proxy for _, proxy in proxy_lines(response.text)]
+        if self._lifetime is None:
+            return list(lines)
+        expires = self._clock() + self._lifetime
+        return [Proxy(line, expires=expires) for line in lines]
 
 
 def proxy_lines(text: str) -> list[tuple[int, str]]:

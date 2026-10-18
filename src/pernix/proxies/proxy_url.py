@@ -17,10 +17,13 @@ def proxy_url(text: str) -> str:
 
     The scheme is `http` unless given, and it and the host are lower-cased; the user
     and the password are kept as written, so that two sticky sessions on one gateway,
-    which differ only in them, stay two proxies.
+    which differ only in them, stay two proxies. A proxy written as
+    `host:port:user:password`, as some vendors list them, is read as
+    `user:password@host:port`, everything after the third colon being the password.
 
     Args:
-        text: A proxy, such as `http://user:password@proxy:8080` or `proxy:8080`.
+        text: A proxy, such as `http://user:password@proxy:8080`, `proxy:8080`, or
+            `proxy:8080:user:password`.
 
     Returns:
         The proxy URL, such as `http://user:password@proxy:8080`.
@@ -30,7 +33,7 @@ def proxy_url(text: str) -> str:
             host, and a port, and nothing else. The message does not quote it, as it
             may hold credentials.
     """
-    text = text.strip()
+    text = _with_userinfo(text.strip())
     try:
         parts = urlsplit(text if "://" in text else f"http://{text}")
         port = parts.port
@@ -50,6 +53,17 @@ def proxy_url(text: str) -> str:
     if ":" in host:
         host = f"[{host}]"
     return f"{scheme}://{userinfo}{at}{host}:{port}"
+
+
+def _with_userinfo(text: str) -> str:
+    """A proxy written as `host:port:user:password` as `user:password@host:port`; any other as it is."""
+    parts = text.split(":", 3)
+    if "@" in text or "://" in text or "[" in text or len(parts) != 4:
+        return text
+    host, port, user, password = parts
+    if not port.isdigit() or not user:
+        return text
+    return f"{user}:{password}@{host}:{port}"
 
 
 def proxy_credentials(url: str) -> tuple[str, ...]:

@@ -42,14 +42,27 @@ class _Entry:
     retired: bool = False
     used: int = 0
     """When it was last taken or bound, as a count of those, so it goes to the back of the line."""
+    expiry_counted: bool = False
+    """Whether its expiry was counted, so it counts once until a source gives it a later one."""
+
+    def expired(self, now: float) -> bool:
+        return self.expires is not None and self.expires <= now
 
     def available(self, now: float) -> bool:
-        return not self.retired and self.cool_until <= now
+        return not self.retired and not self.expired(now) and self.cool_until <= now
 
     def health(self, now: float) -> ProxyHealth:
         if self.retired:
             return "retired"
+        if self.expired(now):
+            return "expired"
         return "cooldown" if self.cool_until > now else "available"
+
+    def renew(self, proxy: Proxy, now: float) -> None:
+        """Take the tags and the expiry a source, or a binding policy, gives the proxy now."""
+        self.tags, self.expires = proxy.tags, proxy.expires
+        if not self.expired(now):
+            self.expiry_counted = False
 
 
 class MemoryProxyPool:
@@ -71,7 +84,10 @@ class MemoryProxyPool:
     seconds, doubled with each failure in a row, at most `cooldown_max`, and
     Retires it after `max_failures` in a row; a fetch that got through ends the
     row. A proxy that is no longer listed, or held, keeps its health, should it be
-    listed or held again, and a Retired one stays Retired.
+    listed or held again, and a Retired one stays Retired. A proxy whose `expires`
+    passed is expired: no fetch takes it and no Session is bound to it, and it is
+    among the candidates only while Sessions occupy it; then the pool forgets it,
+    but for a Retired one, which stays Retired should a source give it again.
 
     Attributes:
         max_sessions: Sessions a proxy is bound to at most; `None` for no limit.
@@ -94,9 +110,10 @@ class MemoryProxyPool:
             cooldown: Seconds a proxy cools down after its first failure in a row.
             cooldown_max: The longest a proxy cools down.
             max_failures: Failures in a row after which a proxy is Retired.
-            stats: Where bindings, failures, cooldowns, and Retirements are
-                counted, as `proxies.bindings`, `proxies.failures`,
-                `proxies.cooldowns`, and `proxies.retirements`.
+            stats: Where bindings, failures, cooldowns, Retirements, and
+                expirations are counted, as `proxies.bindings`, `proxies.failures`,
+                `proxies.cooldowns`, `proxies.retirements`, and
+                `proxies.expirations`.
             clock: The current time, in seconds since the epoch.
         """
         self.max_sessions = max_sessions
@@ -120,27 +137,30 @@ class MemoryProxyPool:
 
         Returns:
             Its health, or `None` if the pool neither lists it nor holds it as a
-            Session's own.
+            Session's own, or forgot it once it expired.
         """
+        now = self._clock()
+        self._forget_expired(now)
         entry = self._entries.get(proxy)
-        if entry is None or not self._in_use(entry):
+        if entry is None or not (entry.listed or self._holder(entry) is not None):
             return None
-        return entry.health(self._clock())
+        return entry.health(now)
 
     def counts(self) -> ProxyCounts:
-        """Return how many of the proxies listed, and of the Sessions' own in use, are in each state.
+        """Return how many of the proxies listed, and of the Sessions' own in use, are in each state, but expired.
 
         Returns:
             The counts.
         """
         now = self._clock()
-        used = [entry for entry in self._entries.values() if self._in_use(entry)]
+        used = [entry for entry in self._entries.values() if self._in_use(entry, now)]
         retired = sum(entry.retired for entry in used)
         available = sum(entry.available(now) for entry in used)
         return ProxyCounts(available=available, cooldown=len(used) - retired - available, retired=retired)
 
     def __len__(self) -> int:
-        return sum(self._in_use(entry) for entry in self._entries.values())
+        now = self._clock()
+        return sum(self._in_use(entry, now) for entry in self._entries.values())
 
     async def replace(self, proxies: Collection[Proxy]) -> None:
         """List the proxies the sources gave, in place of those listed before.
@@ -151,14 +171,29 @@ class MemoryProxyPool:
         Args:
             proxies: The proxies, with URLs as `proxy_url()` gives them.
         """
-        listed: dict[str, Proxy] = {}
-        for proxy in proxies:
-            listed.setdefault(proxy.url, proxy)
+        now = self._clock()
+        self._forget_expired(now)
+        listed = _first_of_each(proxies)
         for url, entry in self._entries.items():
             entry.listed = url in listed
         for url, proxy in listed.items():
+            self._entries.setdefault(url, _Entry(url)).renew(proxy, now)
+
+    async def add(self, proxies: Collection[Proxy]) -> None:
+        """List more proxies, keeping those listed until they expire.
+
+        A proxy listed again, or added again, keeps its health, and takes the tags
+        and the expiry given now; a proxy given twice keeps the first.
+
+        Args:
+            proxies: The proxies, with URLs as `proxy_url()` gives them.
+        """
+        now = self._clock()
+        self._forget_expired(now)
+        for url, proxy in _first_of_each(proxies).items():
             entry = self._entries.setdefault(url, _Entry(url))
-            entry.tags, entry.expires = proxy.tags, proxy.expires
+            entry.listed = True
+            entry.renew(proxy, now)
 
     async def take(self) -> str | None:
         """Take a proxy for one fetch: the available one used least recently, of those listed and no Session's own.
@@ -167,6 +202,7 @@ class MemoryProxyPool:
             The proxy, or `None` if none is available now.
         """
         now = self._clock()
+        self._forget_expired(now)
         usable = [entry for entry in self._entries.values() if self._shared(entry) and entry.available(now)]
         if not usable:
             return None
@@ -183,9 +219,10 @@ class MemoryProxyPool:
 
         Returns:
             Every proxy listed, whatever its health, but the other Sessions' own, and
-            the Session's own.
+            the Session's own; an expired one only while Sessions occupy it.
         """
         now = self._clock()
+        self._forget_expired(now)
         bound: defaultdict[str, set[str]] = defaultdict(set)
         for each, url in self._bound.items():
             bound[url].add(each)
@@ -198,6 +235,8 @@ class MemoryProxyPool:
             holder = self._holder(entry)
             if not (entry.listed if holder is None else holder == session):
                 continue  # not listed, or another Session's own
+            if entry.expired(now) and not (bound[entry.url] or leaving[entry.url]):
+                continue  # it left the pool, though a Retired one is remembered
             health = entry.health(now)
             candidates.append(
                 ProxyCandidate(
@@ -241,13 +280,16 @@ class MemoryProxyPool:
             return False  # a record of a proxy the pool lists, or a URL it neither lists nor holds for the Session
         elif own and holder is None and self._occupants(url) - {session}:
             return False  # Sessions bound to it while it was listed still go through it
-        if not entry.available(self._clock()):
+        now = self._clock()
+        expires = proxy.expires if isinstance(proxy, Proxy) else entry.expires
+        if entry.retired or entry.cool_until > now or (expires is not None and expires <= now):
             return False
         shared = holder is None and not own
         if shared and self.max_sessions is not None and len(self._occupants(url) - {session}) >= self.max_sessions:
             return False
         if isinstance(proxy, Proxy):
-            entry.owner, entry.tags, entry.expires = session, proxy.tags, proxy.expires
+            entry.owner = session
+            entry.renew(proxy, now)
             self._entries.setdefault(url, entry)
         elif shared:
             entry.owner = None  # a Session that held it as its own before shares it now, as the others do
@@ -311,12 +353,17 @@ class MemoryProxyPool:
 
         Returns:
             Seconds until one is available; 0 if one is, and `math.inf` if none ever
-            will be, as every one listed is Retired, or none is.
+            will be, as every one listed is Retired or expired, or none is.
         """
-        waiting = [entry.cool_until for entry in self._entries.values() if self._shared(entry) and not entry.retired]
+        now = self._clock()
+        waiting = [
+            entry.cool_until
+            for entry in self._entries.values()
+            if self._shared(entry) and not entry.retired and not entry.expired(now)
+        ]
         if not waiting:
             return math.inf
-        return max(0.0, min(waiting) - self._clock())
+        return max(0.0, min(waiting) - now)
 
     def _occupants(self, proxy: str) -> set[str]:
         """The Sessions that count toward a proxy's `max_sessions`: bound to it, or with Leases through it."""
@@ -335,10 +382,31 @@ class MemoryProxyPool:
         """Whether a proxy is the pool's to give: listed, and held by no Session as its own."""
         return entry.listed and self._holder(entry) is None
 
-    def _in_use(self, entry: _Entry) -> bool:
-        """Whether a proxy is listed, or held by a Session as its own."""
-        return entry.listed or self._holder(entry) is not None
+    def _in_use(self, entry: _Entry, now: float) -> bool:
+        """Whether a proxy is listed, or held by a Session as its own, and not expired."""
+        return (entry.listed or self._holder(entry) is not None) and not entry.expired(now)
+
+    def _forget_expired(self, now: float) -> None:
+        """Count the proxies in use that expired, and forget those no Session occupies, but for the Retired."""
+        occupied = set(self._bound.values()) | {url for _, url in self._leases}
+        for url, entry in list(self._entries.items()):
+            if not entry.expired(now):
+                continue
+            if not entry.expiry_counted:
+                entry.expiry_counted = True
+                if entry.listed or entry.owner is not None:
+                    self._count("proxies.expirations")
+            if url not in occupied and not entry.retired:
+                del self._entries[url]
 
     def _count(self, key: str) -> None:
         if self._stats is not None:
             self._stats.inc(key)
+
+
+def _first_of_each(proxies: Collection[Proxy]) -> dict[str, Proxy]:
+    """The proxies by URL, the first given of each kept."""
+    first: dict[str, Proxy] = {}
+    for proxy in proxies:
+        first.setdefault(proxy.url, proxy)
+    return first

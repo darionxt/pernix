@@ -14,8 +14,9 @@ if TYPE_CHECKING:
 
 __all__ = ["ProxyCandidate", "ProxyCounts", "ProxyHealth", "ProxyPool"]
 
-type ProxyHealth = Literal["available", "cooldown", "retired"]
-"""Whether a proxy can be used: available, cooling down until a time, or retired for good."""
+type ProxyHealth = Literal["available", "cooldown", "retired", "expired"]
+"""Whether a proxy can be used: available, cooling down until a time, retired for good, or expired, until a source gives
+it again with a later expiry. A proxy Retired is so whether it expired or not, and one expired whether it cools down."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +49,8 @@ class ProxyCandidate:
         leaving: The ids of the Sessions bound to another proxy since, whose
             Leases still go through this one.
         failures: Its failures in a row.
-        expires: When it stops working, as its source tells, in seconds since the
-            epoch; `None` if it does not tell.
+        expires: When it stops working, as its source tells, or as its lifetime
+            gives, in seconds since the epoch; `None` if neither tells.
         until: When it stops cooling down, in seconds since the epoch; `None` unless
             it cools down.
         own: Whether it is the Session's own, which the binding policy gave it and
@@ -81,9 +82,11 @@ class ProxyCandidate:
 class ProxyPool(Protocol):
     """The proxies Requests are sent through, with their health, and the Sessions bound to them.
 
-    The proxies are those last listed by the sources; a proxy no longer listed is
-    not used, but its health is kept, should it be listed again. A proxy that fails
-    cools down, longer with each failure in a row, and is Retired after too many.
+    The proxies are those the sources listed, last or, when they are added, since:
+    a proxy no longer listed is not used, but its health is kept, should it be
+    listed again. A proxy expires once its `expires` passed: it is not used, and it
+    leaves the pool once no Session occupies it. A proxy that fails cools down,
+    longer with each failure in a row, and is Retired after too many.
     Sessions are bound to proxies as a binding policy picks among the
     `candidates()`, and the pool holds each binding, binding no more than
     `max_sessions` Sessions to a proxy; a Session bound to another counts toward a
@@ -112,6 +115,18 @@ class ProxyPool(Protocol):
         """
         ...
 
+    async def add(self, proxies: Collection[Proxy]) -> None:
+        """List more proxies, keeping those listed until they expire.
+
+        A proxy listed again, or added again, keeps its health, and takes the tags
+        and the expiry given now; a later expiry has one expired available again,
+        unless it is Retired.
+
+        Args:
+            proxies: The proxies, with URLs as `proxy_url()` gives them.
+        """
+        ...
+
     async def take(self) -> str | None:
         """Take a proxy for one fetch: the available one used least recently, of those listed and no Session's own.
 
@@ -132,7 +147,7 @@ class ProxyPool(Protocol):
 
         Returns:
             Every proxy listed, whatever its health, but the other Sessions' own, and
-            the Session's own.
+            the Session's own; an expired one only while Sessions occupy it.
         """
         ...
 
@@ -200,6 +215,6 @@ class ProxyPool(Protocol):
 
         Returns:
             Seconds until one is available; 0 if one is, and `math.inf` if none ever
-            will be, as every one listed is Retired, or none is.
+            will be, as every one listed is Retired or expired, or none is.
         """
         ...
