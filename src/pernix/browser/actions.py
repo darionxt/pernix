@@ -93,6 +93,8 @@ class Click(_PageAction, frozen=True, tag="click"):
 class Type(_PageAction, frozen=True, tag="type"):
     """Type text into an element, key by key, after what it holds.
 
+    The text, which may be a password, appears neither in its `repr` nor in errors.
+
     Attributes:
         selector: A CSS selector; the first element matching it gets the text.
         text: The text to type.
@@ -110,6 +112,9 @@ class Type(_PageAction, frozen=True, tag="type"):
         _check_selector(self, self.selector)
         if not self.delay >= 0:
             raise ValueError(f"Type: delay must not be negative, got {self.delay}")
+
+    def __repr__(self) -> str:
+        return f"Type(selector={self.selector!r}, text='***')"
 
 
 class Evaluate(_PageAction, frozen=True, tag="evaluate"):

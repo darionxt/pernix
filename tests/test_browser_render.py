@@ -233,11 +233,9 @@ async def test_an_action_that_takes_too_long_is_a_timeout_naming_it(server: Loop
     server.route("/", "<p>plain</p>", headers=HTML)
     url = server.url("/")
 
-    with pytest.raises(
-        ActionTimeout, match=r"actions\[1\], WaitFor\(selector='p.never', timeout=0.2\), on .* took longer"
-    ):
+    with pytest.raises(ActionTimeout, match=r"actions\[1\], WaitFor\('p.never'\), on .* took longer than 0.2 s"):
         await _fetch(url, Render(actions=[Evaluate("1"), WaitFor("p.never", timeout=0.2)]))
-    with pytest.raises(ActionTimeout, match=r"actions\[0\], Evaluate\(.*\), on .* took longer than 0.2 s"):
+    with pytest.raises(ActionTimeout, match=r"actions\[0\], Evaluate, on .* took longer than 0.2 s"):
         await _fetch(url, Render(actions=[Evaluate("() => new Promise(() => {})", timeout=0.2)]))
     with pytest.raises(ActionTimeout, match=r"Render\(wait_for='p.never'\) on .* took longer than 0.2 s"):
         await _fetch(url, Render(wait_for="p.never"), BrowserSettings(action_timeout=0.2))
@@ -282,6 +280,92 @@ async def test_an_optional_action_that_fails_is_logged_and_skipped(
     assert response.browser.evaluated == ("Search",)
     assert [record.getMessage().split(",")[0] for record in caplog.records] == ["actions[0]", "actions[1]"]
     assert all("going on, as the action is optional" in record.getMessage() for record in caplog.records)
+
+
+async def test_typed_text_stays_out_of_errors_logs_and_reprs(
+    server: LoopbackServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.route("/", FORM, headers=HTML)
+    typed = Type("#password", "hunter2", timeout=0.2)
+
+    with pytest.raises(ActionTimeout) as raised:
+        await _fetch(server.url("/"), Render(actions=[typed]))
+    with caplog.at_level(logging.WARNING, logger="pernix.fetchers.page_actions"):
+        await _fetch(server.url("/"), Render(actions=[Type("#password", "hunter2", timeout=0.2, optional=True)]))
+
+    assert "actions[0], Type('#password'), on" in str(raised.value)
+    assert [record.getMessage().split(" on ")[0] for record in caplog.records] == ["actions[0], Type('#password'),"]
+    assert "hunter2" not in f"{raised.value} {caplog.text} {typed!r} {Render(actions=[typed])!r}"
+    assert repr(typed) == "Type(selector='#password', text='***')"
+
+
+async def test_actions_that_navigate_give_the_document_they_lead_to(server: LoopbackServer) -> None:
+    server.route("/", "<a href='/gone'>next</a>", headers=HTML)
+    server.route("/gone", "<p class='gone'>gone</p>", status=404, headers=[*HTML, ("X-Shop", "gone")])
+
+    response = await _fetch(server.url("/"), Render(actions=[Click("a"), WaitFor("p.gone")]))
+
+    assert (response.status, response.url, response.headers.get("X-Shop")) == (404, server.url("/gone"), "gone")
+    assert response.css("p.gone::text").get() == "gone"
+    assert response.browser is not None
+    assert response.browser.document is not None
+    assert (response.browser.document.url, response.browser.document.status) == (server.url("/gone"), 404)
+    assert response.browser.document.body == b"<p class='gone'>gone</p>"
+
+
+SERVICE_WORKER = """self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", event => event.respondWith(fetch(event.request)));"""
+
+WORKER_PAGE = """<html><body><script>
+const show = text => document.body.insertAdjacentHTML("beforeend", `<img src="/cover.png"><p class=ready>${text}</p>`);
+if (navigator.serviceWorker.controller) {
+  show("worker");
+} else {
+  navigator.serviceWorker.register("/worker.js").then(() => navigator.serviceWorker.ready).then(() => {
+    const controlled = () => document.querySelector("p.ready") || show("worker");
+    if (navigator.serviceWorker.controller) controlled();
+    else navigator.serviceWorker.addEventListener("controllerchange", controlled);
+  });
+  setTimeout(() => document.querySelector("p.ready") || show("no worker"), 2000);  // registering never ends if blocked
+}
+</script></body></html>"""
+
+
+def _serve_worker(server: LoopbackServer) -> None:
+    """A page whose image a service worker loads once it controls the page, and the page itself otherwise."""
+    server.route("/", WORKER_PAGE, headers=HTML)
+    server.route("/worker.js", SERVICE_WORKER, headers=[("Content-Type", "text/javascript")])
+    server.route("/cover.png", PNG, headers=[("Content-Type", "image/png")])
+
+
+async def test_service_workers_cannot_load_what_is_blocked(server: LoopbackServer) -> None:
+    _serve_worker(server)
+
+    async with BrowserFetcher() as fetcher:
+        open_page = await fetcher.fetch(_rendered(server.url("/"), Render(wait_for="p.ready")))
+        blocking = await fetcher.fetch(_rendered(server.url("/"), Render(wait_for="p.ready", block="image")))
+
+    assert open_page.css("p.ready::text").get() == "worker"  # the worker would have loaded the image
+    assert blocking.css("p.ready::text").get() == "no worker"
+    assert [request.path for request in server.received].count("/cover.png") == 1
+
+
+async def test_service_workers_of_a_session_cannot_load_what_is_blocked(server: LoopbackServer) -> None:
+    _serve_worker(server)
+    session = Session("alice")
+
+    async with BrowserFetcher() as fetcher:
+        registered = await fetcher.fetch(_rendered(server.url("/"), Render(wait_for="p.ready")), session=session)
+        blocking = await fetcher.fetch(
+            _rendered(server.url("/"), Render(wait_for="p.ready", block="image")), session=session
+        )
+        again = await fetcher.fetch(_rendered(server.url("/"), Render(wait_for="p.ready")), session=session)
+
+    assert registered.css("p.ready::text").get() == "worker"
+    assert blocking.css("p.ready::text").get() == "no worker"
+    assert again.css("p.ready::text").get() == "worker"
+    assert [request.path for request in server.received].count("/cover.png") == 2  # the first fetch and the last
 
 
 async def test_the_browser_stays_usable_after_an_action_failed(server: LoopbackServer) -> None:

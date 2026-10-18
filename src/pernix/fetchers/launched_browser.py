@@ -48,7 +48,11 @@ class LaunchedBrowser:
     refusing_proxy: RefusingProxy | None
 
     async def new_context(
-        self, *, proxy: str | None = None, local_storage: Mapping[str, Mapping[str, str]] | None = None
+        self,
+        *,
+        proxy: str | None = None,
+        local_storage: Mapping[str, Mapping[str, str]] | None = None,
+        blocks_service_workers: bool = False,
     ) -> BrowserContext:
         """Create a context, for one fetch or for the fetches of a Session.
 
@@ -57,6 +61,9 @@ class LaunchedBrowser:
                 ones included; without one, the browser's own applies.
             local_storage: The localStorage the context starts with, by origin, then
                 by key.
+            blocks_service_workers: Keep its pages from registering service
+                workers, whose requests no route of a page sees; registering one
+                then never completes.
 
         Returns:
             The context, without pages.
@@ -66,6 +73,8 @@ class LaunchedBrowser:
             options["proxy"] = _proxy_settings(proxy)
         if local_storage:
             options["storage_state"] = _storage_state(local_storage)
+        if blocks_service_workers:
+            options["service_workers"] = "block"
         return await self.browser.new_context(**options)
 
     async def close(self) -> None:

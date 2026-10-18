@@ -58,7 +58,7 @@ async def run_render(page: Page, render: Render, *, action_timeout: float, url: 
         label = f"Render(wait_for={render.wait_for!r})"
         await _run(page, WaitFor(render.wait_for), outputs, action_timeout, label, url)
     for index, action in enumerate(render.actions):
-        label = f"actions[{index}], {action!r},"
+        label = f"actions[{index}], {_described(action)},"
         try:
             await _run(page, action, outputs, action.timeout or action_timeout, label, url)
         except ActionError as exc:
@@ -68,6 +68,15 @@ async def run_render(page: Page, render: Render, *, action_timeout: float, url: 
     if render.screenshot:
         await _run(page, Screenshot(), outputs, action_timeout, "Render(screenshot=True)", url)
     return outputs
+
+
+def _described(action: Action) -> str:
+    """An action as messages name it: its kind and selector, never what it types or runs, which may be secret."""
+    match action:
+        case WaitFor(selector=selector) | Click(selector=selector) | Type(selector=selector):
+            return f"{type(action).__name__}({selector!r})"
+        case _:
+            return type(action).__name__
 
 
 async def _run(page: Page, action: Action, outputs: ActionOutputs, seconds: float, label: str, url: str) -> None:

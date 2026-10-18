@@ -57,11 +57,15 @@ class Browser:
 
     def __init__(self) -> None:
         self.created: list[FakeContext] = []
+        self.blocking: list[bool] = []
         self.closed: list[FakeContext] = []
 
-    async def new_context(self, _launched: LaunchedBrowser, session: Session, proxy: str | None) -> BrowserContext:
+    async def new_context(
+        self, _launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
+    ) -> BrowserContext:
         context = FakeContext(proxy, {origin: dict(items) for origin, items in session.local_storage.items()})
         self.created.append(context)
+        self.blocking.append(blocks_service_workers)
         return cast("BrowserContext", context)
 
     def discard(self, context: BrowserContext) -> None:
@@ -75,8 +79,10 @@ def _contexts(browser: Browser, *, kept: int = 8, idle: float = 300.0) -> Sessio
     return SessionContexts(kept=kept, idle=idle, new_context=browser.new_context, discard=browser.discard)
 
 
-async def _fetch(contexts: SessionContexts, session: Session, *, proxy: str | None = None) -> FakeContext:
-    async with contexts.using(LAUNCHED, session, proxy=proxy) as held:
+async def _fetch(
+    contexts: SessionContexts, session: Session, *, proxy: str | None = None, blocks_service_workers: bool = False
+) -> FakeContext:
+    async with contexts.using(LAUNCHED, session, proxy=proxy, blocks_service_workers=blocks_service_workers) as held:
         return cast("FakeContext", held.context)
 
 
@@ -152,6 +158,22 @@ async def test_a_session_whose_proxy_or_storage_changed_gets_a_new_context(chang
 
     assert new is not old
     assert browser.closed == [old]
+
+
+async def test_a_fetch_blocking_service_workers_never_uses_a_context_that_let_them_register() -> None:
+    browser = Browser()
+    contexts = _contexts(browser)
+    session = Session("alice")
+
+    open_context = await _fetch(contexts, session)
+    blocking = await _fetch(contexts, session, blocks_service_workers=True)
+    blocking_again = await _fetch(contexts, session, blocks_service_workers=True)
+    reopened = await _fetch(contexts, session)
+
+    assert blocking is blocking_again
+    assert len({id(open_context), id(blocking), id(reopened)}) == 3
+    assert browser.blocking == [False, True, False]
+    assert browser.closed == [open_context, blocking]
 
 
 async def test_a_context_whose_fetch_was_cancelled_or_that_broke_is_closed() -> None:

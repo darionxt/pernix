@@ -128,9 +128,10 @@ class BrowserFetcher:
     fetch. A `Render` in `request.render` then waits for its `wait_for`, runs its
     actions, and takes its screenshot, each within `browser.action_timeout` unless
     an action sets its own. The page may not load the resource types of its
-    `block`, or of `browser.block` without one, and the XHR and fetch responses
-    matching its `capture` are kept; `response.browser` holds what they gave, with
-    the document as received.
+    `block`, or of `browser.block` without one, nor register service workers then,
+    and the XHR and fetch responses matching its `capture` are kept;
+    `response.browser` holds what they gave, with the document as received. When
+    an action leads to another document, the Response describes that one.
 
     A Request other than a plain GET, or with headers, changes the first
     request of the page accordingly. The browser keeps those headers on the
@@ -274,14 +275,16 @@ class BrowserFetcher:
             )
         started = time.monotonic()
         render = request.render if isinstance(request.render, Render) else Render()
-        load = _Load(request, render, proxy=proxy, guarded=launched.guarded, started=started)
+        blocked = self._settings.block if render.block is None else render.block
+        load = _Load(request, render, blocked, proxy=proxy, guarded=launched.guarded, started=started)
+        workers = bool(blocked)  # service workers would load what is blocked, unseen by the page's routes
         if session is None:
-            context = await launched.new_context(proxy=proxy)
+            context = await launched.new_context(proxy=proxy, blocks_service_workers=workers)
             try:
                 return await self._load(context, load)
             finally:
                 await self._close_soon(context)
-        async with self._contexts.using(launched, session, proxy=proxy) as kept:
+        async with self._contexts.using(launched, session, proxy=proxy, blocks_service_workers=workers) as kept:
             return await self._load(kept.context, load, kept=kept, session=session)
 
     async def _browser(self) -> LaunchedBrowser:
@@ -332,14 +335,12 @@ class BrowserFetcher:
             await kept.sync(session, own, now=time.time())
         elif own:
             await page.context.add_cookies(own)
-        render = load.render
-        blocked = self._settings.block if render.block is None else render.block
-        if blocked:
-            await page.route("**/*", ResourceBlocker(blocked))
+        if load.blocked:
+            await page.route("**/*", ResourceBlocker(load.blocked))
         rewrite = _FirstRequest.of(page, request)
         if rewrite is not None:
             await page.route("**/*", rewrite)  # tried first, as the last added
-        capture = ResponseCapture(page, render.capture) if render.capture else None
+        capture = ResponseCapture(page, load.render.capture) if load.render.capture else None
         try:
             return await self._rendered(page, watch, load, session, capture)
         finally:
@@ -358,11 +359,11 @@ class BrowserFetcher:
             return await self._failed_load(exc, watch, load, session)
         if document is None:
             raise FetchError(f"loading {request.url} gave no document")
-        received = await captured_response(document)
         action_timeout = self._settings.action_timeout
         outputs = await run_render(page, load.render, action_timeout=action_timeout, url=request.url)
+        document = watch.document or document  # an action may have led to another one
         result = RenderResult(
-            document=received,
+            document=await captured_response(document),
             captured=() if capture is None else await capture.responses(within=action_timeout),
             screenshots=outputs.screenshots,
             evaluated=outputs.evaluated,
@@ -478,10 +479,11 @@ class BrowserFetcher:
 
 @dataclass(frozen=True, slots=True)
 class _Load:
-    """A Request on its way to the browser, with its Render options and the proxy it goes through."""
+    """A Request on its way to the browser, with its Render options, the resource types it blocks, and its proxy."""
 
     request: Request
     render: Render
+    blocked: tuple[str, ...]
     proxy: str | None
     guarded: bool
     started: float
@@ -637,6 +639,10 @@ def _socks_with_credentials(proxy: str) -> bool:
     return parts.scheme.lower().startswith("socks") and "@" in parts.netloc
 
 
-async def _session_context(launched: LaunchedBrowser, session: Session, proxy: str | None) -> BrowserContext:
-    """A context for a Session, with its localStorage, and a proxy."""
-    return await launched.new_context(proxy=proxy, local_storage=session.local_storage)
+async def _session_context(
+    launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
+) -> BrowserContext:
+    """A context for a Session, with its localStorage, a proxy, and service workers blocked or not."""
+    return await launched.new_context(
+        proxy=proxy, local_storage=session.local_storage, blocks_service_workers=blocks_service_workers
+    )

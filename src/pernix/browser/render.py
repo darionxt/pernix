@@ -31,7 +31,9 @@ class Render:
             actions, within `browser.action_timeout`.
         actions: The actions run on the page, in order.
         block: The resource types the page may not load; `None` for those of
-            `browser.block`, which this replaces, and `()` for none.
+            `browser.block`, which this replaces, and `()` for none. A page that
+            blocks some type cannot register service workers, whose requests
+            would not be judged.
         capture: URL patterns of the XHR and fetch responses to capture, as globs:
             `*` matches anything but `/`, `**` anything, and `{a,b}` either. Those
             that arrived by the time the actions were done are kept, if their
