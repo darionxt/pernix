@@ -9,6 +9,7 @@ import orjson
 
 from pernix.cli.downloader import Downloader
 from pernix.cli.options import UsageError, command_crawler, settings_parser
+from pernix.errors import CONFIGURATION_ERRORS
 from pernix.request import Request
 from pernix.runner import ExitCode
 
@@ -30,14 +31,17 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="fetch one URL and print the Response",
         description=(
             "Fetch one URL through the download Middleware and the Fetchers of the project settings, without "
-            "retries. The status line, redirects, and headers go to stderr, and the body to stdout; with --json, "
-            "one JSON object goes to stdout. Exits with 0 when a Response arrived, whatever its status, 1 when "
-            "fetching failed, and 2 for a configuration error."
+            "retries; --fetcher browser renders the page. The status line, redirects, and headers go to stderr, and "
+            "the body to stdout; with --json, one JSON object goes to stdout. Exits with 0 when a Response arrived, "
+            "whatever its status, 1 when fetching failed, and 2 for a configuration error, such as a browser engine "
+            "that is not installed."
         ),
     )
     parser.add_argument("url", help="the absolute URL to fetch")
     parser.add_argument(
-        "--fetcher", metavar="NAME", help="the registered Fetcher to use, such as http; by default, the URL scheme's"
+        "--fetcher",
+        metavar="NAME",
+        help="the registered Fetcher to use, such as http, or browser to render the page; by default, the URL scheme's",
     )
     parser.add_argument("--timeout", type=float, metavar="SECONDS", help="seconds the fetch may take")
     parser.add_argument("--json", action="store_true", help="print the Response, or the error, as one JSON object")
@@ -56,6 +60,8 @@ def run(args: argparse.Namespace) -> int:
 
     Raises:
         UsageError: The URL or the Fetcher is invalid.
+        pernix.errors.ComponentError: A component cannot be built, or cannot fetch,
+            as when the browser engine is not installed.
     """
     crawler = command_crawler(args.settings)
     fetchers = crawler.settings.named_components("fetchers")
@@ -69,6 +75,8 @@ def run(args: argparse.Namespace) -> int:
     downloader = Downloader(crawler)
     try:
         response = asyncio.run(_fetch(downloader, request))
+    except CONFIGURATION_ERRORS:
+        raise  # such as a browser engine that is not installed: no fetch can succeed until it is fixed
     except Exception as exc:
         _report_error(args, exc)
         return ExitCode.FAILED

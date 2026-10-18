@@ -21,7 +21,9 @@ BANNER = """\
 pernix shell: code may use await at the top level.
   request, response              the last Request and its Response
   settings                       the settings
-  await fetch(url_or_request)    fetches, and updates request and response"""
+  Request                        the Request class
+  await fetch(url_or_request)    fetches, and updates request and response
+  await fetch(url, render=True)  renders it; keywords go to Request, or to replace() for a Request"""
 
 
 def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:  # pyright: ignore[reportPrivateUsage]
@@ -31,8 +33,9 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         parents=[settings_parser()],
         help="explore Responses in an interactive console",
         description=(
-            "Start an interactive console with top-level await, preloaded with request, response, settings, and "
-            "fetch(). Fetches go through the download Middleware and the Fetchers of the project settings."
+            "Start an interactive console with top-level await, preloaded with request, response, settings, Request, "
+            "and fetch(). Fetches go through the download Middleware and the Fetchers of the project settings, and "
+            "Requests with render go to the browser Fetcher."
         ),
     )
     parser.add_argument("url", nargs="?", help="a URL to fetch first; by default, none")
@@ -51,10 +54,11 @@ def run(args: argparse.Namespace) -> int:
     crawler = command_crawler(args.settings)
     downloader = Downloader(crawler)
     loop = LoopThread()
+    namespace: dict[str, Any] = {"request": None, "response": None, "settings": crawler.settings, "Request": Request}
     try:
         loop.run(downloader.__aenter__())
         try:
-            _interact(loop, downloader, {"request": None, "response": None, "settings": crawler.settings}, args.url)
+            _interact(loop, downloader, namespace, args.url)
         finally:
             loop.run(downloader.__aexit__(None, None, None))
     finally:
@@ -63,8 +67,21 @@ def run(args: argparse.Namespace) -> int:
 
 
 def _interact(loop: LoopThread, downloader: Downloader, namespace: dict[str, Any], url: str | None) -> None:
-    async def fetch(target: str | Request) -> Response:
-        request = target if isinstance(target, Request) else Request(target)
+    async def fetch(target: str | Request, **options: Any) -> Response:
+        """Fetch a URL or a Request, updating `request` and `response`.
+
+        Args:
+            target: The absolute URL, or the Request.
+            **options: Keywords of `Request`, such as `render=True`, or, for a
+                Request, of its `replace()`.
+
+        Returns:
+            The Response.
+        """
+        if isinstance(target, Request):
+            request = target.replace(**options) if options else target
+        else:
+            request = Request(target, **options)
         response = await downloader.fetch(request)
         namespace["request"], namespace["response"] = request, response
         return response

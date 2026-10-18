@@ -25,6 +25,9 @@ async def stamp(request: Request, call_next: Download) -> Response:
     return await call_next(request.replace(headers=[("X-Stamp", "cli")]))
 
 
+_SCRIPTED = "<p id=by>HTML</p><script>document.getElementById('by').textContent = 'script'</script>"
+
+
 @pytest.fixture
 def site(server: LoopbackServer) -> LoopbackServer:
     server.route("/page", "<h1>Dune</h1>", headers=[("Content-Type", "text/html; charset=utf-8"), ("X-Tag", "a")])
@@ -36,6 +39,7 @@ def site(server: LoopbackServer) -> LoopbackServer:
         return Reply("late")
 
     server.route("/slow", handler=slow)
+    server.route("/scripted", _SCRIPTED, headers=[("Content-Type", "text/html")])
     return server
 
 
@@ -139,6 +143,40 @@ def test_the_project_settings_and_middleware_apply(site: LoopbackServer, capsys:
     assert code == 0
     assert site.received[-1].header("X-Stamp") == "cli"
     assert capsys.readouterr().out == "<h1>Dune</h1>"
+
+
+@pytest.mark.usefixtures("browser_engine")
+def test_the_browser_fetcher_prints_the_rendered_page(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["fetch", site.url("/scripted"), "--fetcher", "browser"]) == 0
+    out, err = capsys.readouterr()
+    assert '<p id="by">script</p>' in out
+    assert err.startswith(f"HTTP 200 {site.url('/scripted')} (")
+
+    assert main(["fetch", site.url("/scripted"), "--fetcher", "browser", "--json"]) == 0
+    described = orjson.loads(capsys.readouterr().out)
+    assert (described["fetcher"], described["status"], described["http_version"]) == ("browser", 200, None)
+    assert '<p id="by">script</p>' in described["body"]
+
+
+@pytest.mark.parametrize(
+    ("missing", "hint"),
+    [
+        ("without_patchright", "install it with: pip install 'pernix[browser]'"),
+        ("without_browser_engine", "install it with: pernix browser install"),
+    ],
+)
+def test_a_browser_that_is_not_installed_is_a_configuration_error(
+    site: LoopbackServer, capsys: pytest.CaptureFixture[str], request: pytest.FixtureRequest, missing: str, hint: str
+) -> None:
+    request.getfixturevalue(missing)
+
+    assert main(["fetch", site.url("/scripted"), "--fetcher", "browser", "--json"]) == 2
+
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("Error: ")
+    assert err.endswith(f"{hint}\n")
+    assert site.received == []
 
 
 @pytest.mark.parametrize(

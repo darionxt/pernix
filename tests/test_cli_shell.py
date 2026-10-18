@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 def site(server: LoopbackServer) -> LoopbackServer:
     server.route("/1", "<h1>Dune</h1>", headers=[("Content-Type", "text/html")])
     server.route("/2", "<h1>Emma</h1>", headers=[("Content-Type", "text/html")])
+    scripted = "<h1>HTML</h1><script>document.querySelector('h1').textContent = 'script'</script>"
+    server.route("/scripted", scripted, headers=[("Content-Type", "text/html")])
     return server
 
 
@@ -45,6 +47,31 @@ def test_the_shell_fetches_first_and_awaits_at_the_top_level(
     assert f"second True {site.url('/2')} Emma" in out
     assert "settings 3" in out
     assert f"response: <Response 200 {site.url('/1')}>" in err  # the banner
+
+
+@pytest.mark.usefixtures("browser_engine")
+def test_fetch_renders_requests_with_render(
+    site: LoopbackServer, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    url = site.url("/scripted")
+    _type(
+        monkeypatch,
+        f"""\
+        rendered = await fetch("{url}", render=True)
+        print("keyword", rendered.fetcher, request.render, response.css("h1::text").get())
+        await fetch(Request("{url}", render=True))
+        print("request", response.fetcher, response.css("h1::text").get())
+        await fetch(request, render=False)
+        print("replaced", response.fetcher, request.render, response.css("h1::text").get())
+        """,
+    )
+
+    assert main(["shell"]) == 0
+
+    out, err = capsys.readouterr()
+    assert "keyword browser True script" in out, err
+    assert "request browser script" in out
+    assert "replaced http False HTML" in out
 
 
 def test_errors_are_shown_and_the_shell_goes_on(
