@@ -41,6 +41,10 @@ _Avoid_: dynamic request, browser request
 A transport that turns a Request into a Response, such as `http` or `browser`.
 _Avoid_: downloader, client
 
+**Generation**:
+One browser and the patchright driver running it, from its launch until it is closed. The current one takes the new rendered fetches; it is replaced as it ages, or lost when it disconnects, its driver dies, or it stops answering, and the fetches in a lost one end with `BrowserLost`.
+_Avoid_: browser instance, browser restart (a restart is a new Generation)
+
 **Fingerprint**:
 The key that decides whether two Requests are duplicates.
 _Avoid_: dedup key, hash, and "fingerprint" for client characteristics (that is a Profile)
@@ -62,6 +66,10 @@ _Avoid_: proxy list, rotator
 **Profile**:
 A mutually consistent set of client characteristics: TLS, HTTP/2, request headers, and UA version.
 _Avoid_: browser fingerprint, fingerprint
+
+**Pinned Pair**:
+The browser build the browser Fetcher launches and the Profile the HTTP Fetcher impersonates by default, pinned together, which the Profile contract tests show to present one client on the wire.
+_Avoid_: fingerprint pair, matching versions
 
 **Account**:
 Login credentials for a target site, which can be bound to a Session.
@@ -107,6 +115,10 @@ _Avoid_: queue, scheduler
 **Dead Request**:
 A Request that exhausted its retries or cannot be processed. It is kept in the Frontier for inspection, never deleted.
 _Avoid_: failed queue
+
+**Retry Budget**:
+Retries a Request may have for one kind of failure that is not its own, such as a lost browser, counted apart from its attempts, so they take none of its ordinary retries.
+_Avoid_: retry quota
 
 **Drain**:
 Stop claiming new Requests, finish the in-flight ones, then end.

@@ -10,12 +10,12 @@ at-least-once: a Request whose Lease expires is handed out again.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from pernix.request import Request
 
@@ -30,12 +30,15 @@ class Lease:
         id: The Frontier's id of the Request.
         token: Increases with every claim; writes with an older token have no effect.
         attempt: Which attempt this is, from 1. Attempts settled with
-            `nack(count_attempt=False)` do not count; expired Leases do.
+            `nack(count_attempt=False)` or under a retry budget do not count;
+            expired Leases do.
         expires_at: When the Lease ends unless renewed, on the Frontier's clock.
         slot: The concurrency slot of the Request, such as its host.
         request: The Request.
         rendered: Whether the Request goes to the browser Fetcher, as
             `pernix.fetchers.is_rendered()` tells.
+        spent: The retries the Request had under each retry budget, by name, as
+            `nack(budget=...)` counted them; a budget it had none under is missing.
     """
 
     id: str
@@ -45,6 +48,7 @@ class Lease:
     slot: str
     request: Request
     rendered: bool = False
+    spent: Mapping[str, int] = field(default_factory=dict[str, int])
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +146,15 @@ class Frontier(Protocol):
         """
         ...
 
-    async def nack(self, lease: Lease, *, delay: float = 0.0, count_attempt: bool = True, reason: str = "") -> bool:
+    async def nack(
+        self,
+        lease: Lease,
+        *,
+        delay: float = 0.0,
+        count_attempt: bool = True,
+        reason: str = "",
+        budget: str | None = None,
+    ) -> bool:
         """Return a leased Request, to be claimed again after a delay.
 
         Args:
@@ -151,6 +163,9 @@ class Frontier(Protocol):
                 Requests of its priority that are ready.
             count_attempt: Count this as a failed attempt.
             reason: Why, kept for inspection.
+            budget: Count this as a retry under the retry budget of this name,
+                in `Lease.spent`, instead of as an attempt, whatever
+                `count_attempt` says.
 
         Returns:
             `False` if the Lease is no longer valid, and nothing changed.

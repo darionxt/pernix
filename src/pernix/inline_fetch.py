@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
@@ -14,7 +15,7 @@ from pernix.fetchers import StreamedResponse
 from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
 from pernix.frontiers import host_slot
 from pernix.response import Response, expect_response
-from pernix.retry_policy import Action, consult
+from pernix.retry_policy import Action, budget_spent, consult
 from pernix.sending import IndependentSending, NotYet
 from pernix.sessions.session_leasing import sending_session
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
@@ -70,7 +71,8 @@ class InlineFetch:
     attempt waits for its slot in the Throttle, waiting out a cooldown in place, and
     goes through the download chain. The retry policy judges every attempt, as for
     Requests from the Frontier, but a retry waits in place for its delay, emitting
-    `RequestRetried`. Each attempt takes its place in its slot, then, with a Session
+    `RequestRetried`; a retry under a retry budget counts there, for this fetch,
+    rather than as an attempt. Each attempt takes its place in its slot, then, with a Session
     Pool, leases a Session, waiting for one in place, but giving up its place now and
     then meanwhile, then waits for the slot's delay and rate; a Session that must log
     in does so first, in the fetch's place. With the Run's proxies, each attempt goes
@@ -145,6 +147,7 @@ class InlineFetch:
         """
         request = _continuing(request)
         attempt = 1
+        spent = Counter[str]()
         while True:
             slot = self._slot_of(request)
             async with self._sending(request, slot) as sending:
@@ -152,8 +155,8 @@ class InlineFetch:
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
                 return _accepted(outcome)
-            await self._retry_later(request, outcome, decision, attempt)
-            attempt += 1
+            await self._retry_later(request, outcome, decision, attempt, spent)
+            attempt += decision.budget is None
 
     @asynccontextmanager
     async def stream(self, request: Request, *, max_bytes: int | None = None) -> AsyncGenerator[StreamedResponse]:
@@ -181,6 +184,7 @@ class InlineFetch:
         """
         request = _continuing(request)
         attempt = 1
+        spent = Counter[str]()
         while True:
             slot = self._slot_of(request)
             async with self._sending(request, slot) as sending:  # through the block too
@@ -193,8 +197,8 @@ class InlineFetch:
                         return
                 finally:
                     await streams.close()
-            await self._retry_later(request, outcome, decision, attempt)
-            attempt += 1
+            await self._retry_later(request, outcome, decision, attempt, spent)
+            attempt += decision.budget is None
 
     @asynccontextmanager
     async def _sending(self, request: Request, slot: str) -> AsyncGenerator[Sending]:
@@ -263,18 +267,40 @@ class InlineFetch:
         return response
 
     async def _retry_later(
-        self, request: Request, outcome: Response | Exception, decision: Decision, attempt: int
+        self, request: Request, outcome: Response | Exception, decision: Decision, attempt: int, spent: Counter[str]
     ) -> None:
-        """Wait for the retry the policy decided, or raise `RetriesExhausted` when it gave up."""
-        if decision.action is Action.GIVE_UP:
+        """Wait for the retry the policy decided, counting it in `spent` under its budget, if any.
+
+        Raises:
+            pernix.errors.RetriesExhausted: The policy gave up, or the retry
+                would go past the limit of its budget.
+        """
+        budget = decision.budget
+        if decision.action is Action.GIVE_UP or (budget is not None and spent[budget.name] >= budget.limit):
+            reason = decision.reason if budget is None else budget_spent(decision.reason, budget)
             response = outcome if isinstance(outcome, Response) else None
-            raise RetriesExhausted(decision.reason, response=response) from (
-                outcome if isinstance(outcome, Exception) else None
+            raise RetriesExhausted(reason, response=response) from (outcome if isinstance(outcome, Exception) else None)
+        if budget is None:
+            logger.info(
+                "Retrying %r in place in %.2f s after attempt %d: %s", request, decision.delay, attempt, decision.reason
             )
-        logger.info(
-            "Retrying %r in place in %.2f s after attempt %d: %s", request, decision.delay, attempt, decision.reason
+        else:
+            spent[budget.name] += 1
+            logger.info(
+                "Retrying %r in place in %.2f s after attempt %d, as %s retry %d of %d: %s",
+                request,
+                decision.delay,
+                attempt,
+                budget.name,
+                spent[budget.name],
+                budget.limit,
+                decision.reason,
+            )
+        await self._events.emit(
+            RequestRetried(
+                request, attempt, decision.delay, decision.reason, budget=None if budget is None else budget.name
+            )
         )
-        await self._events.emit(RequestRetried(request, attempt, decision.delay, decision.reason))
         await asyncio.sleep(decision.delay)
 
     async def _streamed(self, response: Response, streams: Streams) -> StreamedResponse:

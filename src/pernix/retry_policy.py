@@ -3,6 +3,14 @@
 The Engine asks the policy after every attempt that produced a Response, raised
 while fetching, or raised `Retry`. Requests from the Frontier wait for their retry
 back in the Frontier (`nack` with a delay), so they hold no concurrency slot.
+
+A retry counts as an attempt, which the policy is told of, unless it names a
+`RetryBudget`: for failures that are not the Request's own, such as a browser that
+went away, a policy retries under a budget that counts those retries apart, and
+takes nothing from the attempts. The Frontier keeps the count of each budget with
+the Request (`Lease.spent`), as it keeps its attempts, and the Engine, or the
+Inline Fetch, gives up once a retry would go past the budget's limit, failing the
+Request with `RetriesExhausted`.
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
-from pernix.errors import ConnectError, ProxyError, Retry, Timeout
+from pernix.errors import BrowserLost, ConnectError, PageCrashed, ProxyError, Retry, Timeout
 from pernix.response import Response
 
 if TYPE_CHECKING:
@@ -25,10 +33,13 @@ if TYPE_CHECKING:
     from pernix.settings import RetrySettings
 
 __all__ = [
+    "BROWSER_LOST",
     "Action",
     "Decision",
     "DefaultRetryPolicy",
+    "RetryBudget",
     "RetryPolicy",
+    "budget_spent",
     "consult",
     "full_jitter",
     "retry_after_seconds",
@@ -36,7 +47,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_RETRIED_ERRORS = (Timeout, ConnectError, ProxyError)
+_RETRIED_ERRORS = (Timeout, ConnectError, ProxyError, PageCrashed)
+
+BROWSER_LOST = "browser_lost"
+"""The retry budget of the Requests whose browser went away; `retry.browser_lost` is its limit."""
 _MAX_DOUBLINGS = 64
 """Backoff stops doubling here, long past any cap, so the delay stays a finite float."""
 
@@ -53,6 +67,20 @@ class Action(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RetryBudget:
+    """Retries a Request may have for one kind of failure, counted apart from its attempts.
+
+    Attributes:
+        name: Names the budget, such as `"browser_lost"`; the retries under one
+            name are counted together, as `Lease.spent[name]`.
+        limit: Retries under the budget a Request may have; 0 for none.
+    """
+
+    name: str
+    limit: int
+
+
+@dataclass(frozen=True, slots=True)
 class Decision:
     """A retry policy's verdict on one attempt.
 
@@ -60,11 +88,13 @@ class Decision:
         action: What to do.
         delay: Seconds to wait before the retry.
         reason: Why the attempt is retried or given up, for logs and Events.
+        budget: The budget a retry counts against instead of the attempts, if any.
     """
 
     action: Action
     delay: float = 0.0
     reason: str = ""
+    budget: RetryBudget | None = None
 
     @classmethod
     def accept(cls) -> Decision:
@@ -72,17 +102,20 @@ class Decision:
         return cls(Action.ACCEPT)
 
     @classmethod
-    def retry(cls, delay: float, reason: str) -> Decision:
+    def retry(cls, delay: float, reason: str, *, budget: RetryBudget | None = None) -> Decision:
         """Fetch the Request again.
 
         Args:
             delay: Seconds to wait first.
             reason: Why.
+            budget: Count the retry against this budget instead of as an attempt;
+                once the Request has had `budget.limit` retries under it, it fails
+                with `RetriesExhausted` instead.
 
         Returns:
             The Decision.
         """
-        return cls(Action.RETRY, delay, reason)
+        return cls(Action.RETRY, delay, reason, budget)
 
     @classmethod
     def give_up(cls, reason: str) -> Decision:
@@ -115,6 +148,19 @@ class RetryPolicy(Protocol):
         ...
 
 
+def budget_spent(reason: str, budget: RetryBudget) -> str:
+    """Tell why a Request fails once its retries under a budget are spent.
+
+    Args:
+        reason: Why its last attempt failed.
+        budget: The budget.
+
+    Returns:
+        The reason, naming the budget and its limit, as for `RetriesExhausted`.
+    """
+    return f"{reason} ({budget.name}: {budget.limit} retries spent)"
+
+
 def consult(policy: RetryPolicy, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
     """Ask a retry policy to judge an attempt; a policy that raises keeps the outcome.
 
@@ -139,11 +185,15 @@ class DefaultRetryPolicy:
     """Retries some statuses, transport errors, and `Retry`, with full-jitter backoff.
 
     The statuses are `retry.statuses`. The transport errors are `Timeout`,
-    `ConnectError`, and `ProxyError`; others, such as an invalid certificate, would
-    fail again. The delay is the one `Retry` names, else a `Retry-After` header's,
-    up to `retry.retry_after_max`, else a random backoff up to `retry.backoff_base`
-    doubled per retry, up to `retry.backoff_max`; `retry.delay_scale` multiplies it.
-    After `retry.times` retries the Request fails.
+    `ConnectError`, `ProxyError`, and `PageCrashed`; others, such as an invalid
+    certificate, would fail again. The delay is the one `Retry` names, else a
+    `Retry-After` header's, up to `retry.retry_after_max`, else a random backoff up
+    to `retry.backoff_base` doubled per retry, up to `retry.backoff_max`;
+    `retry.delay_scale` multiplies it. After `retry.times` retries the Request
+    fails.
+
+    `BrowserLost` is retried at once, under the `browser_lost` budget, up to
+    `retry.browser_lost` times, which take none of the retries of `retry.times`.
     """
 
     def __init__(
@@ -175,6 +225,9 @@ class DefaultRetryPolicy:
         Returns:
             What to do next.
         """
+        if isinstance(outcome, BrowserLost):
+            budget = RetryBudget(BROWSER_LOST, self._settings.browser_lost)
+            return Decision.retry(0.0, f"BrowserLost: {outcome}", budget=budget)
         reason = self._retry_reason(outcome)
         if reason is None:
             return Decision.accept()

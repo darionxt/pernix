@@ -10,6 +10,7 @@ __all__ = [
     "ActionError",
     "ActionTimeout",
     "AddonError",
+    "BrowserLost",
     "ComponentError",
     "ConnectError",
     "DecodeError",
@@ -19,6 +20,7 @@ __all__ = [
     "IgnoreRequest",
     "LoginExpired",
     "NetworkBlocked",
+    "PageCrashed",
     "PernixError",
     "ProxyError",
     "ResponseTooLarge",
@@ -165,6 +167,24 @@ class ActionTimeout(ActionError, Timeout):
 
     It is a `Timeout`, so the default retry policy retries it, as it does a page that
     loads too slowly.
+    """
+
+
+class PageCrashed(FetchError):
+    """The page of a rendered fetch crashed, as when the page ran out of memory.
+
+    The page is closed. The default retry policy retries it as a retry like any
+    other, as the page may crash again.
+    """
+
+
+class BrowserLost(FetchError):
+    """The browser a rendered fetch used went away: it disconnected, its driver died, or it stopped answering.
+
+    Every fetch in the browser fails with it, and the next one starts another
+    browser. The default retry policy retries it at once, as the fetch did not
+    fail by itself, under a retry budget of its own, `retry.browser_lost`, so it
+    takes none of the retries of `retry.times`.
     """
 
 

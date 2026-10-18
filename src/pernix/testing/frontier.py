@@ -265,6 +265,25 @@ class FrontierConformance:
 
         assert [(lease.request.url, lease.attempt) for lease in leases] == [(f"{URL}2", 1), (f"{URL}1", 2)]
 
+    async def test_returns_under_a_retry_budget_are_counted_apart_from_the_attempts(self, frontier: Frontier) -> None:
+        await frontier.add([_page(1)])
+        first = await self._claim_one(frontier)
+        assert (first.attempt, dict(first.spent)) == (1, {})
+
+        assert await frontier.nack(first, budget="browser_lost")
+        second = await self._claim_one(frontier)
+        assert await frontier.nack(second, budget="browser_lost", count_attempt=True)  # the budget counts instead
+        third = await self._claim_one(frontier)
+        assert await frontier.nack(third, reason="HTTP 503")
+        fourth = await self._claim_one(frontier)
+        assert await frontier.nack(fourth, budget="session_switch")
+        fifth = await self._claim_one(frontier)
+
+        assert [lease.attempt for lease in (first, second, third, fourth, fifth)] == [1, 1, 1, 2, 2]
+        assert dict(third.spent) == {"browser_lost": 2}
+        assert dict(fifth.spent) == {"browser_lost": 2, "session_switch": 1}
+        assert dict(first.spent) == {}  # a Lease handed out keeps what it was claimed with
+
     async def test_nack_with_a_delay_waits_until_it_passes(self, frontier: Frontier, clock: FakeClock) -> None:
         await frontier.add([_page(1)])
 

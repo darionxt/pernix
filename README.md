@@ -81,6 +81,8 @@ class Shop(Spider):
 
 Rendered Requests have workers of their own: `browser.max_pages` (8) of them, as many as the pages the browser opens at once, while the `concurrency` (16) workers take the other Requests, so neither waits for the other. Both kinds share their domain's limits: `domain.concurrency`, the delay, the rate, and cooldowns. A Request a download Middleware switches to Render, and a rendered Inline Fetch, wait for a page in the worker they run in. The `browser.*` stats count the pages and contexts opened, how many are open, and the fetches that waited for a page. See [`docs/design.md`](docs/design.md) §6.3.
 
+Long Runs replace the browser as it ages: after `browser.generation_age` (an hour), `browser.generation_pages` (1000 pages), or, if set, once its processes take more than `browser.generation_memory` MiB; the pages in it finish there while the next go to a new one. A page that crashes fails with `PageCrashed`, retried as other transient errors are. A browser that disconnects, whose driver dies, or that stops answering its health probe fails every fetch in it with `BrowserLost`, retried at once, up to `retry.browser_lost` (3) times, which take none of `retry.times`; the next fetch starts another browser, and the processes of the old one are killed. See [`docs/design.md`](docs/design.md) §5.2.
+
 ```python
 from pernix.browser import Click, Evaluate, Render, Scroll, WaitFor
 
@@ -329,6 +331,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `retry.backoff_base` / `retry.backoff_max` | `1.0` / `60.0` | Full-jitter backoff: seconds of the first retry, doubling up to the maximum |
 | `retry.retry_after_max` | `300.0` | The longest wait a `Retry-After` header can set |
 | `retry.delay_scale` | `1.0` | Multiplies every retry delay; `0` retries at once, as in tests |
+| `retry.browser_lost` | `3` | Retries after a browser went away (`BrowserLost`), at once, apart from `retry.times` |
 | `retry.policy` | `None` | A replacement retry policy, an object with `decide(request, outcome, attempt)` |
 | `log.output` | `"auto"` | `"stderr"`, `"stdout"`, or `"root"` (the application's handlers); `"auto"` is `"root"` if logging is configured, else `"stderr"` |
 | `log.format` | `"auto"` | `"text"`, `"json"` (JSON lines), or `"auto"`: text on a terminal, JSON lines otherwise |
@@ -352,6 +355,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included, once it may open its page |
 | `browser.launch_options` | `{}` | Options passed as they are to patchright's `launch()`, such as `executable_path` or `args` |
 | `browser.max_pages` | `8` | Pages open at once, each that of one fetch, and the rendered Requests a Run processes at once |
+| `browser.generation_age` / `browser.generation_pages` | `3600.0` / `1000` | Seconds, and pages opened, after which the browser is replaced by a new one; `0` turns each off |
+| `browser.generation_memory` | `0` | MiB the browser's processes may take before it is replaced; `0` does not measure them |
 | `browser.max_idle_contexts` / `browser.context_idle` | `8` / `300.0` | Browser contexts kept idle for Sessions between their fetches, at most, and seconds one may stay idle |
 | `browser.block` | `[]` | Resource types no rendered page loads, such as `"image"` or `"font"`; `Render(block=...)` replaces them |
 | `browser.action_timeout` | `10.0` | Seconds `Render(wait_for=...)` and each page action may take, unless the action sets its own `timeout` |
@@ -464,7 +469,7 @@ src/pernix/
 ├── stop_signals.py      SIGINT and SIGTERM stop a Run
 ├── run_result.py        RunResult, how a Run ended
 ├── callbacks.py         runs Callbacks and errbacks, collects their outputs
-├── retry_policy.py      retry decisions, backoff, Retry-After
+├── retry_policy.py      retry decisions, retry budgets, backoff, Retry-After
 ├── throttle.py          per-domain slots: concurrency, delay, rate, cooldowns
 ├── request.py           Request
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
@@ -540,6 +545,9 @@ src/pernix/
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
 │   ├── page_slots.py    the pages open at once, browser.max_pages, each taken by one fetch
+│   ├── browser_generations.py the browsers one Generation after another: replaced, lost, probed, closed
+│   ├── browser_processes.py the processes of a browser and its driver: memory, and killing them
+│   ├── tripwire.py      cancels the work in its scopes once tripped, raising an error in its place
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
@@ -590,7 +598,7 @@ src/pernix/
     ├── loopback_server.py LoopbackServer: routes and files served on 127.0.0.1
     ├── pytest_plugin.py the pytest plugin: the network guard, the loopback_server fixture
     └── frontier.py      conformance suite for Frontier backends
-tests/                   one test module per source module, plus end-to-end crawls
+tests/                   one test module per source module, end-to-end crawls, and the Profile contract
 ```
 
 Pluggable component families with several implementations, such as Extensions, Feeds, Fetchers, Frontiers, Middleware, and Pipelines, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
@@ -607,6 +615,8 @@ uv run ruff check
 uv run ruff format --check
 uv run pyright
 ```
+
+curl-cffi and patchright are pinned to exact versions, as their Profile and browser build form a Pinned Pair: upgrade either only with `uv run pytest tests/test_profile_contract.py` passing, which needs the browser engine. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
 
 ## License
 

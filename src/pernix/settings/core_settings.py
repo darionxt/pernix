@@ -401,6 +401,8 @@ class RetrySettings(Section):
         retry_after_max: The most seconds a `Retry-After` header can make a retry wait.
         delay_scale: Multiplies every delay the default policy chooses; 0 retries at
             once, as in tests.
+        browser_lost: Retries after the browser of a rendered fetch went away
+            (`BrowserLost`), at once, apart from `times`; 0 turns them off.
         policy: A replacement retry policy, an object with
             `decide(request, outcome, attempt)`, as an object, a class building one,
             or an import path; `None` for the default policy.
@@ -414,6 +416,7 @@ class RetrySettings(Section):
     backoff_max: Annotated[float, msgspec.Meta(ge=0)] = 60.0
     retry_after_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
     delay_scale: Annotated[float, msgspec.Meta(ge=0)] = 1.0
+    browser_lost: Annotated[int, msgspec.Meta(ge=0)] = 3
     policy: Any = None
 
 

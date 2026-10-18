@@ -65,14 +65,20 @@ async def test_at_most_browser_max_pages_pages_are_open_at_once(server: Loopback
 
 
 async def test_waiting_for_a_page_takes_no_part_in_the_deadline(server: LoopbackServer) -> None:
-    server.route("/slow", handler=SlowPages(1.5))
-    settings = BrowserSettings(max_pages=1, deadline=3.0)
+    server.route("/", "<p>up</p>", headers=HTML)
+    settings = BrowserSettings(max_pages=1, deadline=4.0)  # ample for one fast page on a slow runner
 
     async with BrowserFetcher(settings) as fetcher:
-        await fetcher._browser()  # pyright: ignore[reportPrivateUsage]  # started apart, as the deadline counts it
-        responses = await asyncio.gather(*(fetcher.fetch(_render(server.url(f"/slow?n={n}"))) for n in range(2)))
+        async with fetcher._generations.fetching(""):  # pyright: ignore[reportPrivateUsage]
+            pass  # the browser starts apart, as the deadline counts it
+        held = await fetcher._pages.take()  # pyright: ignore[reportPrivateUsage]  # the only slot
+        fetching = asyncio.create_task(fetcher.fetch(_render(server.url("/"))))
+        await asyncio.sleep(4.5)  # longer than the deadline
+        assert not fetching.done()  # still waiting for the slot
+        held.release()
+        response = await fetching
 
-    assert [response.status for response in responses] == [200, 200]  # the second waited for the first
+    assert response.status == 200
 
 
 async def test_a_page_whose_fetch_was_cancelled_holds_its_slot_until_its_context_is_closed(
