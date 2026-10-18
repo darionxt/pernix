@@ -4,38 +4,42 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import pytest
 
-from pernix import Request
+from pernix import Account, Request
 from pernix.errors import ConnectError, ProxyError, SettingsError
-from pernix.proxies import MemoryProxyPool
+from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool, Proxy, ProxyCandidate
 from pernix.proxies.proxy_sources import StaticProxies
 from pernix.proxies.run_proxies import NoProxyYet, RunProxies
 from pernix.sending import Sending
+from pernix.settings import ProxySettings
 from pernix.stats import Stats
 from pernix.testing import make_response
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
-    from pernix.proxies import ProxyProvider
+    from pernix.proxies import Binding, BindingPolicy, ProxyProvider
 
 A, B = "http://user:a-secret@a.example:8080", "http://b.example:8080"
+C = "http://c.example:8080"
+NOW = 1_800_000_000.0
 
 
 class Listed:
     """A provider giving the proxies set last, and failing once told to."""
 
-    def __init__(self, *proxies: str) -> None:
-        self.given: Sequence[str] = proxies
+    def __init__(self, *proxies: str | Proxy) -> None:
+        self.given: Sequence[str | Proxy] = proxies
         self.error: Exception | None = None
         self.calls = 0
         self.called = asyncio.Event()
 
-    async def proxies(self) -> Sequence[str]:
+    async def proxies(self) -> Sequence[str | Proxy]:
         self.calls += 1
         self.called.set()
         if self.error is not None:
@@ -64,11 +68,16 @@ class Run:
         self.masked |= set(secrets)
 
     def proxies(
-        self, *sources: ProxyProvider, refresh: float | None = None, pool: MemoryProxyPool | None = None
+        self,
+        *sources: ProxyProvider,
+        refresh: float | None = None,
+        pool: MemoryProxyPool | None = None,
+        policy: BindingPolicy | None = None,
     ) -> RunProxies:
         return RunProxies(
             MemoryProxyPool(stats=self.stats) if pool is None else pool,
             [(f"source {number}", source) for number, source in enumerate(sources, start=1)],
+            policy=policy or DefaultBindingPolicy(ProxySettings()),
             refresh=refresh,
             stats=self.stats,
             stop=self.stop,
@@ -99,7 +108,27 @@ async def test_proxies_a_source_gave_that_are_not_valid_are_skipped_without_quot
     await proxies.close()
 
     assert await proxies.take() == B
-    assert "source 1 gave that are not valid: #1 (a proxy needs a port), #2 (not a string)" in caplog.text
+    assert "source 1 gave that are not valid: #1 (a proxy needs a port), #2 (not a string or a Proxy)" in caplog.text
+    assert "secret-pw" not in caplog.text
+
+
+async def test_a_provider_may_give_records_to_tag_its_proxies(caplog: pytest.LogCaptureFixture) -> None:
+    pool = MemoryProxyPool()
+    given = [
+        Proxy("A.example:1", tags=frozenset({"us"}), expires=NOW),
+        Proxy(42),  # pyright: ignore[reportArgumentType]
+        Proxy("c.example:3", tags=frozenset({3})),  # pyright: ignore[reportArgumentType]
+        Proxy("user:secret-pw@no-port.example"),
+    ]
+    proxies = Run().proxies(Listed(*given), pool=pool)  # pyright: ignore[reportArgumentType]
+
+    with caplog.at_level(logging.WARNING, logger="pernix"):
+        await proxies.open()
+
+    assert await pool.candidates() == (ProxyCandidate("http://a.example:1", tags=frozenset({"us"}), expires=NOW),)
+    assert "#2 (Expected `str`, got `int` - at `$.url`)" in caplog.text
+    assert "#3 (Expected `str`, got `int` - at `$.tags[0]`)" in caplog.text
+    assert "#4 (a proxy needs a port)" in caplog.text
     assert "secret-pw" not in caplog.text
 
 
@@ -259,3 +288,205 @@ async def test_how_a_fetch_went_through_its_proxy_is_reported(
             fetch(sending)
 
     assert pool.reports == reports
+
+
+class Told:
+    """A binding policy keeping what it was told, and binding as the default does."""
+
+    def __init__(self) -> None:
+        self.told: list[Binding] = []
+        self._default = DefaultBindingPolicy(ProxySettings())
+
+    async def bind(self, binding: Binding) -> str | None:
+        self.told.append(binding)
+        return await self._default.bind(binding)
+
+
+async def _opened(
+    *urls: str, pool: MemoryProxyPool | None = None, policy: BindingPolicy | None = None, run: Run | None = None
+) -> RunProxies:
+    proxies = (run or Run()).proxies(StaticProxies(urls), pool=pool, policy=policy)
+    await proxies.open()
+    return proxies
+
+
+async def test_by_default_a_session_keeps_its_proxy_and_sessions_share_one_only_when_they_must() -> None:
+    proxies = await _opened(A, B)
+
+    first = await proxies.bind("one", None)
+    second = await proxies.bind("two", None)
+    again = await proxies.bind("one", first)
+    third = await proxies.bind("three", None)
+
+    assert (first, second, again) == (A, B, A)
+    assert third in (A, B)
+
+
+async def test_leases_of_one_session_that_overlap_are_given_one_proxy() -> None:
+    pool = MemoryProxyPool()
+    proxies = await _opened(A, B, C, pool=pool)
+    first = await proxies.bind("one", None)
+    overlapping = await proxies.bind("one", None)  # a Lease that loaded the state before the first saved its binding
+    await proxies.bind("two", None)
+
+    await pool.report(A, failed=True, since=time.time())
+    rebound = await proxies.bind("one", A)
+    stale = await proxies.bind("one", A)  # another Lease of it, which loaded the state before the rebinding
+
+    assert (first, overlapping) == (A, A)
+    assert rebound == stale == C
+
+
+@pytest.mark.parametrize(
+    ("gone", "said"), [("cooldown", "is cooling down"), ("retired", "is retired"), ("unlisted", "is not listed")]
+)
+async def test_a_session_whose_proxy_is_gone_is_bound_to_another(
+    gone: str, said: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    pool = MemoryProxyPool(max_failures=1 if gone == "retired" else 5)
+    policy = Told()
+    proxies = await _opened(A, B, pool=pool, policy=policy)
+    await proxies.bind("one", None)
+    if gone == "unlisted":
+        await pool.replace([Proxy(B)])
+    else:
+        await pool.report(A, failed=True, since=time.time())
+
+    with caplog.at_level(logging.INFO, logger="pernix"):
+        rebound = await proxies.bind("one", A)
+
+    assert rebound == B
+    assert policy.told[-1].reason == gone
+    assert f"The proxy of the Session 'one' {said}; it goes through another" in caplog.text
+
+
+async def test_the_policy_is_told_of_the_session_its_account_its_proxy_and_the_candidates() -> None:
+    policy = Told()
+    account = Account(username="alice", password="pw")  # pyright: ignore[reportArgumentType]
+    proxies = await _opened(A, B, policy=policy)
+
+    await proxies.bind("one", None, account=account)
+    await proxies.bind("one", A)
+    await proxies.bind("two", "http://gone.example:1")  # its state names a proxy no longer listed
+
+    new, lease, unlisted = policy.told
+    assert (new.session, new.account, new.current, new.health, new.reason) == ("one", account, None, None, "new")
+    assert new.candidates == (ProxyCandidate(A), ProxyCandidate(B))
+    assert (lease.account, lease.current, lease.health, lease.reason) == (None, A, "available", "lease")
+    assert lease.candidates == (ProxyCandidate(B), ProxyCandidate(A, sessions=frozenset({"one"})))
+    assert (unlisted.current, unlisted.health, unlisted.reason) == ("http://gone.example:1", None, "unlisted")
+
+
+async def test_while_no_proxy_is_available_the_policy_is_not_asked() -> None:
+    pool = MemoryProxyPool()
+    policy = Told()
+    proxies = await _opened(B, pool=pool, policy=policy)
+    await pool.report(B, failed=True, since=time.time())
+
+    with pytest.raises(NoProxyYet, match="no proxy available"):
+        await proxies.bind("one", None)
+
+    assert policy.told == []
+
+
+async def test_sessions_no_proxy_fits_wait_counted_and_logged_once_until_bound(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run = Run()
+    proxies = await _opened(A, B, pool=MemoryProxyPool(max_sessions=1), run=run)
+    await proxies.bind("one", None)
+    await proxies.bind("two", None)
+
+    with caplog.at_level(logging.WARNING, logger="pernix"):
+        waits: list[NoProxyYet] = []
+        for _ in range(2):
+            with pytest.raises(NoProxyYet) as waiting:
+                await proxies.bind("three", None)
+            waits.append(waiting.value)
+        await proxies.unbind("one")
+        bound = await proxies.bind("three", None)
+
+    assert [(wait.delay, wait.reason) for wait in waits] == [(1.0, "no proxy fits the Session")] * 2
+    assert caplog.text.count("No proxy fits the Session 'three' now; its Requests wait for one") == 1
+    assert _count(run.stats, "proxies.binding_waits") == 2
+    assert bound == A
+
+
+async def test_with_every_lease_a_session_goes_through_the_proxies_with_room_in_turn() -> None:
+    every_lease = DefaultBindingPolicy(ProxySettings(rebind="every_lease"))
+    proxies = await _opened(A, B, C, pool=MemoryProxyPool(max_sessions=1), policy=every_lease)
+    await proxies.bind("two", None)  # A, which it keeps
+
+    seen: list[str] = []
+    for _ in range(4):
+        seen.append(await proxies.bind("one", seen[-1] if seen else None))
+
+    assert seen == [B, C, B, C]
+
+
+class Racing:
+    """A binding policy binding as the default does, once the first two Sessions read the same candidates."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+        self._both_read = asyncio.Barrier(2)
+        self._default = DefaultBindingPolicy(ProxySettings())
+
+    async def bind(self, binding: Binding) -> str | None:
+        self.asked.append(binding.session)
+        if len(self.asked) <= 2:
+            await self._both_read.wait()
+        return await self._default.bind(binding)
+
+
+async def test_a_session_whose_pick_another_took_first_is_bound_as_the_policy_picks_again() -> None:
+    policy = Racing()
+    proxies = await _opened(A, B, pool=MemoryProxyPool(max_sessions=1), policy=policy)
+
+    bound = await asyncio.gather(proxies.bind("one", None), proxies.bind("two", None))
+
+    assert sorted(bound) == sorted([A, B])  # both picked A first
+    assert len(policy.asked) == 3
+
+
+class Stubborn:
+    """A binding policy that always picks one proxy."""
+
+    def __init__(self, proxy: str) -> None:
+        self.proxy = proxy
+        self.asked = 0
+
+    async def bind(self, binding: Binding) -> str | None:
+        self.asked += 1
+        return self.proxy
+
+
+async def test_the_policy_is_asked_again_only_a_few_times() -> None:
+    policy = Stubborn(A)
+    proxies = await _opened(A, B, pool=MemoryProxyPool(max_sessions=1), policy=policy)
+    await proxies.bind("one", None)
+
+    with pytest.raises(NoProxyYet, match="no proxy fits the Session"):
+        await proxies.bind("two", None)
+
+    assert policy.asked == 1 + 3
+
+
+async def test_a_policy_that_picks_a_proxy_the_pool_does_not_list_fails_the_binding() -> None:
+    proxies = await _opened(A, policy=Stubborn("http://user:pw@elsewhere.example:1"))
+
+    with pytest.raises(ValueError, match="picked a proxy the Proxy Pool does not list") as failed:
+        await proxies.bind("one", None)
+
+    assert "pw" not in str(failed.value)
+
+
+async def test_a_policy_that_raises_fails_the_binding() -> None:
+    class Broken:
+        async def bind(self, binding: Binding) -> str | None:
+            raise RuntimeError("the database is down")
+
+    proxies = await _opened(A, policy=Broken())
+
+    with pytest.raises(RuntimeError, match="the database is down"):
+        await proxies.bind("one", None)

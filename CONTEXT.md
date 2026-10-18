@@ -56,7 +56,7 @@ A named set of Sessions that multiple Workers and Spiders can share.
 _Avoid_: account pool, cookie pool (they are special cases of a Session Pool)
 
 **Proxy Pool**:
-The proxies a Run sends Requests through, from its sources, with the health of each. A Session is bound to one proxy, which it keeps while that is available; a Request without a Session goes through the next one in turn.
+The proxies a Run sends Requests through, from its sources, with the health of each and the Sessions bound to each. A Session is bound to one proxy, as the Run's binding policy picks it, by default keeping it while that is available; a Request without a Session goes through the next one in turn.
 _Avoid_: proxy list, rotator
 
 **Profile**:

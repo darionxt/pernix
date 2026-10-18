@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from pernix.errors import IgnoreRequest, LoginExpired, ProxyError
+from pernix.errors import IgnoreRequest, LoginExpired, ProxyError, SessionError
 from pernix.fetchers.fetcher_dispatch import sending_as
 from pernix.retry_policy import retry_after_seconds
 from pernix.sending import NotYet, Sending
@@ -19,9 +19,10 @@ from pernix.session import Session, SessionState
 from pernix.sessions.session_pool import Outcome, OutcomeKind, StateDelta
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Iterable
     from contextlib import AbstractAsyncContextManager
 
+    from pernix.account import Account
     from pernix.proxies.run_proxies import RunProxies
     from pernix.request import Request
     from pernix.response import Response
@@ -44,6 +45,8 @@ _SEVERITY: tuple[OutcomeKind, ...] = (
     "ok",
 )
 """The outcomes, the one a Lease is released with first, when the fetches sharing it fared differently."""
+_RETIRING: frozenset[OutcomeKind] = frozenset({"login_failed", "blocked"})
+"""The outcomes a Session Pool may Retire a Session for."""
 
 
 @dataclass(slots=True)
@@ -92,14 +95,16 @@ class SessionLeasing:
     the Lease is released with the most severe outcome of them all, so a 429 one of
     them got cools the Session down.
 
-    With the Run's proxies, a Session goes through the proxy it is bound to while
-    that is available, and is bound to another once it is not. Each Lease settles
-    the Session's proxy once, before its first fetch that goes through it, which may
-    be one of its login or one nested in another, and its later fetches keep it, so
-    each is reported against the proxy it went through; the binding is saved with
-    the Session's state. A Request with a proxy of its own goes through that, and
-    needs none of the Run's. When no proxy is available, the Lease is released, and
-    the Request waits elsewhere; a nested fetch waits as its caller does.
+    With the Run's proxies, a Session goes through the proxy the binding policy
+    binds it to, by default the one it is bound to while that is available. Each
+    Lease settles the Session's proxy once, before its first fetch that goes through
+    it, which may be one of its login or one nested in another, and its later
+    fetches keep it, so each is reported against the proxy it went through; the
+    binding is saved with the Session's state, and released once the pool Retires
+    the Session. A Request with a proxy of its own goes through that, and needs none
+    of the Run's. When no proxy is available, or none fits the Session, the Lease is
+    released, and the Request waits elsewhere; a nested fetch waits as its caller
+    does.
 
     With a login, a fetch whose Lease must log its Session in runs the login first,
     in the fetch's task, where the fetches the login makes share the Lease and are
@@ -119,6 +124,7 @@ class SessionLeasing:
         stats: Stats,
         login: SessionLogin | None = None,
         proxies: RunProxies | None = None,
+        accounts: Iterable[Account] = (),
         clock: Callable[[], float] = time.time,
     ) -> None:
         """Wire the leasing to its pool.
@@ -131,6 +137,8 @@ class SessionLeasing:
                 `None` when Sessions do not log in.
             proxies: The Run's proxies, which Sessions are bound to; `None` without
                 any.
+            accounts: The Accounts Sessions are bound to, which the binding policy
+                is told of.
             clock: The current time, in seconds since the epoch.
         """
         self.pool = pool
@@ -138,6 +146,7 @@ class SessionLeasing:
         self._stats = stats
         self._login = login
         self._proxies = proxies
+        self._accounts = {account.id: account for account in accounts}
         self._clock = clock
 
     @asynccontextmanager
@@ -158,7 +167,8 @@ class SessionLeasing:
             NoSessionYet: No Session could be leased within `wait`, or the one
                 leased failed to log in.
             pernix.proxies.run_proxies.NoProxyYet: The Request goes through its
-                Session's proxy, and no proxy is available.
+                Session's proxy, and no proxy is available, or none fits the
+                Session.
             pernix.errors.SessionError: No Session can ever be leased for the
                 Request.
         """
@@ -246,7 +256,7 @@ class SessionLeasing:
         """Release the Lease of a Session whose login failed, cooling it down."""
         cooldowns = [outcome.until for outcome in nested if outcome.kind == "rate_limited" and outcome.until]
         outcome = Outcome("login_failed", until=max([self._clock() + self._settings.cooldown, *cooldowns]))
-        released = await self.pool.release(lease, outcome)
+        released = await self._release(lease, outcome)
         self._stats.inc("sessions.login_failures")
         for each in (outcome, *nested):
             self._stats.inc(f"sessions.outcomes.{each.kind}")
@@ -272,7 +282,7 @@ class SessionLeasing:
             )
             self._stats.inc("sessions.login_failures")
             outcome = Outcome("login_failed", until=now + self._settings.cooldown)
-        released = await self.pool.release(lease, outcome)
+        released = await self._release(lease, outcome)
         for each in outcomes:
             self._stats.inc(f"sessions.outcomes.{each.kind}")
         if outcome.kind == "rate_limited":
@@ -285,15 +295,27 @@ class SessionLeasing:
                 sending.request,
             )
 
+    async def _release(self, lease: SessionLease, outcome: Outcome) -> bool:
+        """Release a Lease, and the proxy binding of its Session, should the pool Retire it for the outcome."""
+        released = await self.pool.release(lease, outcome)
+        if self._proxies is not None and outcome.kind in _RETIRING:
+            try:
+                await self.pool.ready_in(session=lease.session)
+            except SessionError:  # it is Retired
+                await self._proxies.unbind(lease.session)
+        return released
+
     async def _bind_proxy(self, session: Session, request: Request) -> bool:
-        """Bind a Session to an available proxy, unless the Request goes through its own; return whether it did.
+        """Bind a Session to a proxy, unless the Request goes through its own; return whether it did.
 
         Raises:
-            pernix.proxies.run_proxies.NoProxyYet: No proxy is available.
+            pernix.proxies.run_proxies.NoProxyYet: No proxy is available, or none
+                fits the Session.
         """
         if self._proxies is None or request.proxy is not None:
             return False
-        session.proxy = await self._proxies.bind(session.id, session.proxy)
+        account = None if session.account is None else self._accounts.get(session.account)
+        session.proxy = await self._proxies.bind(session.id, session.proxy, account=account)
         return True
 
     def _reporting(self, sending: Sending) -> AbstractAsyncContextManager[None]:

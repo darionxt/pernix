@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from pernix.errors import SettingsError
+from pernix.proxies import Proxy
 from pernix.secret import Secret
 from pernix.settings import ProxySettings, load_settings
 
@@ -27,3 +28,36 @@ def test_listed_proxies_that_are_not_valid_are_named_without_quoting_them() -> N
 
     assert "proxies.urls[1]: a proxy needs a port" in str(refused.value)
     assert "secret-pw" not in str(refused.value)
+
+
+def test_listed_proxies_may_be_tables_to_tag_them() -> None:
+    settings = load_settings(
+        spider_settings={"proxies.urls": ["a.example:1", {"url": "b.example:2", "tags": ["us", "residential"]}]}
+    )
+
+    assert settings.section(ProxySettings).urls == (
+        "a.example:1",
+        Proxy("b.example:2", tags=frozenset({"us", "residential"})),
+    )
+
+
+def test_a_listed_table_must_be_a_proxy_record() -> None:
+    with pytest.raises(SettingsError, match="unknown field `tag`"):
+        load_settings(spider_settings={"proxies.urls": [{"url": "b.example:2", "tag": ["us"]}]})
+    with pytest.raises(SettingsError) as refused:
+        load_settings(spider_settings={"proxies.urls": [{"url": "user:secret-pw@b.example"}]})
+
+    assert "proxies.urls[0]: a proxy needs a port" in str(refused.value)
+    assert "secret-pw" not in str(refused.value)
+
+
+def test_sessions_keep_their_proxy_with_no_limit_on_how_many_share_one_unless_set() -> None:
+    defaults = ProxySettings()
+
+    assert (defaults.max_sessions, defaults.rebind, defaults.binding) == (None, "unavailable", None)
+    assert load_settings(spider_settings={"proxies.rebind": "every_lease"}).section(ProxySettings).rebind == (
+        "every_lease"
+    )
+    for wrong in ({"proxies.max_sessions": 0}, {"proxies.rebind": "never"}):
+        with pytest.raises(SettingsError):
+            load_settings(spider_settings=wrong)

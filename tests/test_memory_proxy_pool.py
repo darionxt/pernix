@@ -1,10 +1,10 @@
-"""The in-process Proxy Pool: turns, bindings, cooldowns, Retirements, and what the sources list."""
+"""The in-process Proxy Pool: turns, candidates and bindings, cooldowns, Retirements, and what the sources list."""
 
 from __future__ import annotations
 
 import math
 
-from pernix.proxies import MemoryProxyPool, ProxyCounts
+from pernix.proxies import MemoryProxyPool, Proxy, ProxyCandidate, ProxyCounts
 from pernix.stats import Stats
 
 A, B, C = "http://a.example:8080", "http://b.example:8080", "http://c.example:8080"
@@ -23,8 +23,12 @@ async def _pool(
     *proxies: str, clock: Clock | None = None, stats: Stats | None = None, **options: float
 ) -> MemoryProxyPool:
     pool = MemoryProxyPool(clock=clock or Clock(), stats=stats, **options)  # pyright: ignore[reportArgumentType]
-    await pool.replace(proxies)
+    await pool.replace([Proxy(proxy) for proxy in proxies])
     return pool
+
+
+async def _sessions(pool: MemoryProxyPool) -> dict[str, frozenset[str]]:
+    return {candidate.url: candidate.sessions for candidate in await pool.candidates()}
 
 
 async def test_fetches_take_the_proxies_in_turn() -> None:
@@ -33,45 +37,55 @@ async def test_fetches_take_the_proxies_in_turn() -> None:
     assert [await pool.take() for _ in range(5)] == [A, B, C, A, B]
 
 
-async def test_a_session_keeps_its_proxy_and_sessions_share_one_only_when_they_must() -> None:
-    pool = await _pool(A, B)
-
-    first = await pool.bind("one", None)
-    second = await pool.bind("two", None)
-    again = await pool.bind("one", first)
-    third = await pool.bind("three", None)
-
-    assert (first, second, again) == (A, B, A)
-    assert third in (A, B)
-
-
-async def test_leases_of_one_session_that_overlap_are_given_one_proxy() -> None:
+async def test_the_candidates_are_the_proxies_listed_least_recently_used_first() -> None:
     clock = Clock()
-    pool = await _pool(A, B, C, clock=clock)
-    first = await pool.bind("one", None)
-    overlapping = await pool.bind("one", None)  # a Lease that loaded the state before the first saved its binding
-    await pool.bind("two", None)
+    pool = await _pool(A, B, C, clock=clock, max_failures=1)
+    await pool.replace([Proxy(A, tags=frozenset({"us"}), expires=NOW + 60), Proxy(B), Proxy(C)])
+    await pool.bind("one", B)
+    await pool.take()  # A, unused until now
+    await pool.report(C, failed=True, since=clock.now)
 
-    await pool.report(A, failed=True, since=clock.now)
-    rebound = await pool.bind("one", A)
-    stale = await pool.bind("one", A)  # another Lease of it, which loaded the state before the rebinding
+    assert await pool.candidates() == (
+        ProxyCandidate(C, health="retired", failures=1),
+        ProxyCandidate(B, sessions=frozenset({"one"})),
+        ProxyCandidate(A, tags=frozenset({"us"}), expires=NOW + 60),
+    )
 
-    assert (first, overlapping) == (A, A)
-    assert rebound == stale == C
 
-
-async def test_a_session_whose_proxy_cools_down_is_bound_to_another() -> None:
-    clock = Clock()
+async def test_a_session_is_bound_to_one_proxy_at_a_time_which_its_leases_share() -> None:
     stats = Stats()
-    pool = await _pool(A, B, clock=clock, stats=stats)
-    bound = await pool.bind("one", None)
-    await pool.bind("two", None)
+    pool = await _pool(A, B, stats=stats)
 
-    await pool.report(A, failed=True, since=clock.now)
+    bound = [await pool.bind("one", A), await pool.bind("one", A), await pool.bind("one", B)]
 
-    assert bound == A
-    assert await pool.bind("one", A) == B
-    assert stats.get("proxies.bindings") == 3
+    assert bound == [True, True, True]
+    assert await _sessions(pool) == {A: frozenset(), B: frozenset({"one"})}
+    assert stats.get("proxies.bindings") == 2  # keeping its proxy is no new binding
+
+
+async def test_a_session_is_bound_only_to_a_proxy_available_with_room_for_it() -> None:
+    clock = Clock()
+    pool = await _pool(A, B, C, clock=clock, max_sessions=1)
+    await pool.bind("one", A)
+    await pool.report(B, failed=True, since=clock.now)
+    await pool.replace([Proxy(A), Proxy(B)])
+
+    refused = [await pool.bind("two", A), await pool.bind("two", B), await pool.bind("two", C)]
+
+    assert refused == [False, False, False]  # full, cooling down, and no longer listed
+    assert await pool.bind("one", A)  # its own has room for it
+    assert await _sessions(pool) == {A: frozenset({"one"}), B: frozenset()}
+
+
+async def test_a_session_unbound_no_longer_counts_toward_its_proxy() -> None:
+    pool = await _pool(A, max_sessions=1)
+    await pool.bind("one", A)
+
+    await pool.unbind("one")
+    await pool.unbind("never bound")
+
+    assert await pool.bind("two", A)
+    assert await _sessions(pool) == {A: frozenset({"two"})}
 
 
 async def test_a_failure_cools_a_proxy_down_longer_with_each_in_a_row_then_retires_it() -> None:
@@ -132,14 +146,25 @@ async def test_a_proxy_no_longer_listed_is_not_used_but_keeps_its_health() -> No
     pool = await _pool(A, B, clock=clock, max_failures=1)
     await pool.report(B, failed=True, since=clock.now)
 
-    await pool.replace([A])
+    await pool.replace([Proxy(A)])
     assert [await pool.take() for _ in range(2)] == [A, A]
-    assert await pool.bind("one", B) == A
+    assert not await pool.bind("one", B)
     assert pool.health(B) is None
 
-    await pool.replace([B, C])
+    await pool.replace([Proxy(B), Proxy(C)])
     assert pool.health(B) == "retired"
     assert await pool.take() == C
+
+
+async def test_a_proxy_listed_again_takes_its_new_tags_and_the_first_given_twice_is_kept() -> None:
+    pool = await _pool()
+
+    await pool.replace([Proxy(A, tags=frozenset({"old"})), Proxy(A, tags=frozenset({"twice"}))])
+    first = await pool.candidates()
+    await pool.replace([Proxy(A, tags=frozenset({"new"}), expires=NOW)])
+
+    assert [candidate.tags for candidate in first] == [frozenset({"old"})]
+    assert [(candidate.tags, candidate.expires) for candidate in await pool.candidates()] == [(frozenset({"new"}), NOW)]
 
 
 async def test_ready_in_tells_how_long_until_one_is_available_or_that_none_ever_will_be() -> None:

@@ -9,10 +9,11 @@ import pytest
 
 from pernix import Request
 from pernix.errors import ProxyError, SessionError
-from pernix.proxies import MemoryProxyPool
+from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import StaticProxies
 from pernix.proxies.run_proxies import NoProxyYet, RunProxies
 from pernix.sending import IndependentSending
+from pernix.settings import ProxySettings
 from pernix.stats import Stats
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ async def _proxies(*urls: str, pool: MemoryProxyPool | None = None) -> RunProxie
     proxies = RunProxies(
         MemoryProxyPool() if pool is None else pool,
         [("proxies.urls", StaticProxies(urls))],
+        policy=DefaultBindingPolicy(ProxySettings()),
         refresh=None,
         stats=Stats(),
         stop=lambda: None,
