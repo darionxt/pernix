@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -14,7 +14,7 @@ from pernix import Account, Request
 from pernix.errors import ConnectError, ProxyError, SettingsError
 from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool, Proxy, ProxyCandidate
 from pernix.proxies.proxy_sources import StaticProxies
-from pernix.proxies.run_proxies import NoProxyYet, RunProxies
+from pernix.proxies.run_proxies import FollowedProxy, NoProxyYet, RunProxies
 from pernix.sending import Sending
 from pernix.settings import ProxySettings
 from pernix.stats import Stats
@@ -293,9 +293,9 @@ async def test_how_a_fetch_went_through_its_proxy_is_reported(
 class Told:
     """A binding policy keeping what it was told, and binding as the default does."""
 
-    def __init__(self) -> None:
+    def __init__(self, rebind: str = "unavailable") -> None:
         self.told: list[Binding] = []
-        self._default = DefaultBindingPolicy(ProxySettings())
+        self._default = DefaultBindingPolicy(ProxySettings(rebind=rebind))  # pyright: ignore[reportArgumentType]
 
     async def bind(self, binding: Binding) -> str | None:
         self.told.append(binding)
@@ -377,16 +377,19 @@ async def test_the_policy_is_told_of_the_session_its_account_its_proxy_and_the_c
     assert (unlisted.current, unlisted.health, unlisted.reason) == ("http://gone.example:1", None, "unlisted")
 
 
-async def test_while_no_proxy_is_available_the_policy_is_not_asked() -> None:
-    pool = MemoryProxyPool()
+async def test_while_no_proxy_is_available_a_session_the_policy_binds_to_none_waits_for_one() -> None:
+    pool = MemoryProxyPool(cooldown=30)
+    run = Run()
     policy = Told()
-    proxies = await _opened(B, pool=pool, policy=policy)
+    proxies = await _opened(B, pool=pool, policy=policy, run=run)
     await pool.report(B, failed=True, since=time.time())
 
-    with pytest.raises(NoProxyYet, match="no proxy available"):
+    with pytest.raises(NoProxyYet, match="no proxy available") as waiting:
         await proxies.bind("one", None)
 
-    assert policy.told == []
+    assert [binding.reason for binding in policy.told] == ["new"]  # asked, as it may give a proxy of its own
+    assert waiting.value.delay == pytest.approx(30, abs=1)
+    assert run.stats.get("proxies.binding_waits") is None
 
 
 async def test_sessions_no_proxy_fits_wait_counted_and_logged_once_until_bound(
@@ -451,13 +454,13 @@ async def test_a_session_whose_pick_another_took_first_is_bound_as_the_policy_pi
 
 
 class Stubborn:
-    """A binding policy that always picks one proxy."""
+    """A binding policy that always picks one proxy, or whatever it was given."""
 
-    def __init__(self, proxy: str) -> None:
+    def __init__(self, proxy: Any) -> None:
         self.proxy = proxy
         self.asked = 0
 
-    async def bind(self, binding: Binding) -> str | None:
+    async def bind(self, binding: Binding) -> Any:
         self.asked += 1
         return self.proxy
 
@@ -491,3 +494,172 @@ async def test_a_policy_that_raises_fails_the_binding() -> None:
 
     with pytest.raises(RuntimeError, match="the database is down"):
         await proxies.bind("one", None)
+
+
+async def test_a_session_kept_on_a_proxy_that_cools_down_waits_for_it(caplog: pytest.LogCaptureFixture) -> None:
+    pool = MemoryProxyPool(cooldown=30)
+    proxies = await _opened(A, B, pool=pool, policy=Told("retired"))
+    await proxies.bind("one", None)
+    await pool.report(A, failed=True, since=time.time())
+
+    with caplog.at_level(logging.INFO, logger="pernix"), pytest.raises(FollowedProxy) as following:
+        await proxies.bind("one", A)
+
+    assert following.value.until == pytest.approx(time.time() + 30, abs=1)
+    assert following.value.delay == pytest.approx(30, abs=1)
+    assert {candidate.url: candidate.sessions for candidate in await pool.candidates()}[A] == {"one"}  # still its
+    assert "The proxy of the Session 'one' is cooling down; the Session waits for it" in caplog.text
+
+
+@pytest.mark.parametrize(("gone", "said"), [("retired", "is retired"), ("unlisted", "is not listed")])
+async def test_a_session_kept_on_a_proxy_that_is_gone_is_retired_with_it(
+    gone: str, said: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = await _opened(A, B, pool=pool, policy=Told("never"))
+    await proxies.bind("one", None)
+    if gone == "unlisted":
+        await pool.replace([Proxy(B)])
+    else:
+        await pool.report(A, failed=True, since=time.time())
+
+    with caplog.at_level(logging.WARNING, logger="pernix"), pytest.raises(FollowedProxy) as following:
+        await proxies.bind("one", A)
+
+    assert following.value.until is None
+    assert f"The proxy of the Session 'one' {said}; the Session is retired with it" in caplog.text
+
+
+@pytest.mark.parametrize(("rebind", "follows"), [("unavailable", False), ("retired", True)])
+async def test_once_a_fetch_through_its_proxy_failed_the_policy_tells_whether_its_session_follows_it(
+    rebind: str, *, follows: bool
+) -> None:
+    pool = MemoryProxyPool(cooldown=30)
+    policy = Told(rebind)
+    proxies = await _opened(A, B, pool=pool, policy=policy)
+    await proxies.bind("one", None)
+
+    while_available = await proxies.following("one", A)
+    asked = len(policy.told)
+    await pool.report(A, failed=True, since=time.time())
+    followed = await proxies.following("one", A)
+
+    assert while_available is None
+    assert asked == 1  # not asked while the proxy is available
+    assert (followed is not None) == follows
+    assert policy.told[-1].reason == "cooldown"
+    if followed is not None:
+        assert followed.until == pytest.approx(time.time() + 30, abs=1)
+
+
+OWN = "http://alice:own-secret@own.example:9000"
+
+
+class OwnFor:
+    """A binding policy giving each Session it knows a proxy of its own, and the others none."""
+
+    def __init__(self, **own: str) -> None:
+        self.own = own
+        self.told: list[Binding] = []
+
+    async def bind(self, binding: Binding) -> Proxy | None:
+        self.told.append(binding)
+        url = self.own.get(binding.session)
+        return None if url is None else Proxy(url, tags=frozenset({"isp"}))
+
+
+async def test_a_policy_may_give_a_session_a_proxy_of_its_own_held_for_it_alone() -> None:
+    run = Run()
+    policy = OwnFor(one=OWN)
+    proxies = await _opened(B, policy=policy, run=run)
+
+    bound = await proxies.bind("one", None)
+    again = await proxies.bind("one", bound)
+    taken = [await proxies.take() for _ in range(2)]
+
+    assert bound == again == OWN
+    assert "own-secret" in run.masked
+    assert taken == [B, B]  # it takes no turns
+    lease = policy.told[-1]
+    assert (lease.reason, lease.current, lease.health) == ("lease", OWN, "available")
+    assert [(candidate.url, candidate.tags, candidate.own) for candidate in lease.candidates] == [
+        (B, frozenset(), False),
+        (OWN, frozenset({"isp"}), True),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("given", "error", "message"),
+    [
+        (
+            Proxy("http://alice:own-secret@own.example"),
+            ValueError,
+            "of its own that is not valid: a proxy needs a port",
+        ),
+        (Proxy(B), ValueError, "the Session 'one' as its own a proxy the Proxy Pool lists"),
+        (OWN.encode(), TypeError, "must return a proxy URL, a Proxy, or None, not bytes"),
+    ],
+    ids=["not valid", "listed", "neither"],
+)
+async def test_a_policy_giving_a_proxy_of_its_own_that_is_not_valid_or_listed_fails_the_binding(
+    given: object, error: type[Exception], message: str
+) -> None:
+    proxies = await _opened(B, policy=Stubborn(given))
+
+    with pytest.raises(error, match=message) as failed:
+        await proxies.bind("one", None)
+
+    assert "own-secret" not in str(failed.value)
+
+
+async def test_a_session_given_its_own_proxy_again_follows_it_as_any_other() -> None:
+    pool = MemoryProxyPool(cooldown=30, max_failures=2)
+    proxies = await _opened(B, pool=pool, policy=OwnFor(one=OWN))
+    await proxies.bind("one", None)
+
+    await pool.report(OWN, failed=True, since=time.time())
+    with pytest.raises(FollowedProxy) as cooling:
+        await proxies.bind("one", OWN)
+    await pool.report(OWN, failed=True, since=time.time())
+    with pytest.raises(FollowedProxy) as retired:
+        await proxies.bind("one", OWN)
+
+    assert cooling.value.until == pytest.approx(time.time() + 30, abs=1)
+    assert retired.value.until is None
+
+
+async def test_without_a_source_sessions_go_through_the_proxies_the_policy_gives_them(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run = Run()
+    proxies = run.proxies(policy=OwnFor(one=OWN))
+
+    with caplog.at_level(logging.INFO, logger="pernix"):
+        await proxies.open()
+        bound = await proxies.bind("one", None)
+        with pytest.raises(NoProxyYet) as waiting:
+            await proxies.bind("two", None)
+
+    assert bound == OWN
+    assert (waiting.value.delay, waiting.value.reason) == (1.0, "no proxy fits the Session")
+    assert _count(run.stats, "proxies.binding_waits") == 1
+    assert run.stops == 0
+    assert "No source of proxies is set; Sessions go through those the binding policy gives them" in caplog.text
+
+
+async def test_the_run_drains_for_want_of_proxies_once_no_session_has_one_of_its_own_either() -> None:
+    run = Run()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = await _opened(B, pool=pool, policy=OwnFor(one=OWN), run=run)
+    await proxies.bind("one", None)
+    await pool.report(B, failed=True, since=time.time())  # the only proxy listed is Retired
+
+    with pytest.raises(NoProxyYet) as meanwhile:
+        await proxies.bind("two", None)
+    stops = run.stops
+    await pool.report(OWN, failed=True, since=time.time())
+    with pytest.raises(NoProxyYet) as exhausted:
+        await proxies.bind("two", None)
+
+    assert (meanwhile.value.delay, stops) == (1.0, 0)  # "one" goes on through its own
+    assert (exhausted.value.delay, run.stops) == (5.0, 1)

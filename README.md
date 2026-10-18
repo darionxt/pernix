@@ -154,9 +154,9 @@ class Shop(Spider):
 
 Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart. `proxies.urls` and providers also take `Proxy` records, tables in settings, whose `tags` binding policies select them by.
 
-Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down, unless `proxies.max_sessions` limits how many share one: with 1, no two do, and the Sessions that find none wait. `proxies.rebind = "every_lease"` binds a Session to another proxy at each Lease, so its Leases go through the proxies in turn. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats.
+Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down, unless `proxies.max_sessions` limits how many share one: with 1, no two do, and the Sessions that find none wait. `proxies.rebind = "every_lease"` binds a Session to another proxy at each Lease, so its Leases go through the proxies in turn. For sites that tie an Account to one address, `proxies.rebind = "retired"` has a Session wait for its proxy while it cools down, cooling down with it, and bind it to another only once it is Retired or no longer listed, and `"never"` Retires the Session with it, while the Run goes on with the others. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats.
 
-How Sessions are bound is up to a binding policy, which `proxies.binding` replaces. Its `bind(binding)` is told of the Session, its Account, its proxy, why it is being bound, and the candidates, each with its health, tags, and Sessions, and returns the proxy to bind, or `None` to wait; the pool binds it only while it has room, and asks again if another Session took the last first:
+How Sessions are bound is up to a binding policy, which `proxies.binding` replaces. Its `bind(binding)` is told of the Session, its Account, its proxy, why it is being bound, and the candidates, each with its health, tags, and Sessions, and returns the proxy to bind, or `None` to wait; the pool binds it only while it has room, and asks again if another Session took the last first. Returning `binding.current` keeps the Session on its proxy whatever becomes of it: while the proxy cools down, the Session waits for it, and once it is Retired or no longer listed, the Session is Retired with it.
 
 ```python
 from pernix.proxies import Binding
@@ -172,7 +172,22 @@ class ByRegion:
         return next((proxy.url for proxy in binding.open if region in proxy.tags), None)
 ```
 
-With the default policy, a Session thus changes address, keeping its cookies, whenever its proxy cools down, is Retired, or is no longer listed: a refresh replaces the proxies, so with an API that answers with a new batch each time, every Session changes address at each refresh. Bindings last one Run. Sessions that wait for their own proxy rather than change address, and refreshes that add proxies rather than replace them, are not provided yet. See [`docs/design.md`](docs/design.md) §5.3.
+A policy may also give a Session a proxy of its own, which the pool does not list, by returning a `Proxy` record: an Account's own, or a sticky session on a gateway built from the Session's id. The pool holds it for that Session alone: it takes no turns, no other Session goes through it, and refreshes keep it; its password is masked in the logs, and its health kept as any other's. Such a policy needs no source, but a Session Pool:
+
+```python
+from pernix.proxies import Binding, Proxy
+
+
+class OwnAddress:
+    """Sends each Account through its own proxy, from its `proxy` column of sessions.accounts_file."""
+
+    async def bind(self, binding: Binding) -> str | Proxy | None:
+        if binding.account is None:
+            return None
+        return Proxy(binding.account.extra["proxy"].reveal())  # or f"http://user-{binding.session}:pw@gate.example:7777"
+```
+
+With the default policy, a Session thus changes address, keeping its cookies, whenever its proxy cools down, is Retired, or is no longer listed, or with `retired` once it is Retired or no longer listed: a refresh replaces the proxies, so with an API that answers with a new batch each time, every Session changes address at each refresh, or with `never` is Retired. Bindings last one Run. Refreshes that add proxies rather than replace them are not provided yet. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Running and stopping
 
@@ -215,12 +230,17 @@ pernix run myproject.spiders.books:Books                            # an import 
 pernix fetch https://example.com/ > page.html                        # headers to stderr, the body to stdout
 pernix fetch https://example.com/ --json                             # one JSON object, errors included
 pernix fetch https://example.com/ --fetcher browser                  # the page as its scripts left it
+pernix fetch https://example.com/ --extract markdown --max-chars 20000  # the main content, for a language model
+pernix fetch https://example.com/ --css "article h2" --extract text  # only the parts a selector picks
+pernix fetch -i urls.txt --json --links                             # JSON Lines, one object per URL
 pernix shell https://example.com/                                    # `await fetch(...)`, `response.css(...)`
 pernix check books.py                                                # validate settings and components
 pernix browser install                                               # install the browser engine
 ```
 
-`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `fetch` exits with 0 for any Response, 1 when fetching failed, and 2 when it cannot fetch at all, as without the browser engine. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings, without retries; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too.
+
+`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved; the browser does not render then. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
 ## Configuration
 
@@ -276,9 +296,11 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `proxies.cooldown` / `proxies.cooldown_max` | `60.0` / `600.0` | Seconds a failed proxy cools down, doubled with each failure in a row, and the longest it does |
 | `proxies.max_failures` | `5` | Failures in a row after which a proxy is Retired |
 | `proxies.max_sessions` | `None` | Sessions a proxy is bound to at most; with `1`, no two share one, and those that find none wait |
-| `proxies.rebind` | `"unavailable"` | When the default binding policy binds a Session to another proxy: once its own is `unavailable`, or at `every_lease` |
-| `proxies.binding` | `None` | A replacement binding policy, with `async bind(binding)` |
+| `proxies.rebind` | `"unavailable"` | When the default binding policy binds a Session to another proxy: once its own is `unavailable`, at `every_lease`, once it is `retired` (waiting for it while it cools down), or `never` (Retiring the Session with it) |
+| `proxies.binding` | `None` | A replacement binding policy, with `async bind(binding)`; it may give Sessions proxies of their own, with no source |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
+| `network.public_only` | `false` | Refuses hosts whose addresses are not public, after resolving them, on every redirect hop; the browser does not render meanwhile |
+| `network.allow_hosts` | `()` | Host names `network.public_only` lets through, such as an internal service |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
 | `fingerprint.sort_query` | `true` | Sort query parameters, so their order does not make a Request new |
@@ -392,7 +414,7 @@ async def test_parse():
     assert [request.url for request in outputs] == ["https://shop.example/book/1"]
 ```
 
-`pernix.testing` runs Spiders without a network. `FakeFetcher` answers Requests from canned bodies, Responses, exceptions, or functions, by URL or pattern. `crawl()` runs a Spider to completion and reports its Items and stats, without the delays that would only make a test wait, and `run_callback()` runs one Callback as a Run would. `crawl(fetcher=fake)` answers HTTP Requests only; `crawl(fetcher=fake, browser=fake)` answers rendered ones too, without starting a browser, and `make_response(url, body, browser=RenderResult(evaluated=[...]))` builds a rendered Response. `LoopbackServer`, also the `loopback_server` fixture, serves routes or a directory on 127.0.0.1 for tests that fetch for real.
+`pernix.testing` runs Spiders without a network. `FakeFetcher` answers Requests from canned bodies, Responses, exceptions, or functions, by URL or pattern. `crawl()` runs a Spider to completion and reports its Items and stats, without the delays that would only make a test wait, and with `network.public_only` off, so that it reaches a `LoopbackServer`; `run_callback()` runs one Callback as a Run would. `crawl(fetcher=fake)` answers HTTP Requests only; `crawl(fetcher=fake, browser=fake)` answers rendered ones too, without starting a browser, and `make_response(url, body, browser=RenderResult(evaluated=[...]))` builds a rendered Response. `LoopbackServer`, also the `loopback_server` fixture, serves routes or a directory on 127.0.0.1 for tests that fetch for real.
 
 Installing Pernix adds a pytest plugin that keeps the Fetchers off the network while each test and its fixtures run: only loopback hosts can be reached, redirects and the requests of rendered pages included, and a test during which another host was refused fails. curl and the browser do not use Python's sockets, so other network-blocking plugins cannot do this. Mark a test with `@pytest.mark.pernix_network` to let it reach the network, or set `pernix_network = allow` in the pytest configuration. See [`docs/design.md`](docs/design.md) §9.
 
@@ -443,6 +465,12 @@ src/pernix/
 │   ├── resource_types.py the resource types a page may be kept from loading
 │   ├── url_globs.py     URL globs, as the browser's route patterns read them
 │   └── render_result.py RenderResult and CapturedResponse: what rendering gave
+├── extraction/
+│   ├── visible_text.py  the visible text of HTML, laid out in lines as browsers do
+│   ├── markdown.py      HTML as Markdown, and a document's main content as Markdown
+│   ├── main_content.py  where a document's main content is, and what in it is boilerplate
+│   ├── links.py         the links of HTML, absolute, with their text
+│   └── elements.py      the parts of lxml elements reading HTML uses
 ├── errors.py            exception hierarchy, control-flow exceptions
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse
@@ -450,7 +478,10 @@ src/pernix/
 ├── cli/
 │   ├── __init__.py      the pernix command: main()
 │   ├── run_command.py   pernix run
-│   ├── fetch_command.py pernix fetch, and its JSON output
+│   ├── fetch_command.py pernix fetch: its options, and the Run of its URLs
+│   ├── fetch_spider.py  the Spider of pernix fetch, reporting each URL as it ends
+│   ├── fetch_output.py  JSON Lines or the Response for people, one URL at a time
+│   ├── page_reading.py  what pernix fetch reads: text, Markdown, selected parts, links, cut to size
 │   ├── shell_command.py pernix shell
 │   ├── check_command.py pernix check, launching the browser once
 │   ├── browser_command.py pernix browser install
@@ -499,6 +530,7 @@ src/pernix/
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
+│   ├── address_guard.py network.public_only: refuses hosts not on public addresses, once resolved
 │   └── streamed_response.py a Response whose body is read as it arrives
 ├── frontiers/
 │   ├── frontier.py      Frontier protocol, Lease
@@ -515,7 +547,7 @@ src/pernix/
 │   ├── proxy_url.py     proxy URLs, in the one form that tells proxies apart
 │   ├── proxy.py         Proxy, a proxy as its source gives it, with its tags
 │   ├── proxy_pool.py    ProxyPool protocol, ProxyCandidate, ProxyHealth, ProxyCounts
-│   ├── memory_proxy_pool.py MemoryProxyPool: turns, candidates, bindings, cooldowns, and Retirements
+│   ├── memory_proxy_pool.py MemoryProxyPool: turns, candidates, bindings, Sessions' own, cooldowns, and Retirements
 │   ├── binding_policy.py BindingPolicy protocol, Binding, and the default policy
 │   ├── proxy_sources.py ProxyProvider protocol; lists, files, and APIs of proxies
 │   └── run_proxies.py   the proxies of a Run: loaded, refreshed, given to fetches, bound to Sessions, and reported on

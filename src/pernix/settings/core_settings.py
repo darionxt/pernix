@@ -7,6 +7,7 @@ from pathlib import PurePath
 from typing import Annotated, Any, Literal
 
 import msgspec
+from msgspec import structs
 
 from pernix.account import ACCOUNT_FILE_SUFFIXES, Account
 from pernix.proxies.proxy import Proxy  # noqa: TC001  # msgspec resolves the field types at runtime
@@ -14,6 +15,7 @@ from pernix.proxies.proxy_url import proxy_url
 from pernix.secret import Secret  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.text_decoding import codec_for
+from pernix.urls import url_host
 
 __all__ = [
     "CORE_SECTIONS",
@@ -28,6 +30,7 @@ __all__ = [
     "FrontierSettings",
     "ItemSettings",
     "LogSettings",
+    "NetworkSettings",
     "ProxySettings",
     "ResponseSettings",
     "RetrySettings",
@@ -171,12 +174,14 @@ class SessionSettings(Section):
 class ProxySettings(Section):
     """Settings of the proxies Requests are sent through.
 
-    Proxies are used once a source is set; the proxies of every source are used
-    together. A Session is bound to one, as `binding` picks it: by default, it
-    keeps the one it is bound to while that is available. A Request without a
-    Session goes through the next one, in turn; `Request(proxy=...)` goes through
-    its own instead. A proxy that fails cools down, longer with each failure in a
-    row, and is Retired after `max_failures` in a row. A proxy is a URL such as
+    Proxies are used once a source or a `binding` is set; the proxies of every
+    source are used together. A Session is bound to one, as `binding` picks it: by
+    default, it keeps the one it is bound to while that is available; a `binding`
+    may also give a Session a proxy of its own, so that one without a source gives
+    the Sessions of a Session Pool their proxies. A Request without a Session goes
+    through the next one, in turn; `Request(proxy=...)` goes through its own
+    instead. A proxy that fails cools down, longer with each failure in a row, and
+    is Retired after `max_failures` in a row. A proxy is a URL such as
     `http://user:password@proxy:8080`, or `proxy:8080` for HTTP, with its port; its
     key is all of it, so that sticky sessions on one gateway, which differ only in
     their credentials, stay apart.
@@ -203,7 +208,9 @@ class ProxySettings(Section):
         rebind: When the default `binding` binds a Session to another proxy:
             `unavailable` once its proxy cools down, is Retired, or is no longer
             listed; `every_lease` at each Lease, so its Leases go through the
-            proxies in turn.
+            proxies in turn; `retired` only once its proxy is Retired or no longer
+            listed, the Session cooling down with its proxy meanwhile; `never`,
+            the Session cooling down with its proxy, and Retired with it.
         binding: A replacement binding policy, a `pernix.proxies.BindingPolicy`
             with `async bind(binding)`, as an object, a class building one, or an
             import path; `None` for the default policy.
@@ -220,7 +227,7 @@ class ProxySettings(Section):
     cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 600.0
     max_failures: Annotated[int, msgspec.Meta(ge=1)] = 5
     max_sessions: Annotated[int, msgspec.Meta(ge=1)] | None = None
-    rebind: Literal["unavailable", "every_lease"] = "unavailable"
+    rebind: Literal["unavailable", "every_lease", "retired", "never"] = "unavailable"
     binding: Any = None
 
     def __post_init__(self) -> None:
@@ -235,6 +242,11 @@ class ProxySettings(Section):
 
     @property
     def enabled(self) -> bool:
+        """Whether proxies are used: a source of proxies, or a binding policy, is set."""
+        return self.sourced or self.binding is not None
+
+    @property
+    def sourced(self) -> bool:
         """Whether a source of proxies is set."""
         return bool(self.urls) or self.file is not None or self.api is not None or self.provider is not None
 
@@ -258,6 +270,49 @@ class ResponseSettings(Section):
         except LookupError:
             key = self.key("default_encoding")
             raise ValueError(f"{key}: unknown encoding {self.default_encoding!r}") from None
+
+
+class NetworkSettings(Section):
+    """Settings of the hosts Requests may reach.
+
+    Attributes:
+        public_only: Refuse hosts whose addresses are not public: private, loopback,
+            link-local, and others that are not publicly routable, as fetching
+            untrusted links calls for. The HTTP Fetcher resolves the host of every
+            redirect hop, the first included, before it is sent, and connects only
+            to the addresses it checked; through a proxy, which resolves hosts
+            itself, only hosts written as addresses, and loopback names, are
+            checked. The browser Fetcher refuses to render while it is on, as the
+            browser resolves hosts itself. A refused hop raises `NetworkBlocked`.
+        allow_hosts: Host names reached whatever their addresses, such as an
+            internal service, each matched exactly.
+    """
+
+    __prefix__ = "network"
+
+    public_only: bool = False
+    allow_hosts: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        hosts: list[str] = []
+        for host in self.allow_hosts:
+            name = _host_name(host)
+            if name is None:
+                raise ValueError(
+                    f"{self.key('allow_hosts')}: {host!r} is not a host name; write one alone, such as "
+                    "'wiki.example', without a scheme or a port"
+                )
+            hosts.append(name)
+        structs.force_setattr(self, "allow_hosts", tuple(hosts))
+
+
+def _host_name(host: str) -> str | None:
+    """A host name as `pernix.urls.url_host()` reads it from a URL; `None` for anything but a host alone."""
+    host = host.strip()
+    bracketed = host.startswith("[") and host.endswith("]")
+    if not host or any(char in host for char in "/?#@\\") or (":" in host and not bracketed):
+        return None
+    return url_host(f"//{host}")
 
 
 class FrontierSettings(Section):
@@ -493,6 +548,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     CoreSettings,
     EventSettings,
     ResponseSettings,
+    NetworkSettings,
     FrontierSettings,
     FingerprintSettings,
     RetrySettings,

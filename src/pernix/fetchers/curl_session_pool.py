@@ -16,7 +16,7 @@ from pernix.errors import ResponseTooLarge
 from pernix.fetchers.redirects import REDIRECT_STATUSES
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Sequence
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
@@ -76,6 +76,7 @@ class _Start:
     limit: int | None
     cookie: str | None
     on_headers: HeadersCallback | None
+    resolve: Sequence[str] = ()
     transfer: Transfer | None = None
 
 
@@ -98,7 +99,8 @@ class CurlSession(AsyncSession):
     request is cancelled. The header callback reports the `Set-Cookie` headers of the
     response as they arrive, and lifts the limit for the body of a redirect. The
     `Cookie` header a request is started with is set once curl-cffi has cleared the
-    cookies of curl's own cookie engine, which then adds none.
+    cookies of curl's own cookie engine, which then adds none, and the addresses it
+    is to connect to are set with its URL.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -118,6 +120,7 @@ class CurlSession(AsyncSession):
         body_limit: int | None,
         cookie: str | None = None,
         on_headers: HeadersCallback | None = None,
+        resolve: Sequence[str] = (),
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
@@ -133,6 +136,9 @@ class CurlSession(AsyncSession):
             on_headers: Called at the end of the headers of the response, unless it
                 is informational, with the URL it answered and its `Set-Cookie`
                 values; an error it raises is logged.
+            resolve: `CURLOPT_RESOLVE` entries, such as `+example.com:443:192.0.2.7`:
+                curl connects to those addresses for those hosts and ports instead
+                of resolving them.
             **options: The options of `AsyncSession.request()`, but `stream` and
                 `cookies`.
 
@@ -144,7 +150,7 @@ class CurlSession(AsyncSession):
             pernix.errors.ResponseTooLarge: The limit stopped the transfer before the
                 headers came back.
         """
-        start = _Start(url, body_limit, cookie, on_headers)
+        start = _Start(url, body_limit, cookie, on_headers, resolve)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -186,7 +192,7 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
     """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and report cookies.
 
     It also sets the `Cookie` header of the request once curl-cffi has cleared the
-    cookies the handle held.
+    cookies the handle held, and the addresses its hosts resolve to with its URL.
     """
 
     def watched_setopt(option: CurlOpt, value: Any) -> int:
@@ -210,6 +216,10 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
         elif option == CurlOpt.COOKIELIST and value == "ALL" and start.cookie:
             result = setopt(option, value)
             setopt(CurlOpt.COOKIE, start.cookie)
+            return result
+        elif option == CurlOpt.URL and start.resolve:
+            result = setopt(option, value)
+            setopt(CurlOpt.RESOLVE, list(start.resolve))
             return result
         return setopt(option, value)
 
