@@ -281,9 +281,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
 | `items.failed_output` | `None` | The JSON-lines file where `FailedItemsFile` writes failed Items, with the error |
 | `http.impersonate` | `"chrome150"` | The browser Profile HTTP requests impersonate, a pinned version; `Request(impersonate=...)` overrides it |
-| `http.timeout` | `30.0` | Seconds to connect and receive the headers, and between two pieces of the body |
+| `http.timeout` | `30.0` | Seconds to connect and receive the headers, those of each redirect apart, and between two pieces of the body |
 | `http.deadline` | `180.0` | Seconds a whole fetch may take, waiting for a connection included |
-| `http.max_redirects` | `20` | Redirects followed at most |
+| `http.max_redirects` | `20` | Redirects followed at most, as browsers follow them, before `TooManyRedirects` |
 | `http.max_body_size` | `104857600` | Bytes a body may have at most (100 MiB); `0` for no limit |
 | `http.pool_size` / `http.pool_idle` | `8` / `300.0` | curl sessions kept, one per Profile, and seconds one is kept unused |
 | `browser.headless` | `true` | Runs the browser without a window, in Chrome's new headless mode |
@@ -455,7 +455,9 @@ src/pernix/
 ├── fetchers/
 │   ├── fetcher.py       Fetcher and StreamingFetcher protocols
 │   ├── fetcher_dispatch.py picks the Fetcher of each Request; opens streamed transfers
-│   ├── http_fetcher.py  curl-cffi HTTP Fetcher
+│   ├── http_fetcher.py  curl-cffi HTTP Fetcher, following redirects one hop at a time
+│   ├── redirects.py     which responses redirect, where to, and how the request changes, as in browsers
+│   ├── chain_cookies.py the cookies of a fetch, sent to each redirect hop in Chrome's order
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch

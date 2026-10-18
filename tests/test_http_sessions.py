@@ -117,10 +117,10 @@ async def test_each_redirect_hop_gets_the_session_cookies_matching_it(cookie_ser
     async with HTTPFetcher() as fetcher:  # through the server as a proxy, for any host name
         await fetcher.fetch(Request("http://a.example.test/start", proxy=cookie_server.proxy), session=session)
 
-    assert [(hop.host, sorted(_sent(hop.cookies))) for hop in cookie_server.received] == [
-        ("a.example.test", ["everywhere=1", "here=1"]),
+    assert [(hop.host, _sent(hop.cookies)) for hop in cookie_server.received] == [
+        ("a.example.test", ["everywhere=1", "here=1"]),  # not by domain length, as curl alone orders them
         ("b.example.test", ["end_only=1", "everywhere=1"]),
-    ]  # sorted, as curl orders them by domain length too, unlike a browser
+    ]
 
 
 async def test_the_cookies_of_an_international_host_go_back_to_it_however_it_is_written(
@@ -162,20 +162,21 @@ async def test_cookies_set_on_every_hop_are_kept_in_the_session(cookie_server: C
     assert dict(response.cookies) == {"shared": "1", "start": "", "end": "1"}
 
 
-async def test_the_requests_own_cookies_win_and_are_not_kept(cookie_server: CookieServer) -> None:
+async def test_the_requests_own_cookies_win_in_place_and_are_not_kept(cookie_server: CookieServer) -> None:
     session = Session(
         cookies=[
-            Cookie(name="lang", value="fr", domain="127.0.0.1"),
-            Cookie(name="kept", value="1", domain="127.0.0.1"),
+            Cookie(name="lang", value="fr", domain="127.0.0.1", created=1.0),
+            Cookie(name="kept", value="1", domain="127.0.0.1", created=2.0),
+            Cookie(name="deep", value="1", domain="127.0.0.1", path="/page", created=3.0),
         ]
     )
 
     async with HTTPFetcher() as fetcher:
-        await fetcher.fetch(Request(cookie_server.url("/"), cookies={"lang": "en", "extra": "1"}), session=session)
+        await fetcher.fetch(Request(cookie_server.url("/page"), cookies={"extra": "1", "lang": "en"}), session=session)
 
     [received] = cookie_server.received
-    assert sorted(_sent(received.cookies)) == ["extra=1", "kept=1", "lang=en"]
-    assert [(cookie.name, cookie.value) for cookie in session.cookies] == [("lang", "fr"), ("kept", "1")]
+    assert _sent(received.cookies) == ["deep=1", "lang=en", "kept=1", "extra=1"]
+    assert [(cookie.name, cookie.value) for cookie in session.cookies] == [("lang", "fr"), ("kept", "1"), ("deep", "1")]
 
 
 async def test_the_session_proxy_applies_unless_the_request_names_its_own(
@@ -257,7 +258,7 @@ async def test_cookies_are_kept_once_the_headers_arrived() -> None:
     assert [cookie.name for cookie in session.cookies] == ["seen"]
 
 
-async def test_session_cookies_a_cookie_line_cannot_carry_are_left_out(cookie_server: CookieServer) -> None:
+async def test_session_cookies_a_header_cannot_carry_are_left_out(cookie_server: CookieServer) -> None:
     session = Session(
         cookies=[
             Cookie(name="tab", value="a\tb", domain="127.0.0.1"),
@@ -269,7 +270,7 @@ async def test_session_cookies_a_cookie_line_cannot_carry_are_left_out(cookie_se
     async with HTTPFetcher() as fetcher:
         await fetcher.fetch(Request(cookie_server.url("/")), session=session)
 
-    assert cookie_server.received[0].cookies == ["ok=1"]
+    assert cookie_server.received[0].cookies == ["tab=a\tb; ok=1"]  # a tab is no control character a cookie avoids
 
 
 async def test_cookies_set_before_a_failing_hop_are_kept(server: LoopbackServer) -> None:
@@ -327,18 +328,19 @@ async def test_informational_responses_set_no_cookies(cookie_server: CookieServe
     assert [cookie.name for cookie in session.cookies] == ["final"]
 
 
-async def test_cookies_belong_to_the_host_curl_requested(cookie_server: CookieServer) -> None:
+async def test_a_redirect_goes_to_the_host_browsers_read_in_its_location(cookie_server: CookieServer) -> None:
     other = (
-        f"http://trusted.localhost\\@evil.localhost:{cookie_server.port}/end"  # WHATWG URLs would say trusted.localhost
+        f"http://evil.localhost:{cookie_server.port}\\@trusted.localhost/end"  # curl alone would say trusted.localhost
     )
     cookie_server.routes["/start"] = [("Location", other)]
-    cookie_server.routes["/end"] = [("Set-Cookie", "planted=1")]
+    cookie_server.routes["/@trusted.localhost/end"] = [("Set-Cookie", "planted=1")]
     session = Session()
 
     async with HTTPFetcher() as fetcher:
-        await fetcher.fetch(Request(cookie_server.url("/start")), session=session)
+        response = await fetcher.fetch(Request(cookie_server.url("/start")), session=session)
 
-    assert cookie_server.received[-1].host.split(":")[0] == "evil.localhost"
+    assert cookie_server.received[-1].host == f"evil.localhost:{cookie_server.port}"
+    assert response.url == f"http://evil.localhost:{cookie_server.port}/@trusted.localhost/end"
     assert [(cookie.name, cookie.domain) for cookie in session.cookies] == [("planted", "evil.localhost")]
 
 
@@ -379,3 +381,25 @@ async def test_cookies_of_an_international_host_are_kept_under_its_ascii_name(
         await fetcher.fetch(Request(cookie_server.url("/", host=host)), session=session)
 
     assert [(cookie.name, cookie.domain) for cookie in session.cookies] == [("a", domain)]
+
+
+async def test_session_cookies_match_the_path_as_it_is_sent(cookie_server: CookieServer) -> None:
+    session = Session(cookies=[Cookie(name="scoped", value="1", domain="127.0.0.1", path="/caf%C3%A9")])
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/café")), session=session)
+
+    assert [(hop.path, hop.cookies) for hop in cookie_server.received] == [("/caf%C3%A9", ["scoped=1"])]
+
+
+async def test_cookies_beyond_ascii_are_kept_as_text_and_sent_back_byte_for_byte(cookie_server: CookieServer) -> None:
+    cookie_server.routes["/start"] = [("Location", "/end"), ("Set-Cookie", "name=café")]  # sent in UTF-8
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/start")), session=session)
+        await fetcher.fetch(Request(cookie_server.url("/later")), session=session)
+
+    sent = [[field.encode("latin-1") for field in hop.cookies] for hop in cookie_server.received]  # read as Latin-1
+    assert sent == [[], [b"name=caf\xc3\xa9"], [b"name=caf\xc3\xa9"]]  # on the way, and to a later fetch
+    assert [(cookie.name, cookie.value) for cookie in session.cookies] == [("name", "café")]

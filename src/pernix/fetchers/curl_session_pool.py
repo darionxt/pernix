@@ -7,22 +7,19 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
-from urllib.parse import urljoin
 
-from ada_url import URL
 from curl_cffi import Curl, CurlInfo, CurlOpt
 from curl_cffi.curl import CURL_WRITEFUNC_ERROR, CURL_WRITEFUNC_PAUSE, CURLPAUSE_CONT
 from curl_cffi.requests import AsyncSession
 
-from pernix.errors import NetworkBlocked, ResponseTooLarge
+from pernix.errors import ResponseTooLarge
+from pernix.fetchers.redirects import REDIRECT_STATUSES
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Sequence
+    from collections.abc import AsyncGenerator, Callable
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
-
-    from pernix.fetchers.network_guard import NetworkGuard
 
 __all__ = ["BUFFER_SIZE", "CurlSession", "CurlSessionPool", "Transfer"]
 
@@ -41,13 +38,13 @@ class Transfer:
 
     Attributes:
         curl: The handle.
-        limit: Bytes of body it may deliver; `None` for no limit.
+        limit: Bytes of body it may deliver; `None` for no limit, as for the body of
+            a redirect, which is dropped.
         received: Bytes of body delivered so far, decoded.
         buffered: Bytes of body delivered but not read yet.
         exceeded: Whether the limit stopped it.
         paused: Whether curl stopped receiving until more is read.
         returned: Whether the handle went back to the session's pool.
-        blocked: The redirect the network guard refused, which stopped it.
     """
 
     curl: Curl
@@ -57,7 +54,6 @@ class Transfer:
     exceeded: bool = False
     paused: bool = False
     returned: bool = False
-    blocked: str | None = None
 
     def read(self, size: int) -> None:
         """Note that bytes of body were read, resuming curl once few enough wait.
@@ -78,14 +74,13 @@ class Transfer:
 class _Start:
     url: str
     limit: int | None
-    guard: NetworkGuard | None
-    cookie_lines: Sequence[str]
+    cookie: str | None
     on_headers: HeadersCallback | None
     transfer: Transfer | None = None
 
 
 type HeadersCallback = Callable[[str, list[str]], object]
-"""Called with the URL of each response a transfer receives and its `Set-Cookie` values."""
+"""Called with the URL a transfer requested and the `Set-Cookie` values of its response."""
 
 _starting: ContextVar[_Start | None] = ContextVar("pernix_curl_start", default=None)
 """The request the current task is starting with `CurlSession.start()`, if any."""
@@ -100,11 +95,10 @@ class CurlSession(AsyncSession):
     `push_curl()` hooks of curl-cffi's handle pool. The handle's write callback counts
     the body, failing the transfer past the limit, and pauses curl while
     `BUFFER_SIZE` bytes wait to be read; the handle is removed from curl when the
-    request is cancelled. The header callback follows the responses of each redirect
-    hop: it reports their `Set-Cookie` headers as they arrive, and under a network
-    guard it stops a transfer before curl follows a redirect the guard refuses. The
-    cookie lines a request is started with are loaded once curl-cffi has cleared the
-    cookies the handle held.
+    request is cancelled. The header callback reports the `Set-Cookie` headers of the
+    response as they arrive, and lifts the limit for the body of a redirect. The
+    `Cookie` header a request is started with is set once curl-cffi has cleared the
+    cookies of curl's own cookie engine, which then adds none.
     """
 
     def __init__(self, **options: Any) -> None:
@@ -122,8 +116,7 @@ class CurlSession(AsyncSession):
         url: str,
         *,
         body_limit: int | None,
-        guard: NetworkGuard | None = None,
-        cookie_lines: Sequence[str] = (),
+        cookie: str | None = None,
         on_headers: HeadersCallback | None = None,
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
@@ -133,12 +126,13 @@ class CurlSession(AsyncSession):
             method: The HTTP method.
             url: The URL.
             body_limit: Bytes of body the transfer may deliver; `None` for no limit.
-            guard: The network guard every redirect must pass, if any.
-            cookie_lines: Cookies for curl's cookie engine, as lines of its cookie
-                file format, loaded in this order.
-            on_headers: Called at the end of the headers of each response but
-                informational ones, redirects included, with the URL it answered and
-                its `Set-Cookie` values; an error it raises is logged.
+                The body of a redirect, which is dropped, is not limited.
+            cookie: The cookies to send, as the value of a `Cookie` header, which
+                curl sends as one header over HTTP/1.1 and as a `cookie` field each
+                over HTTP/2; `None` for none.
+            on_headers: Called at the end of the headers of the response, unless it
+                is informational, with the URL it answered and its `Set-Cookie`
+                values; an error it raises is logged.
             **options: The options of `AsyncSession.request()`, but `stream` and
                 `cookies`.
 
@@ -149,9 +143,8 @@ class CurlSession(AsyncSession):
             curl_cffi.CurlError: The transfer failed before the headers arrived.
             pernix.errors.ResponseTooLarge: The limit stopped the transfer before the
                 headers came back.
-            pernix.errors.NetworkBlocked: The guard refused a redirect.
         """
-        start = _Start(url, body_limit, guard, cookie_lines, on_headers)
+        start = _Start(url, body_limit, cookie, on_headers)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -163,10 +156,6 @@ class CurlSession(AsyncSession):
         except Exception as exc:
             if start.transfer is not None and start.transfer.exceeded:
                 raise ResponseTooLarge(f"the body of {url} exceeds {body_limit} bytes") from exc
-            if start.transfer is not None and start.transfer.blocked is not None:
-                raise NetworkBlocked(
-                    f"the network guard refused the redirect from {url} to {start.transfer.blocked}"
-                ) from exc
             raise
         finally:
             _starting.reset(token)
@@ -194,37 +183,33 @@ class CurlSession(AsyncSession):
 
 
 def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _Start) -> Callable[[CurlOpt, Any], int]:
-    """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and check redirects.
+    """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and report cookies.
 
-    It also loads the cookie lines of the request once curl-cffi has cleared the
+    It also sets the `Cookie` header of the request once curl-cffi has cleared the
     cookies the handle held.
     """
-    watching = start.guard is not None or start.on_headers is not None
 
     def watched_setopt(option: CurlOpt, value: Any) -> int:
         if option == CurlOpt.WRITEFUNCTION and callable(value):
             write: Callable[[bytes], Any] = value
-            limit = transfer.limit
 
             def metered(chunk: bytes) -> Any:
                 if transfer.buffered >= BUFFER_SIZE:
                     transfer.paused = True
                     return CURL_WRITEFUNC_PAUSE  # curl keeps the chunk, and delivers it again once resumed
                 transfer.received += len(chunk)
-                if limit is not None and transfer.received > limit:
+                if transfer.limit is not None and transfer.received > transfer.limit:
                     transfer.exceeded = True
                     return CURL_WRITEFUNC_ERROR  # curl stops receiving at once
                 transfer.buffered += len(chunk)
                 return write(chunk)
 
             value = metered
-        elif option == CurlOpt.HEADERDATA and watching:
-            # A header function, unlike the buffer's write(), can fail the transfer by its return value.
-            option, value = CurlOpt.HEADERFUNCTION, _HeaderWatch(value, start, transfer)
-        elif option == CurlOpt.COOKIELIST and value == "ALL":
+        elif option == CurlOpt.HEADERDATA:
+            option, value = CurlOpt.HEADERFUNCTION, _HeaderWatch(value, start.on_headers, transfer)
+        elif option == CurlOpt.COOKIELIST and value == "ALL" and start.cookie:
             result = setopt(option, value)
-            for line in start.cookie_lines:
-                setopt(CurlOpt.COOKIELIST, line)
+            setopt(CurlOpt.COOKIE, start.cookie)
             return result
         return setopt(option, value)
 
@@ -232,32 +217,32 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
 
 
 class _HeaderWatch:
-    """Writes the response headers of one transfer to curl-cffi's buffer, following the response of each hop.
+    """Writes the response headers of one transfer to curl-cffi's buffer, reporting their cookies.
 
-    At the end of the headers of each response, it reports the URL curl requested
-    for it and its `Set-Cookie` values. curl unfolds folded lines itself; one that
-    gets through still continues the header before it. Informational
-    responses and 407s, which answer for a proxy, are not reported, nor are headers
-    after the body, trailers. curl follows a redirect after delivering the headers of
-    the response, so failing the callback on a `Location` the guard refuses stops the
-    transfer before curl connects to it.
+    At the end of the headers of the response, it reports the URL curl requested for
+    it and its `Set-Cookie` values, decoded as UTF-8 unless their bytes are not UTF-8,
+    then as Latin-1. curl unfolds folded lines itself; one that gets
+    through still continues the header before it. Informational responses and 407s,
+    which answer for a proxy, are not reported, nor are headers after the body,
+    trailers. The headers of a redirect, a redirect status with a `Location`, lift
+    the limit of the transfer before curl delivers its body.
     """
 
-    def __init__(self, buffer: Any, start: _Start, transfer: Transfer) -> None:
+    def __init__(self, buffer: Any, on_headers: HeadersCallback | None, transfer: Transfer) -> None:
         self._buffer = buffer
-        self._guard = start.guard
-        self._on_headers = start.on_headers
+        self._on_headers = on_headers
         self._transfer = transfer
         self._status = 0
         self._set_cookies: list[str] = []
         self._in_set_cookie = False
+        self._located = False
 
     def __call__(self, line: bytes) -> int:
         text = line.decode("latin-1").strip()
         if text.startswith("HTTP/"):
             code = text.split(maxsplit=2)[1:2]
             self._status = int(code[0]) if code and code[0].isdigit() else 0
-            self._set_cookies, self._in_set_cookie = [], False
+            self._set_cookies, self._in_set_cookie, self._located = [], False, False
         elif not text:
             self._end()
         elif self._status < 200:  # an informational response, or trailers
@@ -271,54 +256,39 @@ class _HeaderWatch:
             self._in_set_cookie = name == "set-cookie"
             if self._in_set_cookie:
                 self._set_cookies.append(value)
-            elif name == "location" and 300 <= self._status < 400 and not self._admitted(value):
-                return CURL_WRITEFUNC_ERROR  # curl stops the transfer
+            elif name == "location" and value:
+                self._located = True
         self._buffer.write(line)
         return len(line)
 
     def _url(self) -> str:
-        """The URL curl requested for the response it is receiving, which names international hosts in UTF-8."""
+        """The URL curl requested for the response it is receiving, with its path as curl normalized it."""
         effective = cast("bytes", self._transfer.curl.getinfo(CurlInfo.EFFECTIVE_URL))
         return effective.decode("utf-8", "replace")  # a host left unreadable takes no cookies
 
     def _end(self) -> None:
-        """End the headers of a response, reporting its cookies."""
+        """End the headers of a response, reporting its cookies, and lifting the limit for the body of a redirect."""
+        if self._status in REDIRECT_STATUSES and self._located:
+            self._transfer.limit = None
         if self._status >= 200 and self._status != 407 and self._on_headers is not None and self._set_cookies:
             url = self._url()
             try:
-                self._on_headers(url, self._set_cookies)
+                self._on_headers(url, [_text(value) for value in self._set_cookies])
             except Exception:
                 logger.exception("Handling the Set-Cookie headers of %s failed", url)
         if self._status >= 200:
             self._status = 0  # what follows the body is no response
 
-    def _admitted(self, location: str) -> bool:
-        """Whether the guard, if any, admits the URL a redirect leads to.
 
-        urllib and WHATWG resolve some Locations to different hosts, such as
-        `http:///other.example/`, which curl, like WHATWG, takes as a host. Both
-        results must be admitted, and a Location WHATWG cannot parse is refused.
-        """
-        if self._guard is None:
-            return True
-        base = self._url()
-        targets: list[str] = []
-        for join in (urljoin, _whatwg_join):
-            try:
-                targets.append(join(base, location))
-            except ValueError:
-                targets.append(location)  # refused below, as it names no host the guard admits
-        for url in dict.fromkeys(targets):
-            try:
-                self._guard.check(url)
-            except NetworkBlocked:
-                self._transfer.blocked = url
-                return False
-        return True
+def _text(value: str) -> str:
+    """A header value read as Latin-1, decoded as UTF-8 instead, unless its bytes are not UTF-8.
 
-
-def _whatwg_join(base: str, url: str) -> str:
-    return URL(url, base).href
+    Cookies are sent encoded as UTF-8, so those received as UTF-8 go back byte for byte.
+    """
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except UnicodeDecodeError:
+        return value
 
 
 @dataclass(slots=True)
