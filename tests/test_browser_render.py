@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import struct
 from typing import TYPE_CHECKING
 
@@ -10,8 +11,9 @@ import pytest
 
 from pernix import Request, Session
 from pernix.browser import Click, Evaluate, Render, Screenshot, Scroll, Type, WaitFor
-from pernix.errors import ActionError, ActionTimeout, Timeout
+from pernix.errors import ActionError, ActionTimeout, ConnectError, NetworkBlocked, Timeout
 from pernix.fetchers import BrowserFetcher, BrowserSettings
+from pernix.fetchers.network_guard import blocking_network
 
 if TYPE_CHECKING:
     from pernix.response import Response
@@ -282,6 +284,22 @@ async def test_an_optional_action_that_fails_is_logged_and_skipped(
     assert all("going on, as the action is optional" in record.getMessage() for record in caplog.records)
 
 
+async def test_type_types_after_what_an_element_holds(server: LoopbackServer) -> None:
+    page = (
+        "<input id='q' value='old'><textarea id='notes'>first\nsecond</textarea>"
+        "<div id='edit' contenteditable>kept</div>"
+    )
+    server.route("/", page, headers=HTML)
+    read = Evaluate("() => ['q', 'notes'].map(id => document.getElementById(id).value).concat(edit.textContent)")
+
+    response = await _fetch(
+        server.url("/"), Render(actions=[Type("#q", "new"), Type("#notes", "!"), Type("#edit", "+"), read])
+    )
+
+    assert response.browser is not None
+    assert response.browser.evaluated == (["oldnew", "first\nsecond!", "kept+"],)
+
+
 async def test_typed_text_stays_out_of_errors_logs_and_reprs(
     server: LoopbackServer, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -328,6 +346,28 @@ async def test_an_action_whose_navigation_shows_no_document_keeps_the_page(serve
     assert response.browser is not None
     assert response.browser.document is not None
     assert (response.browser.document.status, response.browser.document.body) == (200, page.encode())
+
+
+async def test_an_action_leading_to_a_page_that_does_not_load_fails(server: LoopbackServer) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as listening:
+        closed = f"http://127.0.0.1:{listening.getsockname()[1]}/next"
+    server.route("/", f"<a href='{closed}'>next</a>", headers=HTML)
+
+    with pytest.raises(
+        ConnectError,
+        match=r"the page of .* navigated to http://127\.0\.0\.1:\d+/next, which did not load: net::ERR_CONN",
+    ):
+        await _fetch(server.url("/"), Render(actions=[Click("a")]))
+
+
+async def test_an_action_leading_to_a_refused_host_is_blocked(server: LoopbackServer) -> None:
+    server.route("/", "<a href='http://192.0.2.1/next'>next</a>", headers=HTML)
+
+    async with BrowserFetcher() as fetcher:
+        with blocking_network() as guard, pytest.raises(NetworkBlocked, match=r"refused http://192\.0\.2\.1/next, on"):
+            await fetcher.fetch(_rendered(server.url("/"), Render(actions=[Click("a")])))
+
+    assert guard.blocked == ["http://192.0.2.1/next"]
 
 
 SERVICE_WORKER = """self.addEventListener("install", () => self.skipWaiting());

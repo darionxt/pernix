@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 
 _SCROLL = "() => window.scrollTo(0, document.scrollingElement.scrollHeight)"
 
+_CARET_AT_END = """element => {
+  element.focus();
+  if ("setSelectionRange" in element) {
+    try { element.setSelectionRange(element.value.length, element.value.length); } catch {}  // such as type=email
+  } else if (element.isContentEditable) {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+  }
+}"""
+"""Focuses an element with the caret after what it holds, where typing then goes; a focused one keeps its caret."""
+
 
 @dataclass(slots=True)
 class ActionOutputs:
@@ -90,7 +104,10 @@ async def _run(page: Page, action: Action, outputs: ActionOutputs, seconds: floa
         raise ActionTimeout(f"{label} on {url} took longer than {seconds} s") from None
     except PageError as exc:
         message = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-        raise ActionError(f"{label} on {url} failed: {message}") from exc
+        error = ActionError(f"{label} on {url} failed: {message}")
+        if isinstance(action, Type):
+            raise error from None  # the browser's call log, past the first line, holds the text typed
+        raise error from exc
 
 
 async def _perform(page: Page, action: Action, outputs: ActionOutputs, seconds: float) -> None:
@@ -102,7 +119,9 @@ async def _perform(page: Page, action: Action, outputs: ActionOutputs, seconds: 
         case Click(selector=selector):
             await page.locator(selector).first.click(timeout=milliseconds)
         case Type(selector=selector, text=text, delay=delay):
-            await page.locator(selector).first.press_sequentially(text, delay=delay * 1000, timeout=milliseconds)
+            element = page.locator(selector).first
+            await element.evaluate(_CARET_AT_END, timeout=milliseconds)
+            await element.press_sequentially(text, delay=delay * 1000, timeout=milliseconds)
         case Scroll(times=times, delay=delay):
             for _ in range(times):
                 async with asyncio.timeout(seconds):

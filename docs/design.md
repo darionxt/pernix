@@ -260,7 +260,7 @@ Page interaction comes in three layers; use whichever you need:
 
 **Results** (`response.browser`, a `RenderResult`, on every Response of the browser Fetcher):
 
-- `document`: the main document as it came over the network, before its scripts ran, as a `CapturedResponse(url, status, headers, body)`; the rendered HTML is `body`. When an action leads to another document, such as a `Click` on a link, the Response, its status, headers, and history included, describes the document it led to; a navigation that shows no document, such as one answered with a 204 or a download, leaves the page as it was.
+- `document`: the main document as it came over the network, before its scripts ran, as a `CapturedResponse(url, status, headers, body)`; the rendered HTML is `body`. When an action leads to another document, such as a `Click` on a link, the Response, its status, headers, and history included, describes the document it led to; a navigation that shows no document, such as one answered with a 204 or a download, leaves the page as it was. A navigation of the page, by an action or by its own scripts, to a document that does not load fails the fetch with the `FetchError` of the browser's error, such as a `ConnectError`, as loading it would, and one the network guard refuses raises `NetworkBlocked`.
 - `captured`: the `CapturedResponse`s of `capture`.
 - `screenshots`: PNGs in the order taken, that of `screenshot=True` last.
 - `evaluated`: the results of the `Evaluate` actions, in order.

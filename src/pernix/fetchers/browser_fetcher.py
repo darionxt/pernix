@@ -361,6 +361,10 @@ class BrowserFetcher:
             raise FetchError(f"loading {request.url} gave no document")
         action_timeout = self._settings.action_timeout
         outputs = await run_render(page, load.render, action_timeout=action_timeout, url=request.url)
+        if watch.refused is not None:
+            raise _refused(watch.refused, request) from None
+        if watch.failed is not None:
+            raise _failed_navigation(watch.failed, request) from None
         document = watch.shown or document  # an action may have led to another one
         result = RenderResult(
             document=await captured_response(document),
@@ -391,10 +395,7 @@ class BrowserFetcher:
 
         request = load.request
         if watch.refused is not None:
-            raise NetworkBlocked(
-                f"the network guard refused {watch.refused}, on the way to {request.url}: only loopback hosts, "
-                "such as 127.0.0.1 and localhost, may be reached while it is on"
-            ) from None
+            raise _refused(watch.refused, request) from None
         if isinstance(error, PageTimeout):
             seconds = request.timeout or self._settings.timeout
             raise Timeout(f"{request.url} did not load within {seconds} s") from None
@@ -498,6 +499,9 @@ class _PageLoad:
             it shows a document or not, as a 204 does not.
         shown: The response of the document the main frame shows, once one was
             committed.
+        failed: The navigation of the main frame that did not load since the
+            last document was committed, which then shows an error page; one
+            aborted, as by another navigation or a download, does not count.
         refused: The URL of the main frame's navigation that a guarded browser
             refused, if any.
     """
@@ -506,6 +510,7 @@ class _PageLoad:
         self.page = page
         self.document: PageResponse | None = None
         self.shown: PageResponse | None = None
+        self.failed: PageRequest | None = None
         self.refused: str | None = None
         self._arrived: PageResponse | None = None
         """The navigation response the main frame has not committed yet."""
@@ -513,6 +518,7 @@ class _PageLoad:
         self._guarded = guarded
         page.on("response", self._on_response)
         page.on("framenavigated", self._on_navigated)
+        page.on("requestfailed", self._on_failed)
         if guarded:
             page.context.on("request", self._on_request)
             page.on("websocket", self._on_websocket)
@@ -539,7 +545,14 @@ class _PageLoad:
             and arrived is not None
             and urldefrag(frame.url)[0] == urldefrag(arrived.url)[0]
         ):
-            self.shown, self._arrived = arrived, None
+            self.shown, self._arrived, self.failed = arrived, None, None
+
+    def _on_failed(self, request: PageRequest) -> None:
+        if not (request.is_navigation_request() and request.frame == self.page.main_frame):
+            return
+        found = _NET_ERROR.search(request.failure or "")
+        if found is None or found.group(1) != "ERR_ABORTED":
+            self.failed = request
 
     def _on_request(self, request: PageRequest) -> None:
         if self._refuses(request.url) and request.is_navigation_request() and request.frame == self.page.main_frame:
@@ -631,10 +644,27 @@ async def _history(document: PageResponse) -> list[Redirect]:
 def _fetch_error(error: Exception, request: Request) -> FetchError:
     """Map a browser error onto the FetchError of its kind."""
     message = str(error).splitlines()[0] if str(error) else type(error).__name__
+    return _error_kind(message)(f"loading {request.url} failed: {message}")
+
+
+def _failed_navigation(failed: PageRequest, request: Request) -> FetchError:
+    """The error of a navigation of the main frame that did not load, after the page had loaded."""
+    failure = failed.failure or "the browser tells no reason"
+    return _error_kind(failure)(f"the page of {request.url} navigated to {failed.url}, which did not load: {failure}")
+
+
+def _error_kind(message: str) -> type[FetchError]:
+    """The FetchError of the Chrome network error a message names; `FetchError` for none."""
     found = _NET_ERROR.search(message)
     name = found.group(1) if found else ""
-    kind = next((kind for prefix, kind in _NET_ERROR_KINDS if name.startswith(prefix)), FetchError)
-    return kind(f"loading {request.url} failed: {message}")
+    return next((kind for prefix, kind in _NET_ERROR_KINDS if name.startswith(prefix)), FetchError)
+
+
+def _refused(url: str, request: Request) -> NetworkBlocked:
+    return NetworkBlocked(
+        f"the network guard refused {url}, on the way to {request.url}: only loopback hosts, "
+        "such as 127.0.0.1 and localhost, may be reached while it is on"
+    )
 
 
 async def _quietly(closing: Awaitable[None], what: str) -> None:
