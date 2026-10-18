@@ -169,12 +169,14 @@ class SessionSettings(Section):
 class ProxySettings(Section):
     """Settings of the proxies Requests are sent through.
 
-    Proxies are used once a source is set; the proxies of every source are used
-    together. A Session is bound to one, as `binding` picks it: by default, it
-    keeps the one it is bound to while that is available. A Request without a
-    Session goes through the next one, in turn; `Request(proxy=...)` goes through
-    its own instead. A proxy that fails cools down, longer with each failure in a
-    row, and is Retired after `max_failures` in a row. A proxy is a URL such as
+    Proxies are used once a source or a `binding` is set; the proxies of every
+    source are used together. A Session is bound to one, as `binding` picks it: by
+    default, it keeps the one it is bound to while that is available; a `binding`
+    may also give a Session a proxy of its own, so that one without a source gives
+    the Sessions of a Session Pool their proxies. A Request without a Session goes
+    through the next one, in turn; `Request(proxy=...)` goes through its own
+    instead. A proxy that fails cools down, longer with each failure in a row, and
+    is Retired after `max_failures` in a row. A proxy is a URL such as
     `http://user:password@proxy:8080`, or `proxy:8080` for HTTP, with its port; its
     key is all of it, so that sticky sessions on one gateway, which differ only in
     their credentials, stay apart.
@@ -201,7 +203,9 @@ class ProxySettings(Section):
         rebind: When the default `binding` binds a Session to another proxy:
             `unavailable` once its proxy cools down, is Retired, or is no longer
             listed; `every_lease` at each Lease, so its Leases go through the
-            proxies in turn.
+            proxies in turn; `retired` only once its proxy is Retired or no longer
+            listed, the Session cooling down with its proxy meanwhile; `never`,
+            the Session cooling down with its proxy, and Retired with it.
         binding: A replacement binding policy, a `pernix.proxies.BindingPolicy`
             with `async bind(binding)`, as an object, a class building one, or an
             import path; `None` for the default policy.
@@ -218,7 +222,7 @@ class ProxySettings(Section):
     cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 600.0
     max_failures: Annotated[int, msgspec.Meta(ge=1)] = 5
     max_sessions: Annotated[int, msgspec.Meta(ge=1)] | None = None
-    rebind: Literal["unavailable", "every_lease"] = "unavailable"
+    rebind: Literal["unavailable", "every_lease", "retired", "never"] = "unavailable"
     binding: Any = None
 
     def __post_init__(self) -> None:
@@ -233,6 +237,11 @@ class ProxySettings(Section):
 
     @property
     def enabled(self) -> bool:
+        """Whether proxies are used: a source of proxies, or a binding policy, is set."""
+        return self.sourced or self.binding is not None
+
+    @property
+    def sourced(self) -> bool:
         """Whether a source of proxies is set."""
         return bool(self.urls) or self.file is not None or self.api is not None or self.provider is not None
 

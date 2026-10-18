@@ -6,11 +6,13 @@ import asyncio
 import io
 import sys
 from typing import TYPE_CHECKING, Any, ClassVar, Self
+from urllib.parse import urlsplit
 
 import pytest
 
 from pernix import Request, Response, Spider
 from pernix.crawler import Crawler
+from pernix.proxies import Proxy as ProxyRecord
 from pernix.testing import LoopbackServer, Reply, crawl
 
 if TYPE_CHECKING:
@@ -27,13 +29,23 @@ PATHS = tuple(f"/page/{number}" for number in range(8))
 
 
 class Proxy:
-    """A loopback server standing in for a proxy: it answers every page of the shop with its own name."""
+    """A loopback server standing in for a proxy: it answers every page of the shop with its own name.
+
+    It refuses the next `refusals` requests with a 407, as a proxy that fails.
+    """
 
     def __init__(self, name: str) -> None:
         self.name = name
+        self.refusals = 0
         self.server = LoopbackServer()
         for path in PATHS:
-            self.server.route(path, f"<p>{name}</p>", headers=HTML)
+            self.server.route(path, handler=self._answer)
+
+    def _answer(self, _request: ReceivedRequest) -> Reply:
+        if self.refusals:
+            self.refusals -= 1
+            return Reply(status=407)
+        return Reply(f"<p>{self.name}</p>", headers=HTML)
 
     def __enter__(self) -> Self:
         self.server.start()
@@ -305,3 +317,174 @@ async def test_with_max_sessions_1_no_two_sessions_share_a_proxy() -> None:
     waits = report.stats["proxies.binding_waits"]
     assert isinstance(waits, int)
     assert waits >= 1
+
+
+class OneAddress(Spider):
+    """Fetches the pages of the shop one after another under one Account, which its site allows one address."""
+
+    settings: ClassVar[Mapping[str, Any]] = {
+        "concurrency": 1,
+        "sessions.enabled": True,
+        "proxies.max_sessions": 1,
+        "proxies.cooldown": 0.1,
+    }
+
+    def __init__(self, pages: int = 4) -> None:
+        self.pages = pages
+
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(f"{SHOP}{PATHS[0]}", session="alice")
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        yield {"via": response.css("p::text").get(), "session": response.session}
+        number = PATHS.index(urlsplit(response.url).path)
+        self.parsed(number)
+        if number + 1 < self.pages:
+            yield Request(f"{SHOP}{PATHS[number + 1]}", session="alice")
+
+    def parsed(self, number: int) -> None:
+        """Called once each page is parsed."""
+
+
+async def test_with_retired_a_session_waits_for_its_proxy_and_changes_it_only_once_it_is_retired() -> None:
+    with Proxy("a") as a, Proxy("b") as b:
+
+        class Failing(OneAddress):
+            def parsed(self, number: int) -> None:
+                a.refusals = (1, 3)[number] if number < 2 else 0  # one cooldown, then a row that Retires it
+
+        report = await asyncio.wait_for(
+            crawl(
+                Failing,
+                settings={
+                    "proxies.urls": [a.url, b.url],
+                    "proxies.rebind": "retired",
+                    "proxies.max_failures": 3,
+                    "retry.times": 5,
+                },
+            ),
+            timeout=20,
+        )
+
+    assert _via(report.items) == ["a", "a", "b", "b"]
+    assert len(b.server.received) == 2  # never through b while it waited for a
+    assert report.stats["sessions.outcomes.proxy_failed"] == 4
+    assert report.stats["proxies.retired"] == 1
+
+
+async def test_with_never_a_session_is_retired_with_its_proxy_and_the_run_goes_on_with_the_others() -> None:
+    with Proxy("a") as a, Proxy("b") as b:
+
+        class Failing(Shop):
+            async def parse(self, response: Response) -> AsyncIterator[Any]:
+                async for item in super().parse(response):
+                    yield item
+                if response.url.endswith(PATHS[1]):
+                    a.refusals = 1
+
+        report = await asyncio.wait_for(
+            crawl(
+                Failing,
+                pages=6,
+                settings={
+                    "sessions.enabled": True,
+                    "sessions.size": 2,
+                    "sessions.eager": True,
+                    "proxies.urls": [a.url, b.url],
+                    "proxies.max_sessions": 1,
+                    "proxies.max_failures": 1,
+                    "proxies.rebind": "never",
+                },
+            ),
+            timeout=20,
+        )
+
+    first, second = report.items[0]["session"], report.items[1]["session"]
+    assert [(item["session"], item["via"]) for item in report.items] == [(first, "a"), *[(second, "b")] * 5]
+    assert report.stats["sessions.retirements"] == 1
+    assert report.stats["sessions.outcomes.proxy_retired"] == 1
+    assert report.stats.get("requests.failed", 0) == 0
+
+
+ACCOUNTS = [{"username": "alice", "password": "account-secret"}, {"username": "bob", "password": "account-secret"}]
+
+
+def _own_address(own: Mapping[str, str]) -> type:
+    """A binding policy giving each Account the proxy of its own `own` names."""
+
+    class OwnAddress:
+        async def bind(self, binding: Binding) -> ProxyRecord | None:
+            return None if binding.account is None else ProxyRecord(own[binding.account.id])
+
+    return OwnAddress
+
+
+@pytest.mark.usefixtures("browser_engine")
+async def test_a_policy_giving_each_account_its_own_proxy_sends_its_requests_http_and_rendered_through_it() -> None:
+    class Accounts(Spider):
+        settings: ClassVar[Mapping[str, Any]] = {"concurrency": 1, "sessions.enabled": True}
+
+        async def start(self) -> AsyncIterator[Request]:
+            for number, (account, render) in enumerate(
+                [("alice", False), ("alice", True), ("bob", False), ("bob", True)]
+            ):
+                yield Request(f"{SHOP}{PATHS[number]}", render=render, session=account, priority=-number)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"session": response.session, "fetcher": response.fetcher, "via": response.css("p::text").get()}
+
+    with Proxy("alice's") as alice, Proxy("bob's") as bob:
+        own = {"alice": alice.with_credentials("alice", "alice-pw"), "bob": bob.with_credentials("bob", "bob-pw")}
+        report = await crawl(Accounts, settings={"sessions.accounts": ACCOUNTS, "proxies.binding": _own_address(own)})
+
+    assert sorted((item["session"], item["fetcher"], item["via"]) for item in report.items) == [
+        ("alice", "browser", "alice's"),
+        ("alice", "http", "alice's"),
+        ("bob", "browser", "bob's"),
+        ("bob", "http", "bob's"),
+    ]
+
+
+async def test_the_credentials_of_proxies_of_their_own_never_appear_in_the_logs_or_stats(
+    refused_proxy: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stream = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stream)
+
+    with Proxy("alice's") as alice:
+        own = {
+            "alice": alice.with_credentials("alice-user", "alice-pw"),
+            "bob": refused_proxy.replace("://", "://bob-user:bob-pw@", 1),
+        }
+
+        class Careless(Shop):
+            async def parse(self, response: Response) -> AsyncIterator[Any]:
+                assert response.session is not None
+                self.logger.info("fetched through %s", own[response.session])
+                async for item in super().parse(response):
+                    yield item
+
+        crawler = Crawler.from_spider(
+            Careless,
+            args={"pages": 4, "sessions": ("alice", "bob")},
+            settings={
+                "sessions.enabled": True,
+                "sessions.accounts": ACCOUNTS,
+                "proxies.binding": _own_address(own),
+                "proxies.max_failures": 1,
+                "retry.delay_scale": 0,
+                "stats.interval": 0,
+                "log.output": "stderr",
+                "log.format": "json",
+                "log.level": "DEBUG",
+            },
+        )
+        async with asyncio.timeout(20):
+            await crawler.crawl()
+
+    output = stream.getvalue()
+    assert "fetched through http://***@127.0.0.1" in output
+    assert crawler.stats.get("sessions.retirements") == 1  # bob, with the proxy that failed
+    for secret in ("alice-user", "alice-pw", "bob-user", "bob-pw"):
+        assert secret not in output
+        assert all(secret not in f"{key}={value}" for key, value in crawler.stats.snapshot().items())

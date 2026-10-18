@@ -20,7 +20,7 @@ type ProxyHealth = Literal["available", "cooldown", "retired"]
 
 @dataclass(frozen=True, slots=True)
 class ProxyCounts:
-    """How many of the proxies listed are in each state.
+    """How many of the proxies listed, and of the Sessions' own in use, are in each state.
 
     Attributes:
         available: Proxies that can be used now.
@@ -35,13 +35,14 @@ class ProxyCounts:
 
 @dataclass(frozen=True, slots=True)
 class ProxyCandidate:
-    """A proxy the pool lists, as a binding policy sees it.
+    """A proxy the pool lists, or a Session's own, as a binding policy sees it.
 
     Its `repr` shows it without its credentials.
 
     Attributes:
         url: The proxy URL, which a binding policy returns to bind it.
-        tags: Its tags, as its source gave them.
+        tags: Its tags, as its source, or the binding policy for a Session's own,
+            gave them.
         health: Whether it can be used now.
         sessions: The ids of the Sessions bound to it.
         leaving: The ids of the Sessions bound to another proxy since, whose
@@ -49,6 +50,10 @@ class ProxyCandidate:
         failures: Its failures in a row.
         expires: When it stops working, as its source tells, in seconds since the
             epoch; `None` if it does not tell.
+        until: When it stops cooling down, in seconds since the epoch; `None` unless
+            it cools down.
+        own: Whether it is the Session's own, which the binding policy gave it and
+            no other Session is bound to.
     """
 
     url: str
@@ -58,6 +63,8 @@ class ProxyCandidate:
     leaving: frozenset[str] = frozenset()
     failures: int = 0
     expires: float | None = None
+    until: float | None = None
+    own: bool = False
 
     @property
     def occupants(self) -> frozenset[str]:
@@ -65,7 +72,10 @@ class ProxyCandidate:
         return self.sessions | self.leaving
 
     def __repr__(self) -> str:
-        return f"ProxyCandidate({proxy_address(self.url)!r}, health={self.health!r}, sessions={len(self.sessions)})"
+        own = ", own=True" if self.own else ""
+        return (
+            f"ProxyCandidate({proxy_address(self.url)!r}, health={self.health!r}, sessions={len(self.sessions)}{own})"
+        )
 
 
 class ProxyPool(Protocol):
@@ -77,10 +87,13 @@ class ProxyPool(Protocol):
     Sessions are bound to proxies as a binding policy picks among the
     `candidates()`, and the pool holds each binding, binding no more than
     `max_sessions` Sessions to a proxy; a Session bound to another counts toward a
-    proxy until the Leases that went through it end. Proxies are URLs as
-    `pernix.proxies.proxy_url()` gives them. The in-process implementation is
-    `pernix.proxies.MemoryProxyPool`; one shared by several processes keeps the
-    same protocol.
+    proxy until the Leases that went through it end. A binding policy may also
+    give a Session a proxy of its own, which the pool holds for that Session
+    alone while it is bound to it, or its Leases go through it: it takes no
+    turns, no other Session is bound to it, and refreshes keep it; its health is
+    kept as any other's. Proxies are URLs as `pernix.proxies.proxy_url()` gives
+    them. The in-process implementation is `pernix.proxies.MemoryProxyPool`; one
+    shared by several processes keeps the same protocol.
 
     Attributes:
         max_sessions: Sessions a proxy is bound to at most; `None` for no limit.
@@ -100,42 +113,52 @@ class ProxyPool(Protocol):
         ...
 
     async def take(self) -> str | None:
-        """Take a proxy for one fetch: the available one used least recently.
+        """Take a proxy for one fetch: the available one used least recently, of those listed and no Session's own.
 
         Returns:
             The proxy, or `None` if none is available now.
         """
         ...
 
-    async def candidates(self) -> Sequence[ProxyCandidate]:
-        """Return the proxies listed, as a binding policy sees them, least recently used first.
+    async def candidates(self, session: str | None = None) -> Sequence[ProxyCandidate]:
+        """Return the proxies a Session may be bound to, as a binding policy sees them, least recently used first.
 
         A proxy is used when a fetch takes it, and when a Session is bound to it in
         place of another. Reading them changes nothing.
 
+        Args:
+            session: The id of the Session, whose own proxy, if it holds one, is
+                among them; `None` for the proxies listed only.
+
         Returns:
-            Every proxy listed, whatever its health.
+            Every proxy listed, whatever its health, but the other Sessions' own, and
+            the Session's own.
         """
         ...
 
-    async def bind(self, session: str, proxy: str) -> bool:
+    async def bind(self, session: str, proxy: str | Proxy) -> bool:
         """Bind a Session to a proxy for one of its Leases, in place of the one it was bound to, if the proxy has room.
 
         A proxy has room for a Session while it is available, and while fewer than
         `max_sessions` other Sessions occupy it: those bound to it, and those bound
-        to another since whose Leases still go through it. The Lease holds the
-        proxy until `release()`. The pool holds the binding of each Session, so
-        that Leases of one Session that overlap go through the same proxy, though
-        each loaded its state before the other saved it.
+        to another since whose Leases still go through it. A Session's own has room
+        for it alone. The Lease holds the proxy until `release()`. The pool holds
+        the binding of each Session, so that Leases of one Session that overlap go
+        through the same proxy, though each loaded its state before the other saved
+        it.
 
         Args:
             session: The Session's id.
-            proxy: The proxy, one of the `candidates()`.
+            proxy: The URL of one of its `candidates()`; or a `Proxy` record of its
+                own, which the pool holds for it from now on, keeping the health of
+                one it held before, and taking the tags and the expiry given.
 
         Returns:
             Whether the Session is bound to the proxy now; `False`, changing nothing,
-            if the proxy is not listed, not available, or has no room, as when
-            another Session took the last since the candidates were read.
+            if the proxy is not one of its candidates, not available, or has no
+            room, as when another Session took the last since the candidates were
+            read, or for a record, if the pool lists the proxy, or holds it for
+            another Session.
         """
         ...
 
@@ -173,7 +196,7 @@ class ProxyPool(Protocol):
         ...
 
     async def ready_in(self) -> float:
-        """Return how long the proxies listed are all cooling down for.
+        """Return how long the proxies listed, which no Session holds as its own, are all cooling down for.
 
         Returns:
             Seconds until one is available; 0 if one is, and `math.inf` if none ever

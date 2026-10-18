@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from pernix.errors import IgnoreRequest, LoginExpired, ProxyError, SessionError
 from pernix.fetchers.fetcher_dispatch import sending_as
+from pernix.proxies.run_proxies import FollowedProxy
 from pernix.retry_policy import retry_after_seconds
 from pernix.sending import NotYet, Sending
 from pernix.session import Session, SessionState
@@ -36,16 +37,18 @@ __all__ = ["NoSessionYet", "SessionLeasing", "sending_session"]
 logger = logging.getLogger(__name__)
 
 _SEVERITY: tuple[OutcomeKind, ...] = (
+    "proxy_retired",
     "rate_limited",
     "blocked",
     "login_failed",
     "auth_expired",
+    "proxy_cooldown",
     "proxy_failed",
     "error",
     "ok",
 )
 """The outcomes, the one a Lease is released with first, when the fetches sharing it fared differently."""
-_RETIRING: frozenset[OutcomeKind] = frozenset({"login_failed", "blocked"})
+_RETIRING: frozenset[OutcomeKind] = frozenset({"login_failed", "blocked", "proxy_retired"})
 """The outcomes a Session Pool may Retire a Session for."""
 
 
@@ -102,10 +105,18 @@ class SessionLeasing:
     fetches keep it, so each is reported against the proxy it went through. The
     Lease holds the proxy until it ends, so a Session an overlapping Lease bound to
     another still counts toward it meanwhile. The binding is saved with the
-    Session's state, and released once the pool Retires the Session. A Request with a proxy of its own goes through that, and needs none
-    of the Run's. When no proxy is available, or none fits the Session, the Lease is
-    released, and the Request waits elsewhere; a nested fetch waits as its caller
-    does.
+    Session's state, and released once the pool Retires the Session. A Request with
+    a proxy of its own goes through that, and needs none of the Run's. When no proxy
+    is available, or none fits the Session, the Lease is released, and the Request
+    waits elsewhere; a nested fetch waits as its caller does.
+
+    A Session the policy keeps on a proxy that cools down follows it: its Lease is
+    released as `proxy_cooldown`, or, after a fetch through the proxy failed, as
+    `proxy_failed`, cooling the Session down until the proxy is available, while
+    the Request waits for a Session as for a busy one. Once its proxy is Retired,
+    or no longer listed, the Lease is released as `proxy_retired`, Retiring the
+    Session with it; the Request then waits for another, and one naming it fails
+    with `SessionError`.
 
     With a login, a fetch whose Lease must log its Session in runs the login first,
     in the fetch's task, where the fetches the login makes share the Lease and are
@@ -176,7 +187,7 @@ class SessionLeasing:
         held = _held_by(self, request.session)
         if held is not None:
             if held.proxy is None:
-                held.proxy = await self._bind_proxy(held.session, request)
+                held.proxy = await self._bind_nested(held, request)
             shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
@@ -197,6 +208,9 @@ class SessionLeasing:
             before = await self.pool.load_state(lease)
             session = Session.from_state(lease.session, before)
             bound = await self._bind_proxy(session, request)
+        except FollowedProxy as followed:
+            await self._follow(lease, followed)
+            raise NoSessionYet(await self.pool.ready_in(session=request.session)) from followed
         except BaseException:
             await self.pool.release(lease, Outcome("ok"))
             raise
@@ -217,7 +231,7 @@ class SessionLeasing:
                 raise
             finally:
                 outcomes = [self._outcome(sending.response, error or sending.error), *holding.nested]
-                await self._finish(lease, before, sending, session, outcomes)
+                await self._finish(lease, before, sending, holding, outcomes)
         finally:
             _held.reset(token)
             renewing.cancel()
@@ -267,14 +281,16 @@ class SessionLeasing:
             self._stats.inc("sessions.stale")
 
     async def _finish(
-        self, lease: SessionLease, before: SessionState, sending: Sending, session: Session, outcomes: list[Outcome]
+        self, lease: SessionLease, before: SessionState, sending: Sending, holding: _Held, outcomes: list[Outcome]
     ) -> None:
         """Save the changes the fetches made to their Session, then release the Lease with the most telling outcome.
 
         The cookies removed are timed as the jar removed them, so a cookie another
         fetch set later is kept. A fetch logged out right after the login it made
-        reports the login as failed.
+        reports the login as failed. A Session that follows the proxy a fetch of
+        the Lease failed through cools down, or is Retired, with it.
         """
+        session = holding.session
         now = self._clock()
         delta = StateDelta.between(before, session.state(), now=now, removed_at=session.cookies.removals)
         saved = delta.empty or await self.pool.save_state(lease, delta)
@@ -285,9 +301,14 @@ class SessionLeasing:
             )
             self._stats.inc("sessions.login_failures")
             outcome = Outcome("login_failed", until=now + self._settings.cooldown)
+        followed = await self._follows(holding, outcomes)
+        if followed is not None:
+            outcome = _with_proxy(outcome, followed)
         released = await self._release(lease, outcome)
         for each in outcomes:
             self._stats.inc(f"sessions.outcomes.{each.kind}")
+        if outcome.kind == "proxy_retired" and all(each.kind != "proxy_retired" for each in outcomes):
+            self._stats.inc("sessions.outcomes.proxy_retired")
         if outcome.kind == "rate_limited":
             self._stats.inc("sessions.cooldowns")
         if not (saved and released):
@@ -297,6 +318,28 @@ class SessionLeasing:
                 lease.session,
                 sending.request,
             )
+
+    async def _follow(self, lease: SessionLease, followed: FollowedProxy) -> None:
+        """Release the Lease of a Session that follows its proxy, cooling it down with it, or Retiring it with it."""
+        outcome = _proxy_outcome(followed)
+        released = await self._release(lease, outcome)
+        self._stats.inc(f"sessions.outcomes.{outcome.kind}")
+        if not released:
+            self._stats.inc("sessions.stale")
+
+    async def _follows(self, holding: _Held, outcomes: list[Outcome]) -> FollowedProxy | None:
+        """Whether a Session follows the proxy its Lease went through, once a fetch of the Lease failed through one.
+
+        A binding policy that fails then is logged, and the Session left as it is.
+        """
+        if self._proxies is None or holding.proxy is None or all(each.kind != "proxy_failed" for each in outcomes):
+            return None
+        session = holding.session
+        try:
+            return await self._proxies.following(session.id, holding.proxy, account=self._account(session))
+        except Exception as exc:
+            logger.error("The binding policy failed for the Session %r, whose proxy failed", session.id, exc_info=exc)
+            return None
 
     async def _release(self, lease: SessionLease, outcome: Outcome) -> bool:
         """Release a Lease, and the proxy binding of its Session, should the pool Retire it for the outcome."""
@@ -317,9 +360,35 @@ class SessionLeasing:
         """
         if self._proxies is None or request.proxy is not None:
             return None
-        account = None if session.account is None else self._accounts.get(session.account)
-        session.proxy = await self._proxies.bind(session.id, session.proxy, account=account)
+        session.proxy = await self._proxies.bind(session.id, session.proxy, account=self._account(session))
         return session.proxy
+
+    async def _bind_nested(self, held: _Held, request: Request) -> str | None:
+        """Bind the Session a nested fetch shares to a proxy, for the Lease it shares; return the proxy bound.
+
+        A Session that follows its proxy has its Lease released with it, once the
+        fetch holding the Lease ends.
+
+        Raises:
+            pernix.proxies.run_proxies.FollowedProxy: The Session waits for its
+                proxy, which cools down.
+            pernix.errors.SessionError: The Session is Retired with its proxy.
+            pernix.proxies.run_proxies.NoProxyYet: No proxy is available, or none
+                fits the Session.
+        """
+        try:
+            return await self._bind_proxy(held.session, request)
+        except FollowedProxy as followed:
+            outcome = _proxy_outcome(followed)
+            if outcome not in held.nested:
+                held.nested.append(outcome)
+            if followed.until is None:
+                raise SessionError(f"the Session {held.session.id!r} is retired with its proxy") from followed
+            raise
+
+    def _account(self, session: Session) -> Account | None:
+        """The Account a Session logs in with, if any, which the binding policy is told of."""
+        return None if session.account is None else self._accounts.get(session.account)
 
     def _reporting(self, sending: Sending) -> AbstractAsyncContextManager[None]:
         """Report how a fetch went through its Session's proxy, unless the Request names its own."""
@@ -381,7 +450,21 @@ def _held_by(leasing: SessionLeasing, session: str | None) -> _Held | None:
 
 
 def _most_telling(outcomes: list[Outcome]) -> Outcome:
-    """The outcome to release a Lease with: the most severe, with the latest cooldown among those rate limited."""
+    """The outcome to release a Lease with: the most severe, cooling the Session down until the latest of them all."""
     first = min(outcomes, key=lambda outcome: _SEVERITY.index(outcome.kind))
-    untils = [outcome.until for outcome in outcomes if outcome.kind == first.kind and outcome.until is not None]
+    untils = [outcome.until for outcome in outcomes if outcome.until is not None]
     return Outcome(first.kind, until=max(untils) if untils else None)
+
+
+def _proxy_outcome(followed: FollowedProxy) -> Outcome:
+    """The outcome of a Lease whose Session follows its proxy, without a fetch through it."""
+    if followed.until is None:
+        return Outcome("proxy_retired")
+    return Outcome("proxy_cooldown", until=followed.until)
+
+
+def _with_proxy(outcome: Outcome, followed: FollowedProxy) -> Outcome:
+    """The outcome of a Lease whose Session follows the proxy a fetch of it failed through."""
+    if followed.until is None:
+        return Outcome("proxy_retired")
+    return Outcome(outcome.kind, until=followed.until if outcome.until is None else max(followed.until, outcome.until))
