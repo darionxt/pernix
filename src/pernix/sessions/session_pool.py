@@ -17,23 +17,36 @@ if TYPE_CHECKING:
 
 __all__ = ["CookieRemoval", "Outcome", "OutcomeKind", "SessionLease", "SessionPool", "StateDelta"]
 
-type OutcomeKind = Literal["ok", "rate_limited", "blocked", "auth_expired", "login_failed", "proxy_failed", "error"]
-"""How a Session fared in a fetch."""
+type OutcomeKind = Literal[
+    "ok",
+    "rate_limited",
+    "blocked",
+    "auth_expired",
+    "login_failed",
+    "proxy_failed",
+    "proxy_cooldown",
+    "proxy_retired",
+    "error",
+]
+"""How a Session fared in a fetch, or with its proxy."""
 
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
-    """How a Session fared in the fetch it was leased for.
+    """How a Session fared in the fetch it was leased for, or with its proxy.
 
     Attributes:
         kind: `ok` when nothing went wrong; `rate_limited` when the site asked the
             Session to slow down, until `until`; `blocked` when the site refused
             the Session; `auth_expired` when its login expired; `login_failed`
             when logging it in failed, which cools it down until `until`;
-            `proxy_failed` when its proxy failed; and `error` when the fetch failed
-            otherwise.
-        until: For `rate_limited` and `login_failed`, when the Session may be used
-            again, in seconds since the epoch.
+            `proxy_failed` when its proxy failed, the Session waiting for it until
+            `until` if given; `proxy_cooldown` when the Session waits for its proxy,
+            which cools down until `until`, without a fetch; `proxy_retired` when
+            its proxy is Retired, or no longer listed, and the Session with it; and
+            `error` when the fetch failed otherwise.
+        until: When the Session may be used again, in seconds since the epoch: it
+            cools down until then, whatever the kind; `None` for no cooldown.
     """
 
     kind: OutcomeKind
@@ -228,13 +241,14 @@ class SessionPool(Protocol):
     async def release(self, lease: SessionLease, outcome: Outcome) -> bool:
         """End a Lease, reporting how its Session fared.
 
-        A `rate_limited` outcome cools the Session down. In a pool whose Sessions
-        log in, `auth_expired` has the Session log in again; `login_failed` has it
-        log in again too, once it cooled down, and Retires it after too many in a
-        row. Neither changes anything if the Session logged in again since the Lease
-        was given, or since its holder logged it in. A Lease that was to log
-        its Session in and is released before `logged_in()` lets another Lease log
-        it in.
+        An outcome with an `until` cools the Session down until then, and
+        `proxy_retired` Retires it. In a pool whose Sessions log in, `auth_expired`
+        has the Session log in again; `login_failed` has it log in again too, once
+        it cooled down, and Retires it after too many in a row. Neither changes
+        anything, nor cools the Session down, if the Session logged in again since
+        the Lease was given, or since its holder logged it in. A Lease that was to
+        log its Session in and is released before `logged_in()` lets another Lease
+        log it in.
 
         Args:
             lease: The Lease.
