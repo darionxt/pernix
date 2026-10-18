@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from pernix.cli.fetch_output import FetchOutput
-from pernix.cli.fetch_spider import FetchPlan, FetchSpider, InvalidURL
+from pernix.cli.fetch_spider import FetchPlan, FetchSpider, InvalidURL, NotFetched
 from pernix.cli.options import UsageError, settings_parser
 from pernix.cli.page_reading import ReadingOptions, check_selection
 from pernix.crawler import Crawler
@@ -134,6 +134,9 @@ def run(args: argparse.Namespace) -> int:
         raise spider.configuration_error  # no fetch can succeed until it is fixed
     if interrupted:
         return ExitCode.INTERRUPTED
+    if isinstance(spider, FetchSpider):
+        for url in spider.unfinished:
+            output.failed(url, NotFetched("the Run ended before fetching it, as when it drains for want of proxies"))
     return ExitCode.FAILED if output.failures or output.closed else ExitCode.COMPLETED
 
 
