@@ -16,6 +16,7 @@ from pernix.response import expect_response
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from types import TracebackType
 
     from pernix.fetchers import Fetcher
     from pernix.request import Request
@@ -129,8 +130,10 @@ class _BrowserStandIn:
             await self._lifecycle.open(self._fetcher)
         return self
 
-    async def __aexit__(self, *_exc: object) -> None:
-        await self._lifecycle.aclose()
+    async def __aexit__(
+        self, _type: type[BaseException] | None, error: BaseException | None, _traceback: TracebackType | None
+    ) -> None:
+        await self._lifecycle.aclose(error)  # as the Run would close the Fetcher itself
 
     async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
         if session is None:

@@ -14,6 +14,7 @@ from pernix.browser import Click, Evaluate, Render, Screenshot, Scroll, Type, Wa
 from pernix.errors import ActionError, ActionTimeout, ConnectError, NetworkBlocked, Timeout
 from pernix.fetchers import BrowserFetcher, BrowserSettings
 from pernix.fetchers.network_guard import blocking_network
+from scripted_server import ScriptedServer
 
 if TYPE_CHECKING:
     from pernix.response import Response
@@ -392,6 +393,51 @@ async def test_an_action_leading_to_a_refused_host_is_blocked(server: LoopbackSe
             await fetcher.fetch(_rendered(server.url("/"), Render(actions=[Click("a")])))
 
     assert guard.blocked == ["http://192.0.2.1/next"]
+
+
+async def test_a_no_content_answer_is_not_taken_for_a_later_navigation_within_the_page(server: LoopbackServer) -> None:
+    page = "<form action='/' method='post'><button id='send'>Send</button></form><p id='kept'>kept</p>"
+    server.route("/", page, headers=[*HTML, ("X-Shop", "page")])
+    server.route("/", b"", status=204, method="POST")
+    settle = Evaluate("() => new Promise(resolve => setTimeout(resolve, 300))")  # the 204 arrives meanwhile
+    within = Evaluate("() => { location.hash = 'sent'; history.pushState({}, '', location.pathname); }")
+
+    response = await _fetch(server.url("/"), Render(actions=[Click("#send"), settle, within]))
+
+    assert [request.method for request in server.received] == ["GET", "POST"]
+    assert (response.status, response.headers.get("X-Shop")) == (200, "page")
+    assert response.browser is not None
+    assert response.browser.document is not None
+    assert (response.browser.document.status, response.browser.document.body) == (200, page.encode())
+
+
+async def test_a_page_navigating_while_captured_bodies_arrive_gives_the_document_it_shows(
+    server: LoopbackServer,
+) -> None:
+    slow_api = [
+        (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n", 0.0),
+        (b"Content-Length: 2\r\n\r\n", 0.0),
+        (b"{}", 3.0),  # never read: the page goes on meanwhile, which leaves the body pending
+    ]
+    with ScriptedServer(slow_api) as api:
+        page = f"""<p>first</p><script>
+fetch("{api.url}api").catch(() => {{}});
+setTimeout(() => {{ location.href = "/next"; }}, 300);
+</script>"""
+        server.route("/", page, headers=[*HTML, ("X-Shop", "first")])
+        server.route("/next", "<p id='next'>next</p>", status=202, headers=[*HTML, ("X-Shop", "next")])
+
+        arrived = Evaluate("() => new Promise(resolve => setTimeout(resolve, 150))")  # the API's headers meanwhile
+        render = Render(capture="**/api", actions=[arrived])
+
+        response = await _fetch(server.url("/"), render, BrowserSettings(action_timeout=1))  # waits 1 s for the body
+
+    assert (response.url, response.status, response.headers.get("X-Shop")) == (server.url("/next"), 202, "next")
+    assert response.css("#next::text").get() == "next"
+    assert response.browser is not None
+    assert response.browser.document is not None
+    assert response.browser.document.url == server.url("/next")
+    assert response.browser.captured == ()
 
 
 SERVICE_WORKER = """self.addEventListener("install", () => self.skipWaiting());

@@ -368,13 +368,14 @@ class BrowserFetcher:
             if failure is not None:
                 raise failure from exc  # the action failed as the page it acted on did not load
             raise
-        failure = _navigation_failure(watch, request)
+        captured = () if capture is None else await capture.responses(within=action_timeout)
+        failure = _navigation_failure(watch, request)  # once nothing is awaited but the page itself
         if failure is not None:
             raise failure
         document = watch.shown or document  # an action may have led to another one
         result = RenderResult(
             document=await captured_response(document),
-            captured=() if capture is None else await capture.responses(within=action_timeout),
+            captured=captured,
             screenshots=outputs.screenshots,
             evaluated=outputs.evaluated,
         )
@@ -537,7 +538,8 @@ class _PageLoad:
 
     def _on_response(self, response: PageResponse) -> None:
         if response.request.is_navigation_request() and response.frame == self.page.main_frame:
-            self.document = self._arrived = response
+            self.document = response
+            self._arrived = None if response.status in _NO_CONTENT else response  # those never commit
 
     def _on_navigated(self, frame: Frame) -> None:
         """Take the navigation response the main frame committed to; a 204 or a download commits none.
@@ -556,6 +558,8 @@ class _PageLoad:
     def _on_failed(self, request: PageRequest) -> None:
         if not (request.is_navigation_request() and request.frame == self.page.main_frame):
             return
+        if self._arrived is not None and self._arrived.request == request:
+            self._arrived = None  # its response will not commit, as for a download
         found = _NET_ERROR.search(request.failure or "")
         if found is None or found.group(1) != "ERR_ABORTED":
             self.failed = request
