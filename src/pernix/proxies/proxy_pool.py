@@ -157,8 +157,8 @@ class ProxyPool(Protocol):
             Whether the Session is bound to the proxy now; `False`, changing nothing,
             if the proxy is not one of its candidates, not available, or has no
             room, as when another Session took the last since the candidates were
-            read, or for a record, if the pool lists the proxy, or holds it for
-            another Session.
+            read, or for a record, if the pool lists the proxy, holds it for
+            another Session, or other Sessions still occupy it.
         """
         ...
 

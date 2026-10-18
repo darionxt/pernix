@@ -255,7 +255,7 @@ class SessionLeasing:
                 await self._login.log_in(session)
         except Exception as exc:
             logger.error("Logging in the Session %r failed", lease.session, exc_info=exc)
-            await self._fail_login(lease, holding.nested)
+            await self._fail_login(lease, holding)
             raise NoSessionYet(await self.pool.ready_in(session=request.session)) from exc
         except BaseException:
             await self.pool.release(lease, Outcome("ok"))
@@ -269,14 +269,22 @@ class SessionLeasing:
             logger.info("Logged in the Session %r", lease.session)
         return after
 
-    async def _fail_login(self, lease: SessionLease, nested: list[Outcome]) -> None:
-        """Release the Lease of a Session whose login failed, cooling it down."""
-        cooldowns = [outcome.until for outcome in nested if outcome.kind == "rate_limited" and outcome.until]
-        outcome = Outcome("login_failed", until=max([self._clock() + self._settings.cooldown, *cooldowns]))
+    async def _fail_login(self, lease: SessionLease, holding: _Held) -> None:
+        """Release the Lease of a Session whose login failed, cooling it down, or Retiring it with its proxy.
+
+        A Session that follows the proxy a fetch of the login failed through cools
+        down, or is Retired, with it, as after any fetch.
+        """
+        nested = holding.nested
+        cooldowns = [outcome.until for outcome in nested if outcome.until is not None]
+        failed = Outcome("login_failed", until=max([self._clock() + self._settings.cooldown, *cooldowns]))
+        followed = await self._follows(holding, nested)
+        outcome = failed if followed is None else _with_proxy(failed, followed)
+        if any(each.kind == "proxy_retired" for each in nested):  # a fetch of the login that would bind it found so
+            outcome = Outcome("proxy_retired")
         released = await self._release(lease, outcome)
         self._stats.inc("sessions.login_failures")
-        for each in (outcome, *nested):
-            self._stats.inc(f"sessions.outcomes.{each.kind}")
+        self._count([failed, *nested], outcome)
         if not released:
             self._stats.inc("sessions.stale")
 
@@ -305,10 +313,7 @@ class SessionLeasing:
         if followed is not None:
             outcome = _with_proxy(outcome, followed)
         released = await self._release(lease, outcome)
-        for each in outcomes:
-            self._stats.inc(f"sessions.outcomes.{each.kind}")
-        if outcome.kind == "proxy_retired" and all(each.kind != "proxy_retired" for each in outcomes):
-            self._stats.inc("sessions.outcomes.proxy_retired")
+        self._count(outcomes, outcome)
         if outcome.kind == "rate_limited":
             self._stats.inc("sessions.cooldowns")
         if not (saved and released):
@@ -318,6 +323,13 @@ class SessionLeasing:
                 lease.session,
                 sending.request,
             )
+
+    def _count(self, outcomes: list[Outcome], released: Outcome) -> None:
+        """Count the outcomes of the fetches of a Lease, and its Session's Retirement with its proxy, which none had."""
+        for each in outcomes:
+            self._stats.inc(f"sessions.outcomes.{each.kind}")
+        if released.kind == "proxy_retired" and all(each.kind != "proxy_retired" for each in outcomes):
+            self._stats.inc("sessions.outcomes.proxy_retired")
 
     async def _follow(self, lease: SessionLease, followed: FollowedProxy) -> None:
         """Release the Lease of a Session that follows its proxy, cooling it down with it, or Retiring it with it."""

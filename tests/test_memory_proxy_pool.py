@@ -286,6 +286,20 @@ async def test_once_its_session_leaves_it_another_session_may_hold_it_with_its_h
     assert [(candidate.url, candidate.failures) for candidate in await pool.candidates("two")] == [(A, 0), (OWN, 1)]
 
 
+async def test_a_proxy_no_longer_listed_is_held_as_a_sessions_own_only_once_the_others_left_it() -> None:
+    pool = await _pool(A, B)
+    await pool.bind("one", A)
+    await pool.replace([Proxy(B)])  # while "one" is bound to A, and its Lease goes through it
+
+    refused = await pool.bind("two", Proxy(A))
+    await pool.bind("one", B)
+    still_going_through = await pool.bind("two", Proxy(A))
+    await pool.release("one", A)
+
+    assert (refused, still_going_through) == (False, False)
+    assert await pool.bind("two", Proxy(A))
+
+
 async def test_the_candidates_tell_when_a_proxy_cooling_down_is_available_again() -> None:
     clock = Clock()
     pool = await _pool(A, B, clock=clock, cooldown=10)

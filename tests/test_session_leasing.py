@@ -883,6 +883,47 @@ async def test_a_nested_fetch_whose_session_is_retired_with_its_proxy_fails_and_
     assert pool.health("a") == "retired"
 
 
+@pytest.mark.parametrize(("rebind", "health"), [("retired", "cooldown"), ("never", "retired")])
+async def test_a_session_whose_login_failed_through_the_proxy_it_follows_cools_down_or_is_retired_with_it(
+    rebind: str, health: str
+) -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        refusing = FetcherDispatch({"site": _failing(ProxyError("refused"))})
+        await _send(leasing, refusing, Request(f"{SITE}/login", session=session.id))
+
+    clock = Clock()
+    proxy_pool = MemoryProxyPool(cooldown=60, max_failures=1 if rebind == "never" else 5, clock=clock)
+    policy = DefaultBindingPolicy(ProxySettings(rebind=rebind))  # pyright: ignore[reportArgumentType]
+    proxies = await _proxies(proxy_pool, PROXY_A, PROXY_B, policy=policy, clock=clock)
+    leasing, pool, stats, _ = _leasing(clock=clock, login=_login(log_in), proxies=proxies)
+
+    with pytest.raises((NoSessionYet, SessionError)):
+        await _through(leasing, Request(f"{SITE}/", session="a"))
+
+    assert pool.health("a") == health
+    if health == "cooldown":
+        assert await pool.ready_in(session="a") == 60  # its proxy's cooldown, longer than a failed login's
+    assert stats.get("sessions.login_failures") == 1
+
+
+async def test_a_login_whose_session_is_retired_with_its_proxy_retires_it() -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        await _through(leasing, Request(f"{SITE}/login", session=session.id))  # the first through its proxy
+
+    clock = Clock()
+    proxy_pool = MemoryProxyPool(max_failures=1, clock=clock)
+    proxies = await _proxies(proxy_pool, PROXY_A, PROXY_B, policy=NEVER, clock=clock)
+    leasing, pool, stats, _ = _leasing(clock=clock, login=_login(log_in), proxies=proxies)
+    pool.add(Session("a", proxy=PROXY_A))
+    await proxy_pool.report(PROXY_A, failed=True, since=clock.now)
+
+    with pytest.raises(SessionError, match="retired"):
+        await _through(leasing, Request(f"{SITE}/", session="a", proxy="http://own.example:1"))
+
+    assert pool.health("a") == "retired"
+    assert stats.get("sessions.login_failures") == 1
+
+
 async def test_a_policy_failing_once_a_fetch_through_its_proxy_failed_leaves_the_session_as_it_is(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

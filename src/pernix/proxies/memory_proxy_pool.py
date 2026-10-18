@@ -224,8 +224,8 @@ class MemoryProxyPool:
         Returns:
             Whether the Session is bound to the proxy now; `False`, changing nothing,
             if the proxy is not one of its candidates, not available, or has no
-            room, or for a record, if the pool lists the proxy, or holds it for
-            another Session.
+            room, or for a record, if the pool lists the proxy, holds it for
+            another Session, or other Sessions still occupy it.
         """
         own = isinstance(proxy, Proxy)
         url = proxy.url if isinstance(proxy, Proxy) else proxy
@@ -239,6 +239,8 @@ class MemoryProxyPool:
             entry = _Entry(url, listed=False)
         elif holder is None and entry.listed == own:
             return False  # a record of a proxy the pool lists, or a URL it neither lists nor holds for the Session
+        elif own and holder is None and self._occupants(url) - {session}:
+            return False  # Sessions bound to it while it was listed still go through it
         if not entry.available(self._clock()):
             return False
         shared = holder is None and not own
