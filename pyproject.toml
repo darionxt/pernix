@@ -41,6 +41,7 @@ Repository = "https://github.com/darionxt/pernix"
 [project.optional-dependencies]
 browser = [
     "patchright==1.62.3",
+    "psutil>=7.0",
 ]
 
 [build-system]

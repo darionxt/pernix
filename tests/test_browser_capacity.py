@@ -69,7 +69,8 @@ async def test_waiting_for_a_page_takes_no_part_in_the_deadline(server: Loopback
     settings = BrowserSettings(max_pages=1, deadline=4.0)  # ample for one fast page on a slow runner
 
     async with BrowserFetcher(settings) as fetcher:
-        await fetcher._browser()  # pyright: ignore[reportPrivateUsage]  # started apart, as the deadline counts it
+        async with fetcher._generations.fetching(""):  # pyright: ignore[reportPrivateUsage]
+            pass  # the browser starts apart, as the deadline counts it
         held = await fetcher._pages.take()  # pyright: ignore[reportPrivateUsage]  # the only slot
         fetching = asyncio.create_task(fetcher.fetch(_render(server.url("/"))))
         await asyncio.sleep(4.5)  # longer than the deadline

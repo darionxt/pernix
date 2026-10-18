@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from pernix import IgnoreRequest, Request, Response, events
-from pernix.errors import ConnectError, ResponseTooLarge, RetriesExhausted, SessionError, TLSError
+from pernix.errors import BrowserLost, ConnectError, ResponseTooLarge, RetriesExhausted, SessionError, TLSError
 from pernix.fetchers import FetcherDispatch, StreamedResponse
 from pernix.inline_fetch import InlineFetch, handling
 from pernix.middlewares import build_download_chain
@@ -134,6 +134,33 @@ async def test_once_the_retries_run_out_the_fetch_raises_retries_exhausted() -> 
     assert isinstance(unreachable.value.__cause__, ConnectError)
     assert unreachable.value.response is None
     assert len(site.requests) == 4
+
+
+async def test_retries_under_a_budget_take_none_of_the_attempts_in_place() -> None:
+    site = _site({"/a": [BrowserLost("gone"), _status(503), BrowserLost("gone"), b"ok"]})
+    bus = events.EventBus(timeout=5)
+    retried = Recording(bus, events.RequestRetried)
+    policy = DefaultRetryPolicy(RetrySettings(times=1, browser_lost=2, delay_scale=0))
+
+    response = await _inline(site.fetch, retry_policy=policy, bus=bus).fetch(Request(f"{SITE}/a"))
+
+    assert response.body == b"ok"
+    assert [(event.attempt, event.budget) for event in retried.events] == [
+        (1, "browser_lost"),
+        (1, None),
+        (2, "browser_lost"),
+    ]
+
+
+async def test_a_spent_budget_raises_retries_exhausted_in_place() -> None:
+    site = _site({"/a": [BrowserLost("gone")]})
+    policy = DefaultRetryPolicy(RetrySettings(browser_lost=1, delay_scale=0))
+
+    with pytest.raises(RetriesExhausted, match=r"browser_lost: 1 retries spent") as exhausted:
+        await _inline(site.fetch, retry_policy=policy).fetch(Request(f"{SITE}/a"))
+
+    assert isinstance(exhausted.value.__cause__, BrowserLost)
+    assert len(site.requests) == 2
 
 
 async def test_errors_the_policy_keeps_are_raised_as_they_are() -> None:

@@ -58,7 +58,8 @@ class CoreStats:
     - `requests.enqueued`: Requests that entered the Frontier.
     - `requests.dropped`, `requests.dropped_by_reason.<reason>`: Requests vetoed, or
       dropped as duplicates.
-    - `requests.retried`, `requests.ignored`: Attempts retried; Requests ignored.
+    - `requests.retried`, `requests.retried_by_budget.<budget>`, `requests.ignored`:
+      Attempts retried, those under a retry budget by its name; Requests ignored.
     - `requests.failed`, `requests.failed_by_error.<ErrorType>`: Requests that failed
       for good.
     - `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes`: Responses
@@ -126,9 +127,11 @@ class CoreStats:
         self._stats.inc(f"requests.dropped_by_reason.{_label(event.reason)}")
 
     @on(RequestRetried)
-    def retried(self, _event: RequestRetried) -> None:
-        """Count a retried attempt."""
+    def retried(self, event: RequestRetried) -> None:
+        """Count a retried attempt, and the retry budget it counts against, if any."""
         self._stats.inc("requests.retried")
+        if event.budget is not None:
+            self._stats.inc(f"requests.retried_by_budget.{_label(event.budget)}")
 
     @on(RequestIgnored)
     def ignored(self, _event: RequestIgnored) -> None:

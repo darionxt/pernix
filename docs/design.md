@@ -582,7 +582,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 **Topology**
 
-- The browser Fetcher starts patchright with the first Request that needs rendering, and it launches one browser with `launch()`, so a Run that renders nothing never starts them; both are closed with the Run. Without `pernix[browser]` installed, or without the browser engine, that Request fails with a `ComponentError` naming the command that installs it, `pernix browser install` for the engine, and so do the later ones, at once; an `executable_path` in `browser.launch_options` that does not exist is named instead.
+- The browser Fetcher starts patchright with the first Request that needs rendering, and it launches one browser with `launch()`, so a Run that renders nothing never starts them; both are closed with the Run, or replaced by new ones, as Generations (below) are. Without `pernix[browser]` installed, or without the browser engine, that Request fails with a `ComponentError` naming the command that installs it, `pernix browser install` for the engine, and so do the later ones, at once; an `executable_path` in `browser.launch_options` that does not exist is named instead.
 - The browser is the Chrome for Testing build bundled with the pinned patchright, never the headless shell. It creates multiple contexts, kept per Session (§5.3); without a Session, each rendered Request gets a fresh context, closed after the fetch, so Requests stay independent as on the HTTP side.
 - A context's proxy, locale, and time zone are set once at creation and never modified afterward, and so is the localStorage a Session's context starts with; switching proxies means creating a new context. A Session's cookies are synced into its context before each fetch (§5.3). `Request(proxy=...)` is the proxy of its context, for every request of it, loopback ones included. Chrome cannot go through a SOCKS proxy with credentials, so a Request that would is refused with a `ValueError` before anything is launched.
 
@@ -602,15 +602,25 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 - Every fetch has a context of its own, kept for its Session or fresh (§5.3), so the contexts in use are bounded by `browser.max_pages` too, and those kept idle by `browser.max_idle_contexts`; there is no other limit on contexts, nor on the pages of one.
 - A Run's rendered Requests have `browser.max_pages` workers of their own, apart from the `concurrency` workers that take the other Requests, so neither kind waits for the other (§6.3).
 - Stats: `browser.pages` and `browser.contexts`, the pages and contexts opened; `browser.pages_open` and `browser.contexts_open`, how many are open; `browser.page_waits` and `browser.page_wait_seconds`, the fetches that waited for a page, and how long.
-- Browsers are replaced by a new generation, triggered by age, cumulative page count, or memory: in-flight pages are allowed to finish first, then a new browser takes over.
+
+**Generations** (`pernix.fetchers.browser_generations`)
+
+- Each browser runs with a patchright driver of its own; the two are one Generation, from the browser's launch until it is closed. One takes the new fetches at a time, the current one; the first fetch that finds none launches one, while the others wait for that launch, so a browser is started once, whether it is the first, a replacement, or a restart.
+- A Generation is replaced once it is `browser.generation_age` (3600 s) old or opened `browser.generation_pages` (1000) pages, as the next fetch finds, or once the resident sets of its processes, the browser's and those it started, sum up to more than `browser.generation_memory` MiB (0, not measured, by default), as its health probe finds. 0 turns each off. The fetches in it finish there while the next go to a new one, and it is closed once the last one ends; its contexts kept for Sessions are closed at once, or once their fetch ends, and the Sessions get new ones in the next, from their state. Measuring the memory takes psutil, which the `browser` extra installs.
+- Every 10 s, each Generation's health probe asks the browser for its version, through the driver; the probe also measures its memory, if `browser.generation_memory` is set.
+- Once closed, what is left of a Generation's processes is killed, so a driver that died, which leaves its browser running, leaves no process behind: the browser's process group, which it leads, and the processes it started, as found then, or, should the browser have ended before them, as its health probe last found them. Each is told by its id and when it was created, so a process that took the id of one that ended is left alone.
+- Stats: `browser.generations`, the browsers launched; `browser.replaced` and `browser.replaced_by_reason.<age|pages|memory>`; `browser.lost` and `browser.lost_by_reason.<disconnected|driver|unresponsive>`; and `browser.page_crashes`.
 
 **Failures**
 
 | Failure | Handling |
 | --- | --- |
-| Page crash | Close the page; the Request is handled as a retryable error |
-| Browser disconnected | The current generation is marked invalid, in-flight Requests end with `BrowserLost` (not counted against the normal retry count), and the browser is restarted under a single-flight lock |
-| Driver process dies | No notification is emitted in this case: the error type is recognized at the boundary and periodic health probes are run, then patchright is restarted entirely |
+| Page crash | The page's `crash` event, or patchright's error for it, ends the fetch with `PageCrashed`, a `FetchError` the default retry policy retries as an ordinary retry, as the page may crash again; a context kept for a Session is closed once what the fetch changed is kept |
+| Browser disconnected | The Generation is lost: its fetches are cancelled and end with `BrowserLost`, which the default retry policy retries at once under a retry budget of its own (§6.4), and the next fetch launches another |
+| Driver process dies | No event tells of it: an error of a fetch that names the closed connection, or a driver process that ended, as its health probe finds, loses the Generation as above |
+| Browser or driver stops answering | A health probe that gets no answer within 10 s loses the Generation as above, and its driver is killed, so that what waits for it, cancelled or not, ends |
+
+patchright may fail a call before it emits the event of what failed it, so an error that names a closed page, browser, or driver waits up to a second for the event, and becomes `PageCrashed` or `BrowserLost` if it comes.
 
 **Defaults**
 
@@ -762,14 +772,14 @@ Interface semantics:
 - `claim`: claims a Request and obtains a Lease with a token; `claim(rendered=True)` claims only the Requests that go to the browser Fetcher, and `rendered=False` only the others.
 - `renew`: renews the Lease.
 - `ack`: acknowledges completion.
-- `nack(delay)`: returns the Request with a delay, optionally counting it as a failure.
+- `nack(delay)`: returns the Request with a delay, optionally counting it as a failure; `nack(budget=name)` counts it as a retry under a retry budget instead (§6.4), in `Lease.spent`.
 - `dead`: marks the Request as permanently failed; it is kept as a Dead Request.
 
 Rules:
 
 - All write operations are conditional on `(id, token)`; writes from a stale old Lease have no effect.
 - Lease deadlines are taken from the backend clock.
-- A Lease carries the item id, a token that increases with every claim, the attempt number (from 1; `nack(count_attempt=False)` does not count, an expired Lease does), the expiry time, the concurrency slot (the host by default, used by `claim(skip_slots=...)`), whether the Request is rendered (used by `claim(rendered=...)`), and the Request.
+- A Lease carries the item id, a token that increases with every claim, the attempt number (from 1; `nack(count_attempt=False)` does not count, an expired Lease does), the expiry time, the concurrency slot (the host by default, used by `claim(skip_slots=...)`), whether the Request is rendered (used by `claim(rendered=...)`), the retries it had under each retry budget (`spent`), and the Request.
 - `claim` hands out higher priorities first and, within a priority, the Request that became ready first; a Request returned with `nack` queues behind the ready ones. A Request whose Lease expires becomes ready again.
 - `wait()` returns once something may have changed (an add, a settled Lease, a passed delay, an expired Lease), so idle Workers do not poll; distributed backends may return after a polling interval.
 - Every backend passes the conformance suite in `pernix.testing.frontier`.
@@ -824,13 +834,14 @@ Engine integration:
 After every attempt that produced a Response, raised while fetching, or raised `Retry` in the Callback, the Engine asks the retry policy, `decide(request, outcome, attempt) -> Decision`, where `outcome` is the Response or the exception and `attempt` counts from 1. The Decision is one of:
 
 - `accept()`: the outcome stands; a Response goes to the spider chain, an exception fails the Request.
-- `retry(delay, reason)`: the Request is fetched again after the delay, and `RequestRetried` is emitted.
+- `retry(delay, reason, budget=None)`: the Request is fetched again after the delay, and `RequestRetried` is emitted. With a `RetryBudget(name, limit)`, the retry counts against that budget instead of as an attempt: the `attempt` the policy is next told of is the same, and once the Request had `limit` retries under the budget, the next one fails it with `RetriesExhausted`, naming the budget.
 - `give_up(reason)`: a retry was called for but none is left; the Request fails with `RetriesExhausted`.
 
 Default policy (`DefaultRetryPolicy`, configured by `retry.*`):
 
 - At most 3 retries (`retry.times`; 0 turns retrying off).
-- Retried status codes (`retry.statuses`): 408, 429, 500, 502, 503, 504, 522, 524. Retried exceptions: `Timeout`, `ConnectError`, `ProxyError`, and `Retry`, including `LoginExpired` for a Session found logged out (§5.3); other `FetchError`s, such as `TLSError` or `TooManyRedirects`, would fail again.
+- Retried status codes (`retry.statuses`): 408, 429, 500, 502, 503, 504, 522, 524. Retried exceptions: `Timeout`, `ConnectError`, `ProxyError`, `PageCrashed`, and `Retry`, including `LoginExpired` for a Session found logged out (§5.3); other `FetchError`s, such as `TLSError` or `TooManyRedirects`, would fail again.
+- `BrowserLost` is retried at once under the `browser_lost` budget, up to `retry.browser_lost` (3) times, which take none of `retry.times`: the fetch did not fail by itself, but with every fetch in its browser.
 - The delay is the one `Retry` names; otherwise a `Retry-After` header's, in either format, up to 300 s (`retry.retry_after_max`); otherwise full-jitter backoff with a 1 s base (`retry.backoff_base`) doubling per retry, up to 60 s (`retry.backoff_max`). `retry.delay_scale` multiplies every delay; tests set it to 0.
 - `retry.policy` replaces the policy with any object that has `decide()`; a class gets `RetrySettings` injected. A policy that raises keeps the outcome.
 
@@ -839,6 +850,8 @@ Rules:
 - For Requests that go through the Frontier, a retry returns the Request with `nack(delay)`, so it holds no concurrency slot while it waits, and every Middleware runs again; Inline Fetches are retried in place.
 - A Request whose retries ran out, or that failed in a way the policy keeps, is kept as a Dead Request, `RequestFailed` is emitted, and its errback runs.
 - `CancelledError` is never caught: when a Run is cancelled, Requests in flight are returned to the Frontier without counting an attempt, never retried.
+
+**Retry budgets**: failures that are not the Request's own, such as a browser that went away, or a Session found Blocked (§5.3), are retried under budgets of their own, so they take no ordinary retry, while a Request that keeps meeting them still ends. A policy names the budget and its limit in the Decision, and stays stateless; the Frontier counts the retries of each budget with the Request, as it counts its attempts (`nack(budget=...)`, `Lease.spent`), so the count survives a restart and is shared by Workers; the Engine gives up once the count reaches the limit, and an Inline Fetch counts them in place, for its own retries. `RequestRetried.budget` names the budget, and `requests.retried_by_budget.<budget>` counts its retries, besides `requests.retried`. A custom policy that does not name a budget retries as it always did.
 
 ### 6.5 Resuming and distributed crawling
 
@@ -916,7 +929,7 @@ Rules:
 | `run.id`, `run.spider`, `run.started_at`, `run.finished_at`, `run.elapsed`, `run.reason` | The Run; times in UTC ISO 8601, `elapsed` in seconds, `reason` as in `SpiderClosed` |
 | `requests.enqueued` | Requests that entered the Frontier |
 | `requests.dropped`, `requests.dropped_by_reason.<reason>` | Requests vetoed or dropped as duplicates, such as `duplicate` and `offsite` |
-| `requests.retried`, `requests.ignored` | Attempts retried; Requests ignored |
+| `requests.retried`, `requests.retried_by_budget.<budget>`, `requests.ignored` | Attempts retried, and those of them under a retry budget, by its name (§6.4); Requests ignored |
 | `requests.failed`, `requests.failed_by_error.<ErrorType>` | Requests that failed for good |
 | `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards and those of Inline Fetches, and their body bytes, streamed ones as they are read |
 | `downloads.errors`, `downloads.errors_by_type.<ErrorType>` | Exceptions fetching raised, other than `IgnoreRequest` and `Retry` |

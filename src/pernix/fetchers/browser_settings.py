@@ -26,6 +26,15 @@ class BrowserSettings(Section):
         max_pages: Pages open at once, each that of one fetch, at most; a fetch
             waits for one to close before it opens its own. A Run processes this
             many rendered Requests at once, apart from `concurrency`.
+        generation_age: Seconds after which the browser is replaced by a new one:
+            the fetches in it finish there while the next go to the new one, and it
+            closes once they are done; 0 never replaces it for its age.
+        generation_pages: Pages the browser opens before it is replaced, the same
+            way; 0 for no limit.
+        generation_memory: MiB the processes of the browser may take, their
+            resident sets summed as its health probe measures them every 10 s,
+            before it is replaced, the same way; 0, the default, does not measure
+            it. Measuring it takes psutil, which the `browser` extra installs.
         max_idle_contexts: Browser contexts kept idle for Sessions between their
             fetches, at most; beyond that, the least recently used is closed. 0
             closes each after its fetch.
@@ -46,6 +55,9 @@ class BrowserSettings(Section):
     deadline: Annotated[float, msgspec.Meta(gt=0)] = 180.0
     launch_options: dict[str, Any] = msgspec.field(default_factory=dict[str, Any])
     max_pages: Annotated[int, msgspec.Meta(ge=1)] = 8
+    generation_age: Annotated[float, msgspec.Meta(ge=0)] = 3600.0
+    generation_pages: Annotated[int, msgspec.Meta(ge=0)] = 1000
+    generation_memory: Annotated[int, msgspec.Meta(ge=0)] = 0
     max_idle_contexts: Annotated[int, msgspec.Meta(ge=0)] = 8
     context_idle: Annotated[float, msgspec.Meta(gt=0)] = 300.0
     block: tuple[str, ...] = ()

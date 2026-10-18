@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import unquote, urlsplit
 
 from pernix.errors import ComponentError
+from pernix.fetchers.browser_processes import BrowserProcesses
 from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.refusing_proxy import RefusingProxy
 
@@ -16,7 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from patchright._impl._api_structures import StorageState
-    from patchright.async_api import Browser, BrowserContext, Playwright, ProxySettings
+    from patchright.async_api import Browser, BrowserContext, CDPSession, Playwright, ProxySettings
     from patchright.async_api._context_manager import PlaywrightContextManager
 
     from pernix.fetchers.browser_settings import BrowserSettings
@@ -25,6 +27,8 @@ __all__ = ["LOOPBACK_BYPASS", "LaunchedBrowser", "launch_browser", "probe_browse
 
 LOOPBACK_BYPASS = "<-loopback>,localhost,*.localhost,127.0.0.1/8,[::1]"
 """Proxy bypass rules for loopback hosts and nothing else; Chrome's implicit ones would also bypass link-local addresses."""
+
+logger = logging.getLogger(__name__)
 
 _EXTRA_HINT = "rendering needs patchright; install it with: pip install 'pernix[browser]'"
 _ENGINE_HINT = "the browser engine is not installed; install it with: pernix browser install"
@@ -40,12 +44,18 @@ class LaunchedBrowser:
         guarded: Whether it was launched under the network guard, so that only
             loopback hosts are reached without a proxy of the Request's own.
         refusing_proxy: Where a guarded browser sends everything else.
+        devtools: A session of the browser's DevTools protocol, which `probe()`
+            goes through; `None` if the browser has none.
+        processes: The processes of the browser and of its driver; `None` if they
+            cannot be found, as without psutil.
     """
 
     playwright: Playwright
     browser: Browser
     guarded: bool
     refusing_proxy: RefusingProxy | None
+    devtools: CDPSession | None = None
+    processes: BrowserProcesses | None = None
 
     async def new_context(
         self,
@@ -76,6 +86,18 @@ class LaunchedBrowser:
         if blocks_service_workers:
             options["service_workers"] = "block"
         return await self.browser.new_context(**options)
+
+    async def probe(self) -> None:
+        """Ask the browser for its version, through the driver, which fails, or never ends, once either went away.
+
+        Raises:
+            Exception: The browser or the driver did not answer.
+        """
+        if self.devtools is None:  # a browser without DevTools: a round trip of another kind
+            context = await self.browser.new_context()
+            await context.close()
+            return
+        await _send(self.devtools, "Browser.getVersion")
 
     async def close(self) -> None:
         """Close the browser, stop the driver, and stop the refusing proxy."""
@@ -126,13 +148,14 @@ async def launch_browser(settings: BrowserSettings) -> LaunchedBrowser:
             if "executable doesn't exist" in str(exc).lower():
                 raise ComponentError(_missing_executable(settings)) from exc
             raise
+        devtools, processes = await _inspect(browser)
     except BaseException:
         if playwright is not None:
             await playwright.stop()
         if refusing_proxy is not None:
             await refusing_proxy.close()
         raise
-    return LaunchedBrowser(playwright, browser, refusing_proxy is not None, refusing_proxy)
+    return LaunchedBrowser(playwright, browser, refusing_proxy is not None, refusing_proxy, devtools, processes)
 
 
 async def probe_browser(settings: BrowserSettings) -> str:
@@ -158,6 +181,28 @@ async def probe_browser(settings: BrowserSettings) -> str:
         return f"{launched.browser.browser_type.name} {launched.browser.version}"
     finally:
         await launched.close()
+
+
+async def _inspect(browser: Browser) -> tuple[CDPSession | None, BrowserProcesses | None]:
+    """A DevTools session of a browser just launched, and its processes, as far as it tells them."""
+    try:
+        devtools = await browser.new_browser_cdp_session()
+    except Exception:  # a browser without DevTools
+        logger.debug("The browser has no DevTools session", exc_info=True)
+        return None, None
+    try:
+        info = await _send(devtools, "SystemInfo.getProcessInfo")
+    except Exception:
+        logger.debug("The browser does not tell its processes", exc_info=True)
+        return devtools, None
+    processes = cast("list[dict[str, Any]]", info.get("processInfo", []))
+    pid = next((int(process["id"]) for process in processes if process.get("type") == "browser"), None)
+    return devtools, None if pid is None else BrowserProcesses.of(pid)
+
+
+async def _send(devtools: CDPSession, method: str) -> dict[str, Any]:
+    """Send a command of the DevTools protocol, and return its result."""
+    return cast("dict[str, Any]", await devtools.send(method))  # pyright: ignore[reportUnknownMemberType]  # untyped
 
 
 def require_patchright() -> None:

@@ -122,12 +122,15 @@ class RequestRetried(Event):
         attempt: The attempt that did not succeed, from 1.
         delay: Seconds before the next attempt.
         reason: Why, such as `"HTTP 503"`.
+        budget: The retry budget the retry counts against instead of the
+            attempts, such as `"browser_lost"`; `None` for an ordinary retry.
     """
 
     request: Request
     attempt: int
     delay: float
     reason: str
+    budget: str | None = None
 
 
 @dataclass(frozen=True)

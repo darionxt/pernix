@@ -43,7 +43,8 @@ class SessionContext:
         context: The browser context.
         launched: The browser it belongs to.
         local_storage: The localStorage the context holds, by origin, as last seen.
-        broken: Whether it failed in a way that keeps it from being used again.
+        broken: Whether it is not to be used again: it failed, or its browser is
+            being replaced or was lost.
     """
 
     def __init__(
@@ -176,7 +177,8 @@ class SessionContexts:
     fetch blocks service workers where they did not, or the other way round, are
     closed. At most `kept` contexts are kept between fetches, the least recently used
     closed beyond that, and one kept for `idle` seconds is closed. A context whose
-    fetch was cancelled, or that broke, is closed instead of kept.
+    fetch was cancelled, or that broke, is closed instead of kept, and so are those
+    of a browser that is retired, as it is replaced or was lost.
     """
 
     def __init__(
@@ -200,6 +202,7 @@ class SessionContexts:
         self._new_context = new_context
         self._discard = discard
         self._waiting: list[SessionContext] = []  # least recently used first
+        self._busy: set[SessionContext] = set()
         self._expiries: dict[SessionContext, asyncio.TimerHandle] = {}
 
     def __len__(self) -> int:
@@ -227,16 +230,33 @@ class SessionContexts:
             held = SessionContext(
                 session, context, proxy=proxy, launched=launched, blocks_service_workers=blocks_service_workers
             )
+        self._busy.add(held)
         try:
             yield held
         except asyncio.CancelledError:
+            self._busy.discard(held)
             self._close(held)  # a page may still be loading in it
             raise
         except BaseException:
+            self._busy.discard(held)
             self._give_back(held)
             raise
         else:
+            self._busy.discard(held)
             self._give_back(held)
+
+    def retire(self, launched: LaunchedBrowser) -> None:
+        """Close the contexts kept in a browser that takes no new fetches, and those in use there once their fetch ends.
+
+        Args:
+            launched: The browser, being replaced or lost.
+        """
+        for held in self._busy:
+            if held.launched is launched:
+                held.broken = True
+        for held in [held for held in self._waiting if held.launched is launched]:
+            self._waiting.remove(held)
+            self._close(held)
 
     def close(self) -> None:
         """Close every context kept, without waiting for them."""

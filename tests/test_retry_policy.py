@@ -6,8 +6,18 @@ import random
 import pytest
 
 from pernix import Request, Response, Retry
-from pernix.errors import ConnectError, DecodeError, FetchError, ProxyError, Timeout, TLSError, TooManyRedirects
-from pernix.retry_policy import Action, Decision, DefaultRetryPolicy, retry_after_seconds
+from pernix.errors import (
+    BrowserLost,
+    ConnectError,
+    DecodeError,
+    FetchError,
+    PageCrashed,
+    ProxyError,
+    Timeout,
+    TLSError,
+    TooManyRedirects,
+)
+from pernix.retry_policy import Action, Decision, DefaultRetryPolicy, RetryBudget, budget_spent, retry_after_seconds
 from pernix.settings import RetrySettings
 
 URL = "https://example.com/"
@@ -40,7 +50,9 @@ def test_other_statuses_are_kept(status: int) -> None:
     assert _policy().decide(Request(URL), _response(status), 1) == Decision.accept()
 
 
-@pytest.mark.parametrize("error", [Timeout("slow", code=28), ConnectError("refused", code=7), ProxyError("proxy")])
+@pytest.mark.parametrize(
+    "error", [Timeout("slow", code=28), ConnectError("refused", code=7), ProxyError("proxy"), PageCrashed("crashed")]
+)
 def test_transient_transport_errors_are_retried(error: FetchError) -> None:
     decision = _policy().decide(Request(URL), error, 1)
 
@@ -53,6 +65,27 @@ def test_transient_transport_errors_are_retried(error: FetchError) -> None:
 )
 def test_errors_that_would_happen_again_are_kept(error: Exception) -> None:
     assert _policy().decide(Request(URL), error, 1) == Decision.accept()
+
+
+@pytest.mark.parametrize("attempt", [1, 4, 100])
+def test_a_lost_browser_is_retried_at_once_under_its_own_budget(attempt: int) -> None:
+    decision = _policy(times=3, browser_lost=5).decide(Request(URL), BrowserLost("the browser disconnected"), attempt)
+
+    assert decision == Decision.retry(
+        0.0, "BrowserLost: the browser disconnected", budget=RetryBudget("browser_lost", 5)
+    )  # whatever attempt it was, as its retries take none of retry.times
+
+
+def test_retry_browser_lost_0_leaves_no_retry_in_the_budget() -> None:
+    decision = _policy(browser_lost=0).decide(Request(URL), BrowserLost("gone"), 1)
+
+    assert decision.budget == RetryBudget("browser_lost", 0)
+
+
+def test_a_spent_budget_is_named_in_the_reason() -> None:
+    reason = budget_spent("BrowserLost: gone", RetryBudget("browser_lost", 3))
+
+    assert reason == "BrowserLost: gone (browser_lost: 3 retries spent)"
 
 
 def test_retry_uses_its_delay_or_the_backoff() -> None:
