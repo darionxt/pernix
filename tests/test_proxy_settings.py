@@ -62,3 +62,45 @@ def test_sessions_keep_their_proxy_with_no_limit_on_how_many_share_one_unless_se
     for wrong in ({"proxies.max_sessions": 0}, {"proxies.rebind": "always"}):
         with pytest.raises(SettingsError):
             load_settings(spider_settings=wrong)
+
+
+def test_proxies_are_replaced_at_each_load_and_not_extracted_on_demand_unless_set() -> None:
+    defaults = ProxySettings()
+
+    assert (defaults.supply, defaults.api_lifetime, defaults.min_available, defaults.max_extracted) == (
+        "replace",
+        None,
+        None,
+        None,
+    )
+    assert (defaults.extract_interval, defaults.extract_attempts) == (1.0, 3)
+    settings = load_settings(
+        spider_settings={
+            "proxies.api": "https://vendor.example/proxies?num={count}",
+            "proxies.supply": "add",
+            "proxies.api_lifetime": 300,
+            "proxies.min_available": 10,
+            "proxies.max_extracted": 1000,
+        }
+    ).section(ProxySettings)
+    assert (settings.supply, settings.api_lifetime, settings.min_available, settings.max_extracted) == (
+        "add",
+        300,
+        10,
+        1000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("given", "problem"),
+    [
+        ({"proxies.api": "https://vendor.example/", "proxies.min_available": 1}, "proxies.min_available: proxies are"),
+        ({"proxies.api": "https://vendor.example/", "proxies.max_extracted": 1}, "proxies.max_extracted: proxies are"),
+        ({"proxies.urls": ["a.example:1"], "proxies.supply": "add", "proxies.min_available": 1}, "neither is set"),
+        ({"proxies.urls": ["a.example:1"], "proxies.api_lifetime": 60}, "proxies.api_lifetime: it is the lifetime"),
+    ],
+    ids=["level without add", "limit without add", "level without an extracting source", "lifetime without api"],
+)
+def test_extraction_settings_that_cannot_apply_are_refused(given: dict[str, object], problem: str) -> None:
+    with pytest.raises(SettingsError, match=problem):
+        load_settings(spider_settings=given)

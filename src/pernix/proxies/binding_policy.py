@@ -17,15 +17,15 @@ if TYPE_CHECKING:
 
 __all__ = ["Binding", "BindingPolicy", "BindingReason", "DefaultBindingPolicy"]
 
-type BindingReason = Literal["new", "lease", "cooldown", "retired", "unlisted"]
+type BindingReason = Literal["new", "lease", "cooldown", "retired", "expired", "unlisted"]
 """Why a Session is being bound: it has no proxy yet; a Lease starts while its proxy is available; or its proxy cools
-down, is Retired, or is no longer listed."""
+down, is Retired, expired, or is no longer listed."""
 
 _FOLLOWED: Mapping[str, frozenset[BindingReason]] = {
     "unavailable": frozenset(),
     "every_lease": frozenset(),
     "retired": frozenset({"lease", "cooldown"}),
-    "never": frozenset({"lease", "cooldown", "retired", "unlisted"}),
+    "never": frozenset({"lease", "cooldown", "retired", "expired", "unlisted"}),
 }
 """For each `proxies.rebind`, the reasons for which the default policy keeps a Session on its proxy, whatever its
 health; the others keep it only while it is open."""
@@ -85,15 +85,16 @@ class BindingPolicy(Protocol):
 
     - `binding.current` to keep the Session on its proxy, whatever its health: while
       the proxy cools down, the Session cools down with it, and its Requests wait
-      for it; once the proxy is Retired, or no longer listed, the Session is
-      Retired with it;
+      for it; once the proxy is Retired, expired, or no longer listed, the Session
+      is Retired with it;
     - another candidate's URL to bind that;
     - a `pernix.proxies.Proxy` record to give the Session a proxy of its own, which
       the pool does not list, such as its Account's, or a sticky session on a
       gateway built from its id: it is held for that Session alone, takes no
       turns, and refreshes keep it; it is checked, its password masked in the
       Run's log, and its health kept as any other's, and it is among the
-      Session's candidates from then on;
+      Session's candidates from then on, until its `expires`, which a record
+      given again renews;
     - or `None` to have the Session's Requests wait, as when none fits.
 
     The pool binds a Session only to a proxy available with room for it; should
@@ -129,11 +130,12 @@ class DefaultBindingPolicy:
 
     By `proxies.rebind`, a Session is bound to another proxy:
 
-    - `unavailable`: once its proxy cools down, is Retired, or is no longer listed;
+    - `unavailable`: once its proxy cools down, is Retired, expired, or is no longer
+      listed;
     - `every_lease`: at each Lease, if another proxy is open, so its Leases go
       through the proxies in turn;
-    - `retired`: only once its proxy is Retired, or no longer listed; while it cools
-      down, the Session cools down with it;
+    - `retired`: only once its proxy is Retired, expired, or no longer listed; while
+      it cools down, the Session cools down with it;
     - `never`: the Session cools down with its proxy, and is Retired with it.
 
     Among the open proxies with the fewest other Sessions occupying them, the least

@@ -8,7 +8,7 @@ import pytest
 
 from pernix.errors import FetchError, SettingsError
 from pernix.fetchers import HTTPFetcher
-from pernix.proxies import read_proxies
+from pernix.proxies import Proxy, read_proxies
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies, proxy_lines
 from pernix.secret import Secret
 
@@ -91,3 +91,40 @@ async def test_an_api_answering_with_an_error_fails_without_naming_its_url(serve
         await api.close()
 
     assert "key=k" not in str(failed.value)
+
+
+async def test_an_api_is_told_how_many_proxies_are_wanted_and_its_url_as_fetched_is_masked(
+    server: LoopbackServer,
+) -> None:
+    server.route("/proxies", "a.example:1\n")
+    masked: list[str] = []
+    api = ProxyAPI(Secret(server.url("/proxies?key=k&num={count}")), HTTPFetcher(), mask=masked.extend)
+
+    await api.open()
+    try:
+        await api.proxies(wanted=5)
+        await api.proxies()
+    finally:
+        await api.close()
+
+    assert [received.query for received in server.received] == [
+        [("key", "k"), ("num", "5")],
+        [("key", "k"), ("num", "1")],
+    ]
+    assert masked == [server.url("/proxies?key=k&num=5"), server.url("/proxies?key=k&num=1")]
+
+
+async def test_the_proxies_of_an_api_with_a_lifetime_expire_that_long_after_it_answered(server: LoopbackServer) -> None:
+    server.route("/proxies", "a.example:1\nb.example:2:user:pw\n")
+    api = ProxyAPI(Secret(server.url("/proxies")), HTTPFetcher(), lifetime=300, clock=lambda: 1_800_000_000.0)
+
+    await api.open()
+    try:
+        proxies = await api.proxies()
+    finally:
+        await api.close()
+
+    assert proxies == [
+        Proxy("a.example:1", expires=1_800_000_300.0),
+        Proxy("b.example:2:user:pw", expires=1_800_000_300.0),
+    ]

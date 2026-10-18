@@ -489,3 +489,90 @@ async def test_the_credentials_of_proxies_of_their_own_never_appear_in_the_logs_
     for secret in ("alice-user", "alice-pw", "bob-user", "bob-pw"):
         assert secret not in output
         assert all(secret not in f"{key}={value}" for key, value in crawler.stats.snapshot().items())
+
+
+class Batches(Spider):
+    """Fetches three pages of the shop under one Session, pausing after each while the proxies are refreshed."""
+
+    settings: ClassVar[Mapping[str, Any]] = {"concurrency": 1, "sessions.enabled": True}
+    PAUSES: ClassVar[tuple[float, ...]] = (0.2, 1.4)
+    """After the first page, while refreshes add proxies; after the second, until the proxies of the first expired."""
+
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(f"{SHOP}{PATHS[0]}", session="alice")
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        yield {"via": response.css("p::text").get()}
+        number = PATHS.index(urlsplit(response.url).path)
+        if number < len(self.PAUSES):
+            await asyncio.sleep(self.PAUSES[number])
+            yield Request(f"{SHOP}{PATHS[number + 1]}", session="alice")
+
+
+async def test_with_an_api_giving_new_proxies_each_time_a_session_keeps_its_own_until_it_expires(
+    server: LoopbackServer,
+) -> None:
+    with Proxy("a") as a, Proxy("b") as b, Proxy("c") as c:
+        batches = iter([a.url, b.url])
+
+        def answer(_request: ReceivedRequest) -> Reply:
+            return Reply(next(batches, c.url))
+
+        server.route("/proxies", handler=answer)
+        report = await asyncio.wait_for(
+            crawl(
+                Batches,
+                settings={
+                    "proxies.api": server.url("/proxies?num={count}"),
+                    "proxies.supply": "add",
+                    "proxies.refresh": 0.05,
+                    "proxies.api_lifetime": 1.0,
+                },
+            ),
+            timeout=20,
+        )
+
+    assert _via(report.items) == ["a", "a", "c"]  # a, kept through the refreshes, then c, once a and b expired
+    assert b.server.received == []
+    expirations = report.stats["proxies.expirations"]
+    assert isinstance(expirations, int)
+    assert expirations >= 2
+
+
+async def test_extraction_on_demand_keeps_the_pool_at_its_level_within_its_limit_and_the_run_does_not_drain(
+    server: LoopbackServer,
+) -> None:
+    with Proxy("bad") as bad, Proxy("worse") as worse, Proxy("good") as good, Proxy("better") as better:
+        bad.refusals = worse.refusals = 1_000_000
+        stock = [bad.url, worse.url, good.url, better.url]
+        asked: list[int] = []
+
+        def answer(request: ReceivedRequest) -> Reply:
+            count = int(dict(request.query)["num"])
+            asked.append(count)
+            given = stock[:count]
+            del stock[:count]
+            return Reply("\n".join(given))
+
+        server.route("/proxies", handler=answer)
+        report = await asyncio.wait_for(
+            crawl(
+                Shop,
+                pages=6,
+                settings={
+                    "proxies.api": server.url("/proxies?num={count}"),
+                    "proxies.supply": "add",
+                    "proxies.min_available": 2,
+                    "proxies.extract_interval": 0,
+                    "proxies.max_extracted": 4,
+                    "proxies.max_failures": 1,
+                    "retry.times": 5,
+                },
+            ),
+            timeout=20,
+        )
+
+    assert report.reason == "finished"
+    assert sorted(_via(report.items)) == ["better"] * 3 + ["good"] * 3
+    assert asked == [2, 1, 1]  # the level at first, then one each time it fell below, until the limit
+    assert (report.stats["proxies.extracted"], report.stats["proxies.available"]) == (4, 2)
