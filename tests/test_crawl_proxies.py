@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
     from pathlib import Path
 
+    from pernix.proxies import Binding
     from pernix.testing import ReceivedRequest
 
 HTML = [("Content-Type", "text/html")]
@@ -243,3 +244,64 @@ async def test_the_proxies_of_an_api_are_refreshed(server: LoopbackServer) -> No
     refreshes = report.stats["proxies.refreshes"]
     assert isinstance(refreshes, int)
     assert refreshes >= 1
+
+
+class ByRegion:
+    """Binds each Session to a proxy of its region, which it keeps while it is available."""
+
+    REGIONS: ClassVar[Mapping[str, str]] = {"alice": "eu", "bob": "us"}
+
+    async def bind(self, binding: Binding) -> str | None:
+        if binding.reason == "lease":
+            return binding.current
+        region = self.REGIONS[binding.session]
+        return next((candidate.url for candidate in binding.open if region in candidate.tags), None)
+
+
+async def test_a_binding_policy_of_ones_own_binds_sessions_by_tag_and_keeps_them_there() -> None:
+    with Proxy("eu") as eu, Proxy("us") as us, Proxy("untagged") as untagged:
+        report = await crawl(
+            Shop,
+            pages=6,
+            sessions=("alice", "bob"),
+            settings={
+                "sessions.enabled": True,
+                "proxies.urls": [
+                    untagged.url,
+                    {"url": eu.url, "tags": ["eu"]},
+                    {"url": us.url, "tags": ["us"]},
+                ],
+                "proxies.binding": ByRegion,
+            },
+        )
+
+    assert {(item["session"], item["via"]) for item in report.items} == {("alice", "eu"), ("bob", "us")}
+    assert len(report.items) == 6
+
+
+async def test_with_max_sessions_1_no_two_sessions_share_a_proxy() -> None:
+    with Proxy("a") as a, Proxy("b") as b:
+        report = await asyncio.wait_for(
+            crawl(
+                Shop,
+                pages=6,
+                settings={
+                    "concurrency": 3,
+                    "sessions.enabled": True,
+                    "sessions.eager": True,
+                    "sessions.size": 3,
+                    "proxies.urls": [a.url, b.url],
+                    "proxies.max_sessions": 1,
+                },
+            ),
+            timeout=20,
+        )
+
+    sessions: dict[str, set[str]] = {}
+    for item in report.items:
+        sessions.setdefault(item["via"], set()).add(item["session"])
+    assert len(report.items) == 6
+    assert all(len(each) == 1 for each in sessions.values())
+    waits = report.stats["proxies.binding_waits"]
+    assert isinstance(waits, int)
+    assert waits >= 1

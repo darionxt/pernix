@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from urllib.parse import unquote, urlsplit
 
-__all__ = ["PROXY_SCHEMES", "proxy_credentials", "proxy_url"]
+from pernix.logs.redaction import MASK
+
+__all__ = ["PROXY_SCHEMES", "proxy_address", "proxy_credentials", "proxy_url"]
 
 PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks4a", "socks5", "socks5h"})
 """The proxy schemes both Fetchers can use, but SOCKS with credentials, which the browser cannot."""
@@ -63,3 +65,19 @@ def proxy_credentials(url: str) -> tuple[str, ...]:
     if not password:
         return ()
     return tuple(dict.fromkeys((password, unquote(password))))
+
+
+def proxy_address(proxy: str) -> str:
+    """Return a proxy with whatever precedes its host masked, with or without a scheme, to show it in a `repr`.
+
+    Args:
+        proxy: A proxy, such as `http://user:password@proxy:8080`.
+
+    Returns:
+        The proxy without its credentials, such as `http://***@proxy:8080`.
+    """
+    authority, at, host = proxy.rpartition("@")
+    if not at:
+        return proxy
+    scheme, separator, _ = authority.rpartition("://")
+    return f"{scheme}{separator}{MASK}@{host}"

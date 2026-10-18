@@ -19,7 +19,7 @@ from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
-from pernix.proxies import MemoryProxyPool
+from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies
 from pernix.proxies.run_proxies import RunProxies
 from pernix.retry_policy import DefaultRetryPolicy
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from pernix.frontiers import Frontier
     from pernix.logs import RunLog
     from pernix.middlewares import Download
-    from pernix.proxies import ProxyProvider
+    from pernix.proxies import BindingPolicy, ProxyProvider
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
     from pernix.spider import Spider
@@ -144,11 +144,12 @@ class RunAssembly:
 
         The Crawler's Addons register their subscribers first. Then the components
         are built with `crawler.build_component()`: Stats Sinks, Extensions, the
-        proxies and their provider, Fetchers, download Middleware, spider
-        Middleware, Pipelines, failure Pipelines, Feeds, the Fingerprint function,
-        and the retry policy; the download and spider chains and the Pipelines are
-        checked. Steps that do not depend on each other all run, so their problems
-        are reported together. The core stats and the Stats Sinks are subscribed.
+        proxies, their provider, and their binding policy, Fetchers, download
+        Middleware, spider Middleware, Pipelines, failure Pipelines, Feeds, the
+        Fingerprint function, and the retry policy; the download and spider chains
+        and the Pipelines are checked. Steps that do not depend on each other all
+        run, so their problems are reported together. The core stats and the Stats
+        Sinks are subscribed.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
@@ -269,7 +270,8 @@ class _Proxying:
 def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
     """The proxies of the `proxies.*` settings, from each source set, kept in a pool in this process.
 
-    The API and the provider are opened before the proxies, which load them.
+    The API, the provider, and the binding policy are opened before the proxies,
+    which load them and bind Sessions with it.
     """
     options = crawler.settings.section(ProxySettings)
     if not options.enabled:
@@ -290,16 +292,26 @@ def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
             raise ComponentError(f"proxies.provider must have proxies(), got {provider!r}")
         sources.append((ProxySettings.key("provider"), cast("ProxyProvider", provider)))
         opened.append(provider)
+    policy = crawler.build_component(DefaultBindingPolicy if options.binding is None else options.binding)
+    if not callable(getattr(policy, "bind", None)):
+        raise ComponentError(f"proxies.binding must have bind(binding), got {policy!r}")
     pool = MemoryProxyPool(
+        max_sessions=options.max_sessions,
         cooldown=options.cooldown,
         cooldown_max=options.cooldown_max,
         max_failures=options.max_failures,
         stats=crawler.stats,
     )
     proxies = RunProxies(
-        pool, sources, refresh=options.refresh, stats=crawler.stats, stop=crawler.stop, mask=run_log.mask
+        pool,
+        sources,
+        policy=cast("BindingPolicy", policy),
+        refresh=options.refresh,
+        stats=crawler.stats,
+        stop=crawler.stop,
+        mask=run_log.mask,
     )
-    return _Proxying(proxies, pool, (*opened, proxies))
+    return _Proxying(proxies, pool, (*opened, policy, proxies))
 
 
 def _http_settings(crawler: Crawler) -> HTTPSettings:
@@ -354,7 +366,7 @@ def _session_leasing(
     for account in accounts:
         pool.add(Session(account.id, account=account.id), max_concurrency=account.max_concurrency)
     login = SessionLogin(spider.login, spider.is_logged_out, accounts=accounts) if logs_in else None
-    return SessionLeasing(pool, settings, stats=stats, login=login, proxies=proxies)
+    return SessionLeasing(pool, settings, stats=stats, login=login, proxies=proxies, accounts=accounts)
 
 
 class _Problems:
