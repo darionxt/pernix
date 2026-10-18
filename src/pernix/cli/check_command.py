@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pernix.cli.options import command_crawler, settings_parser, spider_arguments_parser
 from pernix.cli.spider_loader import load_spider
+from pernix.errors import ComponentError
+from pernix.fetchers import BrowserFetcher, BrowserSettings
+from pernix.fetchers.launched_browser import probe_browser, require_patchright
 from pernix.logs import RunContext, RunLog
 from pernix.run_assembly import RunAssembly
 from pernix.runner import ExitCode
@@ -37,8 +41,8 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="validate the settings and the components",
         description=(
             "Load the settings and build every component without opening any, reporting every problem found. "
-            "With TARGET, also find the Spider and convert its arguments. Exits with 0 when everything is valid, "
-            "and 2 otherwise."
+            "With TARGET, also find the Spider and convert its arguments. With the browser Fetcher, launch the "
+            "browser once, if pernix[browser] is installed. Exits with 0 when everything is valid, and 2 otherwise."
         ),
     )
     parser.add_argument(
@@ -60,26 +64,49 @@ def run(args: argparse.Namespace) -> int:
         pernix.cli.options.UsageError: The Spider cannot be found.
         pernix.errors.SettingsError: The settings are invalid.
         pernix.errors.SpiderArgumentError: The Spider arguments are invalid.
-        pernix.errors.ComponentError: A component cannot be built.
+        pernix.errors.ComponentError: A component cannot be built, or the browser
+            engine is not installed or does not start.
     """
     spider_type = load_spider(args.target) if args.target is not None else None
     crawler = command_crawler(args.settings, spider_type, args.spider_args)
     run_log = RunLog(crawler.settings.section(LogSettings), RunContext(crawler.run_id, crawler.spider.name))
     assembly = RunAssembly.build(crawler, run_log)
+    browser = None
+    if any(isinstance(component, BrowserFetcher) for component in assembly.components):
+        browser = _browser(crawler)
     project = find_project_file(Path.cwd())
     lines = ["OK", f"Project file: {project.origin if project is not None else 'none'}"]
     if spider_type is not None:
         lines.append(f"Spider: {spider_type.__qualname__} (name {spider_type.name!r})")
-    lines.extend(_components(crawler))
+    lines.extend(_components(crawler, browser))
     lines.append(f"Feeds: {', '.join(str(feed.path) for feed in assembly.feeds) or 'none'}")
     sys.stdout.write("\n".join(lines) + "\n")
     return ExitCode.COMPLETED
 
 
-def _components(crawler: Crawler) -> list[str]:
+def _browser(crawler: Crawler) -> str:
+    """Describe the browser the browser Fetcher launches, launching it once, if patchright is installed.
+
+    A project that never renders has no use for the `browser` extra, so its absence
+    is noted, not reported as a problem.
+
+    Raises:
+        pernix.errors.ComponentError: patchright is installed, but the browser engine
+            is not, or the browser does not start.
+    """
+    try:
+        require_patchright()
+    except ComponentError as exc:
+        return f"not installed ({exc})"
+    return asyncio.run(probe_browser(crawler.settings.section(BrowserSettings)))
+
+
+def _components(crawler: Crawler, browser: str | None) -> list[str]:
     settings = crawler.settings
     fetchers = [f"{name} ({_label(spec)})" for name, spec in settings.named_components("fetchers").items()]
     lines = [f"Fetchers: {', '.join(fetchers) or 'none'}"]
+    if browser is not None:
+        lines.append(f"Browser: {browser}")
     for title, key in _ROLES:
         lines.append(f"{title}: {', '.join(_label(spec) for spec in settings.components(key)) or 'none'}")
     return lines

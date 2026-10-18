@@ -16,7 +16,7 @@ Requires Python 3.13 or newer. Rendering pages in the browser needs the `browser
 
 ```bash
 uv add "pernix[browser] @ git+https://github.com/darionxt/pernix"
-uv run patchright install chromium
+uv run pernix browser install   # Chrome for Testing, which the browser Fetcher launches
 ```
 
 ## Quick start
@@ -194,11 +194,13 @@ pernix run books.py -a keyword=dune -s concurrency=4 -o books.jsonl   # Books.ru
 pernix run myproject.spiders.books:Books                            # an import path, a Spider chosen by name
 pernix fetch https://example.com/ > page.html                        # headers to stderr, the body to stdout
 pernix fetch https://example.com/ --json                             # one JSON object, errors included
+pernix fetch https://example.com/ --fetcher browser                  # the page as its scripts left it
 pernix shell https://example.com/                                    # `await fetch(...)`, `response.css(...)`
 pernix check books.py                                                # validate settings and components
+pernix browser install                                               # install the browser engine
 ```
 
-`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `fetch` exits with 0 for any Response and 1 when fetching failed. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings, without retries; `--fetcher` picks a registered Fetcher. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `fetch` exits with 0 for any Response, 1 when fetching failed, and 2 when it cannot fetch at all, as without the browser engine. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings, without retries; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
 ## Configuration
 
@@ -421,7 +423,8 @@ src/pernix/
 │   ├── run_command.py   pernix run
 │   ├── fetch_command.py pernix fetch, and its JSON output
 │   ├── shell_command.py pernix shell
-│   ├── check_command.py pernix check
+│   ├── check_command.py pernix check, launching the browser once
+│   ├── browser_command.py pernix browser install
 │   ├── spider_loader.py finds a Spider in a file or an import path
 │   ├── downloader.py    fetches single Requests outside a Run
 │   ├── console.py       the interactive console with top-level await
@@ -458,7 +461,7 @@ src/pernix/
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
-│   ├── launched_browser.py starts patchright and its browser, under the network guard if on
+│   ├── launched_browser.py starts patchright and its browser, under the network guard if on, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
@@ -513,7 +516,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run patchright install chromium   # for the tests that render; they are skipped without it
+uv run pernix browser install   # for the tests that render; they are skipped without it
 uv run pytest
 uv run ruff check
 uv run ruff format --check

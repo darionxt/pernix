@@ -28,6 +28,9 @@ BOOKS = """
 """
 
 
+pytestmark = pytest.mark.usefixtures("without_patchright")  # the browser is checked in test_cli_check_browser.py
+
+
 @pytest.fixture(autouse=True)
 def _in_empty_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
@@ -40,6 +43,7 @@ def test_the_defaults_are_valid(capsys: pytest.CaptureFixture[str]) -> None:
         "OK",
         "Project file: none",
         "Fetchers: http (HTTPFetcher), browser (BrowserFetcher)",
+        "Browser: not installed (rendering needs patchright; install it with: pip install 'pernix[browser]')",
         "Stats Sinks: none",
         "Extensions: OffsiteFilter",
         "Download Middleware: none",
@@ -115,7 +119,9 @@ def test_project_modules_import_from_the_working_directory(tmp_path: Path) -> No
     (package / "__init__.py").write_text("")
     (package / "spiders.py").write_text("from pernix import Spider\n\nclass Books(Spider):\n    pass\n")
     (package / "pipelines.py").write_text("from pernix import Pipeline\n\nclass Store(Pipeline):\n    pass\n")
-    (tmp_path / "pernix.toml").write_text('[pipelines]\n"myproject.pipelines.Store" = 100\n')
+    (tmp_path / "pernix.toml").write_text(
+        '[pipelines]\n"myproject.pipelines.Store" = 100\n\n[fetchers]\nbrowser = false\n'  # no browser to launch
+    )
     script = Path(sys.executable).with_name("pernix")
 
     completed = subprocess.run(  # noqa: S603  # the installed command under test

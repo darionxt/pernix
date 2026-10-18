@@ -1,4 +1,4 @@
-"""The `pernix` command: `run`, `fetch`, `shell`, and `check`."""
+"""The `pernix` command: `run`, `fetch`, `shell`, `check`, and `browser`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sys
 from importlib.metadata import version
 from typing import TYPE_CHECKING
 
-from pernix.cli import check_command, fetch_command, run_command, shell_command
+from pernix.cli import browser_command, check_command, fetch_command, run_command, shell_command
 from pernix.cli.options import UsageError
 from pernix.errors import CONFIGURATION_ERRORS
 from pernix.runner import ExitCode
@@ -50,6 +50,6 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pernix", description="Run Spiders, fetch pages, and check a Pernix project.")
     parser.add_argument("--version", action="version", version=f"pernix {version('pernix')}")
     commands = parser.add_subparsers(title="commands", metavar="COMMAND", required=True)
-    for command in (run_command, fetch_command, shell_command, check_command):
+    for command in (run_command, fetch_command, shell_command, check_command, browser_command):
         command.add_parser(commands)
     return parser
