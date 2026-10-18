@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
-from pernix.errors import ComponentError, SessionError, SettingsError
+from pernix.errors import ComponentError, NetworkBlocked, SessionError, SettingsError
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.response import expect_response
 
@@ -130,13 +130,18 @@ class FetcherDispatch:
     `streamed`. Other Fetchers fetch the whole Response. Inside `sending_as()`, the
     Fetcher gets the Session as `session=`; one without that parameter refuses the
     Request.
+
+    With `public_only`, as `network.public_only` sets it, Requests for the `browser`
+    Fetcher are refused: the browser resolves hosts itself, so their addresses
+    cannot be checked.
     """
 
-    def __init__(self, fetchers: Mapping[str, object]) -> None:
+    def __init__(self, fetchers: Mapping[str, object], *, public_only: bool = False) -> None:
         """Check the Fetchers and index them by name and by URL scheme.
 
         Args:
             fetchers: The built Fetchers, by registered name.
+            public_only: Whether only hosts on public addresses may be reached.
 
         Raises:
             ComponentError: A component has no `async def fetch(self, request)`.
@@ -146,6 +151,7 @@ class FetcherDispatch:
             if not inspect.iscoroutinefunction(getattr(fetcher, "fetch", None)):
                 raise ComponentError(f"the Fetcher {name!r}, {fetcher!r}, has no 'async def fetch(self, request)'")
         self._fetchers = cast("dict[str, Fetcher]", dict(fetchers))
+        self._public_only = public_only
         self._by_scheme: dict[str, str] = {}
         problems: list[str] = []
         for name, fetcher in self._fetchers.items():
@@ -174,8 +180,15 @@ class FetcherDispatch:
                 streamed something other than a StreamedResponse.
             pernix.errors.SessionError: The Request is sent under a Session, which
                 the Fetcher cannot take.
+            pernix.errors.NetworkBlocked: The Request is for the `browser` Fetcher
+                while only hosts on public addresses may be reached.
         """
         name = self._select(request)
+        if self._public_only and name == BROWSER_FETCHER:
+            raise NetworkBlocked(
+                f"network.public_only refused {request.url}: the browser resolves hosts itself, so the addresses "
+                "it would reach cannot be checked; fetch it over HTTP, or turn network.public_only off to render it"
+            )
         fetcher = self._fetchers[name]
         session = _session.get()
         options = {} if session is None else {"session": session}
