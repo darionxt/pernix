@@ -44,7 +44,9 @@ class CoreSettings(Section):
     """Settings of the crawl loop itself.
 
     Attributes:
-        concurrency: The maximum number of Requests processed at once.
+        concurrency: The maximum number of Requests processed at once that do not
+            go to the browser Fetcher; those that do have `browser.max_pages`
+            workers of their own, so neither kind waits for the other.
         extensions: Extensions to run, as `{extension: order}`; the built-in
             `OffsiteFilter` is enabled by default.
         addons: Addons to enable, in order, by entry point name, import path, class,

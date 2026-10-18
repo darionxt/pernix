@@ -79,6 +79,8 @@ class Shop(Spider):
 
 `render=True` sends a Request to the browser Fetcher, which loads the page in Chrome until its `load` event; the Response's body is the page as its scripts left it. Rendered and HTTP Requests mix freely in one Spider. The browser starts with the first rendered Request, so a Run that renders nothing never starts it. Each rendered Request gets a fresh browser context, carrying only the cookies the Request passes, as over HTTP. See [`docs/design.md`](docs/design.md) §5.2.
 
+Rendered Requests have workers of their own: `browser.max_pages` (8) of them, as many as the pages the browser opens at once, while the `concurrency` (16) workers take the other Requests, so neither waits for the other. Both kinds share their domain's limits: `domain.concurrency`, the delay, the rate, and cooldowns. A Request a download Middleware switches to Render, and a rendered Inline Fetch, wait for a page in the worker they run in. The `browser.*` stats count the pages and contexts opened, how many are open, and the fetches that waited for a page. See [`docs/design.md`](docs/design.md) §6.3.
+
 ```python
 from pernix.browser import Click, Evaluate, Render, Scroll, WaitFor
 
@@ -221,9 +223,9 @@ pernix check books.py                                                # validate 
 pernix browser install                                               # install the browser engine
 ```
 
-`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`.
+`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too.
 
-`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency` apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved; the browser does not render then. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved; the browser does not render then. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
 ## Configuration
 
@@ -250,7 +252,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `concurrency` | `16` | Maximum number of Requests processed at once |
+| `concurrency` | `16` | Maximum number of Requests processed at once that do not render; rendered ones have `browser.max_pages` workers of their own |
 | `extensions` | `{OffsiteFilter: 100}` | Extensions to run, as `{extension: order}` |
 | `addons` | `()` | Addons to enable, by entry point name or import path |
 | `middlewares` | `{}` | Download Middleware, as `{middleware: order}`; lower orders are further out |
@@ -313,8 +315,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `http.pool_size` / `http.pool_idle` | `8` / `300.0` | curl sessions kept, one per Profile, and seconds one is kept unused |
 | `browser.headless` | `true` | Runs the browser without a window, in Chrome's new headless mode |
 | `browser.timeout` | `30.0` | Seconds a page may take to load; `Request(timeout=...)` overrides it |
-| `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included |
+| `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included, once it may open its page |
 | `browser.launch_options` | `{}` | Options passed as they are to patchright's `launch()`, such as `executable_path` or `args` |
+| `browser.max_pages` | `8` | Pages open at once, each that of one fetch, and the rendered Requests a Run processes at once |
 | `browser.max_idle_contexts` / `browser.context_idle` | `8` / `300.0` | Browser contexts kept idle for Sessions between their fetches, at most, and seconds one may stay idle |
 | `browser.block` | `[]` | Resource types no rendered page loads, such as `"image"` or `"font"`; `Render(block=...)` replaces them |
 | `browser.action_timeout` | `10.0` | Seconds `Render(wait_for=...)` and each page action may take, unless the action sets its own `timeout` |
@@ -417,7 +420,7 @@ src/pernix/
 ├── spider_hooks.py      tells the Spider hooks a subclass overrides from those it inherits
 ├── crawler.py           Crawler: runs one Run, builds components with injection, stops it
 ├── run_assembly.py      which components a Run has, built and wired before opening; the download chain
-├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
+├── engine.py            worker loop: claim, process, settle Leases; browser workers apart; idle detection, Drain
 ├── request_processor.py one attempt at a Request: fetch, retry decision, Callbacks
 ├── inline_fetch.py      Inline Fetch: fetching in place, retried in place, and streamed
 ├── sending.py           how a Request is sent: as it is, or through the Run's next proxy; Sender
@@ -496,12 +499,13 @@ src/pernix/
 │   └── offsite.py       OffsiteFilter: drops Requests outside allowed_domains
 ├── fetchers/
 │   ├── fetcher.py       Fetcher and StreamingFetcher protocols
-│   ├── fetcher_dispatch.py picks the Fetcher of each Request; opens streamed transfers
+│   ├── fetcher_dispatch.py picks the Fetcher of each Request, and tells rendered ones; opens streamed transfers
 │   ├── http_fetcher.py  curl-cffi HTTP Fetcher, following redirects one hop at a time
 │   ├── redirects.py     which responses redirect, where to, and how the request changes, as in browsers
 │   ├── chain_cookies.py the cookies of a fetch, sent to each redirect hop in Chrome's order
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
+│   ├── page_slots.py    the pages open at once, browser.max_pages, each taken by one fetch
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
@@ -515,7 +519,7 @@ src/pernix/
 │   └── streamed_response.py a Response whose body is read as it arrives
 ├── frontiers/
 │   ├── frontier.py      Frontier protocol, Lease
-│   └── memory_frontier.py in-memory Frontier
+│   └── memory_frontier.py in-memory Frontier, rendered Requests queued apart
 ├── middlewares/
 │   ├── middleware.py    download Middleware, NodeMiddleware, the download chain
 │   └── spider_middleware.py spider Middleware and their chain

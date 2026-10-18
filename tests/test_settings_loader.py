@@ -611,6 +611,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "browser.timeout": 30.0,
         "browser.deadline": 180.0,
         "browser.launch_options": {},
+        "browser.max_pages": 8,
         "browser.max_idle_contexts": 8,
         "browser.context_idle": 300.0,
         "browser.block": (),

@@ -11,7 +11,7 @@ from pernix.browser import RenderResult
 from pernix.callbacks import iterate_and_close, run_callbacks
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.crawler import Crawler
-from pernix.fetchers import BROWSER_FETCHER
+from pernix.fetchers import BROWSER_FETCHER, BrowserSettings
 from pernix.response import expect_response
 
 if TYPE_CHECKING:
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.response import Response
     from pernix.session import Session
+    from pernix.settings import Section
     from pernix.spider import Spider
     from pernix.stats import StatValue
 
@@ -118,10 +119,13 @@ class _BrowserStandIn:
 
     It claims no URL scheme, so the Fetcher it wraps may claim some, and be
     registered as `http` too; unless it is, the stand-in opens and closes it with
-    itself.
+    itself. It registers the `browser.*` settings, as the browser Fetcher does, so
+    that `browser.max_pages` still sets how many rendered Requests the Run
+    processes at once.
     """
 
     schemes: ClassVar[frozenset[str]] = frozenset()
+    settings_sections: ClassVar[tuple[type[Section], ...]] = (BrowserSettings,)
 
     def __init__(self, fetcher: object, *, opens: bool) -> None:
         self._fetcher = cast("Fetcher", fetcher)

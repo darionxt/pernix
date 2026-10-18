@@ -38,6 +38,7 @@ BROWSER_KEYS = (
     "timeout",
     "deadline",
     "launch_options",
+    "max_pages",
     "max_idle_contexts",
     "context_idle",
     "block",

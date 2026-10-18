@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download, HandleResponse
     from pernix.testing import LoopbackServer, ReceivedRequest
 
+_SCRIPTED = "<h1 id=title>Served</h1><script>document.getElementById('title').textContent = 'Rendered'</script>"
+
 OPENED: list[str] = []
 """What the project components below were opened or called for."""
 
@@ -31,6 +33,14 @@ async def ignore_private(request: Request, call_next: Download) -> Response:
     """A download Middleware that ignores the Requests for `/private`."""
     if urlsplit(request.url).path == "/private":
         raise IgnoreRequest("private pages are not fetched")
+    return await call_next(request)
+
+
+@middleware
+async def render_scripted(request: Request, call_next: Download) -> Response:
+    """A download Middleware that renders the Requests for `/scripted`, as a Middleware may decide to."""
+    if urlsplit(request.url).path == "/scripted":
+        request = request.replace(render=True)
     return await call_next(request)
 
 
@@ -57,6 +67,7 @@ def site(server: LoopbackServer) -> LoopbackServer:
     server.route("/a", "<h1>A</h1>", headers=[("Content-Type", "text/html")])
     server.route("/b", "<h1>B</h1>", headers=[("Content-Type", "text/html")])
     server.route("/private", "<h1>Private</h1>", headers=[("Content-Type", "text/html")])
+    server.route("/scripted", _SCRIPTED, headers=[("Content-Type", "text/html")])
     return server
 
 
@@ -258,3 +269,30 @@ def test_the_address_guard_refuses_to_render(site: LoopbackServer, capsys: pytes
     assert error["type"] == "NetworkBlocked"
     assert "the browser resolves hosts itself" in error["message"]
     assert site.received == []
+
+
+@pytest.mark.usefixtures("browser_engine")
+def test_several_rendered_urls_and_a_mix_of_rendered_and_http_ones_complete(
+    site: LoopbackServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rendered = [site.url("/scripted"), site.url("/a"), site.url("/scripted")]
+
+    assert main(["fetch", *rendered, "--fetcher", "browser", "--json", "--css", "h1::text"]) == 0
+    rows = [orjson.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert sorted((row["url"], row["fetcher"], row["matches"][0]) for row in rows) == [
+        (site.url("/a"), "browser", "A"),
+        (site.url("/scripted"), "browser", "Rendered"),
+        (site.url("/scripted"), "browser", "Rendered"),
+    ]
+
+    mixed = ["-s", 'middlewares={"test_cli_fetch_batch.render_scripted": 100}']
+    assert (
+        main(["fetch", site.url("/a"), site.url("/scripted"), site.url("/b"), "--json", "--css", "h1::text", *mixed])
+        == 0
+    )
+    rows = [orjson.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert sorted((row["url"], row["fetcher"], row["matches"][0]) for row in rows) == [
+        (site.url("/a"), "http", "A"),
+        (site.url("/b"), "http", "B"),
+        (site.url("/scripted"), "browser", "Rendered"),
+    ]

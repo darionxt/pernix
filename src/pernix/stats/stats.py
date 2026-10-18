@@ -13,8 +13,9 @@ class Stats:
     labels such as status codes, reasons, and error types, and no key of Pernix is
     the prefix of another, so a snapshot can be nested by its dots. Pernix reserves
     the prefixes `run`, `requests`, `downloads`, `responses`, `items`, `frontier`,
-    `throttle`, `loop`, and `log`; use your own prefix for your stats. Stats are not
-    thread-safe: update them from the event loop.
+    `throttle`, `loop`, `log`, `sessions`, `proxies`, and `browser`; use your own
+    prefix for your stats. Stats are not thread-safe: update them from the event
+    loop.
 
     Example:
         >>> stats = Stats()

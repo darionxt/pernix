@@ -12,7 +12,7 @@ from pernix.engine import Engine
 from pernix.errors import CONFIGURATION_ERRORS, ComponentError, SettingsError
 from pernix.events import StatsSnapshot
 from pernix.feeds import Feed, render_path
-from pernix.fetchers import FetcherDispatch, HTTPFetcher, HTTPSettings
+from pernix.fetchers import BrowserSettings, FetcherDispatch, HTTPFetcher, HTTPSettings
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier
 from pernix.inline_fetch import InlineFetch
@@ -224,6 +224,7 @@ class RunAssembly:
             put_item=items.put,
             events=events,
             concurrency=settings.section(CoreSettings).concurrency,
+            browser_concurrency=_browser_settings(crawler).max_pages,
             lease_ttl=settings.section(FrontierSettings).lease_ttl,
             retry_policy=retry_policy,
             throttle=throttle,
@@ -322,6 +323,18 @@ def _http_settings(crawler: Crawler) -> HTTPSettings:
         return crawler.settings.section(HTTPSettings)
     except KeyError:
         return HTTPSettings()
+
+
+def _browser_settings(crawler: Crawler) -> BrowserSettings:
+    """The `browser.*` settings, or their defaults when no Fetcher registers them.
+
+    The Engine runs `browser.max_pages` workers for rendered Requests even then, so
+    that they fail as no Fetcher fits them rather than wait forever.
+    """
+    try:
+        return crawler.settings.section(BrowserSettings)
+    except KeyError:
+        return BrowserSettings()
 
 
 def _session_leasing(
