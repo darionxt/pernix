@@ -201,22 +201,28 @@ class Generations:
             await asyncio.wait(self._closing)
 
     async def _taking_pages(self) -> Generation:
-        """The Generation new fetches use: the current one, unless it must be replaced, else one launched for them."""
-        if self._unavailable is not None:
-            raise ComponentError(*self._unavailable.args) from self._unavailable.__cause__
-        current = self._current
-        if current is not None and current.taking_pages:
-            reason = self._replace_reason(current)
-            if reason is None:
-                return current
-            self._replace(current, reason)
-        if self._launch is None:
-            self._launch = asyncio.create_task(self._start())
-        try:
-            return await asyncio.shield(self._launch)  # a fetch that gives up waiting leaves the launch to the others
-        except ComponentError as exc:
-            self._unavailable = exc  # installing the extra or the engine takes a new Run
-            raise
+        """The Generation new fetches use: the current one, unless it must be replaced, else one launched for them.
+
+        A fetch that waited for a launch checks the Generation launched as any other
+        does, as the fetches that waited with it may have opened its pages, or it may
+        have been lost meanwhile.
+        """
+        while True:
+            if self._unavailable is not None:
+                raise ComponentError(*self._unavailable.args) from self._unavailable.__cause__
+            current = self._current
+            if current is not None and current.taking_pages:
+                reason = self._replace_reason(current)
+                if reason is None:
+                    return current
+                self._replace(current, reason)
+            if self._launch is None:
+                self._launch = asyncio.create_task(self._start())
+            try:
+                await asyncio.shield(self._launch)  # a fetch that gives up waiting leaves the launch to the others
+            except ComponentError as exc:
+                self._unavailable = exc  # installing the extra or the engine takes a new Run
+                raise
 
     async def _start(self) -> Generation:
         """Launch a browser and make it the current Generation; the next fetch to find none launches another."""
@@ -312,7 +318,10 @@ class Generations:
                 logger.debug("The health probe of the browser failed", exc_info=probe.exception())
                 self._lose(generation, self._loss_reason(generation))
                 return
-            if limit and processes is not None and await asyncio.to_thread(processes.memory) > limit:
+            if processes is None:
+                continue
+            await asyncio.to_thread(processes.remember)  # those it started, in case it ends before they do
+            if limit and await asyncio.to_thread(processes.memory) > limit:
                 self._replace(generation, "memory")
 
     def _loss_reason(self, generation: Generation) -> str:

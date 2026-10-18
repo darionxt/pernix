@@ -47,6 +47,9 @@ class FakeProcesses:
     def memory(self) -> int:
         return self.bytes
 
+    def remember(self) -> None:
+        pass
+
     def driver_alive(self) -> bool:
         return not self.driver_killed
 
@@ -131,6 +134,17 @@ async def test_the_fetches_that_wait_for_a_browser_share_one_launch() -> None:
     assert stats.get("browser.generations") == 1
     await generations.close()
     assert launcher.launched[0].closed
+
+
+async def test_the_fetches_that_waited_for_a_launch_keep_to_the_page_limit() -> None:
+    launcher = Launcher()
+    generations, _, stats = _generations(launcher, generation_pages=1)
+
+    numbers = await asyncio.gather(*(_number(generations) for _ in range(3)))
+
+    assert sorted(numbers) == [1, 2, 3]  # one page each, though all three waited for the first launch
+    assert stats.get("browser.replaced_by_reason.pages") == 2
+    await generations.close()
 
 
 async def test_a_browser_is_replaced_after_its_pages_and_closed_once_its_fetches_end() -> None:
