@@ -636,3 +636,22 @@ async def test_the_login_of_a_request_with_a_proxy_of_its_own_goes_through_the_s
 
     assert seen == [PROXY_A]
     assert await _state_proxy(pool, "a") == PROXY_A
+
+
+async def test_the_fetches_of_a_lease_keep_the_proxy_it_settled() -> None:
+    leasing, _, _, _ = _leasing(proxies=await _proxies(MemoryProxyPool(), PROXY_A, PROXY_B))
+    seen: list[str | None] = []
+
+    async with leasing.sending(Request(f"{SITE}/outer", session="a"), wait=0) as outer:
+        async with leasing.sending(Request(f"{SITE}/token", session="a"), wait=0) as failing:
+            failing.error = ProxyError("refused")  # a Middleware's fetch, through A, cooling it down
+        async with leasing.sending(Request(f"{SITE}/more", session="a"), wait=0) as later:
+            assert later.session is not None
+            seen.append(later.session.proxy)
+        assert outer.session is not None
+        seen.append(outer.session.proxy)  # what the outer transport goes through, and is reported against
+    async with leasing.sending(Request(f"{SITE}/next", session="a"), wait=0) as following:
+        assert following.session is not None
+        seen.append(following.session.proxy)
+
+    assert seen == [PROXY_A, PROXY_A, PROXY_B]  # the next Lease is bound to another

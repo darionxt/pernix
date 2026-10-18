@@ -55,6 +55,8 @@ class _Held:
     task: asyncio.Task[Any] | None
     logging_in: bool = False
     """Whether the fetch is logging the Session in, so the Responses of the fetches nested in it are not judged."""
+    proxy_settled: bool = False
+    """Whether the Lease settled the Session's proxy, which its later fetches keep."""
     nested: list[Outcome] = field(default_factory=list[Outcome])
 
 
@@ -91,11 +93,12 @@ class SessionLeasing:
     them got cools the Session down.
 
     With the Run's proxies, a Session goes through the proxy it is bound to while
-    that is available, and is bound to another once it is not, before each fetch
-    that goes through it, those of its login and those nested in another included;
-    the binding is saved with its state. A Request with a proxy of its own goes
-    through that, and needs none of the Run's. How each fetch through the Session's
-    proxy went is reported. When no proxy is available, the Lease is released, and
+    that is available, and is bound to another once it is not. Each Lease settles
+    the Session's proxy once, before its first fetch that goes through it, which may
+    be one of its login or one nested in another, and its later fetches keep it, so
+    each is reported against the proxy it went through; the binding is saved with
+    the Session's state. A Request with a proxy of its own goes through that, and
+    needs none of the Run's. When no proxy is available, the Lease is released, and
     the Request waits elsewhere; a nested fetch waits as its caller does.
 
     With a login, a fetch whose Lease must log its Session in runs the login first,
@@ -161,7 +164,8 @@ class SessionLeasing:
         """
         held = _held_by(self, request.session)
         if held is not None:
-            await self._bind_proxy(held.session, request)
+            if not held.proxy_settled:
+                held.proxy_settled = await self._bind_proxy(held.session, request)
             shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
@@ -181,12 +185,12 @@ class SessionLeasing:
         try:
             before = await self.pool.load_state(lease)
             session = Session.from_state(lease.session, before)
-            await self._bind_proxy(session, request)
+            settled = await self._bind_proxy(session, request)
         except BaseException:
             await self.pool.release(lease, Outcome("ok"))
             raise
         renewing = asyncio.create_task(self._renew(lease))
-        holding = _Held(self, session, asyncio.current_task(), logging_in=lease.must_log_in)
+        holding = _Held(self, session, asyncio.current_task(), logging_in=lease.must_log_in, proxy_settled=settled)
         token = _held.set((*_held.get(), holding))
         try:
             if lease.must_log_in:
@@ -281,14 +285,16 @@ class SessionLeasing:
                 sending.request,
             )
 
-    async def _bind_proxy(self, session: Session, request: Request) -> None:
-        """Bind a Session to an available proxy, unless the Request goes through its own.
+    async def _bind_proxy(self, session: Session, request: Request) -> bool:
+        """Bind a Session to an available proxy, unless the Request goes through its own; return whether it did.
 
         Raises:
             pernix.proxies.run_proxies.NoProxyYet: No proxy is available.
         """
-        if self._proxies is not None and request.proxy is None:
-            session.proxy = await self._proxies.bind(session.id, session.proxy)
+        if self._proxies is None or request.proxy is not None:
+            return False
+        session.proxy = await self._proxies.bind(session.id, session.proxy)
+        return True
 
     def _reporting(self, sending: Sending) -> AbstractAsyncContextManager[None]:
         """Report how a fetch went through its Session's proxy, unless the Request names its own."""
