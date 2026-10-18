@@ -120,8 +120,8 @@ def _generations(
 
 async def _number(generations: Generations) -> int:
     """Fetch once, and tell which browser the fetch used."""
-    async with generations.fetching("https://shop.example/") as launched:
-        return cast("FakeLaunched", launched).number
+    async with generations.fetching("https://shop.example/") as generation:
+        return cast("FakeLaunched", generation.launched).number
 
 
 async def test_the_fetches_that_wait_for_a_browser_share_one_launch() -> None:
@@ -153,10 +153,10 @@ async def test_a_browser_is_replaced_after_its_pages_and_closed_once_its_fetches
     inside, release = asyncio.Event(), asyncio.Event()
 
     async def held() -> int:
-        async with generations.fetching("https://shop.example/") as launched:
+        async with generations.fetching("https://shop.example/") as generation:
             inside.set()
             await release.wait()
-            return cast("FakeLaunched", launched).number
+            return cast("FakeLaunched", generation.launched).number
 
     first = asyncio.create_task(held())
     await inside.wait()

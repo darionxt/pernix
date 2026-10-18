@@ -101,6 +101,23 @@ yield Request(
 
 `Render(...)` options are persisted with the Request, so a download Middleware can upgrade a Request with `request.replace(render=Render(...))`. After the page loaded, the browser waits for `wait_for`, runs the actions in order, and takes the screenshot; each step may take `browser.action_timeout` (10 s), or its own `timeout`. A step that takes too long raises `ActionTimeout`, which is retried as a slow page is, and one that fails otherwise raises `ActionError`, which is not; an `optional` action that fails is logged, and the next one runs. `response.browser` holds the captured responses, the screenshots, the results of `Evaluate`, which runs in the page unless `isolated=True`, and the document as it was received. `browser.block` lists the resource types no rendered page loads, none by default; `Render(block=...)` replaces it for one Request, and `Render(block=())` blocks nothing. Blocking `stylesheet` or `script` can keep a page from rendering as it should. See [`docs/design.md`](docs/design.md) §4.7.
 
+```python
+from pernix.browser import PageMethod, Render
+
+class Shop(Spider):
+    async def start(self):
+        yield Request("https://shop.example/", render=Render(setup=self.log_in, keep_page=True))
+
+    async def log_in(self, page):                       # before the page loads
+        await page.context.add_cookies([...])
+
+    async def parse(self, response: Response):
+        await response.page.click("button.more")        # the page itself, open while the Callback runs
+        yield {"titles": await response.page.locator("h2").all_text_contents()}
+```
+
+Page methods run any patchright code on the page: `setup` before it loads, and `action` once `wait_for` and the actions are done, before the screenshot; `PageMethod(method, optional=True, timeout=5)` lets one fail, logged, or limits its time. Like Callbacks, they are Spider methods, persisted by name, and they run in rendered Inline Fetches too. With `keep_page=True`, the Callback gets the page as `response.page`; the Run closes it, with its context, once the Callback ends, however it ends. It counts toward `browser.max_pages` meanwhile, and the rendered fetches the Callback makes share its slot. Only the Callback of a Request the Run fetches can keep a page: an Inline Fetch raises `ValueError`. A Callback that fails as its kept page crashed, or its browser was lost, is retried as the fetch would be.
+
 ## Sessions
 
 ```python
@@ -466,6 +483,7 @@ src/pernix/
 ├── fingerprint.py       Fingerprints of Requests
 ├── browser/
 │   ├── render.py        Render: the options of a rendered Request
+│   ├── page_method.py   PageMethod: a Spider method run on the page, optional or limited in time
 │   ├── actions.py       WaitFor, Scroll, Click, Type, Evaluate, Screenshot
 │   ├── resource_types.py the resource types a page may be kept from loading
 │   ├── url_globs.py     URL globs, as the browser's route patterns read them
@@ -532,7 +550,8 @@ src/pernix/
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
-│   ├── page_actions.py  runs a Render's wait, actions, and screenshot on a loaded page
+│   ├── page_actions.py  runs a Render's page methods, wait, actions, and screenshot on its page
+│   ├── kept_pages.py    the pages kept open for Callbacks, and the scope that closes them
 │   ├── page_traffic.py  blocks resource types and captures responses of a page
 │   ├── launched_browser.py starts patchright and its browser, under the network guard if on, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach

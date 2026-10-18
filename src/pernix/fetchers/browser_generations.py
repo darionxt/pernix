@@ -95,6 +95,18 @@ class Generation:
         """Why it was lost, `disconnected`, `driver`, or `unresponsive`, if it was."""
         return self.tripwire.reason
 
+    def lost_error(self, url: str) -> BrowserLost | None:
+        """The error a fetch in it fails with once it is lost; `None` while it is not.
+
+        Args:
+            url: The URL of the fetch, for the message.
+
+        Returns:
+            The `BrowserLost`, naming why it was lost, or `None`.
+        """
+        reason = self.lost
+        return None if reason is None else BrowserLost(f"rendering {url} failed: {_LOSSES[reason]}")
+
     @property
     def taking_pages(self) -> bool:
         """Whether new fetches may use it: it was neither replaced, lost, nor closed."""
@@ -159,14 +171,14 @@ class Generations:
         self._unavailable = None
 
     @asynccontextmanager
-    async def fetching(self, url: str) -> AsyncGenerator[LaunchedBrowser]:
+    async def fetching(self, url: str) -> AsyncGenerator[Generation]:
         """Use the current browser for one fetch, launching one if there is none.
 
         Args:
             url: The URL of the fetch, for errors.
 
         Yields:
-            The browser, which no other fetch closes meanwhile.
+            The Generation, whose browser is not closed meanwhile.
 
         Raises:
             pernix.errors.BrowserLost: The browser was lost before the fetch was
@@ -182,10 +194,31 @@ class Generations:
                 lambda reason: BrowserLost(f"rendering {url} failed: {_LOSSES[reason]}"),
                 may_trip=lambda error: self._may_be_lost(generation, error),
             ):
-                yield generation.launched
+                yield generation
         finally:
             generation.fetching -= 1
             self._close_if_done(generation)
+
+    def keep(self, generation: Generation) -> Callable[[], None]:
+        """Count a page kept open past its fetch as a fetch in its Generation, which is then not closed under it.
+
+        Args:
+            generation: The Generation the page is open in.
+
+        Returns:
+            Ends the count, once the page is closed; calling it again does nothing.
+        """
+        generation.fetching += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                generation.fetching -= 1
+                self._close_if_done(generation)
+
+        return release
 
     async def close(self) -> None:
         """Stop a launch in progress, then close every browser, waiting for them."""

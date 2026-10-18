@@ -45,6 +45,9 @@ class SessionContext:
         local_storage: The localStorage the context holds, by origin, as last seen.
         broken: Whether it is not to be used again: it failed, or its browser is
             being replaced or was lost.
+        handed_over: Whether its fetch handed it on with its page, kept open for a
+            Callback, which then closes it; it is neither kept nor closed when the
+            fetch ends.
     """
 
     def __init__(
@@ -72,6 +75,7 @@ class SessionContext:
         self.launched = launched
         self.local_storage = {origin: dict(items) for origin, items in session.local_storage.items()}
         self.broken = False
+        self.handed_over = False
         self._cookies: dict[BrowserKey, BrowserCookie] | None = None
         """The cookies the context held once synced for the fetch in progress; `None` until then."""
         self._overrides: frozenset[BrowserKey] = frozenset()
@@ -123,7 +127,7 @@ class SessionContext:
             held = keyed(await self.context.cookies())
         self._cookies = held
 
-    async def merge(self, page: Page, session: Session, *, now: float) -> None:
+    async def merge(self, page: Page, session: Session, *, now: float, close_pages: bool = True) -> None:
         """End a fetch: close its pages, and keep in its Session the cookies it changed and the localStorage of its page.
 
         What the fetch changed is read, and the pages of the context closed, the
@@ -136,6 +140,8 @@ class SessionContext:
             page: The page of the fetch, still open.
             session: The Session.
             now: The time of the changes, in seconds since the epoch.
+            close_pages: Close the pages; `False` leaves them open, for a page kept
+                for its Callback.
         """
         before, self._cookies = self._cookies, None
         if before is None:
@@ -143,7 +149,8 @@ class SessionContext:
             return
         after = keyed(await self.context.cookies())
         storage = await _local_storage(page)
-        await self._close_pages()
+        if close_pages:
+            await self._close_pages()
         apply_page_changes(session.cookies, before, after, now=now, overrides=self._overrides)
         if storage is not None:
             self._keep_local_storage(session, *storage)
@@ -243,7 +250,8 @@ class SessionContexts:
             raise
         else:
             self._busy.discard(held)
-            self._give_back(held)
+            if not held.handed_over:
+                self._give_back(held)
 
     def retire(self, launched: LaunchedBrowser) -> None:
         """Close the contexts kept in a browser that takes no new fetches, and those in use there once their fetch ends.

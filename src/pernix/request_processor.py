@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pernix.callbacks import iterate_and_close, run_errback
 from pernix.errors import IgnoreRequest, RetriesExhausted, Retry, SessionError
 from pernix.events import RequestFailed, RequestIgnored, RequestRetried, ResponseReceived
+from pernix.fetchers.kept_pages import keeping_pages
 from pernix.inline_fetch import handling
 from pernix.items import ItemContext, is_item
 from pernix.request import Request
@@ -19,6 +20,7 @@ from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
     from pernix.events import EventBus
+    from pernix.fetchers.kept_pages import PageKeeping
     from pernix.frontiers import Lease
     from pernix.middlewares import Download, HandleResponse
     from pernix.response import Response
@@ -97,6 +99,13 @@ class RequestProcessor:
     yielded before raising are kept. `IgnoreRequest` raised while fetching is emitted
     as `RequestIgnored` and counts as done. Each Response handed to the spider chain
     is emitted as `ResponseReceived`.
+
+    The pages a rendered fetch keeps for the Callback (`Render(keep_page=True)`) are
+    closed once the attempt ends, however it ends. A Callback that fails while the
+    page it keeps crashed, or the browser of that page was lost, fails with
+    `PageCrashed` or `BrowserLost` instead, caused by its own error, which the retry
+    policy judges as it would the fetch failing so: an exception to ADR 0006, as the
+    failure is not the Callback's.
     """
 
     def __init__(
@@ -137,7 +146,7 @@ class RequestProcessor:
         self._sender = sender or IndependentSending()
 
     async def attempt(self, lease: Lease) -> Settlement:
-        """Fetch a Request and run its Callback once.
+        """Fetch a Request and run its Callback once, then close the pages it kept.
 
         Args:
             lease: The Lease on the Request.
@@ -145,6 +154,10 @@ class RequestProcessor:
         Returns:
             How to settle the Lease.
         """
+        async with keeping_pages() as keeping:
+            return await self._attempt(lease, keeping)
+
+    async def _attempt(self, lease: Lease, keeping: PageKeeping) -> Settlement:
         sent = _Sent(lease.request)
         try:
             response = await self._fetch(lease, sent)
@@ -175,11 +188,13 @@ class RequestProcessor:
         error = await self._handle_response(request, response)
         if error is None:
             return Done()
-        if isinstance(error, Retry):
-            decision = self._decide(request, error, lease.attempt)
+        failure = None if isinstance(error, Retry) else keeping.failure(error)  # its kept page went away under it
+        judged = error if isinstance(error, Retry) else failure
+        if judged is not None:
+            decision = self._decide(request, judged, lease.attempt)
             if decision.action is not Action.ACCEPT:
-                return await self._retry_or_give_up(lease, request, decision, cause=error)
-        return await self._fail(request, error)
+                return await self._retry_or_give_up(lease, request, decision, cause=judged)
+        return await self._fail(request, failure or error)
 
     async def _fetch(self, lease: Lease, sent: _Sent) -> Response | None:
         """Fetch through the download chain in its slot, under its Session; `None` if the slot is cooling down.

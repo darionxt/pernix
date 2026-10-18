@@ -176,7 +176,7 @@ Request(
 - A Callback can be an `async def` async generator that yields `Request` objects or Items (None is ignored), or a plain `async def` that returns a single object, a list, or None.
 - **Output is streamed**: each yielded object is processed immediately. Requests go to the Frontier; Items go into a bounded queue, and when the queue is full the Callback is suspended (backpressure).
 - **When a Callback raises** (confirmed):
-  - The Request is marked as failed: it is kept as a Dead Request, `RequestFailed` is emitted, and the errback is called. It is **not retried**, because parsing errors are usually deterministic; this holds for every exception a Callback raises, including one from an Inline Fetch, such as `RetriesExhausted` once its own retries ran out.
+  - The Request is marked as failed: it is kept as a Dead Request, `RequestFailed` is emitted, and the errback is called. It is **not retried**, because parsing errors are usually deterministic; this holds for every exception a Callback raises, including one from an Inline Fetch, such as `RetriesExhausted` once its own retries ran out. The one exception is a Callback that keeps its page (§4.7) and fails while that page crashed or its browser was lost: the failure is not the Callback's, so it fails with `PageCrashed` or `BrowserLost` instead, and is retried as the fetch would be (§6.4).
   - Output yielded before the exception is kept.
   - To retry, the user explicitly writes `raise Retry(reason, delay=None)`; the retry policy still decides whether a retry is left (§6.4). Deciding whether a page is Blocked is covered in §5.4 and handled automatically by the framework.
 - **Errbacks**: `errback(request, error)` runs once a Request fails for good, whether its fetch failed, its retries ran out (`error` is then `RetriesExhausted`, carrying the last `response` or the last exception as its cause), or its Callback raised. Like a Callback, it may yield Requests and Items; relative URLs resolve against the failed Request's URL. An errback that raises is logged.
@@ -235,7 +235,7 @@ Page interaction comes in three layers; use whichever you need:
 
 1. **Declarative actions**: serializable, persisted along with the Request, and covering the most common operations (wait, scroll, click, type, run JS, screenshot).
 2. **Page methods**: `Render(setup=self.before_goto, action=self.after_load)`. The arguments are Spider methods with the signature `async def x(self, page)` and can run arbitrary patchright code. If one raises, the Request fails (each can be marked optional individually).
-3. **Kept page**: `Render(keep_page=True)`; the Callback gets the live `Page` through `response.page`. When the Callback ends (normally, with an exception, or by timeout), the framework **force-closes** the page and releases the concurrency slot.
+3. **Kept page**: `Render(keep_page=True)`; the Callback gets the live `Page` through `response.page`. When the Callback ends (normally, with an exception, or cancelled), the framework **force-closes** the page and its context, and releases the page's slot.
 
 **Render options** (`pernix.browser.Render`, immutable, keyword-only):
 
@@ -267,11 +267,26 @@ Page interaction comes in three layers; use whichever you need:
 
 Bodies are decoded from their `Content-Encoding`, and the headers that describe the encoded body are then left out.
 
+**Page methods** (`setup` and `action` of `Render`): Spider methods, `async def x(self, page)`, given the patchright `Page`, for what the declarative actions cannot do. `PageMethod(method, optional=False, timeout=None)` (`pernix.browser`) marks one optional, so that its failure is logged as a warning and the fetch goes on, or limits its time; without a `timeout`, only `browser.deadline` limits it. Their return values are ignored.
+
+- `setup` runs once the context holds the Request's cookies, before the page loads. The routes it adds are tried after those of the Fetcher, which were added later: resource blocking, the rewrite of the first request, and capture apply whatever it routes.
+- `action` runs once the page has loaded, after `wait_for` and the actions, and before the screenshot and the captures are gathered; the Response describes the page as it left it.
+- A method that takes longer than its `timeout`, or whose call to the browser times out, raises `ActionTimeout`; one that raises otherwise raises `ActionError`, naming it, such as `Render(action=Books.after_load)`, with its exception as the cause. `Retry`, `IgnoreRequest`, and the errors of Pernix go through as they are. A page that crashes, or a browser lost, during a method fails the fetch with `PageCrashed` or `BrowserLost`, as at any other point.
+- They run in rendered Inline Fetches too.
+- They persist by name, as Callbacks do: the name, and the `optional` and `timeout` of a `PageMethod`; a method that is not the Spider's cannot be persisted, and one missing when the Request is restored fails it at once with `SerializationError`.
+
+**Kept pages** (`Render(keep_page=True)`): the Callback gets the page, open, as `response.page`, to work with it, such as clicking through it.
+
+- The page is kept for the Callback of a Request the Run fetches, from the Frontier (`pernix.fetchers.kept_pages`): once its attempt ends, whether the Callback returned, raised, or was cancelled, as by a Force Stop, or a retry was decided instead, the page is closed with its context, and its slot given back once they are closed. Elsewhere a Request that keeps its page raises `ValueError`: in an Inline Fetch, `pernix fetch`, the shell, and a Fetcher called directly outside `keeping_pages()`. A Fetcher that is not the browser's, such as a `FakeFetcher` standing in for it, gives no page.
+- The page counts toward `browser.max_pages` while it is kept, and keeps its browser from closing as it is replaced (§5.2). The rendered fetches made while it is kept, by the Callback or the tasks it starts, Inline Fetches included, share its slot rather than wait for one, as a Callback holding the last page would otherwise wait forever; the pages open may then exceed `browser.max_pages` by those fetches.
+- Under a Session, what the fetch changed is kept in the Session when the fetch ends, as for any fetch, but not what the page changes while the Callback works with it; the page's context is closed after the Callback and never used again, so the Session's next fetch gets a new one from its state (§5.3).
+- A Callback that fails while its page crashed, or its browser was lost, fails with `PageCrashed` or `BrowserLost`, caused by its own error, and the retry policy judges it as it would the fetch failing so (§4.5, §6.4).
+
 **Persistence and Fingerprints**: a `Render` and its actions persist with the Request, each action tagged with its kind. Rendering, and its options, take no part in the default Fingerprint (§6.2): a Request switched to Render, or rendered with other options, is not fetched again.
 
 Other conventions:
 
-- Pages are closed by the Fetcher. Pages that timed out or were cancelled are treated as "dirty pages" and are always closed directly, never reused.
+- Pages are closed by the Fetcher, kept pages by the Run once their Callback ends. Pages that timed out or were cancelled are treated as "dirty pages" and are always closed directly, never reused.
 
 ### 4.8 Items and Pipelines
 
@@ -598,7 +613,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 **Capacity**
 
-- At most `browser.max_pages` (8) pages are open at once, each that of one fetch: a fetch takes a page slot before it starts the browser or creates its context, waiting in the order the fetches asked, and gives it back once its page is closed, so a fetch cancelled or past `browser.deadline`, whose context closes in a task of its own, holds it until the context is closed; waiting for one takes no part in `browser.deadline`. A slot is an object of its own, so a page kept open past its fetch, as for a Callback (§4.7), can hold it until the page is closed.
+- At most `browser.max_pages` (8) pages are open at once, each that of one fetch: a fetch takes a page slot before it starts the browser or creates its context, waiting in the order the fetches asked, and gives it back once its page is closed, so a fetch cancelled or past `browser.deadline`, whose context closes in a task of its own, holds it until the context is closed; waiting for one takes no part in `browser.deadline`. A slot is an object of its own, so a page kept open past its fetch for its Callback (§4.7) holds it until the page is closed; the rendered fetches made while it is kept share it, so the pages open may then exceed `browser.max_pages`.
 - Every fetch has a context of its own, kept for its Session or fresh (§5.3), so the contexts in use are bounded by `browser.max_pages` too, and those kept idle by `browser.max_idle_contexts`; there is no other limit on contexts, nor on the pages of one.
 - A Run's rendered Requests have `browser.max_pages` workers of their own, apart from the `concurrency` workers that take the other Requests, so neither kind waits for the other (§6.3).
 - Stats: `browser.pages` and `browser.contexts`, the pages and contexts opened; `browser.pages_open` and `browser.contexts_open`, how many are open; `browser.page_waits` and `browser.page_wait_seconds`, the fetches that waited for a page, and how long.
@@ -638,6 +653,7 @@ patchright may fail a call before it emits the event of what failed it, so an er
     - A context is created with the Session's localStorage and the proxy of the Request or of the Session, which, like its locale and time zone (§5.4), never change afterwards: a Session whose proxy changes, or whose localStorage changed elsewhere, gets a new context, and its kept ones that no longer fit are closed.
     - Before each fetch, the context is made to hold the Session's cookies that have not expired, with the Request's own for this fetch only, and no other, adding and expiring only those that differ.
     - After it, whether the page loaded or not, what the page changed is read, and the pages of the context closed, the page's and those it opened, as the context is the fetch's alone; only then are the changes kept in the Session, so they are saved with the fetch's `StateDelta` while the Lease is still held: the cookies it set, changed, or removed, and the localStorage of the page's own origin. A fetch cancelled before then keeps nothing, and its context is closed. The localStorage of frames from other sites, which Chrome partitions by top-level site, is not kept, and neither is IndexedDB.
+    - A page kept for its Callback (§4.7) is left open: what the fetch changed is kept all the same, but not what the page changes while the Callback works with it, and its context is closed after the Callback, never used again.
     - Cookies map between the jar and the browser by name, domain, host-only flag (a domain cookie's domain has a leading dot in the browser), and path, with expiry, Secure, HttpOnly, and SameSite. Only the attributes the browser reports changed are taken from it; the others, such as an unspecified SameSite, which the browser reports as Lax, and the time a cookie was first set, are kept from the jar. A cookie the page set in place of one of the Request's own, which the browser held instead of the jar's, takes every attribute from the browser. A cookie the page made without SameSite is held as Lax. Partitioned cookies are left to the browser.
     - At most `browser.max_idle_contexts` (8) contexts are kept idle between fetches, the least recently used closed beyond that, and one idle for `browser.context_idle` (300 s) is closed; those in use are one per fetch, so at most `browser.max_pages` (§5.2). A Retired Session is never leased again, so its contexts go the same way.
 - **Types** (`pernix.Session`, `pernix.CookieJar`, `pernix.Cookie`):
@@ -849,6 +865,7 @@ Rules:
 
 - For Requests that go through the Frontier, a retry returns the Request with `nack(delay)`, so it holds no concurrency slot while it waits, and every Middleware runs again; Inline Fetches are retried in place.
 - A Request whose retries ran out, or that failed in a way the policy keeps, is kept as a Dead Request, `RequestFailed` is emitted, and its errback runs.
+- A Callback's exceptions are not judged by the policy (ADR 0006), but for `Retry`, and for a Callback that keeps its page (§4.7) and fails while that page crashed or its browser was lost: it is judged as `PageCrashed` or `BrowserLost`, caused by the Callback's own error, so the default policy retries it as a crash, or under the `browser_lost` budget. The Items it yielded before are kept, as for `Retry`.
 - `CancelledError` is never caught: when a Run is cancelled, Requests in flight are returned to the Frontier without counting an attempt, never retried.
 
 **Retry budgets**: failures that are not the Request's own, such as a browser that went away, or a Session found Blocked (§5.3), are retried under budgets of their own, so they take no ordinary retry, while a Request that keeps meeting them still ends. A policy names the budget and its limit in the Decision, and stays stateless; the Frontier counts the retries of each budget with the Request, as it counts its attempts (`nack(budget=...)`, `Lease.spent`), so the count survives a restart and is shared by Workers; the Engine gives up once the count reaches the limit, and an Inline Fetch counts them in place, for its own retries. `RequestRetried.budget` names the budget, and `requests.retried_by_budget.<budget>` counts its retries, besides `requests.retried`. A custom policy that does not name a budget retries as it always did.

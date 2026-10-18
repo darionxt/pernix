@@ -7,7 +7,7 @@ import msgspec
 import pytest
 
 from pernix import Request, Response, Spider
-from pernix.browser import Click, Evaluate, Render, Screenshot, Scroll, Type, WaitFor
+from pernix.browser import Click, Evaluate, PageMethod, Render, Screenshot, Scroll, Type, WaitFor
 from pernix.errors import SerializationError
 from pernix.request_codec import REQUEST_SCHEMA_VERSION, decode_request, encode_request
 
@@ -19,6 +19,12 @@ class Shop(Spider):
         pass
 
     async def failed(self, error: Exception) -> None:
+        pass
+
+    async def log_in(self, page: object) -> None:
+        pass
+
+    async def close_banner(self, page: object) -> None:
         pass
 
 
@@ -95,6 +101,57 @@ def test_render_options_round_trip_with_their_actions() -> None:
     assert restored == request
     assert restored.render == render
     assert [type(action) for action in render.actions] == [WaitFor, Scroll, Click, Type, Evaluate, Screenshot]
+
+
+def test_page_methods_round_trip_by_name() -> None:
+    shop = Shop()
+    render = Render(setup=shop.log_in, action=PageMethod(shop.close_banner, optional=True, timeout=5.0), keep_page=True)
+    request = Request(URL, render=render, callback=shop.parse_item)
+
+    data = encode_request(request, shop)
+    restored = decode_request(data, Shop())  # the Spider of a later Run, as on resume
+
+    assert msgspec.msgpack.decode(data)["render"] == {
+        "setup": {"name": "log_in"},
+        "action": {"name": "close_banner", "optional": True, "timeout": 5.0},
+        "keep_page": True,
+    }
+    assert isinstance(restored.render, Render)
+    assert restored.render.setup is not None
+    assert restored.render.action is not None
+    assert (restored.render.setup.method.__name__, restored.render.action.optional) == ("log_in", True)
+    assert (restored.render.action.timeout, restored.render.keep_page) == (5.0, True)
+
+
+def test_a_page_method_missing_on_resume_fails_at_once() -> None:
+    shop = Shop()
+    data = encode_request(Request(URL, render=Render(action=shop.close_banner)), shop)
+
+    class Changed(Spider):
+        async def parse(self, response: Response) -> None:
+            pass
+
+    with pytest.raises(SerializationError, match=r"Render action 'close_banner' is not a method of Changed"):
+        decode_request(data, Changed())
+
+
+def test_page_methods_must_belong_to_the_spider_being_persisted() -> None:
+    other = Shop()
+
+    with pytest.raises(SerializationError, match=r"Render setup .* is not a method of the Spider Shop"):
+        encode_request(Request(URL, render=Render(setup=other.log_in)), Shop())
+
+
+def test_a_persisted_page_method_that_is_not_async_is_refused() -> None:
+    class Synchronous(Spider):
+        def close_banner(self, page: object) -> None:
+            pass
+
+    shop = Shop()
+    data = encode_request(Request(URL, render=Render(action=shop.close_banner)), shop)
+
+    with pytest.raises(SerializationError, match=r"Render options are invalid: PageMethod: .* is not an async method"):
+        decode_request(data, Synchronous())
 
 
 @pytest.mark.parametrize("render", [True, False, Render(), Render(block=()), Render(block=("media",))])

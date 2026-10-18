@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from re import Pattern
 
+    from patchright.async_api import Page
+
     from pernix.browser import RenderResult
     from pernix.request import Request
     from pernix.text_decoding import DecodedText, EncodingSource
@@ -69,6 +71,9 @@ class Response:
         browser: What rendering the page gave besides the body, such as captured
             responses, screenshots, and the results of `Evaluate` actions; `None`
             for a Response that was not rendered.
+        page: The patchright `Page` the Response was rendered in, open, for a
+            Request with `Render(keep_page=True)`; the Run closes it once the
+            Callback ends. `None` otherwise.
     """
 
     url: str
@@ -85,6 +90,7 @@ class Response:
     session: str | None
     streamed: bool
     browser: RenderResult | None
+    page: Page | None
     _encoding: str | None
     _default_encoding: str
     _decoded: DecodedText | None
@@ -111,6 +117,7 @@ class Response:
         session: str | None = None,
         streamed: bool = False,
         browser: RenderResult | None = None,
+        page: Page | None = None,
     ) -> None:
         """Create a Response. Fetchers build these; user code rarely needs to.
 
@@ -132,6 +139,7 @@ class Response:
             session: The Session the Request was sent as.
             streamed: Whether the body is read apart from the Response.
             browser: What rendering the page gave, for a rendered Response.
+            page: The page kept open for the Callback, if any.
 
         Raises:
             LookupError: `encoding` or `default_encoding` names no text encoding.
@@ -154,6 +162,7 @@ class Response:
         set_field(self, "session", session)
         set_field(self, "streamed", streamed)
         set_field(self, "browser", browser)
+        set_field(self, "page", page)
         set_field(self, "_encoding", encoding)
         set_field(self, "_default_encoding", default_encoding)
         set_field(self, "_decoded", None)
@@ -375,6 +384,7 @@ class Response:
             "session": self.session,
             "streamed": self.streamed,
             "browser": self.browser,
+            "page": self.page,
         }
 
 

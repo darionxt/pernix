@@ -2,7 +2,7 @@
 
 Requests are encoded as msgpack with a schema version. Callbacks are stored by the
 name of the Spider method and looked up again when decoding; a missing method is an
-error, never a fallback to `parse`. User data (`kwargs`, `meta`, `ext`) must be
+error, never a fallback to `parse`; so are the page methods of a `Render`. User data (`kwargs`, `meta`, `ext`) must be
 JSON-compatible: `None`, booleans, numbers (integers within 64 bits), strings, lists,
 and mappings with string keys. Tuples come back as lists, and mappings as dicts.
 `Render` options are kept with their actions, each tagged with its kind. Nothing is
@@ -21,12 +21,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
-from pernix.browser import Action, Render  # msgspec resolves the field types at runtime
+from pernix.browser import Action, PageMethod, Render  # msgspec resolves the field types at runtime
 from pernix.errors import SerializationError
 from pernix.request import Request
 
 if TYPE_CHECKING:
-    from pernix.browser import ResourceType
+    from collections.abc import Callable
+
+    from pernix.browser import PageCallable, ResourceType
     from pernix.request import Callback
 
 __all__ = ["REQUEST_SCHEMA_VERSION", "decode_request", "encode_request"]
@@ -35,12 +37,21 @@ REQUEST_SCHEMA_VERSION = 1
 """The version of the persisted Request format this Pernix writes and reads."""
 
 
+class _PageMethodRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
+    name: str
+    optional: bool = False
+    timeout: float | None = None
+
+
 class _RenderRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
     wait_for: str | None = None
     actions: tuple[Action, ...] = ()
     block: tuple[str, ...] | None = None
     capture: tuple[str, ...] = ()
     screenshot: bool = False
+    setup: _PageMethodRecord | None = None
+    action: _PageMethodRecord | None = None
+    keep_page: bool = False
 
 
 class _RequestRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
@@ -84,9 +95,10 @@ def encode_request(request: Request, spider: object) -> bytes:
         The encoded Request.
 
     Raises:
-        SerializationError: The Callback or errback is not a method of `spider`, or
-            `kwargs`, `meta`, or `ext` holds a value that is not JSON-compatible or an
-            integer outside 64 bits; the message names its key.
+        SerializationError: The Callback, the errback, or a page method of the
+            `Render` is not a method of `spider`, or `kwargs`, `meta`, or `ext`
+            holds a value that is not JSON-compatible or an integer outside 64
+            bits; the message names its key.
     """
     kwargs = _json_object("kwargs", request.kwargs)
     meta = _json_object("meta", request.meta)
@@ -106,7 +118,7 @@ def encode_request(request: Request, spider: object) -> bytes:
         fingerprint=request.fingerprint,
         cookies=dict(request.cookies),
         session=request.session,
-        render=_render_record(request.render),
+        render=_render_record(request.render, spider),
         fetcher=request.fetcher,
         timeout=request.timeout,
         proxy=request.proxy,
@@ -129,7 +141,8 @@ def decode_request(data: bytes, spider: object) -> Request:
     Raises:
         SerializationError: The data is not a persisted Request, it was written in a
             newer incompatible format, its `Render` options are invalid, or the
-            Spider has no method by the stored Callback or errback name.
+            Spider has no method by the stored name of the Callback, the errback,
+            or a page method, or that page method is not async.
     """
     try:
         record = _decoder.decode(data)
@@ -140,7 +153,7 @@ def decode_request(data: bytes, spider: object) -> Request:
             f"the Request was persisted in format {record.schema_version}, but this Pernix "
             f"reads format {REQUEST_SCHEMA_VERSION} and older; upgrade Pernix to resume this Run"
         )
-    render = record.render if isinstance(record.render, bool) else _restored_render(record.render)
+    render = record.render if isinstance(record.render, bool) else _restored_render(record.render, spider)
     return Request(
         record.url,
         method=record.method,
@@ -164,7 +177,7 @@ def decode_request(data: bytes, spider: object) -> Request:
     )
 
 
-def _render_record(render: bool | Render) -> bool | _RenderRecord:
+def _render_record(render: bool | Render, spider: object) -> bool | _RenderRecord:
     if isinstance(render, bool):
         return render
     return _RenderRecord(
@@ -173,10 +186,21 @@ def _render_record(render: bool | Render) -> bool | _RenderRecord:
         block=render.block,
         capture=render.capture,
         screenshot=render.screenshot,
+        setup=_page_method_record(render.setup, spider, "Render setup"),
+        action=_page_method_record(render.action, spider, "Render action"),
+        keep_page=render.keep_page,
     )
 
 
-def _restored_render(record: _RenderRecord) -> Render:
+def _page_method_record(method: PageMethod | None, spider: object, role: str) -> _PageMethodRecord | None:
+    if method is None:
+        return None
+    return _PageMethodRecord(
+        name=_name_of(method.method, spider, role), optional=method.optional, timeout=method.timeout
+    )
+
+
+def _restored_render(record: _RenderRecord, spider: object) -> Render:
     try:
         return Render(
             wait_for=record.wait_for,
@@ -184,14 +208,27 @@ def _restored_render(record: _RenderRecord) -> Render:
             block=cast("tuple[ResourceType, ...] | None", record.block),
             capture=record.capture,
             screenshot=record.screenshot,
+            setup=_restored_page_method(record.setup, spider, "Render setup"),
+            action=_restored_page_method(record.action, spider, "Render action"),
+            keep_page=record.keep_page,
         )
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise SerializationError(f"the persisted Request's Render options are invalid: {exc}") from exc
 
 
-def _method_name(method: Callback | None, spider: object, role: str) -> str | None:
-    if method is None:
+def _restored_page_method(record: _PageMethodRecord | None, spider: object, role: str) -> PageMethod | None:
+    if record is None:
         return None
+    method = cast("PageCallable", _resolve_method(spider, record.name, role))
+    return PageMethod(method, optional=record.optional, timeout=record.timeout)
+
+
+def _method_name(method: Callback | None, spider: object, role: str) -> str | None:
+    return None if method is None else _name_of(method, spider, role)
+
+
+def _name_of(method: Callable[..., object], spider: object, role: str) -> str:
+    """The name a method of the Spider is persisted by, which finds it again when the Request is restored."""
     if not inspect.ismethod(method) or method.__self__ is not spider:
         raise SerializationError(f"the {role} {method!r} is not a method of the Spider {type(spider).__name__}")
     found = getattr(spider, method.__name__, None)
