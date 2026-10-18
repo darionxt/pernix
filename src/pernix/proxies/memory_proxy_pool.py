@@ -6,7 +6,8 @@ import itertools
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pernix.proxies.proxy_pool import ProxyCounts
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class _Entry:
-    """A proxy as the pool holds it: whether it is listed, its health, and the Sessions bound to it."""
+    """A proxy as the pool holds it: whether it is listed, and its health."""
 
     url: str
     listed: bool = True
@@ -36,7 +37,6 @@ class _Entry:
     retired: bool = False
     used: int = 0
     """When it was last taken or bound, as a count of those, so it goes to the back of the line."""
-    sessions: set[str] = field(default_factory=set[str])
 
     def usable(self, now: float) -> bool:
         return self.listed and not self.retired and self.cool_until <= now
@@ -48,7 +48,9 @@ class MemoryProxyPool:
     Each fetch without a Session takes the available proxy used least recently, so
     the proxies take turns. A Session keeps the proxy it is bound to while that is
     available, and is otherwise bound to the one with the fewest Sessions, so
-    Sessions share a proxy only when there are more of them than proxies. A failure
+    Sessions share a proxy only when there are more of them than proxies. The pool
+    holds the binding of each Session, so Leases of one Session that overlap, which
+    loaded its state before either saved it, are given the same proxy. A failure
     cools its proxy down for `cooldown` seconds, doubled with each failure in a row,
     at most `cooldown_max`, and Retires it after `max_failures` in a row; a fetch
     that got through ends the row. A proxy that is no longer listed keeps its
@@ -81,6 +83,8 @@ class MemoryProxyPool:
         self._stats = stats
         self._clock = clock
         self._entries: dict[str, _Entry] = {}
+        self._bound: dict[str, str] = {}
+        """The proxy each Session is bound to, by its id."""
         self._uses = itertools.count(1)
 
     def health(self, proxy: str) -> ProxyHealth | None:
@@ -145,24 +149,26 @@ class MemoryProxyPool:
 
         Args:
             session: The Session's id.
-            current: The proxy the Session is bound to, if any.
+            current: The proxy the Session's state names, for a Session the pool
+                bound to none yet; the pool's binding goes first.
 
         Returns:
             The proxy, or `None` if none is available now.
         """
         now = self._clock()
-        held = None if current is None else self._entries.get(current)
-        if held is not None:
-            if held.usable(now):
-                held.sessions.add(session)
-                return held.url
-            held.sessions.discard(session)
+        url = self._bound.get(session, current)
+        held = None if url is None else self._entries.get(url)
+        if held is not None and held.usable(now):
+            self._bound[session] = held.url
+            return held.url
+        self._bound.pop(session, None)
         usable = [entry for entry in self._entries.values() if entry.usable(now)]
         if not usable:
             return None
-        entry = min(usable, key=lambda entry: (len(entry.sessions), entry.used))
-        entry.sessions.add(session)
+        sessions = Counter(self._bound.values())
+        entry = min(usable, key=lambda entry: (sessions[entry.url], entry.used))
         entry.used = next(self._uses)
+        self._bound[session] = entry.url
         self._count("proxies.bindings")
         return entry.url
 

@@ -91,10 +91,12 @@ class SessionLeasing:
     them got cools the Session down.
 
     With the Run's proxies, a Session goes through the proxy it is bound to while
-    that is available, and is bound to another, before its fetch and its login,
-    once it is not; the binding is saved with its state. How each fetch under it went
-    through the proxy is reported, unless the Request named its own proxy. When no
-    proxy is available, the Lease is released, and the Request waits elsewhere.
+    that is available, and is bound to another once it is not, before each fetch
+    that goes through it, those of its login and those nested in another included;
+    the binding is saved with its state. A Request with a proxy of its own goes
+    through that, and needs none of the Run's. How each fetch through the Session's
+    proxy went is reported. When no proxy is available, the Lease is released, and
+    the Request waits elsewhere; a nested fetch waits as its caller does.
 
     With a login, a fetch whose Lease must log its Session in runs the login first,
     in the fetch's task, where the fetches the login makes share the Lease and are
@@ -152,13 +154,14 @@ class SessionLeasing:
         Raises:
             NoSessionYet: No Session could be leased within `wait`, or the one
                 leased failed to log in.
-            pernix.proxies.run_proxies.NoProxyYet: No proxy is available for the
-                Session leased.
+            pernix.proxies.run_proxies.NoProxyYet: The Request goes through its
+                Session's proxy, and no proxy is available.
             pernix.errors.SessionError: No Session can ever be leased for the
                 Request.
         """
         held = _held_by(self, request.session)
         if held is not None:
+            await self._bind_proxy(held.session, request)
             shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
@@ -178,8 +181,7 @@ class SessionLeasing:
         try:
             before = await self.pool.load_state(lease)
             session = Session.from_state(lease.session, before)
-            if self._proxies is not None:
-                session.proxy = await self._proxies.bind(session.id, session.proxy)
+            await self._bind_proxy(session, request)
         except BaseException:
             await self.pool.release(lease, Outcome("ok"))
             raise
@@ -278,6 +280,15 @@ class SessionLeasing:
                 lease.session,
                 sending.request,
             )
+
+    async def _bind_proxy(self, session: Session, request: Request) -> None:
+        """Bind a Session to an available proxy, unless the Request goes through its own.
+
+        Raises:
+            pernix.proxies.run_proxies.NoProxyYet: No proxy is available.
+        """
+        if self._proxies is not None and request.proxy is None:
+            session.proxy = await self._proxies.bind(session.id, session.proxy)
 
     def _reporting(self, sending: Sending) -> AbstractAsyncContextManager[None]:
         """Report how a fetch went through its Session's proxy, unless the Request names its own."""

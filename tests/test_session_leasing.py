@@ -480,12 +480,16 @@ async def test_a_cancelled_login_leaves_the_session_to_log_in() -> None:
 PROXY_A, PROXY_B = "http://a.example:8080", "http://b.example:8080"
 
 
-async def _proxies(pool: MemoryProxyPool, *urls: str) -> RunProxies:
+async def _proxies(pool: MemoryProxyPool, *urls: str, stops: list[None] | None = None) -> RunProxies:
     def mask(_: Iterable[str]) -> None:
         pass
 
+    def stop() -> None:
+        if stops is not None:
+            stops.append(None)
+
     proxies = RunProxies(
-        pool, [("proxies.urls", StaticProxies(urls))], refresh=None, stats=Stats(), stop=lambda: None, mask=mask
+        pool, [("proxies.urls", StaticProxies(urls))], refresh=None, stats=Stats(), stop=stop, mask=mask
     )
     await proxies.open()
     return proxies
@@ -583,3 +587,52 @@ async def test_a_request_with_a_proxy_of_its_own_reports_nothing_against_the_ses
         sending.error = ProxyError("refused")
 
     assert proxy_pool.health(PROXY_A) == "available"
+
+
+async def test_overlapping_leases_of_a_session_go_through_one_proxy() -> None:
+    leasing, _, _, _ = _leasing(proxies=await _proxies(MemoryProxyPool(), PROXY_A, PROXY_B), max_concurrency=2)
+
+    async def overlapping() -> str | None:
+        async with leasing.sending(Request(f"{SITE}/second", session="a"), wait=0) as second:
+            assert second.session is not None
+            return second.session.proxy
+
+    async with leasing.sending(Request(f"{SITE}/first", session="a"), wait=0) as first:
+        assert first.session is not None
+        proxies = (first.session.proxy, await asyncio.create_task(overlapping()))
+
+    assert proxies == (PROXY_A, PROXY_A)
+
+
+@pytest.mark.parametrize("own", ["http://own.example:1", ""], ids=["its own", "none"])
+@pytest.mark.parametrize("pool_state", ["cooling down", "retired"])
+async def test_a_request_with_a_proxy_of_its_own_needs_none_of_the_runs(own: str, pool_state: str) -> None:
+    proxy_pool = MemoryProxyPool(cooldown=30, max_failures=1 if pool_state == "retired" else 5)
+    stops: list[None] = []
+    leasing, pool, _, _ = _leasing(proxies=await _proxies(proxy_pool, PROXY_A, stops=stops))
+    await proxy_pool.report(PROXY_A, failed=True, since=0)
+
+    async with leasing.sending(Request(f"{SITE}/", session="a", proxy=own), wait=0) as sending:
+        assert sending.session is not None
+        assert sending.session.proxy is None
+
+    assert stops == []
+    assert await _state_proxy(pool, "a") is None
+
+
+async def test_the_login_of_a_request_with_a_proxy_of_its_own_goes_through_the_sessions() -> None:
+    seen: list[str | None] = []
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        async with leasing.sending(Request(f"{SITE}/login", session=session.id), wait=0) as sending:
+            assert sending.session is not None
+            seen.append(sending.session.proxy)
+
+    proxies = await _proxies(MemoryProxyPool(), PROXY_A)
+    leasing, pool, _, _ = _leasing(login=_login(log_in), proxies=proxies)
+
+    async with leasing.sending(Request(f"{SITE}/", session="a", proxy="http://own.example:1"), wait=0):
+        pass
+
+    assert seen == [PROXY_A]
+    assert await _state_proxy(pool, "a") == PROXY_A

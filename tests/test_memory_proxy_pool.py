@@ -45,6 +45,21 @@ async def test_a_session_keeps_its_proxy_and_sessions_share_one_only_when_they_m
     assert third in (A, B)
 
 
+async def test_leases_of_one_session_that_overlap_are_given_one_proxy() -> None:
+    clock = Clock()
+    pool = await _pool(A, B, C, clock=clock)
+    first = await pool.bind("one", None)
+    overlapping = await pool.bind("one", None)  # a Lease that loaded the state before the first saved its binding
+    await pool.bind("two", None)
+
+    await pool.report(A, failed=True, since=clock.now)
+    rebound = await pool.bind("one", A)
+    stale = await pool.bind("one", A)  # another Lease of it, which loaded the state before the rebinding
+
+    assert (first, overlapping) == (A, A)
+    assert rebound == stale == C
+
+
 async def test_a_session_whose_proxy_cools_down_is_bound_to_another() -> None:
     clock = Clock()
     stats = Stats()

@@ -59,9 +59,14 @@ class ProxyPool(Protocol):
     async def bind(self, session: str, current: str | None) -> str | None:
         """Return the proxy a Session goes through: its own while available, else the one with the fewest Sessions.
 
+        The pool holds the binding of each Session, so that Leases of one Session
+        that overlap are given the same proxy, though each loaded its state before
+        the other saved it.
+
         Args:
             session: The Session's id.
-            current: The proxy the Session is bound to, if any.
+            current: The proxy the Session's state names, for a Session the pool
+                bound to none yet; the pool's binding goes first.
 
         Returns:
             The proxy, or `None` if none is available now.
