@@ -585,7 +585,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 
 **Capacity**
 
-- At most `browser.max_pages` (8) pages are open at once, each that of one fetch: a fetch takes a page slot before it starts the browser or creates its context, waiting in the order the fetches asked, and gives it back once its page is closed; waiting for one takes no part in `browser.deadline`. A slot is an object of its own, so a page kept open past its fetch, as for a Callback (§4.7), can hold it until the page is closed.
+- At most `browser.max_pages` (8) pages are open at once, each that of one fetch: a fetch takes a page slot before it starts the browser or creates its context, waiting in the order the fetches asked, and gives it back once its page is closed, so a fetch cancelled or past `browser.deadline`, whose context closes in a task of its own, holds it until the context is closed; waiting for one takes no part in `browser.deadline`. A slot is an object of its own, so a page kept open past its fetch, as for a Callback (§4.7), can hold it until the page is closed.
 - Every fetch has a context of its own, kept for its Session or fresh (§5.3), so the contexts in use are bounded by `browser.max_pages` too, and those kept idle by `browser.max_idle_contexts`; there is no other limit on contexts, nor on the pages of one.
 - A Run's rendered Requests have `browser.max_pages` workers of their own, apart from the `concurrency` workers that take the other Requests, so neither kind waits for the other (§6.3).
 - Stats: `browser.pages` and `browser.contexts`, the pages and contexts opened; `browser.pages_open` and `browser.contexts_open`, how many are open; `browser.page_waits` and `browser.page_wait_seconds`, the fetches that waited for a page, and how long.

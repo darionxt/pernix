@@ -29,7 +29,7 @@ from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.page_actions import run_render
-from pernix.fetchers.page_slots import PageSlots
+from pernix.fetchers.page_slots import PageSlot, PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.session_contexts import SessionContexts
 from pernix.headers import Headers
@@ -192,7 +192,8 @@ class BrowserFetcher:
         self._open = False
         self._launch: asyncio.Task[LaunchedBrowser] | None = None
         self._unavailable: ComponentError | None = None
-        self._closing: set[asyncio.Task[None]] = set()
+        self._closing: dict[BrowserContext, asyncio.Task[None]] = {}
+        """The contexts closing in tasks of their own, which closing the fetcher waits for."""
         self._pages = PageSlots(self._settings.max_pages, stats=stats)
         self._contexts_open = 0
         self._contexts = SessionContexts(
@@ -231,7 +232,7 @@ class BrowserFetcher:
         self._contexts.close()
         try:
             if self._closing:
-                await asyncio.wait(self._closing)
+                await asyncio.wait(self._closing.values())
         finally:
             if launch is not None:
                 await _close_launched(launch)
@@ -277,20 +278,20 @@ class BrowserFetcher:
         guard = current_guard()
         if guard is not None:
             guard.check(request.url, proxy=proxy)
-        page = await self._pages.take()
+        page = _Page(await self._pages.take())
         try:
             async with self._deadline(request):
                 try:
-                    return await self._fetch(request, guard, proxy, session)
+                    return await self._fetch(request, guard, proxy, session, page)
                 except PernixError:
                     raise
                 except Exception as exc:  # the browser's own errors
                     raise _fetch_error(exc, request) from exc
         finally:
-            page.release()  # its page is closed, or closing with its context in a task of its own
+            self._release(page)
 
     async def _fetch(
-        self, request: Request, guard: NetworkGuard | None, proxy: str | None, session: Session | None
+        self, request: Request, guard: NetworkGuard | None, proxy: str | None, session: Session | None, page: _Page
     ) -> Response:
         launched = await self._browser()
         if guard is not None and not launched.guarded:
@@ -305,12 +306,15 @@ class BrowserFetcher:
         load = _Load(request, render, blocked, proxy=proxy, guarded=launched.guarded, started=started)
         workers = bool(blocked)  # service workers would load what is blocked, unseen by the page's routes
         if session is None:
-            context = self._opened(await launched.new_context(proxy=proxy, blocks_service_workers=workers))
+            context = page.context = self._opened(
+                await launched.new_context(proxy=proxy, blocks_service_workers=workers)
+            )
             try:
                 return await self._load(context, load)
             finally:
                 await self._close_soon(context)
         async with self._contexts.using(launched, session, proxy=proxy, blocks_service_workers=workers) as kept:
+            page.context = kept.context
             return await self._load(kept.context, load, kept=kept, session=session)
 
     async def _browser(self) -> LaunchedBrowser:
@@ -505,11 +509,21 @@ class BrowserFetcher:
         await asyncio.shield(self._discard(context))
 
     def _discard(self, context: BrowserContext) -> asyncio.Task[None]:
-        """Start closing a context in a task of its own, which closing the fetcher waits for."""
-        closing = asyncio.create_task(_quietly(context.close(), "closing a browser context"))
-        self._closing.add(closing)
-        closing.add_done_callback(self._closed)
+        """Start closing a context in a task of its own, which closing the fetcher waits for; once is enough."""
+        closing = self._closing.get(context)
+        if closing is None:
+            closing = asyncio.create_task(_quietly(context.close(), "closing a browser context"))
+            self._closing[context] = closing
+            closing.add_done_callback(lambda _closing: self._closed(context))
         return closing
+
+    def _release(self, page: _Page) -> None:
+        """Give a fetch's page slot back once its page is closed: at once, or once its context, still closing, is."""
+        closing = None if page.context is None else self._closing.get(page.context)
+        if closing is None:
+            page.slot.release()
+        else:  # a fetch cancelled, or past browser.deadline, leaves its page open while its context closes
+            closing.add_done_callback(lambda _closing: page.slot.release())
 
     async def _session_context(
         self, launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
@@ -527,14 +541,22 @@ class BrowserFetcher:
         self._count_open(1)
         return context
 
-    def _closed(self, closing: asyncio.Task[None]) -> None:
-        self._closing.discard(closing)
+    def _closed(self, context: BrowserContext) -> None:
+        del self._closing[context]
         self._count_open(-1)
 
     def _count_open(self, change: int) -> None:
         self._contexts_open += change
         if self._stats is not None:
             self._stats.set("browser.contexts_open", self._contexts_open)
+
+
+@dataclass(slots=True)
+class _Page:
+    """The page slot a fetch holds, and the context it opens its page in, once it has one."""
+
+    slot: PageSlot
+    context: BrowserContext | None = None
 
 
 @dataclass(frozen=True, slots=True)

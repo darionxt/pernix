@@ -33,16 +33,19 @@ class Pages(Spider):
 
 async def test_requests_that_do_not_render_are_fetched_while_every_page_is_busy() -> None:
     plain_done = asyncio.Event()
+    answered: list[str] = []
     plain = FakeFetcher({})
 
     async def answer_plain(request: Request) -> Response:
-        if request.url.endswith("/1"):
+        answered.append("plain")
+        if len(answered) == 2:
             plain_done.set()
         return make_response(request.url, "<p>plain</p>", request=request)
 
     async def answer_rendered(request: Request) -> Response:
         async with asyncio.timeout(5):  # the Run's single worker would never get to the others
             await plain_done.wait()
+        answered.append("rendered")
         return make_response(request.url, "<p>rendered</p>", request=request)
 
     plain.add(f"{SHOP}/plain/0", answer_plain)
@@ -53,7 +56,8 @@ async def test_requests_that_do_not_render_are_fetched_while_every_page_is_busy(
 
     report = await crawl(Pages, fetcher=plain, browser=browser, settings={"concurrency": 1})
 
-    assert [item["fetcher"] for item in report.items] == ["http", "http", "browser", "browser"]
+    assert answered == ["plain", "plain", "rendered", "rendered"]
+    assert sorted(item["fetcher"] for item in report.items) == ["browser", "browser", "http", "http"]
     assert report.stats["requests.failed"] == 0
 
 

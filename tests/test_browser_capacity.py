@@ -28,6 +28,7 @@ class SlowPages:
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds
         self.most = 0
+        self.arrived = threading.Event()
         self._active = 0
         self._lock = threading.Lock()
 
@@ -35,6 +36,7 @@ class SlowPages:
         with self._lock:
             self._active += 1
             self.most = max(self.most, self._active)
+        self.arrived.set()
         try:
             time.sleep(self.seconds)
         finally:
@@ -72,6 +74,29 @@ async def test_waiting_for_a_page_takes_no_part_in_the_deadline(server: Loopback
         responses = await asyncio.gather(*(fetcher.fetch(_render(server.url(f"/slow?n={n}"))) for n in range(2)))
 
     assert [response.status for response in responses] == [200, 200]  # the second waited a second first
+
+
+async def test_a_page_whose_fetch_was_cancelled_holds_its_slot_until_its_context_is_closed(
+    server: LoopbackServer,
+) -> None:
+    slow = SlowPages(2.0)
+    server.route("/slow", handler=slow)
+    server.route("/", "<p>up</p>", headers=HTML)
+    stats = Stats()
+
+    async with BrowserFetcher(BrowserSettings(max_pages=1), stats=stats) as fetcher:
+        loading = asyncio.create_task(fetcher.fetch(_render(server.url("/slow")), session=Session("alice")))
+        assert await asyncio.to_thread(slow.arrived.wait, 30)
+        loading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loading
+
+        assert stats.get("browser.pages_open") == 1  # its context, and the page in it, are still closing
+        response = await fetcher.fetch(_render(server.url("/")), session=Session("bob"))
+
+    assert response.status == 200
+    assert stats.get("browser.pages_open") == 0
+    assert stats.get("browser.page_waits") == 1
 
 
 async def test_the_contexts_opened_and_open_are_counted(server: LoopbackServer) -> None:
