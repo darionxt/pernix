@@ -53,7 +53,8 @@ class FakeFetcher:
 
     It fetches `http` and `https` URLs, so registered as `http` in the `fetchers`
     setting it stands in for the HTTP Fetcher; `pernix.testing.crawl(fetcher=...)`
-    does that.
+    does that. `crawl(browser=...)` has one answer rendered Requests in place of the
+    browser Fetcher, and the bodies it answers them with make rendered Responses.
 
     Attributes:
         schemes: The URL schemes it fetches.

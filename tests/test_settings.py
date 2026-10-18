@@ -33,7 +33,16 @@ def settings(tmp_path: Path) -> Settings:
 
 
 HTTP_KEYS = ("impersonate", "timeout", "deadline", "max_redirects", "max_body_size", "pool_size", "pool_idle")
-BROWSER_KEYS = ("headless", "timeout", "deadline", "launch_options", "max_idle_contexts", "context_idle")
+BROWSER_KEYS = (
+    "headless",
+    "timeout",
+    "deadline",
+    "launch_options",
+    "max_idle_contexts",
+    "context_idle",
+    "block",
+    "action_timeout",
+)
 
 
 def test_settings_are_a_read_only_mapping(settings: Settings) -> None:

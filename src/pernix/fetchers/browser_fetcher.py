@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Self
 from urllib.parse import urlsplit
 
+from pernix.browser import Render, RenderResult
 from pernix.cookies import request_cookies
 from pernix.errors import (
     ComponentError,
@@ -26,6 +27,8 @@ from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
+from pernix.fetchers.page_actions import run_render
+from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.session_contexts import SessionContexts
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
@@ -55,9 +58,6 @@ _RENDERED_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 
 _NO_CONTENT = frozenset({204, 205})
 """Statuses that make Chrome abandon the navigation, keeping the page it was on."""
-
-_ENCODING_HEADERS = frozenset({"content-encoding", "content-length"})
-"""Headers that describe the body as it was sent, not as the browser decoded it."""
 
 _NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
@@ -125,7 +125,14 @@ class BrowserFetcher:
 
     The page is loaded until its `load` event, within
     `browser.timeout` (or `request.timeout`); `browser.deadline` limits the whole
-    fetch. A Request other than a plain GET, or with headers, changes the first
+    fetch. A `Render` in `request.render` then waits for its `wait_for`, runs its
+    actions, and takes its screenshot, each within `browser.action_timeout` unless
+    an action sets its own. The page may not load the resource types of its
+    `block`, or of `browser.block` without one, and the XHR and fetch responses
+    matching its `capture` are kept; `response.browser` holds what they gave, with
+    the document as received.
+
+    A Request other than a plain GET, or with headers, changes the first
     request of the page accordingly. The browser keeps those headers on the
     redirects that follow, to any host, as the HTTP Fetcher does, so it refuses
     `Authorization` and `Proxy-Authorization`, which the HTTP Fetcher drops on the
@@ -225,6 +232,8 @@ class BrowserFetcher:
             pernix.errors.NetworkBlocked: The network guard refused the document.
             pernix.errors.FetchError: The page did not load; a subclass names the kind
                 of failure.
+            pernix.errors.ActionError: A step of the Render failed; an
+                `ActionTimeout` if it took too long.
             ValueError: The Request has an `Authorization` or `Proxy-Authorization`
                 header, or goes through a SOCKS proxy with credentials.
         """
@@ -264,7 +273,8 @@ class BrowserFetcher:
                 "so it cannot be kept on loopback hosts"
             )
         started = time.monotonic()
-        load = _Load(request, proxy=proxy, guarded=launched.guarded, started=started)
+        render = request.render if isinstance(request.render, Render) else Render()
+        load = _Load(request, render, proxy=proxy, guarded=launched.guarded, started=started)
         if session is None:
             context = await launched.new_context(proxy=proxy)
             try:
@@ -322,9 +332,25 @@ class BrowserFetcher:
             await kept.sync(session, own, now=time.time())
         elif own:
             await page.context.add_cookies(own)
+        render = load.render
+        blocked = self._settings.block if render.block is None else render.block
+        if blocked:
+            await page.route("**/*", ResourceBlocker(blocked))
         rewrite = _FirstRequest.of(page, request)
         if rewrite is not None:
-            await page.route("**/*", rewrite)
+            await page.route("**/*", rewrite)  # tried first, as the last added
+        capture = ResponseCapture(page, render.capture) if render.capture else None
+        try:
+            return await self._rendered(page, watch, load, session, capture)
+        finally:
+            if capture is not None:
+                capture.stop()
+
+    async def _rendered(
+        self, page: Page, watch: _PageLoad, load: _Load, session: Session | None, capture: ResponseCapture | None
+    ) -> Response:
+        """Load the page, then run the steps of its Render on it."""
+        request = load.request
         timeout = request.timeout or self._settings.timeout
         try:
             document = await page.goto(request.url, wait_until="load", timeout=timeout * 1000)
@@ -332,7 +358,16 @@ class BrowserFetcher:
             return await self._failed_load(exc, watch, load, session)
         if document is None:
             raise FetchError(f"loading {request.url} gave no document")
-        return await self._response(page, document, load, session)
+        received = await captured_response(document)
+        action_timeout = self._settings.action_timeout
+        outputs = await run_render(page, load.render, action_timeout=action_timeout, url=request.url)
+        result = RenderResult(
+            document=received,
+            captured=() if capture is None else await capture.responses(within=action_timeout),
+            screenshots=outputs.screenshots,
+            evaluated=outputs.evaluated,
+        )
+        return await self._response(page, document, load, session, result)
 
     async def _done(self, page: Page, watch: _PageLoad, kept: SessionContext | None, session: Session | None) -> None:
         """End a fetch: in a kept context, close its pages and keep what it changed in its Session."""
@@ -364,17 +399,24 @@ class BrowserFetcher:
             raise Timeout(f"{request.url} did not load within {seconds} s") from None
         document = watch.document
         if document is not None and document.status in _NO_CONTENT:
-            return await self._built(load, watch.page, document, url=document.url, body=b"", session=session)
+            result = RenderResult(document=await captured_response(document, body=b""))
+            return await self._built(
+                load, watch.page, document, url=document.url, body=b"", session=session, result=result
+            )
         if "Download is starting" in str(error):
             raise FetchError(f"the browser downloads {request.url} instead of showing it; fetch it without render")
         raise _fetch_error(error, request) from error
 
-    async def _response(self, page: Page, document: PageResponse, load: _Load, session: Session | None) -> Response:
+    async def _response(
+        self, page: Page, document: PageResponse, load: _Load, session: Session | None, result: RenderResult
+    ) -> Response:
         if await page.evaluate("document.contentType") in _RENDERED_TYPES:
             body = (await page.content()).encode()
-            return await self._built(load, page, document, url=page.url, body=body, session=session, rendered=True)
-        body = await document.body()
-        return await self._built(load, page, document, url=document.url, body=body, session=session)
+            return await self._built(
+                load, page, document, url=page.url, body=body, session=session, result=result, rendered=True
+            )
+        body = await document.body() if result.document is None else result.document.body
+        return await self._built(load, page, document, url=document.url, body=body, session=session, result=result)
 
     async def _built(
         self,
@@ -385,11 +427,10 @@ class BrowserFetcher:
         url: str,
         body: bytes,
         session: Session | None,
+        result: RenderResult,
         rendered: bool = False,
     ) -> Response:
-        headers = await _headers(document)
-        if rendered or _decoded(headers):
-            headers = Headers((name, value) for name, value in headers if name.lower() not in _ENCODING_HEADERS)
+        headers = body_headers(await _headers(document), re_encoded=rendered)
         history = await _history(document)
         held = await page.context.cookies([*(hop.url for hop in history), url])
         address = await document.server_addr()
@@ -407,6 +448,7 @@ class BrowserFetcher:
             ip_address=address["ipAddress"] if address else None,
             fetcher="browser",
             session=None if session is None else session.id,
+            browser=result,
         )
 
     @asynccontextmanager
@@ -436,9 +478,10 @@ class BrowserFetcher:
 
 @dataclass(frozen=True, slots=True)
 class _Load:
-    """A Request on its way to the browser, with the proxy it goes through."""
+    """A Request on its way to the browser, with its Render options and the proxy it goes through."""
 
     request: Request
+    render: Render
     proxy: str | None
     guarded: bool
     started: float
@@ -560,11 +603,6 @@ async def _history(document: PageResponse) -> list[Redirect]:
             hops.append(Redirect(hop.url, response.status, await _headers(response)))
         hop = hop.redirected_from
     return hops[::-1]
-
-
-def _decoded(headers: Headers) -> bool:
-    """Whether the body was decoded, as the browser decodes every encoding it does not reject."""
-    return any(value.strip().lower() not in ("", "identity") for value in headers.get_all("Content-Encoding"))
 
 
 def _fetch_error(error: Exception, request: Request) -> FetchError:

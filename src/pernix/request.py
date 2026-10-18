@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 import orjson
 
+from pernix.browser.render import Render
 from pernix.cookies import check_cookies
 from pernix.headers import Headers, HeadersInput
 from pernix.urls import clean_url, is_absolute
@@ -89,7 +90,8 @@ class Request:
         fingerprint: An application-supplied Fingerprint; computed when `None`.
         cookies: Read-only cookies sent with this Request only, by name.
         session: The Session to send the Request as; `None` for none.
-        render: Whether to load the page in the browser.
+        render: Whether to load the page in the browser: `True`, or a `Render`
+            with the options to load it with.
         fetcher: The name of the Fetcher to use; inferred when `None`.
         timeout: Seconds before the fetch fails; the setting applies when `None`.
         proxy: A proxy URL for this Request only, over those of the Run and of its
@@ -111,7 +113,7 @@ class Request:
     fingerprint: str | None
     cookies: Mapping[str, str]
     session: str | None
-    render: bool
+    render: bool | Render
     fetcher: str | None
     timeout: float | None
     proxy: str | None
@@ -137,7 +139,7 @@ class Request:
         fingerprint: str | None = None,
         cookies: Mapping[str, str] | None = None,
         session: str | None = None,
-        render: bool = False,
+        render: bool | Render = False,
         fetcher: str | None = None,
         timeout: float | None = None,
         proxy: str | None = None,
@@ -170,7 +172,8 @@ class Request:
             fingerprint: An application-supplied Fingerprint.
             cookies: Cookies sent with this Request only, by name.
             session: The Session to send the Request as.
-            render: Load the page in the browser.
+            render: Load the page in the browser: `True` with no options, or a
+                `Render` with some, such as actions to run on the page.
             fetcher: The name of the Fetcher to use.
             timeout: Seconds before the fetch fails.
             proxy: A proxy URL for this Request only, over those of the Run and of
@@ -184,8 +187,9 @@ class Request:
                 header; a cookie name is empty or has `=`, `;`, or a control
                 character, or a cookie value has `;` or a control character; or
                 `timeout` is not positive.
-            TypeError: `callback` or `errback` is not a method of an object, or a
-                value of `params` is neither a string nor a number.
+            TypeError: `callback` or `errback` is not a method of an object, a
+                value of `params` is neither a string nor a number, or `render` is
+                neither a boolean nor a `Render`.
         """
         url = _absolute(url)
         if params is not None:
@@ -201,6 +205,7 @@ class Request:
             check_cookies(cookies)
         if timeout is not None and timeout <= 0:
             raise ValueError(f"timeout must be positive, got {timeout}")
+        _check_render(render)
         for name, method_ in (("callback", callback), ("errback", errback)):
             if method_ is not None and not inspect.ismethod(method_):
                 raise TypeError(f"{name} must be a method of the Spider, such as self.parse_item; got {method_!r}")
@@ -303,6 +308,12 @@ def _query_value(name: str, value: object) -> str:
             f"params[{name!r}] must be a string or a number, got {value!r}; spell booleans out, such as 'true'"
         )
     return str(value)
+
+
+def _check_render(render: object) -> None:
+    """Check `render`, as the annotations are not enforced."""
+    if not isinstance(render, bool | Render):
+        raise TypeError(f"render must be True, False, or a pernix.browser.Render; got {render!r}")
 
 
 def _frozen[V](values: Mapping[str, V] | None) -> Mapping[str, V]:

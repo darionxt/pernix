@@ -7,6 +7,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CONFIGURATION_ERRORS",
+    "ActionError",
+    "ActionTimeout",
     "AddonError",
     "ComponentError",
     "ConnectError",
@@ -145,6 +147,21 @@ class DecodeError(FetchError):
 
 class NetworkBlocked(FetchError):
     """A network guard, such as the one tests run under, refused a host other than a loopback one."""
+
+
+class ActionError(FetchError):
+    """A page action of a rendered Request failed, such as a script that threw or an invalid selector.
+
+    The default retry policy does not retry it, as it fails again the same way.
+    """
+
+
+class ActionTimeout(ActionError, Timeout):
+    """A page action, or `Render(wait_for=...)`, took longer than its timeout.
+
+    It is a `Timeout`, so the default retry policy retries it, as it does a page that
+    loads too slowly.
+    """
 
 
 class SessionError(PernixError):

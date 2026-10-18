@@ -142,7 +142,7 @@ Request(
     fingerprint=None,      # application-supplied Fingerprint; computed by default, see §6.2
     cookies=None,          # name -> value, sent with this Request only; cannot be combined with a Cookie header
     session=None,          # pin a Session; none by default (Requests are independent), see §5.3
-    render=None,           # browser Render options, see §4.7
+    render=False,          # True, or browser Render options, see §4.7
     fetcher=None,          # explicit Fetcher; inferred from render and the URL scheme by default
     timeout=None,
     proxy=None, impersonate=None,   # per-Request overrides, rarely needed; proxy="" for none, see §5.3
@@ -169,7 +169,7 @@ Request(
   - The codec actually used is stored in `encoding`, and the step that chose it in `encoding_source`: `explicit`, `bom`, `header`, `document`, `utf-8`, `detected`, or `default`.
 - Selectors: `css()`, `xpath()`, `re()` / `re_first()` over the whole text, and `jmespath()`, whose results keep JSON values as they are. The document is parsed only on first call: XML media types as XML, JSON media types as JSON, and anything else as JSON if it is an object or array, as XML if it starts with an XML declaration, and as HTML otherwise. `json()` decodes the text with orjson and caches the decoded value.
 - Links: `urljoin()` resolves a URL against the Response's base URL (final URL, honoring the first `<base href>` of an HTML document unless browsers would ignore it, such as a `data:` or `javascript:` base), for example to store absolute links in Items. There are no `follow` helpers: Requests are always written out explicitly, and relative URLs are resolved automatically (see §4.3).
-- Responses from the browser also carry `response.browser`: captured XHRs, screenshots, and action outputs; with `keep_page` enabled there is also `response.page`, see §4.7.
+- Responses from the browser also carry `response.browser`: the document as received, captured XHR and fetch responses, screenshots, and the results of `Evaluate` actions; it is `None` for others. With `keep_page` enabled there is also `response.page`, see §4.7.
 
 ### 4.5 Callbacks and output semantics
 
@@ -212,10 +212,10 @@ async def parse_report(self, response):
 
 ### 4.7 Render and page interaction
 
-Browser rendering is expressed with the `render=` parameter (confirmed). Since it is the same Request type, a Middleware can upgrade a Request to Render with `request.replace(render=True)`; custom transports are still selected with `fetcher=`.
+Browser rendering is expressed with the `render=` parameter (confirmed), which takes `True` or a `Render`. Since it is the same Request type, a download Middleware can upgrade a Request to Render with `request.replace(render=True)` or `request.replace(render=Render(...))`, and the Request goes to the browser Fetcher; custom transports are still selected with `fetcher=`.
 
 ```python
-from pernix.browser import Render, Scroll, Click, WaitFor
+from pernix.browser import Click, Render, Scroll, WaitFor
 
 yield Request(
     url,
@@ -223,8 +223,8 @@ yield Request(
     render=Render(
         wait_for="div.item",                       # wait for a selector
         actions=[Scroll(times=3), Click("button.more"), WaitFor("div.loaded")],
-        block=("image", "media", "font"),          # resource types to block; none by default
-        capture="**/api/list*",                    # capture matching XHR responses
+        block=("image", "media", "font"),          # resource types to block; browser.block by default
+        capture="**/api/list*",                    # capture matching XHR and fetch responses
         screenshot=False,
     ),
 )
@@ -237,9 +237,39 @@ Page interaction comes in three layers; use whichever you need:
 2. **Page methods**: `Render(setup=self.before_goto, action=self.after_load)`. The arguments are Spider methods with the signature `async def x(self, page)` and can run arbitrary patchright code. If one raises, the Request fails (each can be marked optional individually).
 3. **Kept page**: `Render(keep_page=True)`; the Callback gets the live `Page` through `response.page`. When the Callback ends (normally, with an exception, or by timeout), the framework **force-closes** the page and releases the concurrency slot.
 
+**Render options** (`pernix.browser.Render`, immutable, keyword-only):
+
+- Once the page has loaded, the browser waits for `wait_for`, a CSS selector of an element to become visible, then runs `actions` in order, then takes a whole-page screenshot if `screenshot` is set. Each of these steps may take `browser.action_timeout` (10 s), unless an action sets its own `timeout`; `browser.deadline` still limits the whole fetch.
+- `block`: the resource types the page may not load, which the browser aborts as a content blocker would. `None`, the default, takes those of `browser.block`, which is empty, so nothing is blocked by default; a `block` replaces `browser.block` for its Request, without merging, and `block=()` blocks nothing. The types are the browser's: `image`, `media`, `font`, `stylesheet`, `script`, `xhr`, `fetch`, `eventsource`, `texttrack`, `manifest`, and `other`, which covers the kinds the browser names apart, such as `ping` for beacons. A misspelled type is refused with a suggestion; `document` is refused, as the page itself is one, and so is `websocket`, as the browser cannot block a page's WebSockets by type. Blocking `stylesheet` or `script` can keep a page from rendering as it should.
+  - Blocking goes by resource type rather than by URL pattern, which would miss resources without an extension: while a page blocks some type, every request it makes goes to Python to be judged, and a page that blocks nothing is not slowed down at all.
+- `capture`: URL patterns, as globs (`*` matches anything but `/`, `**` anything, `{a,b}` either), of the XHR and fetch responses to keep, with their bodies: those that arrived by the time the actions were done, whose bodies then arrive within `browser.action_timeout`, in the order they arrived. A `wait_for` on what the response fills in makes sure it arrived.
+
+**Declarative actions** (`pernix.browser`), immutable and persisted with the Request. Each takes `timeout`, in seconds, and `optional`: an optional action that fails is logged as a warning, gives no output, and the next action runs.
+
+| Action | Does |
+| --- | --- |
+| `WaitFor(selector, state="visible")` | Waits for the first element matching the selector to be `attached`, `detached`, `visible`, or `hidden` |
+| `Scroll(times=1, delay=0.5)` | Scrolls to the bottom of the page `times` times, pausing `delay` seconds after each for the page to load more; the timeout applies to each scroll |
+| `Click(selector)` | Clicks the first element matching the selector, once it can be clicked |
+| `Type(selector, text, delay=0.0)` | Types the text into the first element matching the selector, key by key, `delay` seconds apart, after what it holds |
+| `Evaluate(script, isolated=False)` | Runs JavaScript, an expression or a function to call, in the page, where it reaches the page's globals; with `isolated=True` in a world of its own, which the page's scripts do not see, sharing only the DOM with them. Its result, made JSON-compatible, goes to `response.browser.evaluated` |
+| `Screenshot(full_page=True)` | Takes a PNG screenshot, of the whole page or of the window, into `response.browser.screenshots` |
+
+**Errors**: a step that takes longer than its timeout raises `ActionTimeout`, a `Timeout`, so the default retry policy retries it as it does a page that loads too slowly. A step that fails otherwise, such as a script that throws or an invalid selector, raises `ActionError`, a `FetchError` the default policy does not retry, as it would fail the same way again. Both name the step, such as `actions[1]`, and `ActionTimeout` is an `ActionError` too.
+
+**Results** (`response.browser`, a `RenderResult`, on every Response of the browser Fetcher):
+
+- `document`: the main document as it came over the network, before its scripts ran, as a `CapturedResponse(url, status, headers, body)`; the rendered HTML is `body`.
+- `captured`: the `CapturedResponse`s of `capture`.
+- `screenshots`: PNGs in the order taken, that of `screenshot=True` last.
+- `evaluated`: the results of the `Evaluate` actions, in order.
+
+Bodies are decoded from their `Content-Encoding`, and the headers that describe the encoded body are then left out.
+
+**Persistence and Fingerprints**: a `Render` and its actions persist with the Request, each action tagged with its kind. Rendering, and its options, take no part in the default Fingerprint (§6.2): a Request switched to Render, or rendered with other options, is not fetched again.
+
 Other conventions:
 
-- The rendered HTML becomes `body`; the raw network-level response is available from `response.browser`.
 - Pages are closed by the Fetcher. Pages that timed out or were cancelled are treated as "dirty pages" and are always closed directly, never reused.
 
 ### 4.8 Items and Pipelines
@@ -570,7 +600,8 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 - `headless=True` (`browser.headless`), using the new headless mode; the UA is not overridden.
 - `browser.launch_options` are passed to patchright's `launch()` as they are, over the defaults, for control the settings do not give, such as `executable_path` or `args`.
 - A `stealth` preset is also provided: system Chrome, headed mode, no viewport set.
-- Resource blocking is off by default.
+- Resource blocking is off by default: `browser.block`, the resource types no rendered page may load, is empty. `Render(block=...)` replaces it for one Request, without merging, and `Render(block=())` blocks nothing (§4.7).
+- `browser.action_timeout` (10 s) limits `Render(wait_for=...)` and each page action that sets no `timeout` of its own.
 
 ### 5.3 Sessions and Cookie interoperability
 
@@ -730,7 +761,7 @@ Engine integration:
 
 - Deduplication is handled by the Frontier, in the same atomic operation as insertion.
 - Default Fingerprint: `version | method | normalized URL | body digest | explicitly declared headers`, hashed to 32 hexadecimal characters (`pernix.fingerprint.request_fingerprint`). Headers are declared with `fingerprint.headers`.
-  - It never includes cookies, whether passed as `cookies=` or as a `Cookie` header; declaring the `Cookie` header for the Fingerprint is rejected. By default it does not include the fetcher or the Session either, so the same URL is not fetched again just because it was switched to Render or carries different cookies; fetching it again is the application's explicit decision, through `dont_filter` or a Fingerprint it supplies.
+  - It never includes cookies, whether passed as `cookies=` or as a `Cookie` header; declaring the `Cookie` header for the Fingerprint is rejected. By default it does not include the fetcher, the Session, or the Render options either, so the same URL is not fetched again just because it was switched to Render, rendered with other options, or carries different cookies; fetching it again is the application's explicit decision, through `dont_filter` or a Fingerprint it supplies.
   - The Fingerprint function can be replaced with `fingerprint.function`, a callable `(request) -> str` that may fall back to `request_fingerprint()`, or the application can pass in a Fingerprint directly with `Request(fingerprint=...)`.
   - `dont_filter` bypasses deduplication: such a Request is neither checked nor recorded.
 - URL normalization does only three things: serialize according to WHATWG rules, remove the fragment, and stably sort query parameters by name (`fingerprint.sort_query`, on by default).
@@ -896,8 +927,8 @@ async def test_parse():
 ```
 
 - **Fake fetching**: `FakeFetcher(routes)` answers Requests from canned answers. A route's key is a URL, matched exactly, or a compiled pattern the whole URL must match; the first route added that matches answers, and `add(key, answer, method=...)` can limit one to a method. An answer is a body (200), a `Response` (bound to the Request fetched, so its Callback runs), an exception to raise, or a function of the Request returning or awaiting one of those; a list of answers is used in turn, its last one repeating. Unmatched Requests get 404 and are recorded in `unmatched`, every Request in `requests`. It fetches `http` and `https`, standing in for the HTTP Fetcher when registered as `http`.
-- **Responses**: `make_response(url, body, status=, headers=, json=, request=, encoding=)` builds a Response as a Fetcher would: a `str` body is UTF-8 HTML unless the headers say otherwise, `json=` makes a JSON body, and `request` (by default `Request(url)`) carries the Callback, `kwargs`, and `meta`.
-- **Running**: `crawl(Spider, fetcher=..., settings=..., **args)` runs a Spider to completion and returns a `CrawlReport` with the Items that passed every Pipeline, the final stats, the reason, and the `run_id`. It runs without periodic stats, retry delays, or per-domain delay, rate, and cooldowns, as those only make a test wait; `settings` override that. `run_callback(spider, response)` runs one Callback as a Run would, the Request's or `parse`, with its `kwargs`, resolving relative URLs against the Response, and returns its outputs; spider Middleware do not run, and Inline Fetches need `crawl()`.
+- **Responses**: `make_response(url, body, status=, headers=, json=, request=, encoding=, browser=)` builds a Response as a Fetcher would: a `str` body is UTF-8 HTML unless the headers say otherwise, `json=` makes a JSON body, and `request` (by default `Request(url)`) carries the Callback, `kwargs`, and `meta`. A Response to a rendered Request, or with `browser=RenderResult(...)` given, whose Request then renders by default, is the browser Fetcher's: its `fetcher` is `browser`, and `response.browser` is empty unless given.
+- **Running**: `crawl(Spider, fetcher=..., browser=..., settings=..., **args)` runs a Spider to completion and returns a `CrawlReport` with the Items that passed every Pipeline, the final stats, the reason, and the `run_id`. `fetcher` stands in for the HTTP Fetcher only, so rendered Requests still go to the browser, on loopback hosts under the network guard; `browser`, such as a `FakeFetcher`, or the `fetcher` itself, answers them instead, without starting a browser, and its Responses that have no `browser` get an empty `RenderResult`. It runs without periodic stats, retry delays, or per-domain delay, rate, and cooldowns, as those only make a test wait; `settings` override that. `run_callback(spider, response)` runs one Callback as a Run would, the Request's or `parse`, with its `kwargs`, resolving relative URLs against the Response, and returns its outputs; spider Middleware do not run, and Inline Fetches need `crawl()`.
 - **Local server**: `LoopbackServer` serves on 127.0.0.1: routes registered with `route()` or given up front (a body, a `Reply`, or a handler of the `ReceivedRequest`), then the files of a `directory`. It records every request with its headers in wire order.
 - **Network guard**: while `blocking_network()` is in effect, the Fetchers reach only loopback hosts (loopback addresses, `localhost`, `*.localhost`), or any host through a proxy on one; others raise `NetworkBlocked`, a `FetchError`, and are recorded in the guard. A host is read as the HTTP Fetcher gives it to curl (`pernix.urls.url_host()`), so `localhost` in full-width letters, or as `local%68ost`, is a loopback host too. The HTTP Fetcher checks each hop of a redirect chain before it is sent, the first included, at the URL it is sent to: a redirect's `Location` resolved as WHATWG URLs resolve it, as browsers go. A browser launched while the guard is on sends everything but loopback traffic to a proxy that refuses it, set at launch so that the browser's own requests, which belong to no page, are stopped too; a Request's loopback proxy takes its context's requests instead. The requests its pages make to other hosts, redirects and WebSockets included, are recorded, the browser's own are not, and a refused document raises `NetworkBlocked`. A browser launched while the network was open refuses to render under the guard. This layer is necessary: curl-cffi and the browser do not go through Python's socket, so the usual network-blocking plugins cannot stop them.
 - **pytest plugin**, loaded as `pernix` once Pernix is installed (`-p no:pernix` disables it): the network guard is on while each test is set up, run, and torn down, fixtures of every scope included, and the phase during which it refused a URL fails, even when the refusal happened inside a Run, which only logs a failed fetch. `@pytest.mark.pernix_network` lets a test use the network, and the ini option `pernix_network = allow` lets every test. The `loopback_server` fixture gives a started `LoopbackServer`.

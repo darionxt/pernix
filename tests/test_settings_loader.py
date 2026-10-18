@@ -613,4 +613,6 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "browser.launch_options": {},
         "browser.max_idle_contexts": 8,
         "browser.context_idle": 300.0,
+        "browser.block": (),
+        "browser.action_timeout": 10.0,
     }

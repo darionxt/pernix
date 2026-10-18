@@ -5,15 +5,22 @@ from __future__ import annotations
 from contextlib import aclosing
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
+from pernix.browser import RenderResult
 from pernix.callbacks import iterate_and_close, run_callbacks
+from pernix.component_lifecycle import ComponentLifecycle
 from pernix.crawler import Crawler
+from pernix.fetchers import BROWSER_FETCHER
+from pernix.response import expect_response
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from pernix.fetchers import Fetcher
+    from pernix.request import Request
     from pernix.response import Response
+    from pernix.session import Session
     from pernix.spider import Spider
     from pernix.stats import StatValue
 
@@ -53,6 +60,7 @@ async def crawl(
     spider_type: type[Spider],
     *,
     fetcher: object | None = None,
+    browser: object | None = None,
     settings: Mapping[str, Any] | None = None,
     **args: Any,
 ) -> CrawlReport:
@@ -67,6 +75,11 @@ async def crawl(
         spider_type: The Spider class; a new object is created for the Run.
         fetcher: A Fetcher, such as a `FakeFetcher`, registered as `http` in place of
             the HTTP Fetcher.
+        browser: A Fetcher, such as a `FakeFetcher`, answering the rendered
+            Requests in place of the browser Fetcher, so that no browser starts; it
+            may be `fetcher` itself. Its Responses that have no `browser` get an
+            empty `RenderResult`, as rendered Responses do. Without it, rendered
+            Requests go to the browser.
         settings: Settings for this Run, by dotted key.
         **args: The Spider arguments.
 
@@ -84,6 +97,9 @@ async def crawl(
     overrides: dict[str, Any] = {**_TEST_SETTINGS, **(settings or {})}
     if fetcher is not None:
         overrides["fetchers"] = {**overrides.get("fetchers", {}), "http": fetcher}
+    if browser is not None:
+        stand_in = _BrowserStandIn(browser, opens=browser is not fetcher)
+        overrides["fetchers"] = {**overrides.get("fetchers", {}), BROWSER_FETCHER: stand_in}
     crawler = Crawler.from_spider(spider_type, args=args, settings=overrides)
     async with crawler.stream_items() as stream:
         items = [item async for item in stream]
@@ -91,6 +107,38 @@ async def crawl(
     return CrawlReport(
         items=items, stats=MappingProxyType(stats), reason=str(stats["run.reason"]), run_id=crawler.run_id
     )
+
+
+class _BrowserStandIn:
+    """Answers rendered Requests with another Fetcher, such as a FakeFetcher, in place of the browser Fetcher.
+
+    It claims no URL scheme, so the Fetcher it wraps may claim some, and be
+    registered as `http` too; unless it is, the stand-in opens and closes it with
+    itself.
+    """
+
+    schemes: ClassVar[frozenset[str]] = frozenset()
+
+    def __init__(self, fetcher: object, *, opens: bool) -> None:
+        self._fetcher = cast("Fetcher", fetcher)
+        self._opens = opens
+        self._lifecycle = ComponentLifecycle()
+
+    async def __aenter__(self) -> Self:
+        if self._opens:
+            await self._lifecycle.open(self._fetcher)
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self._lifecycle.aclose()
+
+    async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
+        if session is None:
+            response = await self._fetcher.fetch(request)
+        else:
+            response = await self._fetcher.fetch(request, session=session)
+        response = expect_response(response, f"the Fetcher standing in for {BROWSER_FETCHER!r}")
+        return response if response.browser is not None else response.replace(browser=RenderResult())
 
 
 async def run_callback(spider: Spider, response: Response) -> list[Any]:

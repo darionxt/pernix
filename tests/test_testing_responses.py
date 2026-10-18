@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from pernix import Request, Spider
+from pernix.browser import CapturedResponse, Render, RenderResult
 from pernix.testing import make_response
 
 URL = "https://shop.example/books"
@@ -53,3 +54,33 @@ def test_the_request_carries_the_callback_and_meta() -> None:
 def test_the_url_must_be_absolute() -> None:
     with pytest.raises(ValueError, match="absolute URL"):
         make_response("/books", "x", request=Request(URL))
+
+
+def test_a_response_to_a_plain_request_is_not_rendered() -> None:
+    response = make_response(URL, "<p>1</p>")
+
+    assert (response.fetcher, response.browser) == (None, None)
+
+
+def test_a_response_to_a_rendered_request_is_the_browsers() -> None:
+    request = Request(URL, render=Render(wait_for="p"))
+
+    response = make_response(URL, "<p>1</p>", request=request)
+
+    assert (response.fetcher, response.browser, response.request) == ("browser", RenderResult(), request)
+
+
+def test_a_rendered_response_carries_what_rendering_gave() -> None:
+    api = CapturedResponse(f"{URL}/api", 200, body=b'{"books": 2}')
+    browser = RenderResult(captured=[api], screenshots=[b"png"], evaluated=[42])
+
+    response = make_response(URL, "<p>1</p>", browser=browser)
+
+    assert response.browser is browser
+    assert (response.fetcher, response.request.render) == ("browser", True)
+    assert (browser.captured, browser.screenshots, browser.evaluated, browser.document) == (
+        (api,),
+        (b"png",),
+        (42,),
+        None,
+    )

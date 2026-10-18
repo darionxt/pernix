@@ -2,7 +2,7 @@
 
 An asyncio crawling framework for Python. HTTP (curl-cffi) and the browser (patchright) are peer ways of fetching, selectable per request. The kernel is minimal; retries, deduplication, rate limiting, sessions, and output are replaceable components, extended through Middleware and Events.
 
-> Status: pre-alpha. The API is not stable yet; the HTTP crawl loop and basic rendering in the browser are implemented so far.
+> Status: pre-alpha. The API is not stable yet; the HTTP crawl loop and rendering in the browser, with declarative page actions, are implemented so far.
 
 ## Installation
 
@@ -78,6 +78,24 @@ class Shop(Spider):
 ```
 
 `render=True` sends a Request to the browser Fetcher, which loads the page in Chrome until its `load` event; the Response's body is the page as its scripts left it. Rendered and HTTP Requests mix freely in one Spider. The browser starts with the first rendered Request, so a Run that renders nothing never starts it. Each rendered Request gets a fresh browser context, carrying only the cookies the Request passes, as over HTTP. See [`docs/design.md`](docs/design.md) §5.2.
+
+```python
+from pernix.browser import Click, Evaluate, Render, Scroll, WaitFor
+
+yield Request(
+    "https://shop.example/books",
+    render=Render(
+        wait_for="div.item",                              # an element to wait for once the page loaded
+        actions=[Click("#accept", optional=True, timeout=2), Scroll(times=3), WaitFor("div.loaded"),
+                 Evaluate("() => window.__DATA__")],
+        block=("image", "media", "font"),                 # resource types the page may not load
+        capture="**/api/list*",                           # XHR and fetch responses to keep
+        screenshot=True,
+    ),
+)
+```
+
+`Render(...)` options are persisted with the Request, so a download Middleware can upgrade a Request with `request.replace(render=Render(...))`. After the page loaded, the browser waits for `wait_for`, runs the actions in order, and takes the screenshot; each step may take `browser.action_timeout` (10 s), or its own `timeout`. A step that takes too long raises `ActionTimeout`, which is retried as a slow page is, and one that fails otherwise raises `ActionError`, which is not; an `optional` action that fails is logged, and the next one runs. `response.browser` holds the captured responses, the screenshots, the results of `Evaluate`, which runs in the page unless `isolated=True`, and the document as it was received. `browser.block` lists the resource types no rendered page loads, none by default; `Render(block=...)` replaces it for one Request, and `Render(block=())` blocks nothing. Blocking `stylesheet` or `script` can keep a page from rendering as it should. See [`docs/design.md`](docs/design.md) §4.7.
 
 ## Sessions
 
@@ -291,6 +309,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included |
 | `browser.launch_options` | `{}` | Options passed as they are to patchright's `launch()`, such as `executable_path` or `args` |
 | `browser.max_idle_contexts` / `browser.context_idle` | `8` / `300.0` | Browser contexts kept idle for Sessions between their fetches, at most, and seconds one may stay idle |
+| `browser.block` | `[]` | Resource types no rendered page loads, such as `"image"` or `"font"`; `Render(block=...)` replaces them |
+| `browser.action_timeout` | `10.0` | Seconds `Render(wait_for=...)` and each page action may take, unless the action sets its own `timeout` |
 | `shutdown.grace` | `20.0` | Seconds a Drain may take before it turns into a Force Stop |
 | `shutdown.close_timeout` | `5.0` | Seconds each component may take to close after a Force Stop; `0` for no limit |
 
@@ -369,7 +389,7 @@ async def test_parse():
     assert [request.url for request in outputs] == ["https://shop.example/book/1"]
 ```
 
-`pernix.testing` runs Spiders without a network. `FakeFetcher` answers Requests from canned bodies, Responses, exceptions, or functions, by URL or pattern. `crawl()` runs a Spider to completion and reports its Items and stats, without the delays that would only make a test wait, and `run_callback()` runs one Callback as a Run would. `LoopbackServer`, also the `loopback_server` fixture, serves routes or a directory on 127.0.0.1 for tests that fetch for real.
+`pernix.testing` runs Spiders without a network. `FakeFetcher` answers Requests from canned bodies, Responses, exceptions, or functions, by URL or pattern. `crawl()` runs a Spider to completion and reports its Items and stats, without the delays that would only make a test wait, and `run_callback()` runs one Callback as a Run would. `crawl(fetcher=fake)` answers HTTP Requests only; `crawl(fetcher=fake, browser=fake)` answers rendered ones too, without starting a browser, and `make_response(url, body, browser=RenderResult(evaluated=[...]))` builds a rendered Response. `LoopbackServer`, also the `loopback_server` fixture, serves routes or a directory on 127.0.0.1 for tests that fetch for real.
 
 Installing Pernix adds a pytest plugin that keeps the Fetchers off the network while each test and its fixtures run: only loopback hosts can be reached, redirects and the requests of rendered pages included, and a test during which another host was refused fails. curl and the browser do not use Python's sockets, so other network-blocking plugins cannot do this. Mark a test with `@pytest.mark.pernix_network` to let it reach the network, or set `pernix_network = allow` in the pytest configuration. See [`docs/design.md`](docs/design.md) §9.
 
@@ -414,6 +434,12 @@ src/pernix/
 ├── urls.py              URL clean-up, joining, normalization, and hosts as clients connect to them
 ├── text_decoding.py     decoding bodies: encoding declarations, labels, detection
 ├── fingerprint.py       Fingerprints of Requests
+├── browser/
+│   ├── render.py        Render: the options of a rendered Request
+│   ├── actions.py       WaitFor, Scroll, Click, Type, Evaluate, Screenshot
+│   ├── resource_types.py the resource types a page may be kept from loading
+│   ├── url_globs.py     URL globs, as the browser's route patterns read them
+│   └── render_result.py RenderResult and CapturedResponse: what rendering gave
 ├── errors.py            exception hierarchy, control-flow exceptions
 ├── components.py        loads components from import paths and builds them
 ├── component_lifecycle.py opens components in order, closes them in reverse
@@ -463,6 +489,8 @@ src/pernix/
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
+│   ├── page_actions.py  runs a Render's wait, actions, and screenshot on a loaded page
+│   ├── page_traffic.py  blocks resource types and captures responses of a page
 │   ├── launched_browser.py starts patchright and its browser, under the network guard if on, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure

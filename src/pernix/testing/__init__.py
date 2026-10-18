@@ -1,8 +1,9 @@
 """Tools for testing Spiders and components without a network.
 
-`FakeFetcher` answers Requests from canned answers, `make_response()` builds
-Responses, and `LoopbackServer` serves pages on this machine. `crawl()` runs a Spider
-and reports its Items and stats, and `run_callback()` runs one Callback. While
+`FakeFetcher` answers Requests from canned answers, rendered ones included,
+`make_response()` builds Responses, and `LoopbackServer` serves pages on this
+machine. `crawl()` runs a Spider and reports its Items and stats, and
+`run_callback()` runs one Callback. While
 `blocking_network()` is in effect, Fetchers reach only loopback hosts.
 
 The pytest plugin (`pernix.testing.pytest_plugin`) turns the network guard on in

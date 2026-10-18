@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from pernix import Request
+from pernix.browser import Click, Render
 from pernix.fingerprint import request_fingerprint
 
 URL = "https://example.com/search?q=books"
@@ -24,6 +25,7 @@ def test_fingerprints_are_short_and_stable() -> None:
         Request(URL, headers={"Cookie": "session=b"}),
         Request(URL, headers={"Accept-Language": "en"}),
         Request(URL, render=True, fetcher="browser", session="account-1"),
+        Request(URL, render=Render(wait_for="div", actions=[Click("button.more")], block=("image",), screenshot=True)),
         Request(URL, meta={"page": 1}, priority=5),
     ],
 )
