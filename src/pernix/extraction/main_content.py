@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from pernix.extraction.elements import UNRENDERED, as_element, collapse_spaces, is_hidden, tag_name
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from pernix.extraction.elements import Element
 
@@ -131,18 +131,26 @@ def main_content(document: Element, *, prune_links: bool = True) -> MainContent:
 
 
 def _landmark(body: Element) -> Element | None:
-    """The `<main>` holding text, else the only `<article>`, if any."""
+    """The `<main>` holding text, else the only `<article>`, if any, among the elements a page shows."""
     articles: list[Element] = []
-    for node in body.iter():
-        element = as_element(node)
-        if element is None or is_hidden(element):
-            continue
+    for element in _shown(body):
         tag = tag_name(element)
         if (tag == "main" or "main" in _roles(element)) and any(text.strip() for text in element.itertext()):
             return element
         if tag == "article":
             articles.append(element)
     return articles[0] if len(articles) == 1 else None
+
+
+def _shown(root: Element) -> Iterator[Element]:
+    """The elements of a tree a page shows, in document order: not those inside hidden or unrendered ones."""
+    pending = [root]
+    while pending:
+        element = pending.pop()
+        yield element
+        children = (as_element(child) for child in element)
+        shown = [child for child in children if child is not None and tag_name(child) not in UNRENDERED]
+        pending.extend(child for child in reversed(shown) if not is_hidden(child))
 
 
 def _is_boilerplate(element: Element, *, in_body: bool, density: _LinkDensity | None) -> bool:

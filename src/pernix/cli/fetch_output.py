@@ -54,13 +54,19 @@ class FetchOutput:
         self.closed = False
 
     def response(self, response: Response) -> None:
-        """Report a Response, whatever its status.
+        """Report a Response, whatever its status; one whose body cannot be saved or read is a failure.
 
         Args:
             response: The Response.
         """
         if self._save_to is not None:
-            self._save_to.write_bytes(response.body)
+            try:
+                self._save_to.write_bytes(response.body)
+            except OSError as exc:
+                self._failure(
+                    response.request.url, type(exc).__name__, f"cannot write the body to {self._save_to}: {exc}"
+                )
+                return
         try:
             reading = read(response, self._options, include_body=self._save_to is None)
         except RecursionError:

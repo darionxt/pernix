@@ -13,6 +13,7 @@ import socket
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from ada_url import URL
 from curl_cffi import CurlECode
 
 from pernix.errors import ConnectError, NetworkBlocked
@@ -77,10 +78,12 @@ class AddressGuard:
     ) -> PinnedHost | None:
         """Refuse a URL whose host is not on public addresses.
 
-        A host written as an address is checked as it is, and a loopback name, such
-        as `localhost`, is refused, as clients resolve those themselves. Any other
-        name is resolved, and every address it resolves to must be public. Through a
-        proxy, which resolves names itself, names are not resolved.
+        A host written as an address is checked as it is, in any of the forms browsers
+        and curl read addresses in, such as `127.1` or `0x7f000001`, and a loopback
+        name, such as `localhost`, is refused, as clients resolve those themselves. Any
+        other name is resolved, and every address it resolves to must be public.
+        Through a proxy, which resolves names itself, names are not resolved. A host
+        WHATWG URLs reject is refused.
 
         Args:
             url: The URL to connect to.
@@ -102,12 +105,13 @@ class AddressGuard:
         if host in self.allow_hosts:
             return None
         try:
-            address = ipaddress.ip_address(host)
+            address = _written_address(host)
         except ValueError:
-            address = None
+            raise _refused(url, redirected_from, f"{host} is not a valid host") from None
         if address is not None:
             if not is_public_address(address):
-                raise _refused(url, redirected_from, f"{host} is {_kind(address)}")
+                written = host if str(address) == host else f"{host}, which is {address},"
+                raise _refused(url, redirected_from, f"{written} is {_kind(address)}")
             return None
         if is_loopback_host(host):
             raise _refused(url, redirected_from, f"{host} is a loopback host")
@@ -132,6 +136,21 @@ async def _resolve(host: str, port: int) -> tuple[str, ...]:
     if not addresses:
         raise ConnectError(f"could not resolve {host}: no address", code=CurlECode.COULDNT_RESOLVE_HOST)
     return addresses
+
+
+def _written_address(host: str) -> IPAddress | None:
+    """The address a host is written as, read as WHATWG URLs and curl read addresses; `None` for a name.
+
+    Raises:
+        ValueError: WHATWG URLs reject the host, such as `10.0.0.256`.
+    """
+    if ":" in host:  # an IPv6 address, without its brackets
+        return ipaddress.ip_address(host)
+    hostname = URL(f"http://{host}/").hostname  # 127.1, 2130706433, and 0x7f000001 are all 127.0.0.1
+    try:
+        return ipaddress.ip_address(hostname)
+    except ValueError:
+        return None
 
 
 def _embedded(address: IPAddress) -> IPAddress:

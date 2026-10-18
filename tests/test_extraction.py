@@ -130,6 +130,16 @@ def test_a_page_made_of_links_keeps_them() -> None:
     )
 
 
+def test_hidden_landmarks_and_table_rows_are_left_out() -> None:
+    body = (
+        "<body><div hidden><main><p>Hidden</p></main><article>Hidden too</article></div>"
+        "<main><table><tr hidden><th>Secret</th></tr><tbody style='display: none'><tr><td>Gone</td></tr></tbody>"
+        "<tr><th>Shown</th></tr><tr><td>1</td></tr></table></main></body>"
+    )
+
+    assert _markdown(body) == "| Shown |\n| --- |\n| 1 |"
+
+
 def test_the_only_article_is_the_main_content_but_several_are_not() -> None:
     one = _root(_response("<body><p>Intro</p><article><p>Story</p></article></body>"))
     several = _root(_response("<body><article><p>One</p></article><article><p>Two</p></article></body>"))

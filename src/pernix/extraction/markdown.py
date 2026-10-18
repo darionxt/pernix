@@ -166,7 +166,7 @@ class _Writer:
         return ["\n".join(items)] if items else []
 
     def _table(self, table: Element) -> list[str]:
-        rows = [cells for row in _rows(table) if (cells := self._cells(row))]
+        rows = [cells for row in self._rows(table) if (cells := self._cells(row))]
         caption = next(
             (node for node, _ in self._children(table) if node is not None and tag_name(node) == "caption"), None
         )
@@ -180,6 +180,17 @@ class _Writer:
         lines.insert(1, "| " + " | ".join(["---"] * width) + " |")
         blocks = self.blocks(caption) if caption is not None else []
         return [*blocks, "\n".join(lines)]
+
+    def _rows(self, table: Element) -> Iterator[Element]:
+        """The rows of a table, in its head, bodies, and foot, or directly in it; not those of nested tables."""
+        for child, _ in self._children(table):
+            if child is None:
+                continue
+            tag = tag_name(child)
+            if tag == "tr":
+                yield child
+            elif tag in ("thead", "tbody", "tfoot"):
+                yield from (row for row, _ in self._children(child) if row is not None and tag_name(row) == "tr")
 
     def _cells(self, row: Element) -> list[Element]:
         return [cell for cell, _ in self._children(row) if cell is not None and tag_name(cell) in ("td", "th")]
@@ -245,19 +256,6 @@ def _descendants(element: Element) -> Iterator[Element]:
         found = as_element(node)
         if found is not None and found is not element:
             yield found
-
-
-def _rows(table: Element) -> Iterator[Element]:
-    """The rows of a table, in its head, bodies, and foot, or directly in it; not those of nested tables."""
-    for child in table:
-        node = as_element(child)
-        if node is None:
-            continue
-        tag = tag_name(node)
-        if tag == "tr":
-            yield node
-        elif tag in ("thead", "tbody", "tfoot"):
-            yield from (row for row in map(as_element, node) if row is not None and tag_name(row) == "tr")
 
 
 def _lays_out(cell: Element) -> bool:

@@ -175,6 +175,20 @@ def test_the_projects_feeds_spider_middleware_and_pipelines_are_left_out(
     assert not (tmp_path / "items.jsonl").exists()
 
 
+@pytest.mark.parametrize("path", ["/a", "/down"])
+def test_a_body_that_cannot_be_saved_is_a_failure(
+    site: LoopbackServer, tmp_path: Path, capsys: pytest.CaptureFixture[str], path: str
+) -> None:
+    site.route("/down", "down", status=503)
+    target = tmp_path / "missing" / "page.html"
+
+    assert main(["fetch", site.url(path), "-o", str(target), "--json", "-s", "retry.times=0"]) == 1
+
+    error = orjson.loads(capsys.readouterr().out)["error"]
+    assert error["type"] == "FileNotFoundError"
+    assert error["message"].startswith(f"cannot write the body to {target}: ")
+
+
 def test_several_urls_need_json_and_o_takes_one(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["fetch", site.url("/a"), site.url("/b")]) == 2
     assert capsys.readouterr().err == "Error: several URLs, or -i, are reported as JSON Lines; add --json\n"

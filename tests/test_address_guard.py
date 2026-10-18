@@ -85,14 +85,21 @@ def test_public_addresses(address: str, public: bool) -> None:
         ("http://10.0.0.5/", "10.0.0.5 is a private address"),
         ("http://0.0.0.0/", "0.0.0.0 is an unspecified address"),
         ("http://100.64.0.1/", "100.64.0.1 is an address that is not publicly routable"),
-        ("http://0x7f.1/", "0x7f.1 resolves to 127.0.0.1, a loopback address"),  # as curl reads such addresses
+        ("http://127.1/", "127.1, which is 127.0.0.1, is a loopback address"),  # as curl and browsers read it
+        ("http://2130706433/", "2130706433, which is 127.0.0.1, is a loopback address"),
+        ("http://0x7f000001/", "0x7f000001, which is 127.0.0.1, is a loopback address"),
+        ("http://10.0.0.256/", "10.0.0.256 is not a valid host"),
         ("http://localhost/", "localhost is a loopback host"),
         ("http://admin.localhost/", "admin.localhost is a loopback host"),
     ],
 )
-async def test_hosts_that_are_not_public_are_refused(url: str, reason: str) -> None:
-    with pytest.raises(NetworkBlocked, match=re.escape(f"network.public_only refused {url}: {reason}") + "$"):
+async def test_hosts_that_are_not_public_are_refused(url: str, reason: str, refused_proxy: str) -> None:
+    refusal = re.escape(f"network.public_only refused {url}: {reason}") + "$"
+
+    with pytest.raises(NetworkBlocked, match=refusal):
         await AddressGuard().check(url)
+    with pytest.raises(NetworkBlocked, match=refusal):  # a proxy would reach them too
+        await AddressGuard().check(url, proxy=refused_proxy)
 
 
 async def test_names_are_refused_when_any_address_they_resolve_to_is_not_public(

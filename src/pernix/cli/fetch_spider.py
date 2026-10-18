@@ -117,7 +117,10 @@ class FetchSpider(Spider):
                 self.configuration_error = error
             self.crawler.stop("force")
             return
-        self._plan.output.failed(request.url, error)
+        try:
+            self._plan.output.failed(request.url, error)
+        except Exception as exc:  # as reporting a Response can fail, which no errback would hear of
+            self._plan.output.failed(request.url, exc)
         self._stop_if_closed()
 
     def _stop_if_closed(self) -> None:
