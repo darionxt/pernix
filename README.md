@@ -579,7 +579,7 @@ src/pernix/
     ├── loopback_server.py LoopbackServer: routes and files served on 127.0.0.1
     ├── pytest_plugin.py the pytest plugin: the network guard, the loopback_server fixture
     └── frontier.py      conformance suite for Frontier backends
-tests/                   one test module per source module, plus end-to-end crawls
+tests/                   one test module per source module, end-to-end crawls, and the Profile contract
 ```
 
 Pluggable component families with several implementations, such as Extensions, Feeds, Fetchers, Frontiers, Middleware, and Pipelines, each have a subpackage holding their protocol and the built-in implementations; the core model stays at the top level.
@@ -596,6 +596,8 @@ uv run ruff check
 uv run ruff format --check
 uv run pyright
 ```
+
+curl-cffi and patchright are pinned to exact versions, as their Profile and browser build form a Pinned Pair: upgrade either only with `uv run pytest tests/test_profile_contract.py` passing, which needs the browser engine. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
 
 ## License
 

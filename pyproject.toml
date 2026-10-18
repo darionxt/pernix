@@ -9,7 +9,7 @@ requires-python = ">=3.13"
 dependencies = [
     "ada-url>=4.0",
     "charset-normalizer>=3.4",
-    "curl-cffi>=0.16.3",
+    "curl-cffi==0.16.3",
     "msgspec>=0.21",
     "orjson>=3.12",
     "packaging>=24",
@@ -52,6 +52,7 @@ build-backend = "uv_build"
 dev = [
     "attrs>=25.3",
     "brotli>=1.2.0",
+    "cryptography>=50.0.2",
     "h2>=4.4.1",
     "pernix[browser]",
     "pydantic>=2.11",

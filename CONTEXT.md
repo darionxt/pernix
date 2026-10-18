@@ -67,6 +67,10 @@ _Avoid_: proxy list, rotator
 A mutually consistent set of client characteristics: TLS, HTTP/2, request headers, and UA version.
 _Avoid_: browser fingerprint, fingerprint
 
+**Pinned Pair**:
+The browser build the browser Fetcher launches and the Profile the HTTP Fetcher impersonates by default, pinned together, which the Profile contract tests show to present one client on the wire.
+_Avoid_: fingerprint pair, matching versions
+
 **Account**:
 Login credentials for a target site, which can be bound to a Session.
 _Avoid_: user
