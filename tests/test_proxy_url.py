@@ -19,6 +19,8 @@ from pernix.proxies.proxy_url import proxy_credentials
         ("User-Zone:Pass%40word@Gate.Example:7777", "http://User-Zone:Pass%40word@gate.example:7777"),
         ("Gate.Example:7777:User-Zone:pw", "http://User-Zone:pw@gate.example:7777"),
         ("10.1.2.3:9421:user:pass:with:colons", "http://user:pass:with:colons@10.1.2.3:9421"),
+        ("gate.example:80:user:p@ss/#?", "http://user:p%40ss%2F%23%3F@gate.example:80"),
+        ("user:1:p@h.example:80", "http://user:1:p@h.example:80"),
     ],
 )
 def test_a_proxy_is_held_with_its_scheme_and_port_its_scheme_and_host_lower_cased(given: str, held: str) -> None:

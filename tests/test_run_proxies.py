@@ -703,8 +703,9 @@ class Extracting:
         return [Proxy(f"http://p{next(self._made)}.example:8080") for _ in range(wanted)]
 
 
-def _extracting(**options: float) -> ProxySupply:
-    return ProxySupply(add=True, extracting=frozenset({"source 1"}), interval=0, **options)  # pyright: ignore[reportArgumentType]
+def _extracting(*, sources: int = 1, **options: float) -> ProxySupply:
+    extracting = frozenset(f"source {number}" for number in range(1, sources + 1))
+    return ProxySupply(add=True, extracting=extracting, interval=0, **options)  # pyright: ignore[reportArgumentType]
 
 
 async def _extracted(run: Run, extractions: int) -> None:
@@ -845,3 +846,91 @@ async def test_a_provider_that_takes_no_wanted_is_asked_as_before() -> None:
 
     assert await proxies.take() == B
     assert source.calls >= 1
+
+
+class Gated(Extracting):
+    """An extraction API that answers only once let to."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.gate.set()
+
+    async def proxies(self, wanted: int = 1) -> list[Proxy]:
+        await self.gate.wait()
+        return await super().proxies(wanted)
+
+
+async def test_the_limit_is_counted_source_by_source_and_the_proxies_wanted_asked_of_them_in_all() -> None:
+    run = Run()
+    first, second = Extracting(), Extracting()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = run.proxies(first, second, pool=pool, supply=_extracting(sources=2, min_available=3, max_extracted=4))
+    first.dry = True
+
+    await proxies.open()  # 3 wanted: the first gives none, the second all
+    first.dry = False
+    for candidate in await pool.candidates():
+        await pool.report(candidate.url, failed=True, since=time.time())
+    with pytest.raises(NoProxyYet):
+        await proxies.take()  # 3 wanted, but 1 left within the limit
+    await _extracted(run, 3)
+
+    assert (first.asked, second.asked) == ([3, 1], [3])
+    assert _count(run.stats, "proxies.extracted") == 4
+
+
+async def test_a_refresh_waits_for_an_extraction_under_way_so_the_limit_holds() -> None:
+    run = Run()
+    source = Gated()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = run.proxies(source, refresh=0.01, pool=pool, supply=_extracting(min_available=1, max_extracted=2))
+    await proxies.open()
+    await pool.report("http://p1.example:8080", failed=True, since=time.time())
+    source.gate.clear()
+
+    with pytest.raises(NoProxyYet):
+        await proxies.take()  # an extraction starts, and waits at the gate
+    await asyncio.sleep(0.1)  # refreshes are due meanwhile
+    source.gate.set()
+    await _extracted(run, 2)
+    await asyncio.sleep(0.1)  # and the refreshes after it
+    await proxies.close()
+
+    assert source.asked == [1, 1]
+    assert _count(run.stats, "proxies.extracted") == 2
+
+
+async def test_once_refreshes_can_extract_no_more_the_run_drains_rather_than_wait_for_them() -> None:
+    run = Run()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = run.proxies(Extracting(), refresh=60, pool=pool, supply=_extracting(max_extracted=1))
+    await proxies.open()
+    await pool.report("http://p1.example:8080", failed=True, since=time.time())
+
+    with pytest.raises(NoProxyYet):
+        await proxies.take()
+    await proxies.close()
+
+    assert run.stops == 1
+
+
+async def test_an_expired_proxy_of_its_own_does_not_keep_the_run_from_draining() -> None:
+    clock = Clock()
+    run = Run()
+
+    class ExpiringOwn:
+        async def bind(self, binding: Binding) -> Proxy | None:
+            return Proxy(OWN, expires=NOW + 10) if binding.session == "one" else None
+
+    pool = MemoryProxyPool(clock=clock, max_failures=1)
+    proxies = run.proxies(StaticProxies([B]), pool=pool, policy=ExpiringOwn())
+    await proxies.open()
+    await proxies.bind("one", None)
+    clock.now += 10  # its own expired, while it is still bound to it
+    await pool.report(B, failed=True, since=clock.now)
+
+    with pytest.raises(NoProxyYet):
+        await proxies.bind("two", None)
+
+    assert run.stops == 1

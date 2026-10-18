@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from pernix.logs.redaction import MASK
 
@@ -19,7 +19,8 @@ def proxy_url(text: str) -> str:
     and the password are kept as written, so that two sticky sessions on one gateway,
     which differ only in them, stay two proxies. A proxy written as
     `host:port:user:password`, as some vendors list them, is read as
-    `user:password@host:port`, everything after the third colon being the password.
+    `user:password@host:port`, everything after the third colon being the password,
+    the characters a URL's credentials cannot hold as they are percent-encoded.
 
     Args:
         text: A proxy, such as `http://user:password@proxy:8080`, `proxy:8080`, or
@@ -58,12 +59,22 @@ def proxy_url(text: str) -> str:
 def _with_userinfo(text: str) -> str:
     """A proxy written as `host:port:user:password` as `user:password@host:port`; any other as it is."""
     parts = text.split(":", 3)
-    if "@" in text or "://" in text or "[" in text or len(parts) != 4:
-        return text
+    if "://" in text or len(parts) != 4 or ("@" in text and _host_and_port(text.rpartition("@")[2])):
+        return text  # a URL, or credentials before the host as URLs have them
     host, port, user, password = parts
-    if not port.isdigit() or not user:
+    if not port.isdigit() or not user or any(char in host for char in "@/["):
         return text
-    return f"{user}:{password}@{host}:{port}"
+    return f"{_userinfo(user)}:{_userinfo(password)}@{host}:{port}"
+
+
+def _host_and_port(text: str) -> bool:
+    host, colon, port = text.rpartition(":")
+    return bool(colon and host and port.isdigit())
+
+
+def _userinfo(text: str) -> str:
+    """A user or a password as a URL's credentials hold it: what they cannot hold as it is percent-encoded."""
+    return quote(text, safe="!$&'()*+,;=:")
 
 
 def proxy_credentials(url: str) -> tuple[str, ...]:
