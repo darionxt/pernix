@@ -9,7 +9,8 @@ import pytest
 
 from pernix import Request, Response, middleware
 from pernix.cli import main
-from pernix.cli.fetch_command import describe_response, is_text
+from pernix.cli.fetch_output import describe_response
+from pernix.cli.page_reading import is_text
 from pernix.testing import Reply
 
 if TYPE_CHECKING:
@@ -69,7 +70,9 @@ def test_json_describes_the_response(site: LoopbackServer, capsys: pytest.Captur
 
     described = orjson.loads(capsys.readouterr().out)
     assert code == 0
+    assert (next(iter(described)), described["schema"], described["truncated"]) == ("schema", 1, False)
     assert set(described) == {
+        "schema",
         "url",
         "final_url",
         "status",
@@ -81,6 +84,7 @@ def test_json_describes_the_response(site: LoopbackServer, capsys: pytest.Captur
         "fetcher",
         "body",
         "body_bytes",
+        "truncated",
     }
     assert (described["url"], described["final_url"]) == (site.url("/old"), site.url("/page"))
     assert (described["status"], described["http_version"], described["fetcher"]) == (200, "HTTP/1.1", "http")
@@ -119,19 +123,19 @@ def test_a_binary_body_is_written_raw_but_never_to_a_terminal(
 def test_a_failed_fetch_exits_with_1(capsys: pytest.CaptureFixture[str]) -> None:
     url = f"http://127.0.0.1:{_unused_port()}/"
 
-    assert main(["fetch", url]) == 1
+    assert main(["fetch", url, "-s", "retry.times=0"]) == 1
     assert capsys.readouterr().err.startswith(f"Error: fetching {url} failed: ConnectError: ")
 
-    assert main(["fetch", url, "--json"]) == 1
+    assert main(["fetch", url, "--json", "-s", "retry.times=0"]) == 1
     described = orjson.loads(capsys.readouterr().out)
-    assert described["url"] == url
+    assert (described["schema"], described["url"]) == (1, url)
     assert (described["error"]["type"], described["error"]["code"]) == ("ConnectError", 7)
 
 
 def test_the_timeout_limits_the_fetch(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
     started = time.monotonic()
 
-    assert main(["fetch", site.url("/slow"), "--timeout", "0.2", "--json"]) == 1
+    assert main(["fetch", site.url("/slow"), "--timeout", "0.2", "--json", "-s", "retry.times=0"]) == 1
 
     assert time.monotonic() - started < 1
     assert orjson.loads(capsys.readouterr().out)["error"]["type"] == "Timeout"

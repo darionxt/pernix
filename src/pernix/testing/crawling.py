@@ -11,7 +11,7 @@ from pernix.browser import RenderResult
 from pernix.callbacks import iterate_and_close, run_callbacks
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.crawler import Crawler
-from pernix.fetchers import BROWSER_FETCHER
+from pernix.fetchers import BROWSER_FETCHER, BrowserSettings
 from pernix.response import expect_response
 
 if TYPE_CHECKING:
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.response import Response
     from pernix.session import Session
+    from pernix.settings import Section
     from pernix.spider import Spider
     from pernix.stats import StatValue
 
@@ -35,9 +36,11 @@ _TEST_SETTINGS: Mapping[str, Any] = MappingProxyType(
         "domain.rate": None,
         "domain.cooldown_max": 0,
         "sessions.cooldown_max": 0,
+        "network.public_only": False,
     }
 )
-"""Settings that would only make a test wait: periodic stats, retry delays, per-domain pacing, and cooldowns."""
+"""Settings that would only make a test wait, periodic stats, retry delays, per-domain pacing, and cooldowns, and the
+address guard, which would keep it off the loopback hosts the network guard of tests admits."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +71,10 @@ async def crawl(
     """Run a Spider to completion for a test, and report its Items and stats.
 
     The Run takes `settings` over settings that keep a test from waiting: no periodic
-    stats, no retry delays, and no per-domain delay, rate, or cooldown. The project
-    file, the environment, and the Spider's own settings apply below them, as for any
-    Run.
+    stats, no retry delays, and no per-domain delay, rate, or cooldown; and over
+    `network.public_only`, off, so that a `LoopbackServer` can be reached, as tests
+    reach only loopback hosts under the network guard anyway. The project file, the
+    environment, and the Spider's own settings apply below them, as for any Run.
 
     Args:
         spider_type: The Spider class; a new object is created for the Run.
@@ -115,10 +119,13 @@ class _BrowserStandIn:
 
     It claims no URL scheme, so the Fetcher it wraps may claim some, and be
     registered as `http` too; unless it is, the stand-in opens and closes it with
-    itself.
+    itself. It registers the `browser.*` settings, as the browser Fetcher does, so
+    that `browser.max_pages` still sets how many rendered Requests the Run
+    processes at once.
     """
 
     schemes: ClassVar[frozenset[str]] = frozenset()
+    settings_sections: ClassVar[tuple[type[Section], ...]] = (BrowserSettings,)
 
     def __init__(self, fetcher: object, *, opens: bool) -> None:
         self._fetcher = cast("Fetcher", fetcher)

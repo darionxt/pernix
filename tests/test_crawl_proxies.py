@@ -175,7 +175,8 @@ async def test_the_rendered_and_http_requests_of_a_session_go_through_its_proxy(
     by_session: dict[str, set[str]] = {}
     for item in report.items:
         by_session.setdefault(item["session"], set()).add(item["via"])
-    assert [item["fetcher"] for item in report.items] == ["http", "browser", "http", "browser"]
+    fetched = sorted((item["session"], item["fetcher"]) for item in report.items)  # the browser has workers of its own
+    assert fetched == [("alice", "browser"), ("alice", "http"), ("bob", "browser"), ("bob", "http")]
     assert sorted(map(sorted, by_session.values())) == [["a"], ["b"]]
 
 

@@ -72,7 +72,7 @@ async def test_local_storage_is_seen_by_the_next_rendered_request_of_its_session
     server.route("/", REMEMBER, headers=HTML)
 
     class Remember(Spider):
-        settings: ClassVar[Mapping[str, Any]] = {**POOL, "concurrency": 1}
+        settings: ClassVar[Mapping[str, Any]] = {**POOL, "browser.max_pages": 1}  # one rendered Request at a time
 
         def __init__(self, url: str) -> None:
             self.url = url

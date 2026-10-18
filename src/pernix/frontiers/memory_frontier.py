@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
+from pernix.fetchers.fetcher_dispatch import is_rendered
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers.frontier import FrontierCounts, Lease, host_slot
 
@@ -26,6 +27,7 @@ class _Item:
     id: str
     request: Request
     slot: str
+    rendered: bool = False
     state: _State = "ready"
     sequence: int = 0
     """Orders ready Requests of one priority; a newer heap entry makes older ones stale."""
@@ -42,6 +44,8 @@ class MemoryFrontier:
 
     It is lost when the process ends, so it suits Runs that need no resuming. Done
     Requests are forgotten, except for their Fingerprints; Dead Requests are kept.
+    Rendered Requests queue apart from the others, so a claim of one kind never
+    goes through the Requests of the other.
     """
 
     def __init__(
@@ -63,7 +67,7 @@ class MemoryFrontier:
         self._clock = clock
         self._items: dict[str, _Item] = {}
         self._seen: set[str] = set()
-        self._ready: list[tuple[int, int, str]] = []  # (-priority, sequence, id)
+        self._ready: dict[bool, list[tuple[int, int, str]]] = {False: [], True: []}  # (-priority, sequence, id)
         self._delayed: list[tuple[float, int, str]] = []  # (not_before, sequence, id)
         self._expiries: list[tuple[float, int, str]] = []  # (expires_at, token, id)
         self._counts: Counter[str] = Counter()
@@ -75,16 +79,16 @@ class MemoryFrontier:
     async def add(self, requests: Sequence[Request]) -> list[bool]:
         """Deduplicate and store Requests; see `Frontier.add()`."""
         # Compute every Fingerprint and slot first, so a failing one leaves nothing half-added.
-        prepared = [(None if r.dont_filter else self._key(r), self._slot_of(r)) for r in requests]
+        prepared = [(None if r.dont_filter else self._key(r), self._slot_of(r), is_rendered(r)) for r in requests]
         self._refresh()  # Requests that became ready before these queue ahead of them
         added: list[bool] = []
-        for request, (key, slot) in zip(requests, prepared, strict=True):
+        for request, (key, slot, rendered) in zip(requests, prepared, strict=True):
             if key is not None:
                 if key in self._seen:
                     added.append(False)
                     continue
                 self._seen.add(key)
-            item = _Item(str(next(self._ids)), request, slot)
+            item = _Item(str(next(self._ids)), request, slot, rendered)
             self._items[item.id] = item
             self._counts["ready"] += 1
             self._push_ready(item)
@@ -94,7 +98,13 @@ class MemoryFrontier:
         return added
 
     async def claim(
-        self, worker_id: str, limit: int, ttl: float, skip_slots: Collection[str] = frozenset()
+        self,
+        worker_id: str,
+        limit: int,
+        ttl: float,
+        skip_slots: Collection[str] = frozenset(),
+        *,
+        rendered: bool | None = None,
     ) -> list[Lease]:
         """Lease ready Requests; see `Frontier.claim()`."""
         if limit < 1:
@@ -102,23 +112,29 @@ class MemoryFrontier:
         _check_ttl(ttl)
         now = self._refresh()
         due = self._next_due()
+        queues = list(self._ready.values()) if rendered is None else [self._ready[rendered]]
         leases: list[Lease] = []
-        skipped: list[tuple[int, int, str]] = []
-        while self._ready and len(leases) < limit:
-            entry = heapq.heappop(self._ready)
+        skipped: list[tuple[list[tuple[int, int, str]], tuple[int, int, str]]] = []
+        while len(leases) < limit:
+            ready = min((queue for queue in queues if queue), key=lambda queue: queue[0], default=None)
+            if ready is None:
+                break
+            entry = heapq.heappop(ready)
             item = self._items.get(entry[2])
             if item is None or item.state != "ready" or item.sequence != entry[1]:
                 continue  # stale entry
             if item.slot in skip_slots:
-                skipped.append(entry)
+                skipped.append((ready, entry))
                 continue
             item.token = next(self._tokens)
             item.expires_at = now + ttl
             self._move(item, "leased")
             heapq.heappush(self._expiries, (item.expires_at, item.token, item.id))
-            leases.append(Lease(item.id, item.token, item.attempts + 1, item.expires_at, item.slot, item.request))
-        for entry in skipped:
-            heapq.heappush(self._ready, entry)
+            leases.append(
+                Lease(item.id, item.token, item.attempts + 1, item.expires_at, item.slot, item.request, item.rendered)
+            )
+        for ready, entry in skipped:
+            heapq.heappush(ready, entry)
         if leases and (due is None or now + ttl < due):
             self._notify()  # waiters wake up by the earliest deadline, which is now sooner
         return leases
@@ -234,7 +250,7 @@ class MemoryFrontier:
 
     def _push_ready(self, item: _Item) -> None:
         item.sequence = next(self._sequences)
-        heapq.heappush(self._ready, (-item.request.priority, item.sequence, item.id))
+        heapq.heappush(self._ready[item.rendered], (-item.request.priority, item.sequence, item.id))
 
     def _move(self, item: _Item, state: _State) -> None:
         self._counts[item.state] -= 1
