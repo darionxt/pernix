@@ -68,9 +68,10 @@ async def _run(
     retry_policy: RetryPolicy | None = None,
     record: tuple[type[events.Event], ...] = (),
     contexts: list[ItemContext] | None = None,
+    frontier: MemoryFrontier | None = None,
 ) -> tuple[MemoryFrontier, list[Mapping[str, Any]], list[events.Event]]:
     """Run to the end, retrying at once by default; return the Frontier, the Items, and the recorded Events."""
-    frontier = MemoryFrontier()
+    frontier = frontier or MemoryFrontier()
     items: list[Mapping[str, Any]] = []
     recorded: list[events.Event] = []
     bus = events.EventBus(timeout=5)
@@ -180,15 +181,30 @@ async def test_a_failing_on_idle_ends_the_run(caplog: pytest.LogCaptureFixture) 
 
 
 async def test_leases_are_renewed_while_a_request_is_processed() -> None:
+    now = 0.0
+    renewed = asyncio.Event()
+
+    class Renewals(MemoryFrontier):
+        async def renew(self, lease: Lease, ttl: float) -> Lease | None:
+            renewal = await super().renew(lease, ttl)
+            renewed.set()
+            return renewal
+
     class Slow(Links):
         async def parse(self, response: Response) -> AsyncIterator[Any]:
-            await asyncio.sleep(0.3)  # several times the Lease's lifetime
+            nonlocal now
+            for _ in range(5):  # several times the Lease's lifetime in all, a renewal between steps
+                renewed.clear()
+                async with asyncio.timeout(5):
+                    await renewed.wait()
+                now += 0.04
             async for output in super().parse(response):
                 yield output
 
     site = _site({"/a": "<p>a</p>"})
 
-    frontier, items, _ = await _run(Slow(), site, lease_ttl=0.06)
+    # The Frontier's clock moves only between renewals, so a slow event loop cannot let the Lease expire.
+    frontier, items, _ = await _run(Slow(), site, lease_ttl=0.06, frontier=Renewals(clock=lambda: now))
 
     assert _paths(site) == ["/a"]
     assert items == [{"page": "a"}]
