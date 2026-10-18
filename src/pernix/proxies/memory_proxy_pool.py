@@ -48,9 +48,11 @@ class MemoryProxyPool:
     Each fetch without a Session takes the available proxy used least recently, so
     the proxies take turns. A Session keeps the proxy it is bound to while that is
     available, and is otherwise bound to the one with the fewest Sessions, so
-    Sessions share a proxy only when there are more of them than proxies. The pool
-    holds the binding of each Session, so Leases of one Session that overlap, which
-    loaded its state before either saved it, are given the same proxy. A failure
+    Sessions bound while enough proxies are available get one each; bindings are
+    not exclusive, though, and the Sessions of a proxy that cools down are bound to
+    others, which they then share, and keep. The pool holds the binding of each
+    Session, so Leases of one Session that overlap, which loaded its state before
+    either saved it, are given the same proxy. A failure
     cools its proxy down for `cooldown` seconds, doubled with each failure in a row,
     at most `cooldown_max`, and Retires it after `max_failures` in a row; a fetch
     that got through ends the row. A proxy that is no longer listed keeps its
