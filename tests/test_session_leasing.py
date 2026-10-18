@@ -13,7 +13,7 @@ from pernix import Account, Cookie, Request, Session
 from pernix.errors import ConnectError, LoginExpired, ProxyError, SessionError
 from pernix.fetchers import FetcherDispatch
 from pernix.fetchers.fetcher_dispatch import sending_as
-from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
+from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool, Proxy
 from pernix.proxies.proxy_sources import StaticProxies
 from pernix.proxies.run_proxies import NoProxyYet, RunProxies
 from pernix.sessions import MemorySessionPool, Outcome, StateDelta
@@ -483,7 +483,11 @@ PROXY_A, PROXY_B = "http://a.example:8080", "http://b.example:8080"
 
 
 async def _proxies(
-    pool: MemoryProxyPool, *urls: str, stops: list[None] | None = None, policy: BindingPolicy | None = None
+    pool: MemoryProxyPool,
+    *urls: str,
+    stops: list[None] | None = None,
+    policy: BindingPolicy | None = None,
+    clock: Clock | None = None,
 ) -> RunProxies:
     def mask(_: Iterable[str]) -> None:
         pass
@@ -500,6 +504,7 @@ async def _proxies(
         stats=Stats(),
         stop=stop,
         mask=mask,
+        clock=clock or time.time,
     )
     await proxies.open()
     return proxies
@@ -781,3 +786,178 @@ def _failing(error: Exception) -> Site:
     site = Site()
     site.error = error
     return site
+
+
+RETIRED = DefaultBindingPolicy(ProxySettings(rebind="retired"))
+NEVER = DefaultBindingPolicy(ProxySettings(rebind="never"))
+
+
+async def _following(
+    policy: BindingPolicy, **options: float
+) -> tuple[SessionLeasing, MemorySessionPool, Stats, Clock, MemoryProxyPool]:
+    """Leasing whose Sessions follow their proxies, as the policy says, on one clock."""
+    clock = Clock()
+    proxy_pool = MemoryProxyPool(clock=clock, **options)  # pyright: ignore[reportArgumentType]
+    proxies = await _proxies(proxy_pool, PROXY_A, PROXY_B, policy=policy, clock=clock)
+    leasing, pool, stats, _ = _leasing(clock=clock, proxies=proxies)
+    return leasing, pool, stats, clock, proxy_pool
+
+
+async def _through(leasing: SessionLeasing, request: Request) -> str | None:
+    async with leasing.sending(request, wait=0) as sending:
+        assert sending.session is not None
+        return sending.session.proxy
+
+
+async def test_a_session_kept_on_its_proxy_cools_down_with_it_once_a_fetch_through_it_failed() -> None:
+    leasing, pool, stats, clock, _ = await _following(RETIRED, cooldown=60)
+
+    with pytest.raises(ProxyError):
+        await _send(
+            leasing, FetcherDispatch({"site": _failing(ProxyError("refused"))}), Request(f"{SITE}/", session="a")
+        )
+    cooling = (pool.health("a"), await pool.ready_in(session="a"))
+    clock.now += 60
+    back = await _through(leasing, Request(f"{SITE}/", session="a"))
+
+    assert cooling == ("cooldown", 60.0)
+    assert back == PROXY_A
+    assert stats.get("sessions.outcomes.proxy_failed") == 1
+
+
+async def test_a_lease_that_finds_its_proxy_cooling_down_gives_its_session_back_to_wait_for_it() -> None:
+    leasing, pool, stats, clock, proxy_pool = await _following(RETIRED, cooldown=60)
+    await _through(leasing, Request(f"{SITE}/", session="a"))
+    await proxy_pool.report(PROXY_A, failed=True, since=clock.now)  # as another Session's fetch through it failed
+
+    with pytest.raises(NoSessionYet) as waiting:
+        await _through(leasing, Request(f"{SITE}/", session="a"))
+    other = await _through(leasing, Request(f"{SITE}/"))
+
+    assert waiting.value.delay == 60
+    assert pool.health("a") == "cooldown"
+    assert other == PROXY_B  # a Request naming no Session leases another
+    assert stats.get("sessions.outcomes.proxy_cooldown") == 1
+
+
+async def test_with_never_a_session_is_retired_with_its_proxy_and_the_requests_naming_it_fail() -> None:
+    leasing, pool, stats, _, proxy_pool = await _following(NEVER, max_failures=1)
+
+    with pytest.raises(ProxyError):
+        await _send(
+            leasing, FetcherDispatch({"site": _failing(ProxyError("refused"))}), Request(f"{SITE}/", session="a")
+        )
+    with pytest.raises(SessionError, match="retired"):
+        await _through(leasing, Request(f"{SITE}/", session="a"))
+
+    assert pool.health("a") == "retired"
+    assert (stats.get("sessions.outcomes.proxy_failed"), stats.get("sessions.outcomes.proxy_retired")) == (1, 1)
+    assert stats.get("sessions.retirements") == 1
+    assert [candidate.sessions for candidate in await proxy_pool.candidates()] == [frozenset(), frozenset()]
+
+
+async def test_a_lease_that_finds_its_proxy_retired_retires_its_session_and_its_request_waits_for_another() -> None:
+    leasing, pool, stats, clock, proxy_pool = await _following(NEVER, max_failures=1)
+    await _through(leasing, Request(f"{SITE}/", session="a"))
+    await proxy_pool.report(PROXY_A, failed=True, since=clock.now)
+
+    with pytest.raises(NoSessionYet) as waiting:
+        await _through(leasing, Request(f"{SITE}/"))  # leases the only Session, "a"
+    other = await _through(leasing, Request(f"{SITE}/"))
+
+    assert waiting.value.delay == 0
+    assert pool.health("a") == "retired"
+    assert other == PROXY_B
+    assert stats.get("sessions.outcomes.proxy_retired") == 1
+
+
+async def test_a_nested_fetch_whose_session_is_retired_with_its_proxy_fails_and_its_lease_retires_it() -> None:
+    leasing, pool, _, clock, proxy_pool = await _following(NEVER, max_failures=1)
+    await _through(leasing, Request(f"{SITE}/", session="a"))
+    await proxy_pool.report(PROXY_A, failed=True, since=clock.now)
+
+    with pytest.raises(SessionError, match="retired with its proxy"):
+        async with leasing.sending(Request(f"{SITE}/outer", session="a", proxy="http://own.example:1"), wait=0):
+            await _through(leasing, Request(f"{SITE}/token", session="a"))  # the first through the Session's proxy
+
+    assert pool.health("a") == "retired"
+
+
+@pytest.mark.parametrize(("rebind", "health"), [("retired", "cooldown"), ("never", "retired")])
+async def test_a_session_whose_login_failed_through_the_proxy_it_follows_cools_down_or_is_retired_with_it(
+    rebind: str, health: str
+) -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        refusing = FetcherDispatch({"site": _failing(ProxyError("refused"))})
+        await _send(leasing, refusing, Request(f"{SITE}/login", session=session.id))
+
+    clock = Clock()
+    proxy_pool = MemoryProxyPool(cooldown=60, max_failures=1 if rebind == "never" else 5, clock=clock)
+    policy = DefaultBindingPolicy(ProxySettings(rebind=rebind))  # pyright: ignore[reportArgumentType]
+    proxies = await _proxies(proxy_pool, PROXY_A, PROXY_B, policy=policy, clock=clock)
+    leasing, pool, stats, _ = _leasing(clock=clock, login=_login(log_in), proxies=proxies)
+
+    with pytest.raises((NoSessionYet, SessionError)):
+        await _through(leasing, Request(f"{SITE}/", session="a"))
+
+    assert pool.health("a") == health
+    if health == "cooldown":
+        assert await pool.ready_in(session="a") == 60  # its proxy's cooldown, longer than a failed login's
+    assert stats.get("sessions.login_failures") == 1
+
+
+async def test_a_login_whose_session_is_retired_with_its_proxy_retires_it() -> None:
+    async def log_in(session: Session, account: Account | None) -> None:
+        await _through(leasing, Request(f"{SITE}/login", session=session.id))  # the first through its proxy
+
+    clock = Clock()
+    proxy_pool = MemoryProxyPool(max_failures=1, clock=clock)
+    proxies = await _proxies(proxy_pool, PROXY_A, PROXY_B, policy=NEVER, clock=clock)
+    leasing, pool, stats, _ = _leasing(clock=clock, login=_login(log_in), proxies=proxies)
+    pool.add(Session("a", proxy=PROXY_A))
+    await proxy_pool.report(PROXY_A, failed=True, since=clock.now)
+
+    with pytest.raises(SessionError, match="retired"):
+        await _through(leasing, Request(f"{SITE}/", session="a", proxy="http://own.example:1"))
+
+    assert pool.health("a") == "retired"
+    assert stats.get("sessions.login_failures") == 1
+
+
+async def test_a_policy_failing_once_a_fetch_through_its_proxy_failed_leaves_the_session_as_it_is(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Failing:
+        async def bind(self, binding: Binding) -> str | None:
+            if binding.reason != "new":
+                raise RuntimeError("the database is down")
+            return binding.open[0].url
+
+    leasing, pool, stats, _, _ = await _following(Failing())
+
+    with pytest.raises(ProxyError):
+        await _send(
+            leasing, FetcherDispatch({"site": _failing(ProxyError("refused"))}), Request(f"{SITE}/", session="a")
+        )
+
+    assert pool.health("a") == "available"
+    assert stats.get("sessions.outcomes.proxy_failed") == 1
+    assert "The binding policy failed for the Session 'a', whose proxy failed" in caplog.text
+
+
+async def test_a_session_given_a_proxy_of_its_own_goes_through_it_and_keeps_it() -> None:
+    own = "http://alice:pw@own.example:9000"
+
+    class Own:
+        async def bind(self, binding: Binding) -> Proxy | None:
+            return Proxy(own) if binding.account is not None else None
+
+    account = Account(username="alice", password="pw", id="a")  # pyright: ignore[reportArgumentType]
+    proxies = await _proxies(MemoryProxyPool(), PROXY_A, policy=Own())
+    leasing, pool, _, _ = _leasing(proxies=proxies, accounts=(account,))
+    pool.add(Session("a", account="a"))
+
+    through = [await _through(leasing, Request(f"{SITE}/", session="a")) for _ in range(2)]
+
+    assert through == [own, own]
+    assert await _state_proxy(pool, "a") == own

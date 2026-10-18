@@ -165,6 +165,35 @@ async def test_a_rate_limited_session_cools_down_until_its_time_while_others_are
     assert await pool.acquire(session="alice", timeout=0) is not None
 
 
+@pytest.mark.parametrize("kind", ["rate_limited", "proxy_failed", "proxy_cooldown", "error"])
+async def test_any_outcome_with_an_until_cools_its_session_down(kind: str) -> None:
+    pool, clock = _pool(size=1)
+    lease = await pool.acquire(session="alice")
+    assert lease is not None
+
+    await pool.release(lease, Outcome(kind, until=NOW + 60))  # type: ignore[arg-type]
+
+    assert pool.health("alice") == "cooldown"
+    assert await pool.ready_in(session="alice") == 60.0
+    clock.now += 60
+    assert pool.health("alice") == "available"
+
+
+async def test_a_session_whose_proxy_is_retired_is_retired_with_it_each_retirement_counted_once() -> None:
+    stats = Stats()
+    pool, _ = _pool(size=3, logs_in=True, login_attempts=1, stats=stats)
+    pool.add(Session("carol"))
+    for session, outcome in (("alice", "proxy_retired"), ("bob", "login_failed")):
+        lease = await pool.acquire(session=session)
+        assert lease is not None
+        await pool.release(lease, Outcome(outcome))  # type: ignore[arg-type]
+    pool.retire("carol")
+    pool.retire("alice")
+
+    assert [pool.health(session) for session in ("alice", "bob", "carol")] == ["retired"] * 3
+    assert stats.get("sessions.retirements") == 3
+
+
 async def test_other_outcomes_leave_a_session_available() -> None:
     pool, _ = _pool(size=1)
     for kind in ("ok", "blocked", "auth_expired", "proxy_failed", "error"):

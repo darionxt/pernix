@@ -36,6 +36,7 @@ from pernix.settings import (
     FingerprintSettings,
     FrontierSettings,
     ItemSettings,
+    NetworkSettings,
     ProxySettings,
     RetrySettings,
     SessionSettings,
@@ -98,7 +99,8 @@ class DownloadAssembly:
         """
         fetchers = _build_named(crawler, "fetchers")
         middlewares = _build_all(crawler, "middlewares")
-        download = build_download_chain(middlewares, FetcherDispatch(fetchers))
+        public_only = crawler.settings.section(NetworkSettings).public_only
+        download = build_download_chain(middlewares, FetcherDispatch(fetchers, public_only=public_only))
         return cls(components=(*fetchers.values(), *middlewares), download=download)
 
 
@@ -273,10 +275,27 @@ def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
 
     The API, the provider, and the binding policy are opened before the proxies,
     which load them and bind Sessions with it.
+
+    Raises:
+        pernix.errors.SettingsError: A binding policy is set without a source, and
+            no Session Pool is enabled, so no Request could have a proxy.
     """
     options = crawler.settings.section(ProxySettings)
     if not options.enabled:
         return _Proxying()
+    if not options.sourced and not crawler.settings.section(SessionSettings).enabled:
+        raise SettingsError(
+            [
+                f"{ProxySettings.key('binding')}: without a source of proxies, it gives the Sessions of a Session Pool "
+                f"proxies of their own, but no Session Pool is enabled; enable one with {SessionSettings.key('enabled')}"
+            ]
+        )
+    if options.rebind == "never" and options.binding is None and options.refresh is not None:
+        logger.warning(
+            "%s is never and %s is set: a Session bound to a proxy a refresh no longer lists is retired with it",
+            ProxySettings.key("rebind"),
+            ProxySettings.key("refresh"),
+        )
     sources: list[tuple[str, ProxyProvider]] = []
     opened: list[object] = []
     if options.urls:

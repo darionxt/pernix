@@ -219,3 +219,91 @@ async def test_proxies_the_pool_does_not_hold_are_ignored() -> None:
     await pool.report("http://other.example:1", failed=True, since=NOW)
 
     assert pool.counts() == ProxyCounts(available=1, cooldown=0, retired=0)
+
+
+OWN = "http://user:pw@own.example:9000"
+
+
+async def test_a_proxy_of_its_own_is_held_for_its_session_alone() -> None:
+    stats = Stats()
+    pool = await _pool(A, max_sessions=1, stats=stats)
+
+    bound = await pool.bind("one", Proxy(OWN, tags=frozenset({"isp"})))
+    again = await pool.bind("one", OWN)  # another Lease, as its candidates name it
+
+    assert (bound, again) == (True, True)
+    assert [await pool.take() for _ in range(2)] == [A, A]  # it takes no turns
+    assert [candidate.url for candidate in await pool.candidates()] == [A]
+    assert [candidate.url for candidate in await pool.candidates("two")] == [A]
+    assert await pool.candidates("one") == (
+        ProxyCandidate(OWN, tags=frozenset({"isp"}), sessions=frozenset({"one"}), own=True),
+        ProxyCandidate(A),  # taken since
+    )
+    assert not await pool.bind("two", OWN)
+    assert not await pool.bind("two", Proxy(OWN))
+    assert stats.get("proxies.bindings") == 1
+
+
+async def test_a_session_may_not_hold_as_its_own_a_proxy_the_pool_lists() -> None:
+    pool = await _pool(A)
+
+    assert not await pool.bind("one", Proxy(A))
+    assert await _sessions(pool) == {A: frozenset()}
+
+
+async def test_a_proxy_of_its_own_keeps_its_health_and_refreshes_keep_it() -> None:
+    clock = Clock()
+    pool = await _pool(A, clock=clock, cooldown=10)
+    await pool.bind("one", Proxy(OWN))
+
+    await pool.report(OWN, failed=True, since=clock.now)
+    await pool.replace([Proxy(B)])
+    candidates = await pool.candidates("one")
+
+    assert candidates[-1] == ProxyCandidate(
+        OWN, health="cooldown", sessions=frozenset({"one"}), failures=1, until=NOW + 10, own=True
+    )
+    assert pool.health(OWN) == "cooldown"
+    assert not await pool.bind("one", OWN)  # not while it cools down
+    assert await pool.ready_in() == 0  # what fetches without a Session wait for, which B is
+    assert pool.counts() == ProxyCounts(available=1, cooldown=1, retired=0)  # B, and its own in use
+
+
+async def test_once_its_session_leaves_it_another_session_may_hold_it_with_its_health() -> None:
+    clock = Clock()
+    pool = await _pool(A, clock=clock, cooldown=10)
+    await pool.bind("one", Proxy(OWN))
+    await pool.report(OWN, failed=True, since=clock.now)
+    await pool.bind("one", A)
+    held_through_its_lease = await pool.bind("two", Proxy(OWN))
+    await pool.release("one", OWN)  # the Lease that went through it ended
+    clock.now += 10
+
+    assert not held_through_its_lease
+    assert pool.health(OWN) is None
+    assert pool.counts() == ProxyCounts(available=1, cooldown=0, retired=0)
+    assert await pool.bind("two", Proxy(OWN))
+    assert [(candidate.url, candidate.failures) for candidate in await pool.candidates("two")] == [(A, 0), (OWN, 1)]
+
+
+async def test_a_proxy_no_longer_listed_is_held_as_a_sessions_own_only_once_the_others_left_it() -> None:
+    pool = await _pool(A, B)
+    await pool.bind("one", A)
+    await pool.replace([Proxy(B)])  # while "one" is bound to A, and its Lease goes through it
+
+    refused = await pool.bind("two", Proxy(A))
+    await pool.bind("one", B)
+    still_going_through = await pool.bind("two", Proxy(A))
+    await pool.release("one", A)
+
+    assert (refused, still_going_through) == (False, False)
+    assert await pool.bind("two", Proxy(A))
+
+
+async def test_the_candidates_tell_when_a_proxy_cooling_down_is_available_again() -> None:
+    clock = Clock()
+    pool = await _pool(A, B, clock=clock, cooldown=10)
+
+    await pool.report(B, failed=True, since=clock.now)
+
+    assert [candidate.until for candidate in await pool.candidates()] == [None, NOW + 10]
