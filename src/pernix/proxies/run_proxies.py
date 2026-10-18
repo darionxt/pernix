@@ -9,14 +9,20 @@ import time
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING
 
+import msgspec
+
 from pernix.errors import ProxyError
+from pernix.proxies.binding_policy import Binding
+from pernix.proxies.proxy import Proxy
 from pernix.proxies.proxy_url import proxy_credentials, proxy_url
 from pernix.sending import NotYet
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 
-    from pernix.proxies.proxy_pool import ProxyPool
+    from pernix.account import Account
+    from pernix.proxies.binding_policy import BindingPolicy, BindingReason
+    from pernix.proxies.proxy_pool import ProxyCandidate, ProxyPool
     from pernix.proxies.proxy_sources import ProxyProvider
     from pernix.sending import Sending
     from pernix.stats import Stats
@@ -27,18 +33,24 @@ logger = logging.getLogger(__name__)
 
 _EXHAUSTED_WAIT = 5.0
 """Seconds a Request waits for a proxy once none ever will be, while the Run drains."""
+_UNFIT_WAIT = 1.0
+"""Seconds a Request waits when no proxy fits its Session, though some are available."""
+_BIND_ATTEMPTS = 3
+"""Times the binding policy is asked for one binding, while the proxies it picks are taken first."""
+_GONE: dict[BindingReason, str] = {"cooldown": "is cooling down", "retired": "is retired", "unlisted": "is not listed"}
 
 
 class NoProxyYet(NotYet):
-    """No proxy is available yet; the Request is to wait elsewhere."""
+    """No proxy is available yet, or none fits the Session; the Request is to wait elsewhere."""
 
-    def __init__(self, delay: float) -> None:
+    def __init__(self, delay: float, reason: str = "no proxy available") -> None:
         """Create the signal.
 
         Args:
             delay: Seconds until one may be.
+            reason: Why none is given.
         """
-        super().__init__(delay, "no proxy available")
+        super().__init__(delay, reason)
 
 
 class RunProxies:
@@ -51,11 +63,14 @@ class RunProxies:
     proxies a source other than a list or a file gives that are not valid are
     skipped, with a warning. Their passwords are masked in the Run's log.
 
-    Each fetch takes a proxy, or a Session is bound to one, and how the fetch went
-    is reported: a `ProxyError` is a failure, and a Response tells that the proxy
-    got through. When no proxy is available, the fetch waits until one stops cooling
-    down. When none ever will be, with every proxy Retired and no refresh to bring
-    others, the Run is stopped, draining it.
+    Each fetch takes a proxy, or a Session is bound to one, as the binding policy
+    picks it, and how the fetch went is reported: a `ProxyError` is a failure, and
+    a Response tells that the proxy got through. When no proxy is available, the
+    fetch waits until one stops cooling down. When none ever will be, with every
+    proxy Retired and no refresh to bring others, the Run is stopped, draining it.
+    When the policy finds no proxy for a Session, though some are available, its
+    fetch waits a second, which is counted as `proxies.binding_waits` and logged
+    once until the Session is bound again.
     """
 
     def __init__(
@@ -63,6 +78,7 @@ class RunProxies:
         pool: ProxyPool,
         sources: Sequence[tuple[str, ProxyProvider]],
         *,
+        policy: BindingPolicy,
         refresh: float | None,
         stats: Stats,
         stop: Callable[[], None],
@@ -75,16 +91,19 @@ class RunProxies:
             pool: The Proxy Pool.
             sources: The sources, each named as the settings name it, such as
                 `proxies.file`.
+            policy: Picks the proxy each Session is bound to.
             refresh: Seconds between loads of the sources after the first; `None` to
                 load them once.
-            stats: Where refreshes and their failures are counted, as
-                `proxies.refreshes` and `proxies.refresh_failures`.
+            stats: Where refreshes, their failures, and the bindings that wait are
+                counted, as `proxies.refreshes`, `proxies.refresh_failures`, and
+                `proxies.binding_waits`.
             stop: Stops the Run, draining it.
             mask: Masks values in the Run's log from now on.
             clock: The current time, in seconds since the epoch.
         """
         self._pool = pool
         self._sources = tuple(sources)
+        self._policy = policy
         self._refresh = refresh
         self._stats = stats
         self._stop = stop
@@ -95,6 +114,8 @@ class RunProxies:
         self._next_load = math.inf
         self._refreshing: asyncio.Task[None] | None = None
         self._exhausted = False
+        self._waiting: set[str] = set()
+        """The Sessions told to wait for a proxy that fits, since they were last bound."""
 
     async def open(self) -> None:
         """List the proxies of every source, then refresh them every `refresh` seconds, if set.
@@ -129,25 +150,66 @@ class RunProxies:
             raise NoProxyYet(await self._unavailable())
         return proxy
 
-    async def bind(self, session: str, current: str | None) -> str:
-        """Return the proxy a Session goes through: its own while available, else another.
+    async def bind(self, session: str, current: str | None, *, account: Account | None = None) -> str:
+        """Bind a Session to the proxy the binding policy picks for one of its Leases, and return it.
+
+        The Lease holds the proxy until `release()`.
 
         Args:
             session: The Session's id.
-            current: The proxy the Session is bound to, if any.
+            current: The proxy the Session's state names, if any; the pool's
+                binding goes first.
+            account: The Account the Session logs in with, if any.
 
         Returns:
             The proxy.
 
         Raises:
-            NoProxyYet: None is available now.
+            NoProxyYet: None is available now, or the policy picked none, or those
+                it picked were taken first by other Sessions.
+            ValueError: The policy picked a proxy the pool does not list.
+            Exception: Whatever the policy raised.
         """
-        proxy = await self._pool.bind(session, current)
-        if proxy is None:
-            raise NoProxyYet(await self._unavailable())
-        if current is not None and proxy != current:
-            logger.info("The proxy of the Session %r is not available; it goes through another", session)
-        return proxy
+        for _ in range(_BIND_ATTEMPTS):
+            candidates = tuple(await self._pool.candidates())
+            if not any(candidate.health == "available" for candidate in candidates):
+                raise NoProxyYet(await self._unavailable())
+            binding = _binding(session, account, current, candidates, self._pool.max_sessions)
+            proxy = await self._policy.bind(binding)
+            if proxy is None:
+                break
+            if not any(candidate.url == proxy for candidate in candidates):
+                raise ValueError("the binding policy picked a proxy the Proxy Pool does not list")
+            if await self._pool.bind(session, proxy):
+                self._waiting.discard(session)
+                if binding.reason in _GONE and proxy != binding.current:
+                    logger.info(
+                        "The proxy of the Session %r %s; it goes through another", session, _GONE[binding.reason]
+                    )
+                return proxy
+        self._stats.inc("proxies.binding_waits")
+        if session not in self._waiting:
+            self._waiting.add(session)
+            logger.warning("No proxy fits the Session %r now; its Requests wait for one", session)
+        raise NoProxyYet(_UNFIT_WAIT, "no proxy fits the Session")
+
+    async def release(self, session: str, proxy: str) -> None:
+        """End the hold on a proxy of a Lease that `bind()` bound a Session to it for, once the Lease ends.
+
+        Args:
+            session: The Session's id.
+            proxy: The proxy the Lease was bound to.
+        """
+        await self._pool.release(session, proxy)
+
+    async def unbind(self, session: str) -> None:
+        """Release the binding of a Session, such as one Retired, so it no longer counts toward its proxy's Sessions.
+
+        Args:
+            session: The Session's id.
+        """
+        self._waiting.discard(session)
+        await self._pool.unbind(session)
 
     @asynccontextmanager
     async def reporting(self, proxy: str, sending: Sending) -> AsyncGenerator[None]:
@@ -211,13 +273,14 @@ class RunProxies:
 
     async def _load(self) -> None:
         """List the proxies of every source in the pool, masking their passwords first."""
-        proxies: dict[str, None] = {}
+        proxies: dict[str, Proxy] = {}
         for name, source in self._sources:
-            proxies.update(dict.fromkeys(_valid(name, await source.proxies())))
+            for proxy in _valid(name, await source.proxies()):
+                proxies.setdefault(proxy.url, proxy)
         listed = frozenset(proxies)
         before = self._listed or frozenset()
         self._mask(secret for proxy in listed - before for secret in proxy_credentials(proxy))
-        await self._pool.replace(list(proxies))
+        await self._pool.replace(list(proxies.values()))
         if self._listed is None:
             logger.info("Loaded %d proxies", len(listed))
         else:
@@ -232,18 +295,62 @@ class RunProxies:
             self._next_load = self._clock() + self._refresh
 
 
-def _valid(source: str, proxies: Iterable[object]) -> list[str]:
+def _binding(
+    session: str,
+    account: Account | None,
+    current: str | None,
+    candidates: tuple[ProxyCandidate, ...],
+    max_sessions: int | None,
+) -> Binding:
+    """What the binding policy is told of a Session: the pool's binding goes before the one its state names."""
+    held = next((candidate for candidate in candidates if session in candidate.sessions), None)
+    if held is None:
+        held = next((candidate for candidate in candidates if candidate.url == current), None)
+    else:
+        current = held.url
+    reason: BindingReason
+    if current is None:
+        reason = "new"
+    elif held is None:
+        reason = "unlisted"
+    else:
+        reason = "lease" if held.health == "available" else held.health
+    return Binding(
+        session,
+        account=account,
+        current=current,
+        health=None if held is None else held.health,
+        reason=reason,
+        candidates=candidates,
+        max_sessions=max_sessions,
+    )
+
+
+def _valid(source: str, proxies: Iterable[object]) -> list[Proxy]:
     """The proxies a source gave, as the pool holds them, skipping with a warning those that are not valid."""
-    valid: list[str] = []
+    valid: list[Proxy] = []
     problems: list[str] = []
     for position, proxy in enumerate(proxies, start=1):
-        if not isinstance(proxy, str):
-            problems.append(f"#{position} (not a string)")
-            continue
         try:
-            valid.append(proxy_url(proxy))
+            valid.append(_proxy(proxy))
         except ValueError as exc:
             problems.append(f"#{position} ({exc})")
     if problems:
         logger.warning("Skipped the proxies %s gave that are not valid: %s", source, ", ".join(problems))
     return valid
+
+
+def _proxy(given: object) -> Proxy:
+    """A proxy a source gave, as a URL or a record, as the pool holds it.
+
+    Raises:
+        ValueError: It is neither a proxy URL nor a valid `Proxy` record of one; the
+            message does not quote it.
+    """
+    if isinstance(given, str):
+        return Proxy(proxy_url(given))
+    if not isinstance(given, Proxy):
+        raise ValueError("not a string or a Proxy")
+    # The fields of a record built in code are not checked, as those of one decoded are.
+    record = msgspec.convert(msgspec.structs.asdict(given), Proxy)
+    return msgspec.structs.replace(record, url=proxy_url(record.url))

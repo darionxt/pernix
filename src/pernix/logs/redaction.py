@@ -6,7 +6,7 @@ from typing import cast
 
 import msgspec
 
-from pernix.settings import Secret
+from pernix.secret import Secret
 
 __all__ = ["ELIDED", "HEADER_NAMES", "MASK", "SENSITIVE_NAMES", "Redactor", "revealed_secrets"]
 

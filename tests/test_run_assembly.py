@@ -11,6 +11,7 @@ from pernix.extensions import OffsiteFilter
 from pernix.fetchers import BrowserFetcher, HTTPFetcher
 from pernix.items import FailedItemsFile
 from pernix.logs import RunContext, RunLog
+from pernix.proxies import Binding, DefaultBindingPolicy
 from pernix.proxies.proxy_sources import ProxyAPI
 from pernix.proxies.run_proxies import RunProxies
 from pernix.run_assembly import RunAssembly
@@ -75,12 +76,31 @@ def test_the_sources_of_proxies_and_the_proxies_are_opened_before_the_fetchers()
         OffsiteFilter,
         ProxyAPI,
         Provider,
+        DefaultBindingPolicy,
         RunProxies,
         HTTPFetcher,
         BrowserFetcher,
         FailedItemsFile,
     ]
     assert run.components[2] is provider
+
+
+def test_a_binding_policy_of_ones_own_is_built_and_opened_before_the_proxies() -> None:
+    class ByTag:
+        async def bind(self, binding: Binding) -> str | None:
+            return None
+
+    policy = ByTag()
+
+    run = _build({"proxies.urls": ["a.example:1"], "proxies.binding": policy})
+
+    assert [type(component) for component in run.components[1:3]] == [ByTag, RunProxies]
+    assert run.components[1] is policy
+
+
+def test_a_binding_policy_without_bind_fails_the_build() -> None:
+    with pytest.raises(ComponentError, match=r"proxies\.binding must have bind\(binding\)"):
+        _build({"proxies.urls": ["a.example:1"], "proxies.binding": object()})
 
 
 def test_a_provider_without_proxies_fails_the_build() -> None:
