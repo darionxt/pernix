@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from curl_cffi import CurlECode, CurlError, CurlHttpVersion
 from curl_cffi.requests import exceptions as curl_errors
+from curl_cffi.requests.utils import requote_uri
 
 from pernix.cookies import merge_set_cookies, request_cookies
 from pernix.errors import (
@@ -348,7 +349,7 @@ class HTTPFetcher:
             history.append(Redirect(result.url, result.status_code, _headers(result)))
             if len(history) > max_redirects:
                 raise TooManyRedirects(f"{request.url} redirected more than http.max_redirects ({max_redirects}) times")
-            redirected_from, hop = result.url, redirected(hop, result.status_code, target)
+            redirected_from, hop = result.url, redirected(hop, result.status_code, requote_uri(target))
 
     def _check_hop(self, url: str, proxy: str | None, *, redirected_from: str | None) -> None:
         """Refuse a hop of a redirect chain, the first included, before it is sent.
@@ -396,6 +397,7 @@ class HTTPFetcher:
                     on_headers=cookies.receive,
                     discard_cookies=True,
                     allow_redirects=False,
+                    quote=False,  # the URL is quoted already, so cookies match the one sent
                     proxy=proxy,
                     impersonate=cast("Any", profile),
                     timeout=curl_timeout,
@@ -482,9 +484,13 @@ def _check_declared_size(result: curl_cffi.Response, request: Request, limit: in
 
 
 def _curl_url(request: Request) -> str:
-    """The URL curl is given: the Request's, with its host converted as WHATWG URLs convert it, if needed."""
+    """The URL curl is given: the Request's, with its host converted as WHATWG URLs convert it, if needed.
+
+    It is quoted as curl-cffi quotes URLs, so that `/café` is `/caf%C3%A9`, the path
+    the cookies of the first hop match.
+    """
     try:
-        return with_ascii_host(request.url)
+        return requote_uri(with_ascii_host(request.url))
     except ValueError as exc:
         raise FetchError(str(exc), code=CurlECode.URL_MALFORMAT) from exc
 

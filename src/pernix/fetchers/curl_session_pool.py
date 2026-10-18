@@ -220,7 +220,8 @@ class _HeaderWatch:
     """Writes the response headers of one transfer to curl-cffi's buffer, reporting their cookies.
 
     At the end of the headers of the response, it reports the URL curl requested for
-    it and its `Set-Cookie` values. curl unfolds folded lines itself; one that gets
+    it and its `Set-Cookie` values, decoded as UTF-8 unless their bytes are not UTF-8,
+    then as Latin-1. curl unfolds folded lines itself; one that gets
     through still continues the header before it. Informational responses and 407s,
     which answer for a proxy, are not reported, nor are headers after the body,
     trailers. The headers of a redirect, a redirect status with a `Location`, lift
@@ -272,11 +273,22 @@ class _HeaderWatch:
         if self._status >= 200 and self._status != 407 and self._on_headers is not None and self._set_cookies:
             url = self._url()
             try:
-                self._on_headers(url, self._set_cookies)
+                self._on_headers(url, [_text(value) for value in self._set_cookies])
             except Exception:
                 logger.exception("Handling the Set-Cookie headers of %s failed", url)
         if self._status >= 200:
             self._status = 0  # what follows the body is no response
+
+
+def _text(value: str) -> str:
+    """A header value read as Latin-1, decoded as UTF-8 instead, unless its bytes are not UTF-8.
+
+    Cookies are sent encoded as UTF-8, so those received as UTF-8 go back byte for byte.
+    """
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except UnicodeDecodeError:
+        return value
 
 
 @dataclass(slots=True)

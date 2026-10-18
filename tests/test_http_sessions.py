@@ -381,3 +381,25 @@ async def test_cookies_of_an_international_host_are_kept_under_its_ascii_name(
         await fetcher.fetch(Request(cookie_server.url("/", host=host)), session=session)
 
     assert [(cookie.name, cookie.domain) for cookie in session.cookies] == [("a", domain)]
+
+
+async def test_session_cookies_match_the_path_as_it_is_sent(cookie_server: CookieServer) -> None:
+    session = Session(cookies=[Cookie(name="scoped", value="1", domain="127.0.0.1", path="/caf%C3%A9")])
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/café")), session=session)
+
+    assert [(hop.path, hop.cookies) for hop in cookie_server.received] == [("/caf%C3%A9", ["scoped=1"])]
+
+
+async def test_cookies_beyond_ascii_are_kept_as_text_and_sent_back_byte_for_byte(cookie_server: CookieServer) -> None:
+    cookie_server.routes["/start"] = [("Location", "/end"), ("Set-Cookie", "name=café")]  # sent in UTF-8
+    session = Session()
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/start")), session=session)
+        await fetcher.fetch(Request(cookie_server.url("/later")), session=session)
+
+    sent = [[field.encode("latin-1") for field in hop.cookies] for hop in cookie_server.received]  # read as Latin-1
+    assert sent == [[], [b"name=caf\xc3\xa9"], [b"name=caf\xc3\xa9"]]  # on the way, and to a later fetch
+    assert [(cookie.name, cookie.value) for cookie in session.cookies] == [("name", "café")]
