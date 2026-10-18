@@ -1,7 +1,7 @@
 from pernix.fetchers.browser_fetcher import BrowserFetcher
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import Fetcher, StreamingFetcher
-from pernix.fetchers.fetcher_dispatch import BROWSER_FETCHER, FetcherDispatch
+from pernix.fetchers.fetcher_dispatch import BROWSER_FETCHER, FetcherDispatch, is_rendered
 from pernix.fetchers.http_fetcher import HTTPFetcher
 from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings
 from pernix.fetchers.streamed_response import StreamedResponse
@@ -17,4 +17,5 @@ __all__ = [
     "HTTPSettings",
     "StreamedResponse",
     "StreamingFetcher",
+    "is_rendered",
 ]

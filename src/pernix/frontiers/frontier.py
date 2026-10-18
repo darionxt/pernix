@@ -34,6 +34,8 @@ class Lease:
         expires_at: When the Lease ends unless renewed, on the Frontier's clock.
         slot: The concurrency slot of the Request, such as its host.
         request: The Request.
+        rendered: Whether the Request goes to the browser Fetcher, as
+            `pernix.fetchers.is_rendered()` tells.
     """
 
     id: str
@@ -42,6 +44,7 @@ class Lease:
     expires_at: float
     slot: str
     request: Request
+    rendered: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +95,13 @@ class Frontier(Protocol):
         ...
 
     async def claim(
-        self, worker_id: str, limit: int, ttl: float, skip_slots: Collection[str] = frozenset()
+        self,
+        worker_id: str,
+        limit: int,
+        ttl: float,
+        skip_slots: Collection[str] = frozenset(),
+        *,
+        rendered: bool | None = None,
     ) -> list[Lease]:
         """Lease ready Requests: higher priorities first, oldest first within a priority.
 
@@ -101,6 +110,9 @@ class Frontier(Protocol):
             limit: The most Requests to lease, at least 1.
             ttl: Seconds until the Leases expire unless renewed; positive.
             skip_slots: Concurrency slots whose Requests to leave for later.
+            rendered: Lease only the Requests that go to the browser Fetcher, as
+                `pernix.fetchers.is_rendered()` tells of them when they are added
+                (`True`), only the others (`False`), or both (`None`).
 
         Returns:
             The Leases; empty if nothing is ready.

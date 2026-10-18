@@ -75,7 +75,8 @@ class FrontierConformance:
             clock: The clock the Frontier must use for Lease expiry and delays.
 
         Returns:
-            The Frontier, using the default Fingerprint function and host slots.
+            The Frontier, using the default Fingerprint function and host slots, and
+            telling rendered Requests apart with `pernix.fetchers.is_rendered()`.
         """
         raise NotImplementedError
 
@@ -181,6 +182,52 @@ class FrontierConformance:
 
         assert [lease.request.url for lease in leases] == ["https://b.example/1"]
         assert [lease.request.url for lease in later] == ["https://a.example/1", "https://a.example/2"]
+
+    async def test_claims_can_take_only_rendered_requests_or_only_the_others(self, frontier: Frontier) -> None:
+        await frontier.add(
+            [
+                _page(1),
+                _page(2, render=True),
+                _page(3, fetcher="browser"),
+                _page(4, render=True, fetcher="http"),  # the Fetcher it names fetches it
+                _page(5),
+            ]
+        )
+
+        rendered = await frontier.claim("worker-1", 10, TTL, rendered=True)
+        others = await frontier.claim("worker-1", 10, TTL, rendered=False)
+
+        assert [(lease.request.url, lease.rendered) for lease in rendered] == [(f"{URL}2", True), (f"{URL}3", True)]
+        assert [(lease.request.url, lease.rendered) for lease in others] == [
+            (f"{URL}1", False),
+            (f"{URL}4", False),
+            (f"{URL}5", False),
+        ]
+
+    async def test_claims_of_both_kinds_go_by_priority_then_oldest_first(self, frontier: Frontier) -> None:
+        await frontier.add([_page(1), _page(2, render=True), _page(3, priority=5), _page(4, render=True, priority=5)])
+
+        leases = await frontier.claim("worker-1", 10, TTL)
+
+        assert [lease.request.url for lease in leases] == [f"{URL}{n}" for n in (3, 4, 1, 2)]
+
+    async def test_rendered_requests_stay_rendered_when_returned(self, frontier: Frontier) -> None:
+        await frontier.add([_page(1, render=True), _page(2)])
+        [lease] = await frontier.claim("worker-1", 1, TTL, rendered=True)
+
+        assert await frontier.nack(lease)
+
+        assert await frontier.claim("worker-1", 10, TTL, rendered=False) != []
+        [again] = await frontier.claim("worker-1", 10, TTL, rendered=True)
+        assert (again.id, again.rendered, again.attempt) == (lease.id, True, 2)
+
+    async def test_skipped_slots_apply_to_either_kind(self, frontier: Frontier) -> None:
+        await frontier.add([Request("https://a.example/1", render=True), Request("https://b.example/1", render=True)])
+
+        leases = await frontier.claim("worker-1", 10, TTL, skip_slots={"a.example"}, rendered=True)
+
+        assert [lease.request.url for lease in leases] == ["https://b.example/1"]
+        assert [lease.request.url for lease in await frontier.claim("worker-1", 10, TTL)] == ["https://a.example/1"]
 
     @pytest.mark.parametrize(("limit", "ttl"), [(0, TTL), (1, 0.0), (1, -1.0)])
     async def test_invalid_claims_are_rejected(self, frontier: Frontier, limit: int, ttl: float) -> None:

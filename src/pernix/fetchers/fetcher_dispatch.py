@@ -19,10 +19,24 @@ if TYPE_CHECKING:
     from pernix.response import Response
     from pernix.session import Session
 
-__all__ = ["BROWSER_FETCHER", "FetcherDispatch", "Streams", "sending_as", "streaming_into"]
+__all__ = ["BROWSER_FETCHER", "FetcherDispatch", "Streams", "is_rendered", "sending_as", "streaming_into"]
 
 BROWSER_FETCHER = "browser"
 """The name of the Fetcher that renders Requests with `render` set."""
+
+
+def is_rendered(request: Request) -> bool:
+    """Whether a Request goes to the browser Fetcher, as `FetcherDispatch` picks it.
+
+    Args:
+        request: The Request.
+
+    Returns:
+        Whether it names the `browser` Fetcher, or names none and needs rendering.
+    """
+    if request.fetcher is not None:
+        return request.fetcher == BROWSER_FETCHER
+    return bool(request.render)
 
 
 class Streams:
@@ -199,7 +213,7 @@ class FetcherDispatch:
             if request.fetcher not in self._fetchers:
                 raise LookupError(f"{request!r} names the Fetcher {request.fetcher!r}, which is not registered")
             return request.fetcher
-        if request.render:
+        if is_rendered(request):
             if BROWSER_FETCHER not in self._fetchers:
                 raise LookupError(f"{request!r} needs rendering, but the {BROWSER_FETCHER!r} Fetcher is not registered")
             return BROWSER_FETCHER
