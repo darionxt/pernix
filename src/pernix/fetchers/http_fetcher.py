@@ -22,6 +22,7 @@ from pernix.errors import (
     TLSError,
     TooManyRedirects,
 )
+from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.chain_cookies import ChainCookies
 from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.fetcher import request_proxy
@@ -31,7 +32,7 @@ from pernix.fetchers.redirects import Hop, redirect_target, redirected
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
-from pernix.settings import CoreSettings, ResponseSettings, Section
+from pernix.settings import CoreSettings, NetworkSettings, ResponseSettings, Section
 from pernix.urls import with_ascii_host
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from curl_cffi.requests.session import HttpMethod
 
     from pernix.crawler import Crawler
+    from pernix.fetchers.address_guard import PinnedHost
     from pernix.request import Request
     from pernix.session import Session
 
@@ -160,6 +162,13 @@ class HTTPFetcher:
     loopback hosts are reached: each hop is checked before it is sent, and others
     raise `NetworkBlocked`.
 
+    With `network.public_only`, only hosts on public addresses are reached
+    (`pernix.fetchers.address_guard`): each hop is checked before it is sent, its
+    host resolved unless written as an address, and curl connects only to the
+    addresses checked; others raise `NetworkBlocked`. Through a proxy, which
+    resolves hosts itself, only hosts written as addresses, and loopback names,
+    are checked. The hosts of `network.allow_hosts` are not checked.
+
     Attributes:
         schemes: The URL schemes it fetches by default: `http` and `https`.
         settings_sections: Registers `HTTPSettings`.
@@ -174,6 +183,7 @@ class HTTPFetcher:
         *,
         max_clients: int = 16,
         default_encoding: str = "utf-8",
+        network: NetworkSettings | None = None,
     ) -> None:
         """Configure the fetcher.
 
@@ -181,10 +191,14 @@ class HTTPFetcher:
             settings: The HTTP settings; the defaults when `None`.
             max_clients: The maximum number of transfers in flight at once per Profile.
             default_encoding: The `default_encoding` of the Responses.
+            network: Which hosts may be reached; any when `None`.
         """
         self._settings = settings or HTTPSettings()
         self._max_clients = max_clients
         self._default_encoding = default_encoding
+        self._address_guard = (
+            AddressGuard(frozenset(network.allow_hosts)) if network is not None and network.public_only else None
+        )
         self._pool: CurlSessionPool | None = None
 
     @classmethod
@@ -196,12 +210,14 @@ class HTTPFetcher:
 
         Returns:
             A fetcher with the `http.*` settings, allowing `concurrency` transfers in
-            flight, whose Responses use `response.default_encoding`.
+            flight, whose Responses use `response.default_encoding`, reaching the
+            hosts the `network.*` settings allow.
         """
         return cls(
             crawler.settings.section(HTTPSettings),
             max_clients=crawler.settings.section(CoreSettings).concurrency,
             default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
+            network=crawler.settings.section(NetworkSettings),
         )
 
     async def __aenter__(self) -> Self:
@@ -333,9 +349,9 @@ class HTTPFetcher:
         set_cookies: list[str] = []
         redirected_from: str | None = None
         while True:
-            self._check_hop(hop.url, proxy, redirected_from=redirected_from)
+            pinned = await self._check_hop(hop.url, proxy, resolve_timeout=timeout, redirected_from=redirected_from)
             result, transfer = await self._send(
-                curl, hop, cookies, proxy=proxy, profile=profile, curl_timeout=timeout, limit=limit
+                curl, hop, cookies, proxy=proxy, profile=profile, curl_timeout=timeout, limit=limit, pinned=pinned
             )
             set_cookies += _set_cookies(result)
             try:
@@ -351,23 +367,41 @@ class HTTPFetcher:
                 raise TooManyRedirects(f"{request.url} redirected more than http.max_redirects ({max_redirects}) times")
             redirected_from, hop = result.url, redirected(hop, result.status_code, requote_uri(target))
 
-    def _check_hop(self, url: str, proxy: str | None, *, redirected_from: str | None) -> None:
+    async def _check_hop(
+        self, url: str, proxy: str | None, *, resolve_timeout: float, redirected_from: str | None
+    ) -> PinnedHost | None:
         """Refuse a hop of a redirect chain, the first included, before it is sent.
 
-        Under a network guard, a hop to a host the guard does not admit is refused.
+        Under a network guard, a hop to a host the guard does not admit is refused;
+        with `network.public_only`, a hop to a host not on public addresses, which
+        is resolved within `resolve_timeout`.
+
+        Returns:
+            The host and the addresses the hop may connect to, once resolved.
 
         Raises:
-            pernix.errors.NetworkBlocked: The guard refused the hop.
+            pernix.errors.NetworkBlocked: A guard refused the hop.
+            pernix.errors.ConnectError: The host cannot be resolved.
+            pernix.errors.Timeout: Resolving the host took longer than `resolve_timeout`.
         """
         guard = current_guard()
-        if guard is None:
-            return
+        if guard is not None:
+            try:
+                guard.check(url, proxy=proxy)
+            except NetworkBlocked as exc:
+                if redirected_from is None:
+                    raise
+                raise NetworkBlocked(f"the network guard refused the redirect from {redirected_from} to {url}") from exc
+        if self._address_guard is None:
+            return None
+        scope = asyncio.timeout(resolve_timeout)
         try:
-            guard.check(url, proxy=proxy)
-        except NetworkBlocked as exc:
-            if redirected_from is None:
-                raise
-            raise NetworkBlocked(f"the network guard refused the redirect from {redirected_from} to {url}") from exc
+            async with scope:
+                return await self._address_guard.check(url, proxy=proxy, redirected_from=redirected_from)
+        except TimeoutError:
+            if scope.expired():
+                raise Timeout(f"resolving the host of {url} took longer than {resolve_timeout} s") from None
+            raise
 
     async def _send(
         self,
@@ -379,11 +413,13 @@ class HTTPFetcher:
         profile: str,
         curl_timeout: float,
         limit: int | None,
+        pinned: PinnedHost | None,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Send one hop of a redirect chain and wait for its response headers, without following a redirect.
 
         Waiting for the headers is limited precisely with asyncio; once they arrived,
-        curl limits each pause in the body to whole seconds.
+        curl limits each pause in the body to whole seconds. A pinned host is
+        reached at the addresses it was checked at.
         """
         scope = asyncio.timeout(curl_timeout)
         try:
@@ -403,6 +439,7 @@ class HTTPFetcher:
                     timeout=curl_timeout,
                     http_version=_http_version(hop.url),
                     body_limit=limit,
+                    resolve=_resolve_entries(pinned),
                 )
         except TimeoutError:
             if scope.expired():
@@ -493,6 +530,14 @@ def _curl_url(request: Request) -> str:
         return requote_uri(with_ascii_host(request.url))
     except ValueError as exc:
         raise FetchError(str(exc), code=CurlECode.URL_MALFORMAT) from exc
+
+
+def _resolve_entries(pinned: PinnedHost | None) -> list[str]:
+    """The `CURLOPT_RESOLVE` entry pinning a host to the addresses checked, expiring as curl's cached ones do."""
+    if pinned is None:
+        return []
+    addresses = ",".join(f"[{address}]" if ":" in address else address for address in pinned.addresses)
+    return [f"+{pinned.host}:{pinned.port}:{addresses}"]
 
 
 def _set_cookies(response: curl_cffi.Response) -> list[str]:

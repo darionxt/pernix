@@ -7,6 +7,7 @@ from pathlib import PurePath
 from typing import Annotated, Any, Literal
 
 import msgspec
+from msgspec import structs
 
 from pernix.account import ACCOUNT_FILE_SUFFIXES, Account
 from pernix.proxies.proxy import Proxy  # noqa: TC001  # msgspec resolves the field types at runtime
@@ -14,6 +15,7 @@ from pernix.proxies.proxy_url import proxy_url
 from pernix.secret import Secret  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.text_decoding import codec_for
+from pernix.urls import url_host
 
 __all__ = [
     "CORE_SECTIONS",
@@ -28,6 +30,7 @@ __all__ = [
     "FrontierSettings",
     "ItemSettings",
     "LogSettings",
+    "NetworkSettings",
     "ProxySettings",
     "ResponseSettings",
     "RetrySettings",
@@ -258,6 +261,49 @@ class ResponseSettings(Section):
         except LookupError:
             key = self.key("default_encoding")
             raise ValueError(f"{key}: unknown encoding {self.default_encoding!r}") from None
+
+
+class NetworkSettings(Section):
+    """Settings of the hosts Requests may reach.
+
+    Attributes:
+        public_only: Refuse hosts whose addresses are not public: private, loopback,
+            link-local, and others that are not publicly routable, as fetching
+            untrusted links calls for. The HTTP Fetcher resolves the host of every
+            redirect hop, the first included, before it is sent, and connects only
+            to the addresses it checked; through a proxy, which resolves hosts
+            itself, only hosts written as addresses, and loopback names, are
+            checked. The browser Fetcher refuses to render while it is on, as the
+            browser resolves hosts itself. A refused hop raises `NetworkBlocked`.
+        allow_hosts: Host names reached whatever their addresses, such as an
+            internal service, each matched exactly.
+    """
+
+    __prefix__ = "network"
+
+    public_only: bool = False
+    allow_hosts: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        hosts: list[str] = []
+        for host in self.allow_hosts:
+            name = _host_name(host)
+            if name is None:
+                raise ValueError(
+                    f"{self.key('allow_hosts')}: {host!r} is not a host name; write one alone, such as "
+                    "'wiki.example', without a scheme or a port"
+                )
+            hosts.append(name)
+        structs.force_setattr(self, "allow_hosts", tuple(hosts))
+
+
+def _host_name(host: str) -> str | None:
+    """A host name as `pernix.urls.url_host()` reads it from a URL; `None` for anything but a host alone."""
+    host = host.strip()
+    bracketed = host.startswith("[") and host.endswith("]")
+    if not host or any(char in host for char in "/?#@\\") or (":" in host and not bracketed):
+        return None
+    return url_host(f"//{host}")
 
 
 class FrontierSettings(Section):
@@ -493,6 +539,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     CoreSettings,
     EventSettings,
     ResponseSettings,
+    NetworkSettings,
     FrontierSettings,
     FingerprintSettings,
     RetrySettings,

@@ -146,7 +146,11 @@ class DecodeError(FetchError):
 
 
 class NetworkBlocked(FetchError):
-    """A network guard, such as the one tests run under, refused a host other than a loopback one."""
+    """A network guard refused a host: the one tests run under, which admits loopback hosts only, or `network.public_only`.
+
+    The address guard of `network.public_only` admits hosts on public addresses only.
+    The default retry policy does not retry it, as it is refused again the same way.
+    """
 
 
 class ActionError(FetchError):
