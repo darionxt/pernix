@@ -12,14 +12,18 @@ from pernix.engine import Engine
 from pernix.errors import CONFIGURATION_ERRORS, ComponentError, SettingsError
 from pernix.events import StatsSnapshot
 from pernix.feeds import Feed, render_path
-from pernix.fetchers import FetcherDispatch
+from pernix.fetchers import FetcherDispatch, HTTPFetcher, HTTPSettings
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier
 from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
+from pernix.proxies import MemoryProxyPool
+from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies
+from pernix.proxies.run_proxies import RunProxies
 from pernix.retry_policy import DefaultRetryPolicy
+from pernix.sending import IndependentSending
 from pernix.session import Session
 from pernix.sessions import MemorySessionPool
 from pernix.sessions.session_leasing import SessionLeasing
@@ -32,6 +36,7 @@ from pernix.settings import (
     FingerprintSettings,
     FrontierSettings,
     ItemSettings,
+    ProxySettings,
     RetrySettings,
     SessionSettings,
     StatsSettings,
@@ -49,6 +54,7 @@ if TYPE_CHECKING:
     from pernix.frontiers import Frontier
     from pernix.logs import RunLog
     from pernix.middlewares import Download
+    from pernix.proxies import ProxyProvider
     from pernix.request import Request
     from pernix.retry_policy import RetryPolicy
     from pernix.spider import Spider
@@ -105,8 +111,8 @@ class RunAssembly:
 
     Attributes:
         components: The components to subscribe and open, in order: Stats Sinks,
-            Extensions, Fetchers, download Middleware, spider Middleware, Pipelines,
-            and failure Pipelines.
+            Extensions, the sources of proxies and the proxies, Fetchers, download
+            Middleware, spider Middleware, Pipelines, and failure Pipelines.
         feeds: The Feeds, opened after the components.
         items: Takes the Items through the Pipelines into the Feeds.
         frontier: Holds the Requests of the Run.
@@ -137,12 +143,12 @@ class RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
         The Crawler's Addons register their subscribers first. Then the components
-        are built with `crawler.build_component()`: Stats Sinks, Extensions, Fetchers,
-        download Middleware, spider Middleware, Pipelines, failure Pipelines, Feeds,
-        the Fingerprint function, and the retry policy; the download and spider
-        chains and the Pipelines are checked. Steps that do not depend on each other
-        all run, so their problems are reported together. The core stats and the
-        Stats Sinks are subscribed.
+        are built with `crawler.build_component()`: Stats Sinks, Extensions, the
+        proxies and their provider, Fetchers, download Middleware, spider
+        Middleware, Pipelines, failure Pipelines, Feeds, the Fingerprint function,
+        and the retry policy; the download and spider chains and the Pipelines are
+        checked. Steps that do not depend on each other all run, so their problems
+        are reported together. The core stats and the Stats Sinks are subscribed.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
@@ -168,6 +174,7 @@ class RunAssembly:
             problems.attempt(setup_addon, addon, events=events, settings=settings)
         sinks = problems.attempt(_build_sinks, crawler)
         extensions = problems.attempt(_build_all, crawler, "extensions")
+        proxying = problems.attempt(_proxying, crawler, run_log)
         downloading = problems.attempt(DownloadAssembly.build, crawler)
         spider_middlewares = problems.attempt(_build_all, crawler, "spider_middlewares")
         pipelines = problems.attempt(_build_all, crawler, "pipelines")
@@ -185,6 +192,7 @@ class RunAssembly:
             problems.found
             or sinks is None
             or extensions is None
+            or proxying is None
             or downloading is None
             or spider_middlewares is None
             or pipelines is None
@@ -199,7 +207,11 @@ class RunAssembly:
         core_stats = CoreStats(crawler.stats)
         frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
-        sessions = _session_leasing(settings.section(SessionSettings), crawler.stats, crawler.spider, accounts)
+        proxies = proxying.proxies
+        sessions = _session_leasing(
+            settings.section(SessionSettings), crawler.stats, crawler.spider, accounts, proxies=proxies
+        )
+        sender = sessions or IndependentSending(proxies)
         download = core_stats.count_downloads(downloading.download)
         engine = Engine(
             crawler.spider,
@@ -212,7 +224,7 @@ class RunAssembly:
             lease_ttl=settings.section(FrontierSettings).lease_ttl,
             retry_policy=retry_policy,
             throttle=throttle,
-            sessions=sessions,
+            sender=sender,
         )
         inline_fetch = InlineFetch(
             download=download,
@@ -220,7 +232,7 @@ class RunAssembly:
             retry_policy=retry_policy,
             events=events,
             stats=crawler.stats,
-            sessions=sessions,
+            sender=sender,
         )
         events.subscribe_methods(core_stats)
         for sink in sinks:
@@ -228,6 +240,7 @@ class RunAssembly:
         components = (
             *sinks,
             *extensions,
+            *proxying.components,
             *downloading.components,
             *spider_middlewares,
             *pipelines,
@@ -240,17 +253,76 @@ class RunAssembly:
             frontier=frontier,
             engine=engine,
             inline_fetch=inline_fetch,
-            reporter=_reporter(crawler, frontier, throttle, run_log),
+            reporter=_reporter(crawler, frontier, throttle, run_log, proxying.pool),
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Proxying:
+    """The Run's proxies, if it has any, their pool, and the components to open for them, in order."""
+
+    proxies: RunProxies | None = None
+    pool: MemoryProxyPool | None = None
+    components: tuple[object, ...] = ()
+
+
+def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
+    """The proxies of the `proxies.*` settings, from each source set, kept in a pool in this process.
+
+    The API and the provider are opened before the proxies, which load them.
+    """
+    options = crawler.settings.section(ProxySettings)
+    if not options.enabled:
+        return _Proxying()
+    sources: list[tuple[str, ProxyProvider]] = []
+    opened: list[object] = []
+    if options.urls:
+        sources.append((ProxySettings.key("urls"), StaticProxies(options.urls)))
+    if options.file is not None:
+        sources.append((ProxySettings.key("file"), ProxyFile(options.file)))
+    if options.api is not None:
+        api = ProxyAPI(options.api, HTTPFetcher(_http_settings(crawler)))
+        sources.append((ProxySettings.key("api"), api))
+        opened.append(api)
+    if options.provider is not None:
+        provider = crawler.build_component(options.provider)
+        if not callable(getattr(provider, "proxies", None)):
+            raise ComponentError(f"proxies.provider must have proxies(), got {provider!r}")
+        sources.append((ProxySettings.key("provider"), cast("ProxyProvider", provider)))
+        opened.append(provider)
+    pool = MemoryProxyPool(
+        cooldown=options.cooldown,
+        cooldown_max=options.cooldown_max,
+        max_failures=options.max_failures,
+        stats=crawler.stats,
+    )
+    proxies = RunProxies(
+        pool, sources, refresh=options.refresh, stats=crawler.stats, stop=crawler.stop, mask=run_log.mask
+    )
+    return _Proxying(proxies, pool, (*opened, proxies))
+
+
+def _http_settings(crawler: Crawler) -> HTTPSettings:
+    """The `http.*` settings, or their defaults when no Fetcher registers them."""
+    try:
+        return crawler.settings.section(HTTPSettings)
+    except KeyError:
+        return HTTPSettings()
+
+
 def _session_leasing(
-    settings: SessionSettings, stats: Stats, spider: Spider, accounts: Sequence[Account]
+    settings: SessionSettings,
+    stats: Stats,
+    spider: Spider,
+    accounts: Sequence[Account],
+    *,
+    proxies: RunProxies | None,
 ) -> SessionLeasing | None:
     """The leasing of the Run's Session Pool, held in this process; `None` when Requests are independent.
 
     With Accounts, the pool holds one Session per Account, under its id, and no
-    other. Sessions log in if the Spider defines `login()`.
+    other. Sessions log in if the Spider defines `login()`, and are bound to the
+    Run's proxies, if it has any.
     """
     logs_in = overrides(spider.login)
     if not settings.enabled:
@@ -282,7 +354,7 @@ def _session_leasing(
     for account in accounts:
         pool.add(Session(account.id, account=account.id), max_concurrency=account.max_concurrency)
     login = SessionLogin(spider.login, spider.is_logged_out, accounts=accounts) if logs_in else None
-    return SessionLeasing(pool, settings, stats=stats, login=login)
+    return SessionLeasing(pool, settings, stats=stats, login=login, proxies=proxies)
 
 
 class _Problems:
@@ -422,13 +494,17 @@ def _retry_policy(crawler: Crawler) -> RetryPolicy:
     return cast("RetryPolicy", policy)
 
 
-def _reporter(crawler: Crawler, frontier: Frontier, throttle: Throttle, run_log: RunLog) -> StatsReporter:
-    """The reporter of the Run's stats, reading the Frontier, the Throttle, and the log counts."""
+def _reporter(
+    crawler: Crawler, frontier: Frontier, throttle: Throttle, run_log: RunLog, proxies: MemoryProxyPool | None
+) -> StatsReporter:
+    """The reporter of the Run's stats, reading the Frontier, the Throttle, the proxies, and the log counts."""
     gauges: dict[str, Gauge] = {
         "frontier": frontier.counts,
         "throttle": lambda: throttle.stats,
         "log": lambda: run_log.counts,
     }
+    if proxies is not None:
+        gauges["proxies"] = proxies.counts
     interval = crawler.settings.section(StatsSettings).interval
     run = RunContext(crawler.run_id, crawler.spider.name)
     return StatsReporter(crawler.stats, crawler.events, run, interval=interval, gauges=gauges)

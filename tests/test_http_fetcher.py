@@ -335,6 +335,15 @@ async def test_a_407_from_a_proxy_is_a_proxy_error(server: LoopbackServer) -> No
     assert response.status == 407
 
 
+@pytest.mark.parametrize("url", ["http://pernix.test/", "https://pernix.test/"])
+async def test_a_proxy_that_cannot_be_reached_is_a_proxy_error(refused_proxy: str, url: str) -> None:
+    async with HTTPFetcher() as fetcher:
+        with pytest.raises(ProxyError) as refused:
+            await fetcher.fetch(Request(url, proxy=refused_proxy))
+
+    assert refused.value.code == 7  # curl could not connect, to the proxy, the only host it connects to
+
+
 async def test_cancelled_fetches_stop_their_transfers_and_free_the_handle(server: LoopbackServer) -> None:
     def slow(_request: ReceivedRequest) -> Reply:
         time.sleep(3)

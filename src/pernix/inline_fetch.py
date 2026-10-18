@@ -15,7 +15,8 @@ from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
 from pernix.frontiers import host_slot
 from pernix.response import Response, expect_response
 from pernix.retry_policy import Action, consult
-from pernix.sessions.session_leasing import NoSessionYet, sending_session, sending_with
+from pernix.sending import IndependentSending, NotYet
+from pernix.sessions.session_leasing import sending_session
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download
     from pernix.request import Request
     from pernix.retry_policy import Decision, RetryPolicy
-    from pernix.sessions.session_leasing import Sending, SessionLeasing
+    from pernix.sending import Sender, Sending
     from pernix.stats import Stats
     from pernix.throttle import Throttle
 
@@ -72,7 +73,9 @@ class InlineFetch:
     `RequestRetried`. Each attempt takes its place in its slot, then, with a Session
     Pool, leases a Session, waiting for one in place, but giving up its place now and
     then meanwhile, then waits for the slot's delay and rate; a Session that must log
-    in does so first, in the fetch's place. A Request without a Session continues
+    in does so first, in the fetch's place. With the Run's proxies, each attempt goes
+    through its Session's proxy, or without a Session through the next one, waiting
+    in place while none is available. A Request without a Session continues
     the Session of the fetch it is nested in, or of the Request being handled, if it
     has one; a fetch nested in another of the same Session, in the same task, shares
     its Lease. A Response that shows the Session logged out is retried as for
@@ -97,7 +100,7 @@ class InlineFetch:
         events: EventBus,
         stats: Stats,
         slot_of: Callable[[Request], str] = host_slot,
-        sessions: SessionLeasing | None = None,
+        sender: Sender | None = None,
     ) -> None:
         """Wire the Inline Fetch to the Run's collaborators.
 
@@ -108,7 +111,8 @@ class InlineFetch:
             events: Where `RequestRetried` is emitted.
             stats: Where streamed body bytes are counted, as `downloads.bytes`.
             slot_of: Computes the concurrency slot of a Request.
-            sessions: Leases Sessions from the Session Pool; `None` without one.
+            sender: Sends each Request, under a Session leased from the Session
+                Pool or as it is; `IndependentSending()` when `None`.
         """
         self._download = download
         self._throttle = throttle
@@ -116,7 +120,7 @@ class InlineFetch:
         self._events = events
         self._stats = stats
         self._slot_of = slot_of
-        self._sessions = sessions
+        self._sender = sender or IndependentSending()
 
     async def fetch(self, request: Request) -> Response:
         """Fetch a Request, retrying in place, and return its Response.
@@ -204,8 +208,8 @@ class InlineFetch:
             async with AsyncExitStack() as held:
                 await held.enter_async_context(self._placed(slot))
                 try:
-                    sending = await held.enter_async_context(sending_with(self._sessions, request, wait=_SESSION_WAIT))
-                except NoSessionYet as busy:
+                    sending = await held.enter_async_context(self._sender.sending(request, wait=_SESSION_WAIT))
+                except NotYet as busy:
                     later = busy.delay
                 else:
                     await self._paced(slot)

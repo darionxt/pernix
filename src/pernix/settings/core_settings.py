@@ -9,6 +9,8 @@ from typing import Annotated, Any, Literal
 import msgspec
 
 from pernix.account import ACCOUNT_FILE_SUFFIXES, Account
+from pernix.proxies.proxy_url import proxy_url
+from pernix.secret import Secret  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.text_decoding import codec_for
 
@@ -25,6 +27,7 @@ __all__ = [
     "FrontierSettings",
     "ItemSettings",
     "LogSettings",
+    "ProxySettings",
     "ResponseSettings",
     "RetrySettings",
     "SessionSettings",
@@ -112,7 +115,7 @@ class SessionSettings(Section):
     """Settings of the Session Pool that Requests lease Sessions from.
 
     It is off by default, as Requests are independent (ADR 0011). Once enabled,
-    every Request leases a Session, except those rendered in the browser. With
+    every Request leases a Session, rendered or not. With
     Accounts, the pool holds one Session per Account, and no other.
 
     Attributes:
@@ -160,6 +163,63 @@ class SessionSettings(Section):
                 f"{self.key('accounts_file')}: Accounts are read from "
                 f"{', '.join(sorted(ACCOUNT_FILE_SUFFIXES))} files, not {self.accounts_file.name!r}"
             )
+
+
+class ProxySettings(Section):
+    """Settings of the proxies Requests are sent through.
+
+    Proxies are used once a source is set; the proxies of every source are used
+    together. A Session is bound to one, which it goes through while it is
+    available, and a Request without a Session goes through the next one, in turn;
+    `Request(proxy=...)` goes through its own instead. A proxy that fails cools
+    down, longer with each failure in a row, and is Retired after `max_failures` in
+    a row. A proxy is a URL such as `http://user:password@proxy:8080`, or
+    `proxy:8080` for HTTP, with its port; its key is all of it, so that sticky
+    sessions on one gateway, which differ only in their credentials, stay apart.
+
+    Attributes:
+        urls: Proxies to use.
+        file: A text file of more proxies, one per line, read when the Run starts
+            and at each refresh; blank lines and those starting with `#` are
+            skipped. See `pernix.proxies.read_proxies()`.
+        api: The URL of an API answering with more proxies, one per line, fetched
+            when the Run starts and at each refresh, as a proxy vendor's does.
+        provider: A `pernix.proxies.ProxyProvider` giving more proxies, as an
+            object, a class building one, or an import path.
+        refresh: Seconds between loads of the file, the API, and the provider,
+            whose proxies then replace those they gave before; `None` to load them
+            once, when the Run starts.
+        cooldown: Seconds a proxy cools down after it failed, doubled with each
+            failure in a row.
+        cooldown_max: The longest a proxy cools down.
+        max_failures: Failures in a row after which a proxy is Retired.
+    """
+
+    __prefix__ = "proxies"
+
+    urls: tuple[str, ...] = ()
+    file: PurePath | None = None
+    api: Secret | None = None
+    provider: Any = None
+    refresh: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    cooldown: Annotated[float, msgspec.Meta(ge=0)] = 60.0
+    cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 600.0
+    max_failures: Annotated[int, msgspec.Meta(ge=1)] = 5
+
+    def __post_init__(self) -> None:
+        problems: list[str] = []
+        for index, url in enumerate(self.urls):
+            try:
+                proxy_url(url)
+            except ValueError as exc:
+                problems.append(f"{self.key('urls')}[{index}]: {exc}")
+        if problems:
+            raise ValueError("; ".join(problems))
+
+    @property
+    def enabled(self) -> bool:
+        """Whether a source of proxies is set."""
+        return bool(self.urls) or self.file is not None or self.api is not None or self.provider is not None
 
 
 class ResponseSettings(Section):
@@ -421,6 +481,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     RetrySettings,
     DomainSettings,
     SessionSettings,
+    ProxySettings,
     ItemSettings,
     FeedSettings,
     LogSettings,

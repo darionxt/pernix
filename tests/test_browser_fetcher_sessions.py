@@ -236,6 +236,17 @@ async def test_a_cookie_a_page_set_over_a_requests_own_is_kept_as_the_page_set_i
     assert (sid.value, sid.secure, sid.http_only, sid.expires) == ("new", False, False, None)
 
 
+async def test_an_empty_proxy_loads_a_page_without_the_sessions(server: LoopbackServer, refused_proxy: str) -> None:
+    server.route("/", "<p>direct</p>", headers=HTML)
+
+    async with BrowserFetcher() as fetcher:
+        response = await fetcher.fetch(
+            _render(server.url("/"), proxy=""), session=Session("alice", proxy=refused_proxy)
+        )
+
+    assert response.css("p::text").get() == "direct"
+
+
 async def test_the_pages_a_page_opened_are_closed_with_it(server: LoopbackServer) -> None:
     server.route("/", "<script>window.open('/popup')</script><p>opener</p>", headers=HTML)
     server.route(

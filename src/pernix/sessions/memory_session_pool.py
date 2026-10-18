@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+import msgspec
+
 from pernix.cookie_jar import Cookie, CookieKey, cookie_key
 from pernix.errors import SessionError
 from pernix.session import Session, SessionState
@@ -90,6 +92,8 @@ class _Entry:
                 self.local_storage[origin] = dict(items)
             else:
                 self.local_storage.pop(origin, None)
+        if delta.proxy is not msgspec.UNSET:
+            self.proxy = delta.proxy
 
 
 class MemorySessionPool:

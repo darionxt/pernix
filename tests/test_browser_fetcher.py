@@ -348,6 +348,16 @@ async def test_other_hosts_are_refused_before_the_browser_starts() -> None:
     assert launched is None
 
 
+async def test_a_socks_proxy_with_credentials_is_refused_before_the_browser_starts() -> None:
+    async with BrowserFetcher() as fetcher:
+        with pytest.raises(ValueError, match="SOCKS proxy with credentials") as refused:
+            await fetcher.fetch(_render("http://pernix.test/", proxy="socks5://user:secret-pw@127.0.0.1:1080"))
+        launched = fetcher._launch  # pyright: ignore[reportPrivateUsage]
+
+    assert launched is None
+    assert "secret-pw" not in str(refused.value)
+
+
 async def test_a_loopback_proxy_takes_requests_to_any_host(server: LoopbackServer) -> None:
     server.route("/", "<p>proxied</p>", headers=[("Content-Type", "text/html")])
 

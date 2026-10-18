@@ -86,11 +86,14 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
         removed: The cookies removed.
         local_storage: The origins whose localStorage changed, each with all of it;
             an empty one for an origin cleared.
+        proxy: The proxy the Session was bound to instead of its own, or `None`
+            when it was unbound; unset when it kept its proxy.
     """
 
     cookies: list[Cookie] = msgspec.field(default_factory=list[Cookie])
     removed: list[CookieRemoval] = msgspec.field(default_factory=list[CookieRemoval])
     local_storage: dict[str, dict[str, str]] = msgspec.field(default_factory=dict[str, dict[str, str]])
+    proxy: str | msgspec.UnsetType | None = msgspec.UNSET
 
     @classmethod
     def between(
@@ -132,12 +135,13 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
                 if key not in new
             ],
             local_storage=storage,
+            proxy=msgspec.UNSET if after.proxy == before.proxy else after.proxy,
         )
 
     @property
     def empty(self) -> bool:
         """Whether the delta changes nothing."""
-        return not (self.cookies or self.removed or self.local_storage)
+        return not (self.cookies or self.removed or self.local_storage) and self.proxy is msgspec.UNSET
 
 
 class SessionPool(Protocol):

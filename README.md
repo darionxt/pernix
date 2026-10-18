@@ -116,6 +116,22 @@ With Accounts, the pool holds one Session per Account, under its id, and no othe
 
 `login()` runs before a Session is first used, in the fetch that leases it, and fetches that want the same Session wait for it to finish, so each Session logs in once at a time; the Inline Fetches it makes, over HTTP or rendered, are sent under the Session. Sessions without an Account log in too, with `account=None`. A Response that `is_logged_out()`, a 401 by default, has its Session log in again, and the Request is retried at once, counting as a retry. A login that raises cools its Session down for `sessions.cooldown` and is tried again; after `sessions.login_attempts` failures in a row the Session is Retired. See [`docs/design.md`](docs/design.md) §5.3.
 
+## Proxies
+
+```python
+class Shop(Spider):
+    start_urls = ["https://shop.example/"]
+    settings = {
+        "proxies.urls": ["http://user-session-a1:pw@gate.example:7777", "http://user-session-b2:pw@gate.example:7777"],
+        "proxies.api": "https://vendor.example/proxies?key=...",  # one per line, fetched again every refresh
+        "proxies.refresh": 300,
+    }
+```
+
+Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart.
+
+Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available, and Sessions share one only when there are more of them than proxies. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats. See [`docs/design.md`](docs/design.md) §5.3.
+
 ## Running and stopping
 
 ```python
@@ -210,6 +226,11 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `sessions.lease_ttl` | `300.0` | Seconds a Session stays leased without renewal; leases are renewed while their fetch runs |
 | `sessions.accounts` / `sessions.accounts_file` | `()` / none | Accounts to bind Sessions to, and a JSON Lines or CSV file of more |
 | `sessions.login_attempts` | `3` | Failed logins in a row after which a Session is Retired |
+| `proxies.urls` | `()` | Proxies Requests go through, such as `http://user:password@proxy:8080` |
+| `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`), and a `ProxyProvider` |
+| `proxies.refresh` | `None` | Seconds between loads of the file, the API, and the provider; `None` loads them once |
+| `proxies.cooldown` / `proxies.cooldown_max` | `60.0` / `600.0` | Seconds a failed proxy cools down, doubled with each failure in a row, and the longest it does |
+| `proxies.max_failures` | `5` | Failures in a row after which a proxy is Retired |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -345,6 +366,7 @@ src/pernix/
 ├── engine.py            worker loop: claim, process, settle Leases; idle detection, Drain
 ├── request_processor.py one attempt at a Request: fetch, retry decision, Callbacks
 ├── inline_fetch.py      Inline Fetch: fetching in place, retried in place, and streamed
+├── sending.py           how a Request is sent: as it is, or through the Run's next proxy; Sender
 ├── shutdown.py          Drain, its grace period, and Force Stop
 ├── runner.py            run() as a program: exit codes
 ├── __main__.py          python -m pernix
@@ -425,8 +447,14 @@ src/pernix/
 ├── sessions/
 │   ├── session_pool.py  SessionPool protocol, SessionLease, Outcome, StateDelta
 │   ├── memory_session_pool.py MemorySessionPool: the in-process pool of a Run
-│   ├── session_leasing.py leases a Session per fetch, logs it in, reports how it fared, saves its changes
+│   ├── session_leasing.py leases a Session per fetch, binds its proxy, logs it in, reports how it fared, saves its changes
 │   └── session_login.py logs Sessions in with the Spider's login, judges logged-out Responses
+├── proxies/
+│   ├── proxy_url.py     proxy URLs, in the one form that tells proxies apart
+│   ├── proxy_pool.py    ProxyPool protocol, ProxyHealth, ProxyCounts
+│   ├── memory_proxy_pool.py MemoryProxyPool: turns, bindings, cooldowns, and Retirements
+│   ├── proxy_sources.py ProxyProvider protocol; lists, files, and APIs of proxies
+│   └── run_proxies.py   the proxies of a Run: loaded, refreshed, given to fetches, and reported on
 ├── stats/
 │   ├── stats.py         Stats, the counters and values of a Run
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items

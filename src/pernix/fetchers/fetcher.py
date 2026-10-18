@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from pernix.response import Response
     from pernix.session import Session
 
-__all__ = ["Fetcher", "StreamingFetcher"]
+__all__ = ["Fetcher", "StreamingFetcher", "request_proxy"]
 
 
 class Fetcher(Protocol):
@@ -70,3 +70,18 @@ class StreamingFetcher(Fetcher, Protocol):
             and ending the transfer on exit.
         """
         ...
+
+
+def request_proxy(request: Request, session: Session | None) -> str | None:
+    """Return the proxy a Request goes through: its own, else its Session's.
+
+    Args:
+        request: The Request; an empty `proxy` sends it without one, whatever its
+            Session's.
+        session: The Session it is sent under, if any.
+
+    Returns:
+        The proxy URL, or `None` for none.
+    """
+    proxy = request.proxy if request.proxy is not None else (None if session is None else session.proxy)
+    return proxy or None

@@ -6,14 +6,15 @@ import asyncio
 import datetime as dt
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from pernix.errors import IgnoreRequest, LoginExpired, ProxyError, SessionError
+from pernix.errors import IgnoreRequest, LoginExpired, ProxyError
 from pernix.fetchers.fetcher_dispatch import sending_as
 from pernix.retry_policy import retry_after_seconds
+from pernix.sending import NotYet, Sending
 from pernix.session import Session, SessionState
 from pernix.sessions.session_pool import Outcome, OutcomeKind, StateDelta
 
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
     from contextlib import AbstractAsyncContextManager
 
+    from pernix.proxies.run_proxies import RunProxies
     from pernix.request import Request
     from pernix.response import Response
     from pernix.sessions.session_login import SessionLogin
@@ -28,7 +30,7 @@ if TYPE_CHECKING:
     from pernix.settings import SessionSettings
     from pernix.stats import Stats
 
-__all__ = ["NoSessionYet", "Sending", "SessionLeasing", "sending_session", "sending_with"]
+__all__ = ["NoSessionYet", "SessionLeasing", "sending_session"]
 
 logger = logging.getLogger(__name__)
 
@@ -60,62 +62,17 @@ _held: ContextVar[tuple[_Held, ...]] = ContextVar("pernix_held_sessions", defaul
 """The Sessions held by the fetches the current code runs inside of, innermost last."""
 
 
-class NoSessionYet(Exception):
-    """No Session could be leased in time, or the one leased failed to log in; the Request is to wait elsewhere.
-
-    Attributes:
-        delay: Seconds until a Session that fits stops cooling down; 0 if one is
-            only busy.
-    """
+class NoSessionYet(NotYet):
+    """No Session could be leased in time, or the one leased failed to log in; the Request is to wait elsewhere."""
 
     def __init__(self, delay: float) -> None:
         """Create the signal.
 
         Args:
-            delay: Seconds to wait.
+            delay: Seconds until a Session that fits stops cooling down; 0 if one
+                is only busy.
         """
-        super().__init__(f"no Session could be leased; one may be in {delay:.2f} s")
-        self.delay = delay
-
-
-@dataclass(slots=True)
-class Sending:
-    """A Request on its way, under the Session leased for it, if any.
-
-    Attributes:
-        request: The Request, naming the Session it is sent under.
-        session: The Session; `None` for a Request sent without one.
-        response: The Response, once it arrived, which tells how the Session fared.
-        error: The exception the fetch failed with, for a caller that handles it
-            inside the block, which tells how the Session fared too.
-        is_logged_out: Whether a Response shows the Session logged out; `None`
-            when no Response is judged, as without a login, or during one.
-        nested: Whether the fetch shares the Lease of a fetch it is nested in, such
-            as one a download Middleware makes. Its Session logs in again only once
-            that fetch ends, so a `LoginExpired` is for that fetch to retry.
-    """
-
-    request: Request
-    session: Session | None = None
-    response: Response | None = None
-    error: BaseException | None = None
-    is_logged_out: Callable[[Response], bool] | None = field(default=None, repr=False)
-    nested: bool = False
-
-    def received(self, response: Response) -> None:
-        """Record the Response the fetch got.
-
-        Args:
-            response: The Response.
-
-        Raises:
-            pernix.errors.LoginExpired: The Response shows the Session logged out;
-                it is recorded as the `error` too.
-        """
-        self.response = response
-        if self.is_logged_out is not None and self.is_logged_out(response):
-            self.error = LoginExpired(response)
-            raise self.error
+        super().__init__(delay, "no Session available")
 
 
 class SessionLeasing:
@@ -132,6 +89,12 @@ class SessionLeasing:
     as one a download Middleware makes, shares the outer fetch's Lease and Session;
     the Lease is released with the most severe outcome of them all, so a 429 one of
     them got cools the Session down.
+
+    With the Run's proxies, a Session goes through the proxy it is bound to while
+    that is available, and is bound to another, before its fetch and its login,
+    once it is not; the binding is saved with its state. How each fetch under it went
+    through the proxy is reported, unless the Request named its own proxy. When no
+    proxy is available, the Lease is released, and the Request waits elsewhere.
 
     With a login, a fetch whose Lease must log its Session in runs the login first,
     in the fetch's task, where the fetches the login makes share the Lease and are
@@ -150,6 +113,7 @@ class SessionLeasing:
         *,
         stats: Stats,
         login: SessionLogin | None = None,
+        proxies: RunProxies | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """Wire the leasing to its pool.
@@ -160,12 +124,15 @@ class SessionLeasing:
             stats: Where Leases, logins, and outcomes are counted.
             login: Logs Sessions in, and judges the Responses fetched under them;
                 `None` when Sessions do not log in.
+            proxies: The Run's proxies, which Sessions are bound to; `None` without
+                any.
             clock: The current time, in seconds since the epoch.
         """
         self.pool = pool
         self._settings = settings
         self._stats = stats
         self._login = login
+        self._proxies = proxies
         self._clock = clock
 
     @asynccontextmanager
@@ -185,6 +152,8 @@ class SessionLeasing:
         Raises:
             NoSessionYet: No Session could be leased within `wait`, or the one
                 leased failed to log in.
+            pernix.proxies.run_proxies.NoProxyYet: No proxy is available for the
+                Session leased.
             pernix.errors.SessionError: No Session can ever be leased for the
                 Request.
         """
@@ -193,8 +162,9 @@ class SessionLeasing:
             shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
             failure: BaseException | None = None
             try:
-                with sending_as(held.session):
-                    yield shared
+                async with self._reporting(shared):
+                    with sending_as(held.session):
+                        yield shared
             except BaseException as exc:
                 failure = exc
                 raise
@@ -207,10 +177,12 @@ class SessionLeasing:
         self._stats.inc("sessions.leased")
         try:
             before = await self.pool.load_state(lease)
+            session = Session.from_state(lease.session, before)
+            if self._proxies is not None:
+                session.proxy = await self._proxies.bind(session.id, session.proxy)
         except BaseException:
             await self.pool.release(lease, Outcome("ok"))
             raise
-        session = Session.from_state(lease.session, before)
         renewing = asyncio.create_task(self._renew(lease))
         holding = _Held(self, session, asyncio.current_task(), logging_in=lease.must_log_in)
         token = _held.set((*_held.get(), holding))
@@ -220,8 +192,9 @@ class SessionLeasing:
             sending = Sending(request.replace(session=lease.session), session, is_logged_out=self._judge(holding))
             error: BaseException | None = None
             try:
-                with sending_as(session):
-                    yield sending
+                async with self._reporting(sending):
+                    with sending_as(session):
+                        yield sending
             except BaseException as exc:
                 error = exc
                 raise
@@ -306,6 +279,13 @@ class SessionLeasing:
                 sending.request,
             )
 
+    def _reporting(self, sending: Sending) -> AbstractAsyncContextManager[None]:
+        """Report how a fetch went through its Session's proxy, unless the Request names its own."""
+        proxy = None if sending.session is None else sending.session.proxy
+        if self._proxies is None or proxy is None or sending.request.proxy is not None:
+            return nullcontext()
+        return self._proxies.reporting(proxy, sending)
+
     def _judge(self, held: _Held) -> Callable[[Response], bool] | None:
         """How the Responses fetched under a held Session are judged logged out; `None` during its login, or without one."""
         if self._login is None or held.logging_in:
@@ -341,39 +321,6 @@ def sending_session() -> str | None:
     """
     task = asyncio.current_task()
     return next((held.session.id for held in reversed(_held.get()) if held.task is task), None)
-
-
-def sending_with(
-    leasing: SessionLeasing | None, request: Request, *, wait: float | None
-) -> AbstractAsyncContextManager[Sending]:
-    """Send a Request under a Session leased for it inside the block, or under none without a Session Pool.
-
-    Args:
-        leasing: The Run's Session leasing; `None` without a Session Pool.
-        request: The Request.
-        wait: Seconds to wait for a Session; `None` to wait as long as it takes.
-
-    Returns:
-        An async context manager giving the Request as it is to be sent, and its
-        Session; see `SessionLeasing.sending()`.
-
-    Raises:
-        pernix.errors.SessionError: The Request names a Session, but no Session
-            Pool is enabled.
-    """
-    if leasing is not None:
-        return leasing.sending(request, wait=wait)
-    if request.session is not None:
-        raise SessionError(
-            f"{request!r} names the Session {request.session!r}, but no Session Pool is enabled; "
-            "enable one with sessions.enabled"
-        )
-    return _without_session(request)
-
-
-@asynccontextmanager
-async def _without_session(request: Request) -> AsyncGenerator[Sending]:
-    yield Sending(request)
 
 
 def _held_by(leasing: SessionLeasing, session: str | None) -> _Held | None:

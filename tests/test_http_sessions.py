@@ -191,6 +191,18 @@ async def test_the_session_proxy_applies_unless_the_request_names_its_own(
     assert [hop.path for hop in other_server.received] == ["/via-request"]
 
 
+async def test_an_empty_proxy_sends_a_request_without_the_sessions(
+    cookie_server: CookieServer, other_server: CookieServer
+) -> None:
+    session = Session(proxy=other_server.proxy)
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(cookie_server.url("/direct"), proxy=""), session=session)
+
+    assert [hop.path for hop in cookie_server.received] == ["/direct"]
+    assert other_server.received == []
+
+
 async def test_the_session_profile_applies_unless_the_request_names_its_own(cookie_server: CookieServer) -> None:
     session = Session(profile="firefox147")
 
