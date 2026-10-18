@@ -766,6 +766,7 @@ browser = [
 dev = [
     { name = "attrs" },
     { name = "brotli" },
+    { name = "cryptography" },
     { name = "h2" },
     { name = "pernix", extra = ["browser"] },
     { name = "pydantic" },
@@ -781,7 +782,7 @@ dev = [
 requires-dist = [
     { name = "ada-url", specifier = ">=4.0" },
     { name = "charset-normalizer", specifier = ">=3.4" },
-    { name = "curl-cffi", specifier = ">=0.16.3" },
+    { name = "curl-cffi", specifier = "==0.16.3" },
     { name = "msgspec", specifier = ">=0.21" },
     { name = "orjson", specifier = ">=3.12" },
     { name = "packaging", specifier = ">=24" },
@@ -795,6 +796,7 @@ provides-extras = ["browser"]
 dev = [
     { name = "attrs", specifier = ">=25.3" },
     { name = "brotli", specifier = ">=1.2.0" },
+    { name = "cryptography", specifier = ">=50.0.2" },
     { name = "h2", specifier = ">=4.4.1" },
     { name = "pernix", extras = ["browser"], editable = "." },
     { name = "pydantic", specifier = ">=2.11" },

@@ -721,8 +721,19 @@ class SessionPool(Protocol):
 
 **Profile consistency**
 
-- HTTP uses a pinned-version Chrome Profile by default (`http.impersonate`, `chrome150`), whose major version is aligned with that of the bundled browser once the browser Fetcher lands. Aliases such as `chrome`, which drift as the library is upgraded, are rejected, as are unknown targets, with a suggestion.
-- Contract tests guarantee that, for the same Session, the UA major version, `sec-ch-ua`, and OS platform are consistent between the HTTP side and the browser side.
+- HTTP uses a pinned-version Chrome Profile by default (`http.impersonate`, `chrome150`), whose TLS and HTTP/2 are those of the bundled browser, Chrome 151, which changed neither from 150. Aliases such as `chrome`, which drift as the library is upgraded, are rejected, as are unknown targets, with a suggestion.
+- The default Profile and the browser build form a Pinned Pair: curl-cffi and patchright are pinned to exact versions, and an upgrade of either lands only with the Profile contract tests passing on macOS and Linux (ADR 0010).
+- The Profile contract tests (`tests/test_profile_contract.py`) show that, under one Session, the HTTP Fetcher and the browser Fetcher put one client on the wire. A loopback server records, per connection, the TLS ClientHello, the HTTP/2 preface (the SETTINGS, WINDOW_UPDATE, and PRIORITY frames before the first HEADERS frame), each HEADERS frame with the HPACK representation of each field, and each request's fields in order; HTTP/1.1 requests are recorded as received. Its certificate comes from a CA curl is given, and the browser trusts it through `--ignore-certificate-errors-spki-list`, so that the connections are as valid as any, resumed ones included. Both Fetchers make the same top-level navigations: a first connection, a second request on one connection, and a resumed connection, which the server forces by closing the first with a GOAWAY. Any difference fails, named, such as `connection 1 > HTTP/2 preface` with both sides' frames. Left out, each for its reason:
+  - GREASE values, random for each connection; where they are is compared.
+  - The ClientHello's random, the bytes of its legacy session id, and the keys of its key shares, all random.
+  - The order of TLS extensions, which both clients shuffle for each connection.
+  - The config id, the encapsulated key, and the payload of the GREASE `encrypted_client_hello` extension, the payload's length included, all random.
+  - The identities, ticket ages, and binders of `pre_shared_key`, which come from the server's ticket; their number and the binders' lengths are compared.
+  - The length of the `padding` extension and of the records, which follow from the rest.
+  - SETTINGS and PING acknowledgements, sent whenever the server's frames arrive, and the frames after a connection's first HEADERS frame other than HEADERS, such as WINDOW_UPDATE and GOAWAY, which follow the sizes of the answers and how the connection ends.
+  - Connections that carry no request, which a browser may open ahead of need.
+  - The values of `User-Agent`, `sec-ch-ua`, `sec-ch-ua-platform`, and `Accept-Language`, until the HTTP side derives the UA, its version, and the OS platform from the bundled browser and the languages from the `locale` setting; their names and places are compared.
+- One difference is inside curl: once a server announces `SETTINGS_HEADER_TABLE_SIZE`, curl's HPACK encoder starts its next header block with a dynamic table size update, even when the size is unchanged, which Chrome sends only when the size changes, and Chrome grows its table to a larger size announced, where curl keeps 4096. The contract server announces no header table size, as many servers do not, and a test expected to fail records the difference, so that a curl-cffi upgrade removing it shows.
 - By default no extra browser characteristics are injected or randomly generated, to avoid contradicting the real TLS/HTTP2 characteristics. Locale-related headers such as `Accept-Language` are derived uniformly from the `locale` setting.
 
 **Pacing**
@@ -969,7 +980,7 @@ async def test_parse():
 - **Concurrency model**: native asyncio, with no dependency on AnyIO. One process runs only one event loop.
   - Multiple processes are handled by an optional launcher or by the Platform.
   - uvloop is an optional extra.
-- **Core dependencies**: curl-cffi, parsel (lxml), msgspec, orjson, protego, charset-normalizer, and a WHATWG URL parsing library.
+- **Core dependencies**: curl-cffi (pinned, ADR 0010), parsel (lxml), msgspec, orjson, protego, charset-normalizer, and a WHATWG URL parsing library.
 - **Optional extras**: `browser` (patchright, pinned), `redis`, `postgres`, `mysql`, `mongo`, `kafka`, `prometheus`, `otel`, `selectolax`.
   - The core package imports fully without any extra installed.
   - Using an extra that is not installed produces a clear installation hint.
