@@ -21,6 +21,7 @@ from pernix.errors import (
     TooManyRedirects,
 )
 from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
+from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.http_settings import HTTPSettings, check_profile
 from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.streamed_response import StreamedResponse
@@ -104,7 +105,8 @@ class HTTPFetcher:
     waiting for a connection included, and `http.max_body_size` for the body.
     Redirects are followed up to `http.max_redirects`. A body decoded from gzip,
     deflate, br, or zstd loses the `Content-Encoding` and `Content-Length` headers,
-    which describe the encoded one. A 407 response from a proxy raises `ProxyError`.
+    which describe the encoded one. A proxy that cannot be reached, or answers 407,
+    raises `ProxyError`.
     curl's own retries are off: the retry policy decides.
 
     Requests are independent (ADR 0011): each transfer sends only `request.cookies`,
@@ -126,8 +128,8 @@ class HTTPFetcher:
     match each hop, and the cookies set during the fetch, on redirects included, are
     kept in the Session as the headers of each hop arrive, even if a later hop fails;
     the Request's own cookies are not. The Session's proxy and
-    Profile apply unless the Request names its own, and each Session has curl
-    sessions of its own, so two Sessions never share a connection.
+    Profile apply unless the Request names its own, an empty proxy for none, and each
+    Session has curl sessions of its own, so two Sessions never share a connection.
 
     Under a network guard (`pernix.fetchers.network_guard`), as in tests, only
     loopback hosts are reached, redirects included; others raise `NetworkBlocked`.
@@ -294,7 +296,7 @@ class HTTPFetcher:
         curl limits each pause in the body to whole seconds.
         """
         timeout = request.timeout or self._settings.timeout
-        proxy = request.proxy or (session.proxy if session is not None else None)
+        proxy = request_proxy(request, session)
         scope = asyncio.timeout(timeout)
         try:
             async with scope:
@@ -340,7 +342,7 @@ class HTTPFetcher:
                 guard=None if proxy else guard,  # a loopback proxy takes every hop
             )
         except CurlError as exc:
-            raise _fetch_error(exc) from exc
+            raise _fetch_error(exc, proxied=proxy is not None) from exc
 
     def _response(
         self,
@@ -484,9 +486,15 @@ def _decoded(headers: Headers) -> bool:
     return any(value.strip().lower() not in ("", "identity") for value in headers.get_all("Content-Encoding"))
 
 
-def _fetch_error(error: CurlError) -> FetchError:
-    """Map a curl error onto the FetchError of its kind, keeping libcurl's code."""
+def _fetch_error(error: CurlError, *, proxied: bool = False) -> FetchError:
+    """Map a curl error onto the FetchError of its kind, keeping libcurl's code.
+
+    Through a proxy, curl connects to the proxy alone, so failing to connect is the
+    proxy's failure.
+    """
     code = int(error.code)
+    if proxied and code == CurlECode.COULDNT_CONNECT:
+        return ProxyError(str(error), code=code)
     kind = next((kind for curl_kind, kind in _ERROR_KINDS if isinstance(error, curl_kind)), None)
     return (kind or _ERROR_CODES.get(code, FetchError))(str(error), code=code)
 

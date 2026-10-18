@@ -72,7 +72,7 @@ def _inline(
         retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings(delay_scale=0)),
         events=bus or events.EventBus(timeout=5),
         stats=stats or Stats(),
-        sessions=sessions,
+        sender=sessions,
     )
 
 

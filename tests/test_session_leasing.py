@@ -13,15 +13,18 @@ from pernix import Account, Cookie, Request, Session
 from pernix.errors import ConnectError, LoginExpired, ProxyError, SessionError
 from pernix.fetchers import FetcherDispatch
 from pernix.fetchers.fetcher_dispatch import sending_as
+from pernix.proxies import MemoryProxyPool
+from pernix.proxies.proxy_sources import StaticProxies
+from pernix.proxies.run_proxies import NoProxyYet, RunProxies
 from pernix.sessions import MemorySessionPool, Outcome, StateDelta
-from pernix.sessions.session_leasing import NoSessionYet, SessionLeasing, sending_session, sending_with
+from pernix.sessions.session_leasing import NoSessionYet, SessionLeasing, sending_session
 from pernix.sessions.session_login import SessionLogin
 from pernix.settings import SessionSettings
 from pernix.stats import Stats
 from pernix.testing import make_response
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterable
 
     from pernix import Response
 
@@ -60,7 +63,11 @@ class Site:
 
 
 def _leasing(
-    *, clock: Clock | None = None, login: SessionLogin | None = None, **settings: Any
+    *,
+    clock: Clock | None = None,
+    login: SessionLogin | None = None,
+    proxies: RunProxies | None = None,
+    **settings: Any,
 ) -> tuple[SessionLeasing, MemorySessionPool, Stats, Clock]:
     clock, stats = clock or Clock(), Stats()
     config = SessionSettings(enabled=True, **settings)
@@ -73,7 +80,8 @@ def _leasing(
         stats=stats,
         clock=clock,
     )
-    return SessionLeasing(pool, config, stats=stats, login=login, clock=clock), pool, stats, clock
+    leasing = SessionLeasing(pool, config, stats=stats, login=login, proxies=proxies, clock=clock)
+    return leasing, pool, stats, clock
 
 
 async def _send(leasing: SessionLeasing, dispatch: FetcherDispatch, request: Request) -> Response:
@@ -239,14 +247,6 @@ async def test_changes_of_a_lease_that_expired_are_dropped_and_counted(caplog: p
     assert (await pool.load_state(lease)).cookies == []
     assert stats.get("sessions.stale") == 1
     assert "expired before its fetch" in caplog.text
-
-
-async def test_without_a_session_pool_requests_go_without_a_session() -> None:
-    async with sending_with(None, Request(f"{SITE}/"), wait=0) as sending:
-        assert (sending.session, sending.request.session) == (None, None)
-
-    with pytest.raises(SessionError, match="no Session Pool is enabled"):
-        sending_with(None, Request(f"{SITE}/", session="a"), wait=0)
 
 
 async def test_a_fetcher_without_a_session_parameter_refuses_requests_under_one() -> None:
@@ -475,3 +475,183 @@ async def test_a_cancelled_login_leaves_the_session_to_log_in() -> None:
     lease = await pool.acquire(session="a", timeout=0)
     assert lease is not None
     assert lease.must_log_in
+
+
+PROXY_A, PROXY_B = "http://a.example:8080", "http://b.example:8080"
+
+
+async def _proxies(pool: MemoryProxyPool, *urls: str, stops: list[None] | None = None) -> RunProxies:
+    def mask(_: Iterable[str]) -> None:
+        pass
+
+    def stop() -> None:
+        if stops is not None:
+            stops.append(None)
+
+    proxies = RunProxies(
+        pool, [("proxies.urls", StaticProxies(urls))], refresh=None, stats=Stats(), stop=stop, mask=mask
+    )
+    await proxies.open()
+    return proxies
+
+
+async def _state_proxy(pool: MemorySessionPool, session: str) -> str | None:
+    lease = await pool.acquire(session=session, timeout=0)
+    assert lease is not None
+    try:
+        return (await pool.load_state(lease)).proxy
+    finally:
+        await pool.release(lease, Outcome("ok"))
+
+
+async def test_a_session_is_bound_to_a_proxy_it_keeps_and_the_binding_is_saved() -> None:
+    proxies = await _proxies(MemoryProxyPool(), PROXY_A, PROXY_B)
+    leasing, pool, _, _ = _leasing(proxies=proxies)
+    bound: list[str | None] = []
+
+    for session in ("a", "b", "a"):
+        async with leasing.sending(Request(f"{SITE}/", session=session), wait=0) as sending:
+            assert sending.session is not None
+            bound.append(sending.session.proxy)
+
+    assert bound == [PROXY_A, PROXY_B, PROXY_A]
+    assert await _state_proxy(pool, "a") == PROXY_A
+
+
+async def test_a_session_whose_proxy_failed_is_bound_to_another() -> None:
+    proxy_pool = MemoryProxyPool()
+    leasing, pool, stats, _ = _leasing(proxies=await _proxies(proxy_pool, PROXY_A, PROXY_B))
+    site = Site()
+    site.error = ProxyError("refused")
+
+    with pytest.raises(ProxyError):
+        await _send(leasing, FetcherDispatch({"site": site}), Request(f"{SITE}/", session="a"))
+    site.error = None
+    await _send(leasing, FetcherDispatch({"site": site}), Request(f"{SITE}/", session="a"))
+
+    assert proxy_pool.health(PROXY_A) == "cooldown"
+    assert await _state_proxy(pool, "a") == PROXY_B
+    assert stats.get("sessions.outcomes.proxy_failed") == 1
+
+
+async def test_with_no_proxy_available_the_lease_is_released_and_the_request_waits() -> None:
+    proxy_pool = MemoryProxyPool(cooldown=30)
+    leasing, pool, _, _ = _leasing(proxies=await _proxies(proxy_pool, PROXY_A))
+    await proxy_pool.report(PROXY_A, failed=True, since=0)
+
+    with pytest.raises(NoProxyYet) as waiting:
+        async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+            pass
+
+    assert waiting.value.delay == pytest.approx(30, abs=1)
+    assert pool.health("a") == "available"
+    assert await pool.acquire(session="a", timeout=0) is not None  # its Lease was released
+
+
+async def test_a_login_goes_through_the_proxy_its_session_is_bound_to() -> None:
+    seen: list[str | None] = []
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        async with leasing.sending(Request(f"{SITE}/login", session=session.id), wait=0) as sending:
+            assert sending.session is not None
+            seen.append(sending.session.proxy)
+
+    leasing, pool, _, _ = _leasing(login=_login(log_in), proxies=await _proxies(MemoryProxyPool(), PROXY_A))
+
+    async with leasing.sending(Request(f"{SITE}/", session="a"), wait=0):
+        pass
+
+    assert seen == [PROXY_A]
+    assert await _state_proxy(pool, "a") == PROXY_A
+
+
+async def test_a_nested_fetch_reports_how_it_went_through_the_proxy() -> None:
+    proxy_pool = MemoryProxyPool()
+    leasing, _, _, _ = _leasing(proxies=await _proxies(proxy_pool, PROXY_A, PROXY_B))
+
+    async with (
+        leasing.sending(Request(f"{SITE}/outer", session="a"), wait=0),
+        leasing.sending(Request(f"{SITE}/token", session="a"), wait=0) as nested,
+    ):
+        nested.error = ProxyError("refused")
+
+    assert proxy_pool.health(PROXY_A) == "cooldown"
+
+
+@pytest.mark.parametrize("own", ["http://own.example:1", ""], ids=["its own", "none"])
+async def test_a_request_with_a_proxy_of_its_own_reports_nothing_against_the_sessions(own: str) -> None:
+    proxy_pool = MemoryProxyPool()
+    leasing, _, _, _ = _leasing(proxies=await _proxies(proxy_pool, PROXY_A))
+
+    async with leasing.sending(Request(f"{SITE}/", session="a", proxy=own), wait=0) as sending:
+        sending.error = ProxyError("refused")
+
+    assert proxy_pool.health(PROXY_A) == "available"
+
+
+async def test_overlapping_leases_of_a_session_go_through_one_proxy() -> None:
+    leasing, _, _, _ = _leasing(proxies=await _proxies(MemoryProxyPool(), PROXY_A, PROXY_B), max_concurrency=2)
+
+    async def overlapping() -> str | None:
+        async with leasing.sending(Request(f"{SITE}/second", session="a"), wait=0) as second:
+            assert second.session is not None
+            return second.session.proxy
+
+    async with leasing.sending(Request(f"{SITE}/first", session="a"), wait=0) as first:
+        assert first.session is not None
+        proxies = (first.session.proxy, await asyncio.create_task(overlapping()))
+
+    assert proxies == (PROXY_A, PROXY_A)
+
+
+@pytest.mark.parametrize("own", ["http://own.example:1", ""], ids=["its own", "none"])
+@pytest.mark.parametrize("pool_state", ["cooling down", "retired"])
+async def test_a_request_with_a_proxy_of_its_own_needs_none_of_the_runs(own: str, pool_state: str) -> None:
+    proxy_pool = MemoryProxyPool(cooldown=30, max_failures=1 if pool_state == "retired" else 5)
+    stops: list[None] = []
+    leasing, pool, _, _ = _leasing(proxies=await _proxies(proxy_pool, PROXY_A, stops=stops))
+    await proxy_pool.report(PROXY_A, failed=True, since=0)
+
+    async with leasing.sending(Request(f"{SITE}/", session="a", proxy=own), wait=0) as sending:
+        assert sending.session is not None
+        assert sending.session.proxy is None
+
+    assert stops == []
+    assert await _state_proxy(pool, "a") is None
+
+
+async def test_the_login_of_a_request_with_a_proxy_of_its_own_goes_through_the_sessions() -> None:
+    seen: list[str | None] = []
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        async with leasing.sending(Request(f"{SITE}/login", session=session.id), wait=0) as sending:
+            assert sending.session is not None
+            seen.append(sending.session.proxy)
+
+    proxies = await _proxies(MemoryProxyPool(), PROXY_A)
+    leasing, pool, _, _ = _leasing(login=_login(log_in), proxies=proxies)
+
+    async with leasing.sending(Request(f"{SITE}/", session="a", proxy="http://own.example:1"), wait=0):
+        pass
+
+    assert seen == [PROXY_A]
+    assert await _state_proxy(pool, "a") == PROXY_A
+
+
+async def test_the_fetches_of_a_lease_keep_the_proxy_it_settled() -> None:
+    leasing, _, _, _ = _leasing(proxies=await _proxies(MemoryProxyPool(), PROXY_A, PROXY_B))
+    seen: list[str | None] = []
+
+    async with leasing.sending(Request(f"{SITE}/outer", session="a"), wait=0) as outer:
+        async with leasing.sending(Request(f"{SITE}/token", session="a"), wait=0) as failing:
+            failing.error = ProxyError("refused")  # a Middleware's fetch, through A, cooling it down
+        async with leasing.sending(Request(f"{SITE}/more", session="a"), wait=0) as later:
+            assert later.session is not None
+            seen.append(later.session.proxy)
+        assert outer.session is not None
+        seen.append(outer.session.proxy)  # what the outer transport goes through, and is reported against
+    async with leasing.sending(Request(f"{SITE}/next", session="a"), wait=0) as following:
+        assert following.session is not None
+        seen.append(following.session.proxy)
+
+    assert seen == [PROXY_A, PROXY_A, PROXY_B]  # the next Lease is bound to another

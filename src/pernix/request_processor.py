@@ -14,7 +14,7 @@ from pernix.items import ItemContext, is_item
 from pernix.request import Request
 from pernix.response import expect_response
 from pernix.retry_policy import Action, consult
-from pernix.sessions.session_leasing import NoSessionYet, sending_with
+from pernix.sending import IndependentSending, NotYet
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download, HandleResponse
     from pernix.response import Response
     from pernix.retry_policy import Decision, RetryPolicy
-    from pernix.sessions.session_leasing import SessionLeasing
+    from pernix.sending import Sender
     from pernix.spider import Spider
     from pernix.throttle import Throttle
 
@@ -75,7 +75,10 @@ class RequestProcessor:
     one; when every Session that fits is busy or cooling down, it goes back to the
     Frontier the same way, until one stops cooling down, and a Request no Session can
     ever be leased for fails. A Session that must log in does so first, in the
-    Request's place. It then waits for the slot's delay and rate. It is fetched
+    Request's place. With the Run's proxies, the Request goes through its Session's
+    proxy, or without a Session through the next one, and goes back to the Frontier
+    the same way while none is available. It then waits for the slot's delay and
+    rate. It is fetched
     through the download chain while holding its Session and the slot, and the
     Response is handled through the spider chain, which ends in the Callback. A
     Response that shows the Session logged out raises `LoginExpired`, a `Retry`. Callbacks, errbacks, and Events get the Request as it
@@ -105,7 +108,7 @@ class RequestProcessor:
         events: EventBus,
         retry_policy: RetryPolicy,
         throttle: Throttle,
-        sessions: SessionLeasing | None = None,
+        sender: Sender | None = None,
     ) -> None:
         """Wire the processor to its collaborators.
 
@@ -118,7 +121,8 @@ class RequestProcessor:
             events: Where Request and Response Events are emitted.
             retry_policy: Decides which attempts are retried.
             throttle: Paces fetches per slot.
-            sessions: Leases Sessions from the Session Pool; `None` without one.
+            sender: Sends each Request, under a Session leased from the Session
+                Pool or as it is; `IndependentSending()` when `None`.
         """
         self._spider = spider
         self._download = download
@@ -128,7 +132,7 @@ class RequestProcessor:
         self._events = events
         self._retry_policy = retry_policy
         self._throttle = throttle
-        self._sessions = sessions
+        self._sender = sender or IndependentSending()
 
     async def attempt(self, lease: Lease) -> Settlement:
         """Fetch a Request and run its Callback once.
@@ -142,8 +146,8 @@ class RequestProcessor:
         sent = _Sent(lease.request)
         try:
             response = await self._fetch(lease, sent)
-        except NoSessionYet as wait:
-            return Again(wait.delay, "no Session available", count_attempt=False)
+        except NotYet as wait:
+            return Again(wait.delay, wait.reason, count_attempt=False)
         except SessionError as exc:
             logger.error("Cannot send %r: %s", sent.request, exc)
             return await self._fail(sent.request, exc)
@@ -191,7 +195,7 @@ class RequestProcessor:
             return None
         try:
             with self._throttle.holding(lease.slot):  # Inline Fetches a login or a Middleware makes share it
-                async with sending_with(self._sessions, lease.request, wait=_SESSION_WAIT) as sending:
+                async with self._sender.sending(lease.request, wait=_SESSION_WAIT) as sending:
                     sent.request = sending.request
                     if not await self._throttle.pace(lease.slot):
                         return None

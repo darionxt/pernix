@@ -11,6 +11,8 @@ from pernix.extensions import OffsiteFilter
 from pernix.fetchers import BrowserFetcher, HTTPFetcher
 from pernix.items import FailedItemsFile
 from pernix.logs import RunContext, RunLog
+from pernix.proxies.proxy_sources import ProxyAPI
+from pernix.proxies.run_proxies import RunProxies
 from pernix.run_assembly import RunAssembly
 from pernix.settings import LogSettings
 
@@ -58,6 +60,32 @@ def test_the_components_are_built_in_opening_order_and_none_is_opened() -> None:
     ]
     assert run.components[1:3] == (early, late)
     assert calls == []
+
+
+def test_the_sources_of_proxies_and_the_proxies_are_opened_before_the_fetchers() -> None:
+    class Provider:
+        async def proxies(self) -> list[str]:
+            return []
+
+    provider = Provider()
+
+    run = _build({"proxies.api": "http://vendor.example/proxies", "proxies.provider": provider})
+
+    assert [type(component) for component in run.components] == [
+        OffsiteFilter,
+        ProxyAPI,
+        Provider,
+        RunProxies,
+        HTTPFetcher,
+        BrowserFetcher,
+        FailedItemsFile,
+    ]
+    assert run.components[2] is provider
+
+
+def test_a_provider_without_proxies_fails_the_build() -> None:
+    with pytest.raises(ComponentError, match=r"proxies\.provider must have proxies\(\)"):
+        _build({"proxies.provider": object()})
 
 
 def test_a_component_that_does_not_fit_its_role_fails_the_build() -> None:

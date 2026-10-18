@@ -92,7 +92,8 @@ class Request:
         render: Whether to load the page in the browser.
         fetcher: The name of the Fetcher to use; inferred when `None`.
         timeout: Seconds before the fetch fails; the setting applies when `None`.
-        proxy: A proxy URL for this Request only.
+        proxy: A proxy URL for this Request only, over those of the Run and of its
+            Session; an empty one sends it without a proxy.
         impersonate: A Profile override for this Request only.
         ext: Read-only component-private data, by component name.
     """
@@ -172,7 +173,8 @@ class Request:
             render: Load the page in the browser.
             fetcher: The name of the Fetcher to use.
             timeout: Seconds before the fetch fails.
-            proxy: A proxy URL for this Request only.
+            proxy: A proxy URL for this Request only, over those of the Run and of
+                its Session; an empty one sends it without a proxy.
             impersonate: A Profile override for this Request only.
             ext: Component-private data, by component name.
 

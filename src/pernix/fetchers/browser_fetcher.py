@@ -23,6 +23,7 @@ from pernix.errors import (
 )
 from pernix.fetchers.browser_cookies import request_cookie
 from pernix.fetchers.browser_settings import BrowserSettings
+from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.session_contexts import SessionContexts
@@ -107,8 +108,9 @@ class BrowserFetcher:
     A Request under a Session is loaded in a context kept for that Session, which
     one fetch uses at a time; concurrent fetches of a Session get one each. It is
     created with the Session's localStorage and the proxy of the Request or of the
-    Session, which never change afterwards: a Session whose proxy or localStorage
-    changed elsewhere gets a new one. Before each fetch, the context is made to hold
+    Session, an empty proxy for none, which never change afterwards: a Session whose
+    proxy or localStorage changed elsewhere gets a new one. The browser cannot go
+    through a SOCKS proxy with credentials. Before each fetch, the context is made to hold
     the Session's cookies, with the Request's own, and after it its pages are
     closed, those the page opened included, and the cookies the page changed, and
     the localStorage of the page's origin, are kept in the Session, whether the page
@@ -224,7 +226,7 @@ class BrowserFetcher:
             pernix.errors.FetchError: The page did not load; a subclass names the kind
                 of failure.
             ValueError: The Request has an `Authorization` or `Proxy-Authorization`
-                header.
+                header, or goes through a SOCKS proxy with credentials.
         """
         if not self._open:
             raise RuntimeError("BrowserFetcher must be entered with 'async with' before fetching")
@@ -234,7 +236,12 @@ class BrowserFetcher:
                 f"{request!r} has a {' and '.join(credentials)} header, which the browser would send on to any host a "
                 "redirect leads to; render it without, or fetch it over HTTP"
             )
-        proxy = request.proxy or (session.proxy if session is not None else None)
+        proxy = request_proxy(request, session)
+        if proxy is not None and _socks_with_credentials(proxy):
+            raise ValueError(
+                f"{request!r} goes through a SOCKS proxy with credentials, which the browser cannot use; "
+                "render it through an HTTP proxy, or fetch it over HTTP"
+            )
         guard = current_guard()
         if guard is not None:
             guard.check(request.url, proxy=proxy)
@@ -584,6 +591,12 @@ async def _close_launched(launch: asyncio.Task[LaunchedBrowser]) -> None:
     if launch.cancelled() or launch.exception() is not None:
         return  # a launch that failed or was stopped cleaned up after itself
     await launch.result().close()
+
+
+def _socks_with_credentials(proxy: str) -> bool:
+    """Whether a proxy is a SOCKS one with credentials, which Chrome does not support."""
+    parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    return parts.scheme.lower().startswith("socks") and "@" in parts.netloc
 
 
 async def _session_context(launched: LaunchedBrowser, session: Session, proxy: str | None) -> BrowserContext:

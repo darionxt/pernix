@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sys
 import textwrap
 from typing import TYPE_CHECKING
@@ -52,6 +53,14 @@ def _restore_import_path(monkeypatch: pytest.MonkeyPatch) -> None:
 def server(loopback_server: LoopbackServer) -> LoopbackServer:
     """The pytest plugin's `loopback_server`, under the shorter name the suite uses."""
     return loopback_server
+
+
+@pytest.fixture
+def refused_proxy() -> str:
+    """A proxy on a loopback port nothing listens on, so that every connection to it is refused."""
+    with socket.create_server(("127.0.0.1", 0)) as listening:
+        port = listening.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
 
 
 @pytest.fixture
