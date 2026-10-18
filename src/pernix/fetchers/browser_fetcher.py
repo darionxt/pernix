@@ -7,7 +7,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Self
-from urllib.parse import urlsplit
+from urllib.parse import urldefrag, urlsplit
 
 from pernix.browser import Render, RenderResult
 from pernix.cookies import request_cookies
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Iterable
 
     from patchright._impl._api_structures import NameValue, SetCookieParam
-    from patchright.async_api import BrowserContext, Page, Route, WebSocket
+    from patchright.async_api import BrowserContext, Frame, Page, Route, WebSocket
     from patchright.async_api import Request as PageRequest
     from patchright.async_api import Response as PageResponse
 
@@ -361,7 +361,7 @@ class BrowserFetcher:
             raise FetchError(f"loading {request.url} gave no document")
         action_timeout = self._settings.action_timeout
         outputs = await run_render(page, load.render, action_timeout=action_timeout, url=request.url)
-        document = watch.document or document  # an action may have led to another one
+        document = watch.shown or document  # an action may have led to another one
         result = RenderResult(
             document=await captured_response(document),
             captured=() if capture is None else await capture.responses(within=action_timeout),
@@ -494,7 +494,10 @@ class _PageLoad:
 
     Attributes:
         page: The page.
-        document: The latest response to a navigation of the main frame.
+        document: The latest response to a navigation of the main frame, whether
+            it shows a document or not, as a 204 does not.
+        shown: The response of the document the main frame shows, once one was
+            committed.
         refused: The URL of the main frame's navigation that a guarded browser
             refused, if any.
     """
@@ -502,10 +505,14 @@ class _PageLoad:
     def __init__(self, page: Page, *, proxy: str | None, guarded: bool) -> None:
         self.page = page
         self.document: PageResponse | None = None
+        self.shown: PageResponse | None = None
         self.refused: str | None = None
+        self._arrived: PageResponse | None = None
+        """The navigation response the main frame has not committed yet."""
         self._proxy = proxy
         self._guarded = guarded
         page.on("response", self._on_response)
+        page.on("framenavigated", self._on_navigated)
         if guarded:
             page.context.on("request", self._on_request)
             page.on("websocket", self._on_websocket)
@@ -518,7 +525,21 @@ class _PageLoad:
 
     def _on_response(self, response: PageResponse) -> None:
         if response.request.is_navigation_request() and response.frame == self.page.main_frame:
-            self.document = response
+            self.document = self._arrived = response
+
+    def _on_navigated(self, frame: Frame) -> None:
+        """Take the navigation response the main frame committed to; a 204 or a download commits none.
+
+        A navigation within the document, such as `history.pushState()`, commits
+        no response either, and its URL is not that of the response pending.
+        """
+        arrived = self._arrived
+        if (
+            frame == self.page.main_frame
+            and arrived is not None
+            and urldefrag(frame.url)[0] == urldefrag(arrived.url)[0]
+        ):
+            self.shown, self._arrived = arrived, None
 
     def _on_request(self, request: PageRequest) -> None:
         if self._refuses(request.url) and request.is_navigation_request() and request.frame == self.page.main_frame:

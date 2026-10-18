@@ -313,6 +313,23 @@ async def test_actions_that_navigate_give_the_document_they_lead_to(server: Loop
     assert response.browser.document.body == b"<p class='gone'>gone</p>"
 
 
+@pytest.mark.parametrize("status", [204, 205])
+async def test_an_action_whose_navigation_shows_no_document_keeps_the_page(server: LoopbackServer, status: int) -> None:
+    page = "<form action='/send' method='post'><button id='send'>Send</button></form><p id='kept'>kept</p>"
+    server.route("/", page, headers=[*HTML, ("X-Shop", "page")])
+    server.route("/send", b"", status=status, method="POST")
+    settle = Evaluate("() => new Promise(resolve => setTimeout(resolve, 300))")  # the answer arrives meanwhile
+
+    response = await _fetch(server.url("/"), Render(actions=[Click("#send"), settle]))
+
+    assert [request.path for request in server.received] == ["/", "/send"]
+    assert (response.status, response.url, response.headers.get("X-Shop")) == (200, server.url("/"), "page")
+    assert response.css("#kept::text").get() == "kept"
+    assert response.browser is not None
+    assert response.browser.document is not None
+    assert (response.browser.document.status, response.browser.document.body) == (200, page.encode())
+
+
 SERVICE_WORKER = """self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
 self.addEventListener("fetch", event => event.respondWith(fetch(event.request)));"""
