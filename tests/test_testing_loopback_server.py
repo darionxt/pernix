@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import socket
+import struct
+import time
 import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING
@@ -110,3 +113,21 @@ def test_a_directory_is_served_below_the_routes(tmp_path: Path) -> None:
                 _get(server.url(missing))
             with excinfo.value as error:
                 assert error.code == 404
+
+
+def test_a_client_resetting_a_kept_connection_leaves_nothing_on_stderr(
+    server: LoopbackServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server.route("/", "ok")
+    host, port = server.base_url.removeprefix("http://").split(":")
+    with socket.create_connection((host, int(port))) as client:
+        client.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        client.recv(4096)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # closes with a reset
+    printed = ""
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and not printed:
+        time.sleep(0.05)  # what the server thread would print arrives meanwhile
+        printed += capsys.readouterr().err
+
+    assert printed == ""

@@ -106,6 +106,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 
+- `LoopbackServer` no longer prints a traceback when a client, such as a browser, drops a connection it kept open, which landed in the stderr of the tests.
 - The HTTP Fetcher sends cookies in the order Chrome sends them: longer paths first, then the earliest set first, a cookie that replaces another keeping its place. curl ordered them by path, domain, and name length instead, the Request's own, a Session's, and those set on redirects alike.
 - Cookies set over HTTP with values beyond ASCII in UTF-8 are kept in a Session as text, and sent back byte for byte; they were kept as Latin-1 and sent back garbled.
 - The HTTP Fetcher reaches the host a browser does for international host names, on every platform. curl converted them to ASCII itself, and on Linux reached other hosts for some, such as `strasse.de` for `STRAẞE.de`, where `Request(cookies=...)` then never went. A host that is not ASCII, or holds percent escapes, is now converted as WHATWG URLs convert hosts before curl sees the URL, and `Response.url` names it in ASCII; a host WHATWG URLs reject fails the fetch with a `FetchError`, as browsers refuse such a URL. The network guard reads hosts the same way, so `localhost` in full-width letters, or as `local%68ost`, is a loopback host. `pernix.urls.url_host()` and `with_ascii_host()` give the host and the URL as the Fetcher uses them.
