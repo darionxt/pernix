@@ -69,7 +69,8 @@ async def test_waiting_for_a_page_takes_no_part_in_the_deadline(server: Loopback
     settings = BrowserSettings(max_pages=1, deadline=3.0)
 
     async with BrowserFetcher(settings) as fetcher:
-        await fetcher._browser()  # pyright: ignore[reportPrivateUsage]  # started apart, as the deadline counts it
+        async with fetcher._generations.fetching(""):  # pyright: ignore[reportPrivateUsage]
+            pass  # the browser starts apart, as the deadline counts it
         responses = await asyncio.gather(*(fetcher.fetch(_render(server.url(f"/slow?n={n}"))) for n in range(2)))
 
     assert [response.status for response in responses] == [200, 200]  # the second waited for the first

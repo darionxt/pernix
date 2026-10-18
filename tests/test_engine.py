@@ -11,7 +11,7 @@ import pytest
 from pernix import IgnoreRequest, Request, Response, Retry, Spider, events
 from pernix.callbacks import run_callbacks
 from pernix.engine import Engine
-from pernix.errors import ConnectError, RetriesExhausted
+from pernix.errors import BrowserLost, ConnectError, RetriesExhausted
 from pernix.frontiers import MemoryFrontier
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import DomainSettings, RetrySettings
@@ -267,6 +267,70 @@ async def test_transport_errors_are_retried_and_become_the_cause() -> None:
     assert isinstance(failed, events.RequestFailed)
     assert isinstance(failed.error, RetriesExhausted)
     assert isinstance(failed.error.__cause__, ConnectError)
+    assert items[0] == {"failed": "/a", "error": "RetriesExhausted"}
+
+
+async def test_retries_under_a_budget_take_none_of_the_attempts() -> None:
+    class Attempts(MemoryFrontier):
+        def __init__(self) -> None:
+            super().__init__()
+            self.leases: list[Lease] = []
+
+        async def claim(self, *args: Any, **kwargs: Any) -> list[Lease]:
+            leases = await super().claim(*args, **kwargs)
+            self.leases.extend(leases)
+            return leases
+
+    site = _site({"/a": [BrowserLost("gone"), _status(503), BrowserLost("gone"), "<p>a</p>"]})
+    frontier = Attempts()
+    recorded: list[events.Event] = []
+    bus = events.EventBus(timeout=5)
+    bus.on(events.RequestRetried, recorded.append)
+    spider = Links()
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=site.fetch,
+        handle=run_callbacks(spider),
+        put_item=_discard,
+        events=bus,
+        concurrency=1,
+        retry_policy=DefaultRetryPolicy(RetrySettings(times=1, browser_lost=2, delay_scale=0)),
+    )
+
+    async with asyncio.timeout(10):
+        await engine.run()
+
+    assert _paths(site) == ["/a"] * 4  # one ordinary retry, and two of the budget
+    assert [(lease.attempt, dict(lease.spent)) for lease in frontier.leases] == [
+        (1, {}),
+        (1, {"browser_lost": 1}),
+        (2, {"browser_lost": 1}),
+        (2, {"browser_lost": 2}),
+    ]
+    assert [(event.attempt, event.budget) for event in recorded if isinstance(event, events.RequestRetried)] == [
+        (1, "browser_lost"),
+        (1, None),
+        (2, "browser_lost"),
+    ]
+
+
+async def test_a_spent_budget_fails_the_request_with_retries_exhausted() -> None:
+    site = _site({"/a": BrowserLost("the browser disconnected"), "/fallback": "<p>fallback</p>"})
+
+    _, items, recorded = await _run(
+        Recovering(),
+        site,
+        retry_policy=DefaultRetryPolicy(RetrySettings(browser_lost=2, delay_scale=0)),
+        record=(events.RequestFailed,),
+    )
+
+    assert _paths(site).count("/a") == 3
+    [failed] = recorded
+    assert isinstance(failed, events.RequestFailed)
+    assert isinstance(failed.error, RetriesExhausted)
+    assert failed.error.reason == "BrowserLost: the browser disconnected (browser_lost: 2 retries spent)"
+    assert isinstance(failed.error.__cause__, BrowserLost)
     assert items[0] == {"failed": "/a", "error": "RetriesExhausted"}
 
 
@@ -535,9 +599,9 @@ async def test_requests_claimed_for_a_cooling_domain_go_back_without_counting_an
             super().__init__()
             self.returns: list[tuple[float, bool, str]] = []
 
-        async def nack(self, lease: Lease, *, delay: float = 0.0, count_attempt: bool = True, reason: str = "") -> bool:
-            self.returns.append((round(delay, 1), count_attempt, reason))
-            return await super().nack(lease, delay=delay, count_attempt=count_attempt, reason=reason)
+        async def nack(self, lease: Lease, *, delay: float = 0.0, count_attempt: bool = True, **kwargs: Any) -> bool:
+            self.returns.append((round(delay, 1), count_attempt, kwargs.get("reason", "")))
+            return await super().nack(lease, delay=delay, count_attempt=count_attempt, **kwargs)
 
     class One(Spider):
         start_urls = ("https://a.example/1",)

@@ -13,7 +13,7 @@ from pernix.inline_fetch import handling
 from pernix.items import ItemContext, is_item
 from pernix.request import Request
 from pernix.response import expect_response
-from pernix.retry_policy import Action, consult
+from pernix.retry_policy import Action, budget_spent, consult
 from pernix.sending import IndependentSending, NotYet
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
@@ -48,11 +48,12 @@ class Done:
 
 @dataclass(frozen=True, slots=True)
 class Again:
-    """Return the Request to the Frontier for another attempt."""
+    """Return the Request to the Frontier for another attempt, counted as one, under a retry budget, or not at all."""
 
     delay: float
     reason: str
     count_attempt: bool = True
+    budget: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,8 +89,9 @@ class RequestProcessor:
 
     After every attempt that produced a Response, raised while fetching, or raised
     `Retry` in the Callback, the retry policy decides. A retried Request goes back to
-    the Frontier with a delay (`RequestRetried`). A Request fails for good when its
-    retries run out (with `RetriesExhausted`), when fetching raised an exception the
+    the Frontier with a delay (`RequestRetried`), counted as an attempt, or under the
+    retry budget the policy names. A Request fails for good when its retries run
+    out, those of a budget included (with `RetriesExhausted`), when fetching raised an exception the
     policy does not retry, or when its Callback raised: `RequestFailed` is emitted,
     its errback runs, and it is to be kept as a Dead Request. Outputs a Callback
     yielded before raising are kept. `IgnoreRequest` raised while fetching is emitted
@@ -221,6 +223,27 @@ class RequestProcessor:
         response: Response | None = None,
         cause: Exception | None = None,
     ) -> Settlement:
+        budget = decision.budget
+        if decision.action is Action.RETRY and budget is not None:
+            spent = lease.spent.get(budget.name, 0)
+            if spent >= budget.limit:
+                reason = budget_spent(decision.reason, budget)
+                logger.error("Gave up on %r after attempt %d: %s", request, lease.attempt, reason)
+                return await self._exhausted(request, reason, response, cause)
+            logger.info(
+                "Retrying %r in %.2f s after attempt %d, as %s retry %d of %d: %s",
+                request,
+                decision.delay,
+                lease.attempt,
+                budget.name,
+                spent + 1,
+                budget.limit,
+                decision.reason,
+            )
+            await self._events.emit(
+                RequestRetried(request, lease.attempt, decision.delay, decision.reason, budget=budget.name)
+            )
+            return Again(decision.delay, decision.reason, count_attempt=False, budget=budget.name)
         if decision.action is Action.RETRY:
             logger.info(
                 "Retrying %r in %.2f s after attempt %d: %s", request, decision.delay, lease.attempt, decision.reason
@@ -228,7 +251,12 @@ class RequestProcessor:
             await self._events.emit(RequestRetried(request, lease.attempt, decision.delay, decision.reason))
             return Again(decision.delay, decision.reason)
         logger.error("Gave up on %r after %d attempts: %s", request, lease.attempt, decision.reason)
-        exhausted = RetriesExhausted(decision.reason, response=response)
+        return await self._exhausted(request, decision.reason, response, cause)
+
+    async def _exhausted(
+        self, request: Request, reason: str, response: Response | None, cause: Exception | None
+    ) -> Settlement:
+        exhausted = RetriesExhausted(reason, response=response)
         exhausted.__cause__ = cause
         return await self._fail(request, exhausted)
 

@@ -13,10 +13,10 @@ from pernix.browser import Render, RenderResult
 from pernix.cookies import request_cookies
 from pernix.errors import (
     ActionError,
-    ComponentError,
     ConnectError,
     FetchError,
     NetworkBlocked,
+    PageCrashed,
     PernixError,
     ProxyError,
     Timeout,
@@ -24,14 +24,15 @@ from pernix.errors import (
     TooManyRedirects,
 )
 from pernix.fetchers.browser_cookies import request_cookie
+from pernix.fetchers.browser_generations import Generations
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
-from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.page_actions import run_render
 from pernix.fetchers.page_slots import PageSlot, PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.session_contexts import SessionContexts
+from pernix.fetchers.tripwire import Tripwire
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
 from pernix.settings import ResponseSettings, Section
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from patchright.async_api import Response as PageResponse
 
     from pernix.crawler import Crawler
+    from pernix.fetchers.launched_browser import LaunchedBrowser
     from pernix.fetchers.network_guard import NetworkGuard
     from pernix.fetchers.session_contexts import SessionContext
     from pernix.request import Request
@@ -68,6 +70,9 @@ _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 """Headers the browser would send on to every host a redirect leads to."""
 
 _NET_ERROR = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+
+_PAGE_GONE = ("Target crashed", "Page crashed", "Target page, context or browser has been closed")
+"""Parts of the messages of patchright's errors for a page that went away."""
 
 _NET_ERROR_KINDS: tuple[tuple[str, type[FetchError]], ...] = (
     ("ERR_PROXY_", ProxyError),
@@ -158,10 +163,22 @@ class BrowserFetcher:
     other hosts are recorded in the guard; a refused document raises
     `NetworkBlocked`.
 
+    The browser is replaced by a new one once it is `browser.generation_age`
+    seconds old, opened `browser.generation_pages` pages, or its processes take
+    more than `browser.generation_memory` MiB: the fetches in it finish there while
+    the next go to the new one, and it closes once they are done (see
+    `pernix.fetchers.browser_generations`). A page that crashes is closed, and its
+    fetch fails with `PageCrashed`. A browser that disconnects, whose driver dies,
+    or that stops answering its health probe is lost: the fetches in it fail with
+    `BrowserLost`, and the next starts another browser, with a driver of its own.
+    The processes of a browser are killed once it is closed, so a driver that died
+    leaves none behind.
+
     In `stats`, if given, `browser.pages` and `browser.contexts` count the pages and
     the contexts opened, `browser.pages_open` and `browser.contexts_open` tell how
     many are open, and `browser.page_waits` and `browser.page_wait_seconds` count the
-    fetches that waited for a page, and how long.
+    fetches that waited for a page, and how long; `browser.page_crashes` counts the
+    pages that crashed, and the browsers are counted as `Generations` tells.
 
     Attributes:
         schemes: None: the browser Fetcher renders only Requests that need it.
@@ -190,8 +207,6 @@ class BrowserFetcher:
         self._default_encoding = default_encoding
         self._stats = stats
         self._open = False
-        self._launch: asyncio.Task[LaunchedBrowser] | None = None
-        self._unavailable: ComponentError | None = None
         self._closing: dict[BrowserContext, asyncio.Task[None]] = {}
         """The contexts closing in tasks of their own, which closing the fetcher waits for."""
         self._pages = PageSlots(self._settings.max_pages, stats=stats)
@@ -202,6 +217,7 @@ class BrowserFetcher:
             new_context=self._session_context,
             discard=self._discard,
         )
+        self._generations = Generations(self._settings, retire=self._contexts.retire, stats=stats)
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -222,20 +238,18 @@ class BrowserFetcher:
 
     async def __aenter__(self) -> Self:
         self._open = True
-        self._unavailable = None
+        self._generations.open()
         self._pages = PageSlots(self._settings.max_pages, stats=self._stats)  # waiters bind to this event loop
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
         self._open = False
-        launch, self._launch = self._launch, None
         self._contexts.close()
         try:
             if self._closing:
                 await asyncio.wait(self._closing.values())
         finally:
-            if launch is not None:
-                await _close_launched(launch)
+            await self._generations.close()
 
     async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
         """Load a Request in the browser, once fewer than `browser.max_pages` pages are open.
@@ -258,6 +272,8 @@ class BrowserFetcher:
                 of failure.
             pernix.errors.ActionError: A step of the Render failed; an
                 `ActionTimeout` if it took too long.
+            pernix.errors.PageCrashed: The page crashed.
+            pernix.errors.BrowserLost: The browser went away during the fetch.
             ValueError: The Request has an `Authorization` or `Proxy-Authorization`
                 header, or goes through a SOCKS proxy with credentials.
         """
@@ -293,7 +309,19 @@ class BrowserFetcher:
     async def _fetch(
         self, request: Request, guard: NetworkGuard | None, proxy: str | None, session: Session | None, page: _Page
     ) -> Response:
-        launched = await self._browser()
+        async with self._generations.fetching(request.url) as launched:
+            return await self._fetch_in(launched, request, guard, proxy, session, page)
+
+    async def _fetch_in(
+        self,
+        launched: LaunchedBrowser,
+        request: Request,
+        guard: NetworkGuard | None,
+        proxy: str | None,
+        session: Session | None,
+        page: _Page,
+    ) -> Response:
+        """Fetch in a browser, in a context of its own or one kept for its Session."""
         if guard is not None and not launched.guarded:
             guard.blocked.append(request.url)
             raise NetworkBlocked(
@@ -317,23 +345,6 @@ class BrowserFetcher:
             page.context = kept.context
             return await self._load(kept.context, load, kept=kept, session=session)
 
-    async def _browser(self) -> LaunchedBrowser:
-        """The browser, launched by the first fetch that needs it while the others wait."""
-        if self._unavailable is not None:
-            raise ComponentError(*self._unavailable.args) from self._unavailable.__cause__
-        if self._launch is None:
-            self._launch = asyncio.create_task(launch_browser(self._settings))
-        launch = self._launch
-        try:
-            return await asyncio.shield(launch)  # a fetch that gives up waiting leaves the launch to the others
-        except ComponentError as exc:
-            self._unavailable = exc  # installing the extra or the engine takes a new Run
-            raise
-        except Exception:
-            if self._launch is launch:
-                self._launch = None  # a later fetch launches again
-            raise
-
     async def _load(
         self,
         context: BrowserContext,
@@ -342,21 +353,36 @@ class BrowserFetcher:
         kept: SessionContext | None = None,
         session: Session | None = None,
     ) -> Response:
-        """Load a Request in a page of its own, keeping what it changed in its Session, if any."""
+        """Load a Request in a page of its own, keeping what it changed in its Session, if any.
+
+        A page that crashes fails the fetch with `PageCrashed`; its context is closed,
+        if it is kept for a Session, once what the fetch changed is kept.
+        """
         page = await context.new_page()
         if self._stats is not None:
             self._stats.inc("browser.pages")
+        crash = Tripwire()
+        page.on("crash", lambda _page: self._crashed(crash))
         watch = _PageLoad(page, proxy=load.proxy, guarded=load.guarded)
+        url = load.request.url
         try:
-            response = await self._loaded(page, watch, load, kept, session)
+            async with crash.guarding(lambda _reason: PageCrashed(f"the page of {url} crashed"), may_trip=_page_gone):
+                response = await self._loaded(page, watch, load, kept, session)
         except asyncio.CancelledError:
             watch.stop()
             raise  # a kept context is closed, with the page
         except BaseException:
+            if crash.reason is not None and kept is not None:
+                kept.broken = True  # what the page held is not known
             await self._done(page, watch, kept, session)
             raise
         await self._done(page, watch, kept, session)
         return response
+
+    def _crashed(self, crash: Tripwire) -> None:
+        if crash.reason is None and self._stats is not None:
+            self._stats.inc("browser.page_crashes")
+        crash.trip("crashed")
 
     async def _loaded(
         self, page: Page, watch: _PageLoad, load: _Load, kept: SessionContext | None, session: Session | None
@@ -763,14 +789,16 @@ async def _quietly(closing: Awaitable[None], what: str) -> None:
         logger.debug("Ignoring an error %s", what, exc_info=True)
 
 
-async def _close_launched(launch: asyncio.Task[LaunchedBrowser]) -> None:
-    """Close a launched browser, or stop a launch in progress."""
-    if not launch.done():
-        launch.cancel()
-    await asyncio.wait([launch])
-    if launch.cancelled() or launch.exception() is not None:
-        return  # a launch that failed or was stopped cleaned up after itself
-    await launch.result().close()
+def _page_gone(error: BaseException) -> bool:
+    """Whether an error, or one that caused it, may tell of a page that crashed before its `crash` event."""
+    seen: list[BaseException] = []
+    cause: BaseException | None = error
+    while cause is not None and cause not in seen:
+        if any(marker in str(cause) for marker in _PAGE_GONE):
+            return True
+        seen.append(cause)
+        cause = cause.__cause__ or cause.__context__
+    return False
 
 
 def _socks_with_credentials(proxy: str) -> bool:

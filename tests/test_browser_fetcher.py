@@ -14,6 +14,7 @@ from pernix.fetchers.launched_browser import LOOPBACK_BYPASS
 from pernix.fetchers.network_guard import blocking_network
 from pernix.fetchers.refusing_proxy import RefusingProxy
 from pernix.response import Redirect
+from pernix.stats import Stats
 from pernix.testing import ReceivedRequest, Reply
 
 if TYPE_CHECKING:
@@ -158,13 +159,14 @@ async def test_the_method_body_and_headers_go_with_the_first_request(server: Loo
 
 @pytest.mark.parametrize("name", ["Authorization", "proxy-authorization"])
 async def test_credentials_in_headers_are_refused(server: LoopbackServer, name: str) -> None:
-    async with BrowserFetcher() as fetcher:
+    stats = Stats()
+
+    async with BrowserFetcher(stats=stats) as fetcher:
         with pytest.raises(ValueError, match=f"has a {name} header, which the browser would send on to any host"):
             await fetcher.fetch(_render(server.url("/"), headers={name: "Bearer secret"}))
-        launched = fetcher._launch  # pyright: ignore[reportPrivateUsage]
 
     assert server.received == []
-    assert launched is None
+    assert stats.get("browser.generations") is None  # no browser was launched
 
 
 @pytest.mark.parametrize(("host", "other"), [("127.0.0.1", "localhost"), ("localhost", "127.0.0.1")])
@@ -292,12 +294,13 @@ async def test_closing_while_patchright_starts_leaves_nothing_running(monkeypatc
 async def test_fetches_share_one_browser(server: LoopbackServer) -> None:
     server.route("/", "<p>x</p>", headers=[("Content-Type", "text/html")])
 
-    async with BrowserFetcher() as fetcher:
+    stats = Stats()
+
+    async with BrowserFetcher(stats=stats) as fetcher:
         responses = await asyncio.gather(*(fetcher.fetch(_render(server.url("/"))) for _ in range(4)))
-        launches = fetcher._launch  # pyright: ignore[reportPrivateUsage]
 
     assert [response.status for response in responses] == [200] * 4
-    assert launches is not None
+    assert stats.get("browser.generations") == 1
 
 
 async def test_a_fetcher_must_be_entered() -> None:
@@ -339,22 +342,24 @@ async def test_a_redirect_to_another_host_is_refused(server: LoopbackServer) -> 
 
 
 async def test_other_hosts_are_refused_before_the_browser_starts() -> None:
-    async with BrowserFetcher() as fetcher:
+    stats = Stats()
+
+    async with BrowserFetcher(stats=stats) as fetcher:
         with blocking_network() as guard, pytest.raises(NetworkBlocked):
             await fetcher.fetch(_render(PUBLIC))
-        launched = fetcher._launch  # pyright: ignore[reportPrivateUsage]
 
     assert guard.blocked == [PUBLIC]
-    assert launched is None
+    assert stats.get("browser.generations") is None
 
 
 async def test_a_socks_proxy_with_credentials_is_refused_before_the_browser_starts() -> None:
-    async with BrowserFetcher() as fetcher:
+    stats = Stats()
+
+    async with BrowserFetcher(stats=stats) as fetcher:
         with pytest.raises(ValueError, match="SOCKS proxy with credentials") as refused:
             await fetcher.fetch(_render("http://pernix.test/", proxy="socks5://user:secret-pw@127.0.0.1:1080"))
-        launched = fetcher._launch  # pyright: ignore[reportPrivateUsage]
 
-    assert launched is None
+    assert stats.get("browser.generations") is None
     assert "secret-pw" not in str(refused.value)
 
 

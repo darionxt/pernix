@@ -5,7 +5,7 @@ import heapq
 import itertools
 import time
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal
 
 from pernix.fetchers.fetcher_dispatch import is_rendered
@@ -33,6 +33,8 @@ class _Item:
     """Orders ready Requests of one priority; a newer heap entry makes older ones stale."""
     attempts: int = 0
     """Failed attempts that count."""
+    spent: dict[str, int] = field(default_factory=dict[str, int])
+    """Retries under each retry budget."""
     token: int = 0
     expires_at: float = 0.0
     not_before: float = 0.0
@@ -130,8 +132,9 @@ class MemoryFrontier:
             item.expires_at = now + ttl
             self._move(item, "leased")
             heapq.heappush(self._expiries, (item.expires_at, item.token, item.id))
+            attempt = item.attempts + 1
             leases.append(
-                Lease(item.id, item.token, item.attempts + 1, item.expires_at, item.slot, item.request, item.rendered)
+                Lease(item.id, item.token, attempt, item.expires_at, item.slot, item.request, item.rendered, item.spent)
             )
         for ready, entry in skipped:
             heapq.heappush(ready, entry)
@@ -162,13 +165,24 @@ class MemoryFrontier:
         self._notify()
         return True
 
-    async def nack(self, lease: Lease, *, delay: float = 0.0, count_attempt: bool = True, reason: str = "") -> bool:
+    async def nack(
+        self,
+        lease: Lease,
+        *,
+        delay: float = 0.0,
+        count_attempt: bool = True,
+        reason: str = "",
+        budget: str | None = None,
+    ) -> bool:
         """Return a leased Request; see `Frontier.nack()`."""
         now = self._refresh()
         item = self._leased(lease)
         if item is None:
             return False
-        item.attempts += count_attempt
+        if budget is None:
+            item.attempts += count_attempt
+        else:
+            item.spent = {**item.spent, budget: item.spent.get(budget, 0) + 1}  # Leases handed out keep theirs
         item.reason = reason
         if delay > 0:
             item.not_before = now + delay
