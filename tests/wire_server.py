@@ -44,6 +44,9 @@ PAGE = b'<!doctype html><html><head><link rel="icon" href="data:,"></head><body>
 _ANNOUNCED = (h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS, h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE)
 """The settings the server announces: those of h2 that are not the protocol's defaults, as many servers announce only those."""
 
+_ACCEPT_POLL = 0.05
+"""Seconds the server waits for a connection before checking whether it is stopped."""
+
 _PEEK_TIMEOUT = 5.0
 """Seconds a client may take to send its whole ClientHello."""
 
@@ -145,6 +148,8 @@ class WireServer:
         self._connections: list[CapturedConnection] = []
         self._sequence = itertools.count()
         self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
 
     @property
     def port(self) -> int:
@@ -189,10 +194,13 @@ class WireServer:
         assert closed, f"the connection of {path} is still open"
 
     def __enter__(self) -> Self:
-        threading.Thread(target=self._serve, daemon=True).start()
+        self._socket.settimeout(_ACCEPT_POLL)  # closing the socket would not wake an accept() on Linux
+        self._thread.start()
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        self._stopped.set()
+        self._thread.join(timeout=5)
         self._socket.close()
 
     def _next(self) -> int:
@@ -201,11 +209,14 @@ class WireServer:
             return next(self._sequence)
 
     def _serve(self) -> None:
-        while True:
+        while not self._stopped.is_set():
             try:
                 connection, _ = self._socket.accept()
+            except TimeoutError:
+                continue
             except OSError:
                 return  # closed
+            connection.settimeout(None)
             captured = CapturedConnection()
             with self._lock:
                 self._connections.append(captured)
