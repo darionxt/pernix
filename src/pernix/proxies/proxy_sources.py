@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
 
     from pernix.fetchers import HTTPFetcher
+    from pernix.proxies.proxy import Proxy
     from pernix.secret import Secret
 
 __all__ = ["ProxyAPI", "ProxyFile", "ProxyProvider", "StaticProxies", "proxy_lines", "read_proxies"]
@@ -25,25 +26,26 @@ class ProxyProvider(Protocol):
 
     `proxies()` is called when the Run starts, and again every `proxies.refresh`
     seconds, if set; the proxies it gives then replace those it gave before. They
-    are URLs such as `http://user:password@proxy:8080`, or `proxy:8080` for HTTP;
-    those that are not valid are skipped, with a warning. Like other components, a
-    provider gets services injected, and is opened and closed with the Run.
+    are URLs such as `http://user:password@proxy:8080`, or `proxy:8080` for HTTP,
+    or `pernix.proxies.Proxy` records, to tag them; those that are not valid are
+    skipped, with a warning. Like other components, a provider gets services
+    injected, and is opened and closed with the Run.
 
     Example:
         >>> class FromDatabase:
         ...     def __init__(self, database: Database) -> None:
         ...         self.database = database
         ...
-        ...     async def proxies(self) -> list[str]:
-        ...         rows = await self.database.fetch("SELECT url FROM proxies WHERE enabled")
-        ...         return [row["url"] for row in rows]
+        ...     async def proxies(self) -> list[Proxy]:
+        ...         rows = await self.database.fetch("SELECT url, region FROM proxies WHERE enabled")
+        ...         return [Proxy(row["url"], tags=frozenset({row["region"]})) for row in rows]
     """
 
-    async def proxies(self) -> Iterable[str]:
+    async def proxies(self) -> Iterable[str | Proxy]:
         """Return the proxies to use now.
 
         Returns:
-            The proxy URLs.
+            The proxy URLs, or records of them.
         """
         ...
 
@@ -51,15 +53,15 @@ class ProxyProvider(Protocol):
 class StaticProxies:
     """The proxies of `proxies.urls`, which never change."""
 
-    def __init__(self, urls: Collection[str]) -> None:
+    def __init__(self, urls: Collection[str | Proxy]) -> None:
         """Hold the proxies.
 
         Args:
-            urls: The proxy URLs.
+            urls: The proxy URLs, or records of them.
         """
         self._urls = tuple(urls)
 
-    async def proxies(self) -> tuple[str, ...]:
+    async def proxies(self) -> tuple[str | Proxy, ...]:
         """Return the proxies."""
         return self._urls
 

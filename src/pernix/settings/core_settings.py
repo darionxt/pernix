@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 import msgspec
 
 from pernix.account import ACCOUNT_FILE_SUFFIXES, Account
+from pernix.proxies.proxy import Proxy  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.proxies.proxy_url import proxy_url
 from pernix.secret import Secret  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.settings.section import ComponentMap, NamedComponents, Section
@@ -169,16 +170,18 @@ class ProxySettings(Section):
     """Settings of the proxies Requests are sent through.
 
     Proxies are used once a source is set; the proxies of every source are used
-    together. A Session is bound to one, which it goes through while it is
-    available, and a Request without a Session goes through the next one, in turn;
-    `Request(proxy=...)` goes through its own instead. A proxy that fails cools
-    down, longer with each failure in a row, and is Retired after `max_failures` in
-    a row. A proxy is a URL such as `http://user:password@proxy:8080`, or
-    `proxy:8080` for HTTP, with its port; its key is all of it, so that sticky
-    sessions on one gateway, which differ only in their credentials, stay apart.
+    together. A Session is bound to one, as `binding` picks it: by default, it
+    keeps the one it is bound to while that is available. A Request without a
+    Session goes through the next one, in turn; `Request(proxy=...)` goes through
+    its own instead. A proxy that fails cools down, longer with each failure in a
+    row, and is Retired after `max_failures` in a row. A proxy is a URL such as
+    `http://user:password@proxy:8080`, or `proxy:8080` for HTTP, with its port; its
+    key is all of it, so that sticky sessions on one gateway, which differ only in
+    their credentials, stay apart.
 
     Attributes:
-        urls: Proxies to use.
+        urls: Proxies to use, each a URL, or a `pernix.proxies.Proxy` table to tag
+            it, such as `{ url = "http://proxy:8080", tags = ["us"] }`.
         file: A text file of more proxies, one per line, read when the Run starts
             and at each refresh; blank lines and those starting with `#` are
             skipped. See `pernix.proxies.read_proxies()`.
@@ -193,11 +196,20 @@ class ProxySettings(Section):
             failure in a row.
         cooldown_max: The longest a proxy cools down.
         max_failures: Failures in a row after which a proxy is Retired.
+        max_sessions: Sessions a proxy is bound to at most, so that with 1 no two
+            share one; those that find none wait. `None` for no limit.
+        rebind: When the default `binding` binds a Session to another proxy:
+            `unavailable` once its proxy cools down, is Retired, or is no longer
+            listed; `every_lease` at each Lease, so its Leases go through the
+            proxies in turn.
+        binding: A replacement binding policy, a `pernix.proxies.BindingPolicy`
+            with `async bind(binding)`, as an object, a class building one, or an
+            import path; `None` for the default policy.
     """
 
     __prefix__ = "proxies"
 
-    urls: tuple[str, ...] = ()
+    urls: tuple[str | Proxy, ...] = ()
     file: PurePath | None = None
     api: Secret | None = None
     provider: Any = None
@@ -205,12 +217,15 @@ class ProxySettings(Section):
     cooldown: Annotated[float, msgspec.Meta(ge=0)] = 60.0
     cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 600.0
     max_failures: Annotated[int, msgspec.Meta(ge=1)] = 5
+    max_sessions: Annotated[int, msgspec.Meta(ge=1)] | None = None
+    rebind: Literal["unavailable", "every_lease"] = "unavailable"
+    binding: Any = None
 
     def __post_init__(self) -> None:
         problems: list[str] = []
         for index, url in enumerate(self.urls):
             try:
-                proxy_url(url)
+                proxy_url(url if isinstance(url, str) else url.url)
             except ValueError as exc:
                 problems.append(f"{self.key('urls')}[{index}]: {exc}")
         if problems:

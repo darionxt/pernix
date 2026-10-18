@@ -19,15 +19,6 @@ if TYPE_CHECKING:
 from pernix.settings import CORE_SECTIONS, load_settings
 
 
-@pytest.fixture
-def without_patchright(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make importing patchright fail, as where `pernix[browser]` is not installed."""
-    for name in list(sys.modules):
-        if name == "patchright" or name.startswith("patchright."):
-            monkeypatch.delitem(sys.modules, name)
-    monkeypatch.setitem(sys.modules, "patchright", None)
-
-
 @pytest.mark.usefixtures("without_patchright")
 async def test_rendering_without_the_extra_fails_with_an_install_hint() -> None:
     async with BrowserFetcher() as fetcher:
@@ -36,14 +27,25 @@ async def test_rendering_without_the_extra_fails_with_an_install_hint() -> None:
                 await fetcher.fetch(Request("http://127.0.0.1/", render=True))
 
 
+@pytest.mark.usefixtures("without_browser_engine")
 async def test_rendering_without_the_browser_engine_fails_with_an_install_hint() -> None:
+    async with BrowserFetcher() as fetcher:
+        with pytest.raises(ComponentError, match=r"install it with: pernix browser install$") as raised:
+            await fetcher.fetch(Request("http://127.0.0.1/", render=True))
+
+    assert "executable doesn't exist" in str(raised.value.__cause__).lower()
+
+
+async def test_a_browser_executable_that_does_not_exist_is_named() -> None:
     settings = BrowserSettings(launch_options={"executable_path": "/nonexistent/chrome"})
 
     async with BrowserFetcher(settings) as fetcher:
-        with pytest.raises(ComponentError, match="patchright install chromium") as raised:
+        with pytest.raises(ComponentError) as raised:
             await fetcher.fetch(Request("http://127.0.0.1/", render=True))
 
-    assert "executable doesn't exist" in str(raised.value.__cause__)
+    assert str(raised.value) == (
+        "the browser executable /nonexistent/chrome does not exist; change browser.launch_options"
+    )
 
 
 def test_the_core_imports_without_patchright() -> None:

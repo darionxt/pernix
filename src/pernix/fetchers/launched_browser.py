@@ -1,8 +1,9 @@
-"""Starting patchright and its browser for the browser Fetcher, under the network guard if it is on."""
+"""Starting patchright and its browser for the browser Fetcher, under the network guard if it is on, and probing it."""
 
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
@@ -20,13 +21,13 @@ if TYPE_CHECKING:
 
     from pernix.fetchers.browser_settings import BrowserSettings
 
-__all__ = ["LOOPBACK_BYPASS", "LaunchedBrowser", "launch_browser"]
+__all__ = ["LOOPBACK_BYPASS", "LaunchedBrowser", "launch_browser", "probe_browser", "require_patchright"]
 
 LOOPBACK_BYPASS = "<-loopback>,localhost,*.localhost,127.0.0.1/8,[::1]"
 """Proxy bypass rules for loopback hosts and nothing else; Chrome's implicit ones would also bypass link-local addresses."""
 
 _EXTRA_HINT = "rendering needs patchright; install it with: pip install 'pernix[browser]'"
-_ENGINE_HINT = "the browser engine is not installed; install it with: patchright install chromium"
+_ENGINE_HINT = "the browser engine is not installed; install it with: pernix browser install"
 
 
 @dataclass(slots=True)
@@ -95,7 +96,7 @@ async def launch_browser(settings: BrowserSettings) -> LaunchedBrowser:
 
     Raises:
         pernix.errors.ComponentError: patchright or its browser engine is not
-            installed.
+            installed, or the executable `launch_options` name does not exist.
     """
     try:
         from patchright.async_api import Error, async_playwright  # an optional dependency, imported when needed
@@ -114,7 +115,7 @@ async def launch_browser(settings: BrowserSettings) -> LaunchedBrowser:
             browser = await playwright.chromium.launch(**options)
         except Error as exc:
             if "executable doesn't exist" in str(exc).lower():
-                raise ComponentError(_ENGINE_HINT) from exc
+                raise ComponentError(_missing_executable(settings)) from exc
             raise
     except BaseException:
         if playwright is not None:
@@ -123,6 +124,49 @@ async def launch_browser(settings: BrowserSettings) -> LaunchedBrowser:
             await refusing_proxy.close()
         raise
     return LaunchedBrowser(playwright, browser, refusing_proxy is not None, refusing_proxy)
+
+
+async def probe_browser(settings: BrowserSettings) -> str:
+    """Launch a browser as a fetch would and close it, to tell whether it starts.
+
+    Args:
+        settings: The browser settings.
+
+    Returns:
+        The browser's name and version, such as `chromium 151.0.7922.34`.
+
+    Raises:
+        pernix.errors.ComponentError: patchright or its browser engine is not
+            installed, or the browser does not start; the message says why.
+    """
+    try:
+        launched = await launch_browser(settings)
+    except ComponentError:
+        raise
+    except Exception as exc:  # patchright's own errors, such as for system libraries that are missing
+        raise ComponentError(f"the browser does not start: {exc}") from exc
+    try:
+        return f"{launched.browser.browser_type.name} {launched.browser.version}"
+    finally:
+        await launched.close()
+
+
+def require_patchright() -> None:
+    """Make sure patchright, which the `browser` extra installs, is installed.
+
+    Raises:
+        pernix.errors.ComponentError: It is not; the message says how to install it.
+    """
+    if importlib.util.find_spec("patchright") is None:
+        raise ComponentError(_EXTRA_HINT)
+
+
+def _missing_executable(settings: BrowserSettings) -> str:
+    """What to do about a browser executable that does not exist: install the engine, or name another one."""
+    path = settings.launch_options.get("executable_path")
+    if path is None:
+        return _ENGINE_HINT
+    return f"the browser executable {path} does not exist; change {settings.key('launch_options')}"
 
 
 async def _start(manager: PlaywrightContextManager) -> Playwright:

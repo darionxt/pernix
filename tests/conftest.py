@@ -81,6 +81,21 @@ def write_spider(tmp_path: Path) -> Iterator[Callable[[str, str], Path]]:
             del sys.modules[name]  # never a module of the same name loaded from elsewhere
 
 
+@pytest.fixture
+def without_patchright(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make importing patchright fail, as where `pernix[browser]` is not installed."""
+    for name in list(sys.modules):
+        if name == "patchright" or name.startswith("patchright."):
+            monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "patchright", None)
+
+
+@pytest.fixture
+def without_browser_engine(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make patchright look for its browser engine in an empty directory, as where it is not installed."""
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path_factory.mktemp("no-browsers")))
+
+
 @pytest.fixture(scope="session")
 def browser_engine() -> None:
     """Launch the browser once, for the tests that need it.

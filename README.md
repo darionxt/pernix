@@ -16,7 +16,7 @@ Requires Python 3.13 or newer. Rendering pages in the browser needs the `browser
 
 ```bash
 uv add "pernix[browser] @ git+https://github.com/darionxt/pernix"
-uv run patchright install chromium
+uv run pernix browser install   # Chrome for Testing, which the browser Fetcher launches
 ```
 
 ## Quick start
@@ -122,17 +122,37 @@ With Accounts, the pool holds one Session per Account, under its id, and no othe
 class Shop(Spider):
     start_urls = ["https://shop.example/"]
     settings = {
-        "proxies.urls": ["http://user-session-a1:pw@gate.example:7777", "http://user-session-b2:pw@gate.example:7777"],
+        "proxies.urls": [
+            "http://user-session-a1:pw@gate.example:7777",
+            {"url": "http://user-session-b2:pw@gate.example:7777", "tags": ["us"]},
+        ],
         "proxies.api": "https://vendor.example/proxies?key=...",  # one per line, fetched again every refresh
         "proxies.refresh": 300,
+        "proxies.max_sessions": 1,  # no two Sessions share a proxy
     }
 ```
 
-Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart.
+Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart. `proxies.urls` and providers also take `Proxy` records, tables in settings, whose `tags` binding policies select them by.
 
-Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats.
+Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down, unless `proxies.max_sessions` limits how many share one: with 1, no two do, and the Sessions that find none wait. `proxies.rebind = "every_lease"` binds a Session to another proxy at each Lease, so its Leases go through the proxies in turn. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats.
 
-A Session thus changes address, keeping its cookies, whenever its proxy cools down, is Retired, or is no longer listed: a refresh replaces the proxies, so with an API that answers with a new batch each time, every Session changes address at each refresh. Bindings last one Run. Sites that tie an Account to one address need more than this for now. See [`docs/design.md`](docs/design.md) §5.3.
+How Sessions are bound is up to a binding policy, which `proxies.binding` replaces. Its `bind(binding)` is told of the Session, its Account, its proxy, why it is being bound, and the candidates, each with its health, tags, and Sessions, and returns the proxy to bind, or `None` to wait; the pool binds it only while it has room, and asks again if another Session took the last first:
+
+```python
+from pernix.proxies import Binding
+
+
+class ByRegion:
+    """Keeps each Account on its proxy while it is available, and binds it to one of its region."""
+
+    async def bind(self, binding: Binding) -> str | None:
+        if binding.reason == "lease":  # its proxy is available
+            return binding.current
+        region = REGIONS[binding.account.id] if binding.account else "us"
+        return next((proxy.url for proxy in binding.open if region in proxy.tags), None)
+```
+
+With the default policy, a Session thus changes address, keeping its cookies, whenever its proxy cools down, is Retired, or is no longer listed: a refresh replaces the proxies, so with an API that answers with a new batch each time, every Session changes address at each refresh. Bindings last one Run. Sessions that wait for their own proxy rather than change address, and refreshes that add proxies rather than replace them, are not provided yet. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Running and stopping
 
@@ -174,11 +194,13 @@ pernix run books.py -a keyword=dune -s concurrency=4 -o books.jsonl   # Books.ru
 pernix run myproject.spiders.books:Books                            # an import path, a Spider chosen by name
 pernix fetch https://example.com/ > page.html                        # headers to stderr, the body to stdout
 pernix fetch https://example.com/ --json                             # one JSON object, errors included
+pernix fetch https://example.com/ --fetcher browser                  # the page as its scripts left it
 pernix shell https://example.com/                                    # `await fetch(...)`, `response.css(...)`
 pernix check books.py                                                # validate settings and components
+pernix browser install                                               # install the browser engine
 ```
 
-`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `fetch` exits with 0 for any Response and 1 when fetching failed. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings, without retries; `--fetcher` picks a registered Fetcher. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `fetch` exits with 0 for any Response, 1 when fetching failed, and 2 when it cannot fetch at all, as without the browser engine. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings, without retries; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
 ## Configuration
 
@@ -228,11 +250,14 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `sessions.lease_ttl` | `300.0` | Seconds a Session stays leased without renewal; leases are renewed while their fetch runs |
 | `sessions.accounts` / `sessions.accounts_file` | `()` / none | Accounts to bind Sessions to, and a JSON Lines or CSV file of more |
 | `sessions.login_attempts` | `3` | Failed logins in a row after which a Session is Retired |
-| `proxies.urls` | `()` | Proxies Requests go through, such as `http://user:password@proxy:8080` |
+| `proxies.urls` | `()` | Proxies Requests go through, such as `http://user:password@proxy:8080`, or tables with a `url` and `tags` |
 | `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`), and a `ProxyProvider` |
 | `proxies.refresh` | `None` | Seconds between loads of the file, the API, and the provider; `None` loads them once |
 | `proxies.cooldown` / `proxies.cooldown_max` | `60.0` / `600.0` | Seconds a failed proxy cools down, doubled with each failure in a row, and the longest it does |
 | `proxies.max_failures` | `5` | Failures in a row after which a proxy is Retired |
+| `proxies.max_sessions` | `None` | Sessions a proxy is bound to at most; with `1`, no two share one, and those that find none wait |
+| `proxies.rebind` | `"unavailable"` | When the default binding policy binds a Session to another proxy: once its own is `unavailable`, or at `every_lease` |
+| `proxies.binding` | `None` | A replacement binding policy, with `async bind(binding)` |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -398,7 +423,8 @@ src/pernix/
 │   ├── run_command.py   pernix run
 │   ├── fetch_command.py pernix fetch, and its JSON output
 │   ├── shell_command.py pernix shell
-│   ├── check_command.py pernix check
+│   ├── check_command.py pernix check, launching the browser once
+│   ├── browser_command.py pernix browser install
 │   ├── spider_loader.py finds a Spider in a file or an import path
 │   ├── downloader.py    fetches single Requests outside a Run
 │   ├── console.py       the interactive console with top-level await
@@ -437,7 +463,7 @@ src/pernix/
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
 │   ├── browser_settings.py the browser.* settings
-│   ├── launched_browser.py starts patchright and its browser, under the network guard if on
+│   ├── launched_browser.py starts patchright and its browser, under the network guard if on, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
@@ -455,10 +481,12 @@ src/pernix/
 │   └── session_login.py logs Sessions in with the Spider's login, judges logged-out Responses
 ├── proxies/
 │   ├── proxy_url.py     proxy URLs, in the one form that tells proxies apart
-│   ├── proxy_pool.py    ProxyPool protocol, ProxyHealth, ProxyCounts
-│   ├── memory_proxy_pool.py MemoryProxyPool: turns, bindings, cooldowns, and Retirements
+│   ├── proxy.py         Proxy, a proxy as its source gives it, with its tags
+│   ├── proxy_pool.py    ProxyPool protocol, ProxyCandidate, ProxyHealth, ProxyCounts
+│   ├── memory_proxy_pool.py MemoryProxyPool: turns, candidates, bindings, cooldowns, and Retirements
+│   ├── binding_policy.py BindingPolicy protocol, Binding, and the default policy
 │   ├── proxy_sources.py ProxyProvider protocol; lists, files, and APIs of proxies
-│   └── run_proxies.py   the proxies of a Run: loaded, refreshed, given to fetches, and reported on
+│   └── run_proxies.py   the proxies of a Run: loaded, refreshed, given to fetches, bound to Sessions, and reported on
 ├── stats/
 │   ├── stats.py         Stats, the counters and values of a Run
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items
@@ -490,7 +518,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-uv run patchright install chromium   # for the tests that render; they are skipped without it
+uv run pernix browser install   # for the tests that render; they are skipped without it
 uv run pytest
 uv run ruff check
 uv run ruff format --check

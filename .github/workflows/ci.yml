@@ -42,5 +42,5 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
       - name: Install the browser engine
-        run: uv run patchright install --with-deps --no-shell chromium
+        run: uv run pernix browser install --with-deps
       - run: uv run pytest
