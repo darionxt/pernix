@@ -7,6 +7,7 @@ import msgspec
 import pytest
 
 from pernix import Request, Response, Spider
+from pernix.browser import Click, Evaluate, Render, Screenshot, Scroll, Type, WaitFor
 from pernix.errors import SerializationError
 from pernix.request_codec import REQUEST_SCHEMA_VERSION, decode_request, encode_request
 
@@ -69,6 +70,67 @@ def test_minimal_requests_round_trip_with_defaults() -> None:
     request = Request(URL)
 
     assert decode_request(encode_request(request, shop), shop) == request
+
+
+def test_render_options_round_trip_with_their_actions() -> None:
+    shop = Shop()
+    render = Render(
+        wait_for="ul.books",
+        actions=[
+            WaitFor("li.book", state="attached", timeout=5),
+            Scroll(times=3, delay=0.25),
+            Click("#accept", optional=True, timeout=2),
+            Type("input[name=q]", "dune", delay=0.05),
+            Evaluate("() => window.__DATA__", isolated=True),
+            Screenshot(full_page=False),
+        ],
+        block=("image", "font"),
+        capture=("**/api/list*", "**/api/item/*"),
+        screenshot=True,
+    )
+    request = Request(URL, render=render, callback=shop.parse_item)
+
+    restored = decode_request(encode_request(request, shop), shop)
+
+    assert restored == request
+    assert restored.render == render
+    assert [type(action) for action in render.actions] == [WaitFor, Scroll, Click, Type, Evaluate, Screenshot]
+
+
+@pytest.mark.parametrize("render", [True, False, Render(), Render(block=()), Render(block=("media",))])
+def test_render_true_and_render_options_stay_apart(render: bool | Render) -> None:
+    shop = Shop()
+
+    assert decode_request(encode_request(Request(URL, render=render), shop), shop).render == render
+
+
+def test_actions_are_persisted_tagged_by_kind() -> None:
+    shop = Shop()
+    request = Request(URL, render=Render(actions=[Click("a.more"), Scroll(times=2)]))
+
+    record = msgspec.msgpack.decode(encode_request(request, shop))
+
+    assert record["render"] == {
+        "actions": [{"action": "click", "selector": "a.more"}, {"action": "scroll", "times": 2}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("render", "message"),
+    [
+        (
+            {"block": ["document"]},
+            "the persisted Request's Render options are invalid: Render\\(block=...\\): 'document'",
+        ),
+        ({"actions": [{"action": "click", "selector": ""}]}, "not a valid persisted Request: Click: selector"),
+        ({"actions": [{"action": "hover", "selector": "a"}]}, "not a valid persisted Request"),
+    ],
+)
+def test_invalid_persisted_render_options_are_refused(render: dict[str, Any], message: str) -> None:
+    data = msgspec.msgpack.encode({"schema_version": REQUEST_SCHEMA_VERSION, "url": URL, "render": render})
+
+    with pytest.raises(SerializationError, match=message):
+        decode_request(data, Shop())
 
 
 def test_tuples_come_back_as_lists() -> None:

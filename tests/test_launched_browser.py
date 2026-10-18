@@ -53,7 +53,7 @@ def test_the_core_imports_without_patchright() -> None:
         """
         import sys
         sys.modules["patchright"] = None
-        import pernix, pernix.fetchers, pernix.testing
+        import pernix, pernix.browser, pernix.fetchers, pernix.testing
         from pernix.fetchers import BrowserFetcher
         print(BrowserFetcher.__name__)
         """

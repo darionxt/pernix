@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import mimetypes
 import threading
 from collections.abc import Callable
@@ -202,6 +203,11 @@ class LoopbackServer:
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            @override
+            def handle(self) -> None:
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):  # a browser dropping a kept connection
+                    super().handle()
 
             def _handle(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)

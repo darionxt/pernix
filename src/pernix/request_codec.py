@@ -5,7 +5,8 @@ name of the Spider method and looked up again when decoding; a missing method is
 error, never a fallback to `parse`. User data (`kwargs`, `meta`, `ext`) must be
 JSON-compatible: `None`, booleans, numbers (integers within 64 bits), strings, lists,
 and mappings with string keys. Tuples come back as lists, and mappings as dicts.
-Nothing is ever pickled.
+`Render` options are kept with their actions, each tagged with its kind. Nothing is
+ever pickled.
 
 `REQUEST_SCHEMA_VERSION` changes only for incompatible changes. Fields added later
 have defaults, and fields a decoder does not know are ignored, so older and newer
@@ -20,16 +21,26 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 
+from pernix.browser import Action, Render  # msgspec resolves the field types at runtime
 from pernix.errors import SerializationError
 from pernix.request import Request
 
 if TYPE_CHECKING:
+    from pernix.browser import ResourceType
     from pernix.request import Callback
 
 __all__ = ["REQUEST_SCHEMA_VERSION", "decode_request", "encode_request"]
 
 REQUEST_SCHEMA_VERSION = 1
 """The version of the persisted Request format this Pernix writes and reads."""
+
+
+class _RenderRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
+    wait_for: str | None = None
+    actions: tuple[Action, ...] = ()
+    block: tuple[str, ...] | None = None
+    capture: tuple[str, ...] = ()
+    screenshot: bool = False
 
 
 class _RequestRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
@@ -47,7 +58,7 @@ class _RequestRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
     fingerprint: str | None = None
     cookies: dict[str, str] = msgspec.field(default_factory=dict[str, str])
     session: str | None = None
-    render: bool = False
+    render: bool | _RenderRecord = False
     fetcher: str | None = None
     timeout: float | None = None
     proxy: str | None = None
@@ -95,7 +106,7 @@ def encode_request(request: Request, spider: object) -> bytes:
         fingerprint=request.fingerprint,
         cookies=dict(request.cookies),
         session=request.session,
-        render=request.render,
+        render=_render_record(request.render),
         fetcher=request.fetcher,
         timeout=request.timeout,
         proxy=request.proxy,
@@ -117,8 +128,8 @@ def decode_request(data: bytes, spider: object) -> Request:
 
     Raises:
         SerializationError: The data is not a persisted Request, it was written in a
-            newer incompatible format, or the Spider has no method by the stored
-            Callback or errback name.
+            newer incompatible format, its `Render` options are invalid, or the
+            Spider has no method by the stored Callback or errback name.
     """
     try:
         record = _decoder.decode(data)
@@ -129,6 +140,7 @@ def decode_request(data: bytes, spider: object) -> Request:
             f"the Request was persisted in format {record.schema_version}, but this Pernix "
             f"reads format {REQUEST_SCHEMA_VERSION} and older; upgrade Pernix to resume this Run"
         )
+    render = record.render if isinstance(record.render, bool) else _restored_render(record.render)
     return Request(
         record.url,
         method=record.method,
@@ -143,13 +155,38 @@ def decode_request(data: bytes, spider: object) -> Request:
         fingerprint=record.fingerprint,
         cookies=record.cookies,
         session=record.session,
-        render=record.render,
+        render=render,
         fetcher=record.fetcher,
         timeout=record.timeout,
         proxy=record.proxy,
         impersonate=record.impersonate,
         ext=record.ext,
     )
+
+
+def _render_record(render: bool | Render) -> bool | _RenderRecord:
+    if isinstance(render, bool):
+        return render
+    return _RenderRecord(
+        wait_for=render.wait_for,
+        actions=render.actions,
+        block=render.block,
+        capture=render.capture,
+        screenshot=render.screenshot,
+    )
+
+
+def _restored_render(record: _RenderRecord) -> Render:
+    try:
+        return Render(
+            wait_for=record.wait_for,
+            actions=record.actions,
+            block=cast("tuple[ResourceType, ...] | None", record.block),
+            capture=record.capture,
+            screenshot=record.screenshot,
+        )
+    except ValueError as exc:
+        raise SerializationError(f"the persisted Request's Render options are invalid: {exc}") from exc
 
 
 def _method_name(method: Callback | None, spider: object, role: str) -> str | None:

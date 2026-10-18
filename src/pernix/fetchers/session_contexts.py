@@ -21,8 +21,8 @@ if TYPE_CHECKING:
 
 __all__ = ["NewContext", "SessionContext", "SessionContexts"]
 
-type NewContext = Callable[[LaunchedBrowser, Session, str | None], Awaitable[BrowserContext]]
-"""Creates the context of a Session in a browser, with a proxy and the Session's localStorage."""
+type NewContext = Callable[[LaunchedBrowser, Session, str | None, bool], Awaitable[BrowserContext]]
+"""Creates a Session's context: with a proxy, its localStorage, and service workers blocked or not."""
 
 _LOCAL_STORAGE = "() => [location.origin, Object.entries(localStorage)]"
 
@@ -32,11 +32,14 @@ class SessionContext:
 
     Before each fetch, its cookies are made those of the Session, with the
     Request's own; after it, the changes the page made are merged back into the
-    Session. Its proxy is fixed when it is created.
+    Session. Its proxy, and whether it blocks service workers, are fixed when it is
+    created.
 
     Attributes:
         session: The id of the Session.
         proxy: The proxy of the context, if any.
+        blocks_service_workers: Whether its pages cannot register service
+            workers, as fetches that block resource types need.
         context: The browser context.
         launched: The browser it belongs to.
         local_storage: The localStorage the context holds, by origin, as last seen.
@@ -50,6 +53,7 @@ class SessionContext:
         *,
         proxy: str | None,
         launched: LaunchedBrowser,
+        blocks_service_workers: bool = False,
     ) -> None:
         """Keep a context created for a Session, with the Session's localStorage.
 
@@ -58,10 +62,12 @@ class SessionContext:
             context: The context.
             proxy: Its proxy.
             launched: The browser it belongs to.
+            blocks_service_workers: Whether it blocks service workers.
         """
         self.session = session.id
         self.context = context
         self.proxy = proxy
+        self.blocks_service_workers = blocks_service_workers
         self.launched = launched
         self.local_storage = {origin: dict(items) for origin, items in session.local_storage.items()}
         self.broken = False
@@ -70,13 +76,18 @@ class SessionContext:
         self._overrides: frozenset[BrowserKey] = frozenset()
         """The keys of the cookies it holds as the Request's own for the fetch in progress."""
 
-    def fits(self, session: Session, *, proxy: str | None, launched: LaunchedBrowser) -> bool:
-        """Whether a fetch under a Session can use the context: same browser and proxy, and the Session's localStorage.
+    def fits(
+        self, session: Session, *, proxy: str | None, launched: LaunchedBrowser, blocks_service_workers: bool = False
+    ) -> bool:
+        """Whether a fetch under a Session can use the context: same browser, proxy, service workers, and localStorage.
 
         Args:
             session: The Session.
             proxy: The proxy of the fetch.
             launched: The browser of the fetch.
+            blocks_service_workers: Whether the fetch needs service workers
+                blocked, as it blocks resource types; a context that let them
+                register may hold some that would load what is blocked.
 
         Returns:
             Whether it fits; one whose localStorage changed elsewhere does not.
@@ -85,6 +96,7 @@ class SessionContext:
             not self.broken
             and self.launched is launched
             and self.proxy == proxy
+            and self.blocks_service_workers == blocks_service_workers
             and self.local_storage == session.local_storage
         )
 
@@ -160,7 +172,8 @@ class SessionContexts:
     A fetch takes the context kept for its Session that fits it, or a new one,
     created with the Session's localStorage and the fetch's proxy, and gives it back
     once it ends. Concurrent fetches of one Session each get one. A Session's kept
-    contexts that no longer fit, as its proxy or its localStorage changed, are
+    contexts that no longer fit, as its proxy or its localStorage changed, or the
+    fetch blocks service workers where they did not, or the other way round, are
     closed. At most `kept` contexts are kept between fetches, the least recently used
     closed beyond that, and one kept for `idle` seconds is closed. A context whose
     fetch was cancelled, or that broke, is closed instead of kept.
@@ -194,7 +207,7 @@ class SessionContexts:
 
     @asynccontextmanager
     async def using(
-        self, launched: LaunchedBrowser, session: Session, *, proxy: str | None
+        self, launched: LaunchedBrowser, session: Session, *, proxy: str | None, blocks_service_workers: bool = False
     ) -> AsyncGenerator[SessionContext]:
         """Use a context of a Session for one fetch.
 
@@ -202,14 +215,18 @@ class SessionContexts:
             launched: The browser.
             session: The Session.
             proxy: The proxy of the fetch.
+            blocks_service_workers: Whether the fetch needs service workers
+                blocked.
 
         Yields:
             The context, which no other fetch uses meanwhile.
         """
-        held = self._take(launched, session, proxy)
+        held = self._take(launched, session, proxy, blocks_service_workers)
         if held is None:
-            context = await self._new_context(launched, session, proxy)
-            held = SessionContext(session, context, proxy=proxy, launched=launched)
+            context = await self._new_context(launched, session, proxy, blocks_service_workers)
+            held = SessionContext(
+                session, context, proxy=proxy, launched=launched, blocks_service_workers=blocks_service_workers
+            )
         try:
             yield held
         except asyncio.CancelledError:
@@ -227,10 +244,16 @@ class SessionContexts:
         for held in waiting:
             self._close(held)
 
-    def _take(self, launched: LaunchedBrowser, session: Session, proxy: str | None) -> SessionContext | None:
+    def _take(
+        self, launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
+    ) -> SessionContext | None:
         """The most recently used context kept for a Session that fits a fetch; the Session's others are closed."""
         mine = [held for held in self._waiting if held.session == session.id]
-        fitting = [held for held in mine if held.fits(session, proxy=proxy, launched=launched)]
+        fitting = [
+            held
+            for held in mine
+            if held.fits(session, proxy=proxy, launched=launched, blocks_service_workers=blocks_service_workers)
+        ]
         taken = fitting[-1] if fitting else None
         for held in mine:
             if held is not taken and held not in fitting:

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from re import Pattern
 
+    from pernix.browser import RenderResult
     from pernix.request import Request
     from pernix.text_decoding import DecodedText, EncodingSource
 
@@ -65,6 +66,9 @@ class Response:
         streamed: Whether the body is read as it arrives, apart from the Response,
             whose `body` is then empty: download Middleware see such Responses for
             the streamed fetches of `Crawler.stream()`.
+        browser: What rendering the page gave besides the body, such as captured
+            responses, screenshots, and the results of `Evaluate` actions; `None`
+            for a Response that was not rendered.
     """
 
     url: str
@@ -80,6 +84,7 @@ class Response:
     fetcher: str | None
     session: str | None
     streamed: bool
+    browser: RenderResult | None
     _encoding: str | None
     _default_encoding: str
     _decoded: DecodedText | None
@@ -105,6 +110,7 @@ class Response:
         fetcher: str | None = None,
         session: str | None = None,
         streamed: bool = False,
+        browser: RenderResult | None = None,
     ) -> None:
         """Create a Response. Fetchers build these; user code rarely needs to.
 
@@ -125,6 +131,7 @@ class Response:
             fetcher: The name of the Fetcher that produced this Response.
             session: The Session the Request was sent as.
             streamed: Whether the body is read apart from the Response.
+            browser: What rendering the page gave, for a rendered Response.
 
         Raises:
             LookupError: `encoding` or `default_encoding` names no text encoding.
@@ -146,6 +153,7 @@ class Response:
         set_field(self, "fetcher", fetcher)
         set_field(self, "session", session)
         set_field(self, "streamed", streamed)
+        set_field(self, "browser", browser)
         set_field(self, "_encoding", encoding)
         set_field(self, "_default_encoding", default_encoding)
         set_field(self, "_decoded", None)
@@ -366,6 +374,7 @@ class Response:
             "fetcher": self.fetcher,
             "session": self.session,
             "streamed": self.streamed,
+            "browser": self.browser,
         }
 
 

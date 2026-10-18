@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
-from pernix import Pipeline, Request, Response, Spider
+from pernix import Middleware, Pipeline, Request, Response, Spider
 from pernix.errors import SpiderArgumentError, Timeout
 from pernix.testing import FakeFetcher, crawl, make_response, run_callback
 
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from pernix.crawler import Crawler
     from pernix.items import ItemContext
+    from pernix.middlewares import Download
     from pernix.testing import LoopbackServer
 
 SHOP = "https://shop.example"
@@ -30,6 +31,65 @@ class Books(Spider):
     async def parse_book(self, response: Response, source: str) -> AsyncIterator[Any]:
         yield {"title": response.css("h1::text").get(), "source": source}
         yield None
+
+
+class Rendered(Spider):
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(f"{SHOP}/", render=True)
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        yield {"title": response.css("h1::text").get(), "fetcher": response.fetcher}
+
+
+class OpenedFake(FakeFetcher):
+    """A FakeFetcher that records being opened and closed."""
+
+    def __init__(self) -> None:
+        super().__init__({f"{SHOP}/": "<h1>Dune</h1>"})
+        self.lifecycle: list[str] = []
+        self.closed_by: list[BaseException | None] = []
+
+    async def __aenter__(self) -> OpenedFake:
+        self.lifecycle.append("open")
+        return self
+
+    async def __aexit__(
+        self, _type: type[BaseException] | None, error: BaseException | None, _traceback: object
+    ) -> None:
+        self.lifecycle.append("close")
+        self.closed_by.append(error)
+
+
+@pytest.mark.parametrize("also_http", [False, True])
+async def test_a_browser_stand_in_is_opened_with_the_run_once(also_http: bool) -> None:
+    fake = OpenedFake()
+
+    report = await crawl(Rendered, fetcher=fake if also_http else None, browser=fake)
+
+    assert report.items == [{"title": "Dune", "fetcher": "browser"}]
+    assert fake.lifecycle == ["open", "close"]
+    assert fake.closed_by == [None]
+
+
+class BrokenOpening(Middleware):
+    """Fails to open, after the Fetchers opened, which ends the Run."""
+
+    async def open(self) -> None:
+        raise RuntimeError("opening broke")
+
+    async def __call__(self, request: Request, call_next: Download) -> Response:
+        return await call_next(request)
+
+
+@pytest.mark.parametrize("also_http", [False, True])
+async def test_a_browser_stand_in_closes_its_fetcher_with_the_error_that_ended_the_run(also_http: bool) -> None:
+    fake = OpenedFake()
+    settings = {"middlewares": {BrokenOpening: 100}}
+
+    with pytest.raises(RuntimeError, match="opening broke") as raised:
+        await crawl(Rendered, fetcher=fake if also_http else None, browser=fake, settings=settings)
+
+    assert fake.closed_by == [raised.value]
 
 
 async def test_a_spider_runs_end_to_end_on_a_fake_fetcher() -> None:

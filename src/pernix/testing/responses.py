@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Any
 
 import orjson
 
+from pernix.browser import RenderResult
+from pernix.fetchers import BROWSER_FETCHER
 from pernix.headers import Headers
 from pernix.request import Request
 from pernix.response import Response
@@ -27,8 +29,13 @@ def make_response(
     json: Any = None,
     request: Request | None = None,
     encoding: str | None = None,
+    browser: RenderResult | None = None,
 ) -> Response:
     """Build a Response for a test, as a Fetcher would.
+
+    A Response to a rendered Request, or with `browser` given, is one the browser
+    Fetcher would give: its `fetcher` is `browser`, and `response.browser` is empty
+    unless given.
 
     Args:
         url: The absolute URL of the Response.
@@ -39,8 +46,11 @@ def make_response(
         json: A value sent as a JSON body, with `Content-Type: application/json`
             unless `headers` set one, instead of `body`.
         request: The Request it answers, whose Callback, `kwargs`, and `meta` a
-            Callback sees; `Request(url)` by default.
+            Callback sees; `Request(url)` by default, rendered if `browser` is
+            given.
         encoding: Decode the body with this encoding, whatever it declares.
+        browser: What rendering gave, such as captured responses or the results of
+            `Evaluate` actions.
 
     Returns:
         The Response.
@@ -52,6 +62,9 @@ def make_response(
         >>> response = make_response("https://shop.example/books", "<a href='/book/1'>Dune</a>")
         >>> response.css("a::text").get()
         'Dune'
+        >>> rendered = make_response(url, "<h1>Dune</h1>", browser=RenderResult(evaluated=[42]))
+        >>> rendered.browser.evaluated
+        (42,)
     """
     if not is_absolute(url):
         raise ValueError(f"a Response needs an absolute URL, got {url!r}")
@@ -64,13 +77,18 @@ def make_response(
     elif isinstance(body, str):
         body = body.encode()
         response_headers = _with_default(response_headers, _HTML)
+    if request is None:
+        request = Request(url, render=browser is not None)
+    rendered = browser is not None or bool(request.render)
     return Response(
         url=url,
         status=status,
         headers=response_headers,
         body=body,
-        request=request or Request(url),
+        request=request,
         encoding=encoding,
+        fetcher=BROWSER_FETCHER if rendered else None,
+        browser=(browser or RenderResult()) if rendered else None,
     )
 
 
