@@ -360,6 +360,30 @@ async def test_an_action_leading_to_a_page_that_does_not_load_fails(server: Loop
         await _fetch(server.url("/"), Render(actions=[Click("a")]))
 
 
+async def test_a_page_that_did_not_load_fails_as_such_when_a_later_action_fails(server: LoopbackServer) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as listening:
+        closed = f"http://127.0.0.1:{listening.getsockname()[1]}/next"
+    server.route("/", f"<a href='{closed}'>next</a>", headers=HTML)
+    read = Evaluate("() => document.querySelector('#title').textContent")  # fails on the browser's error page
+
+    with pytest.raises(ConnectError, match=r"navigated to .*, which did not load") as raised:
+        await _fetch(server.url("/"), Render(actions=[Click("a"), read]))
+
+    assert isinstance(raised.value.__cause__, ActionError)
+
+
+async def test_type_takes_no_longer_than_its_timeout_in_all(server: LoopbackServer) -> None:
+    page = """<html><body><script>
+const late = () => document.body.insertAdjacentHTML("beforeend", "<input id='late'>");
+addEventListener("load", () => setTimeout(late, 700));
+</script></body></html>"""
+    server.route("/", page, headers=HTML)
+    typing = Type("#late", "abcdef", delay=0.1, timeout=1)  # found after 0.7 s, then 0.6 s of typing
+
+    with pytest.raises(ActionTimeout, match=r"actions\[0\], Type\('#late'\), on .* took longer than 1 s"):
+        await _fetch(server.url("/"), Render(actions=[typing]))
+
+
 async def test_an_action_leading_to_a_refused_host_is_blocked(server: LoopbackServer) -> None:
     server.route("/", "<a href='http://192.0.2.1/next'>next</a>", headers=HTML)
 

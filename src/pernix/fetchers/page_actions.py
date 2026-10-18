@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -120,8 +121,12 @@ async def _perform(page: Page, action: Action, outputs: ActionOutputs, seconds: 
             await page.locator(selector).first.click(timeout=milliseconds)
         case Type(selector=selector, text=text, delay=delay):
             element = page.locator(selector).first
+            deadline = time.monotonic() + seconds  # finding the element and typing share the timeout
             await element.evaluate(_CARET_AT_END, timeout=milliseconds)
-            await element.press_sequentially(text, delay=delay * 1000, timeout=milliseconds)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            await element.press_sequentially(text, delay=delay * 1000, timeout=left * 1000)
         case Scroll(times=times, delay=delay):
             for _ in range(times):
                 async with asyncio.timeout(seconds):

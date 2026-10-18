@@ -252,7 +252,7 @@ Page interaction comes in three layers; use whichever you need:
 | `WaitFor(selector, state="visible")` | Waits for the first element matching the selector to be `attached`, `detached`, `visible`, or `hidden` |
 | `Scroll(times=1, delay=0.5)` | Scrolls to the bottom of the page `times` times, pausing `delay` seconds after each for the page to load more; the timeout applies to each scroll |
 | `Click(selector)` | Clicks the first element matching the selector, once it can be clicked |
-| `Type(selector, text, delay=0.0)` | Types the text into the first element matching the selector, key by key, `delay` seconds apart, after what it holds; the text, which may be a password, is left out of its `repr` and of errors |
+| `Type(selector, text, delay=0.0)` | Types the text into the first element matching the selector, key by key, `delay` seconds apart, after what it holds; finding the element and typing share the timeout. The text, which may be a password, is left out of its `repr` and of errors |
 | `Evaluate(script, isolated=False)` | Runs JavaScript, an expression or a function to call, in the page, where it reaches the page's globals; with `isolated=True` in a world of its own, which the page's scripts do not see, sharing only the DOM with them. Its result, made JSON-compatible, goes to `response.browser.evaluated` |
 | `Screenshot(full_page=True)` | Takes a PNG screenshot, of the whole page or of the window, into `response.browser.screenshots` |
 
@@ -260,7 +260,7 @@ Page interaction comes in three layers; use whichever you need:
 
 **Results** (`response.browser`, a `RenderResult`, on every Response of the browser Fetcher):
 
-- `document`: the main document as it came over the network, before its scripts ran, as a `CapturedResponse(url, status, headers, body)`; the rendered HTML is `body`. When an action leads to another document, such as a `Click` on a link, the Response, its status, headers, and history included, describes the document it led to; a navigation that shows no document, such as one answered with a 204 or a download, leaves the page as it was. A navigation of the page, by an action or by its own scripts, to a document that does not load fails the fetch with the `FetchError` of the browser's error, such as a `ConnectError`, as loading it would, and one the network guard refuses raises `NetworkBlocked`.
+- `document`: the main document as it came over the network, before its scripts ran, as a `CapturedResponse(url, status, headers, body)`; the rendered HTML is `body`. When an action leads to another document, such as a `Click` on a link, the Response, its status, headers, and history included, describes the document it led to; a navigation that shows no document, such as one answered with a 204 or a download, leaves the page as it was. A navigation of the page, by an action or by its own scripts, to a document that does not load fails the fetch with the `FetchError` of the browser's error, such as a `ConnectError`, as loading it would, also when a later action then fails on the browser's error page; one the network guard refuses raises `NetworkBlocked`.
 - `captured`: the `CapturedResponse`s of `capture`.
 - `screenshots`: PNGs in the order taken, that of `screenshot=True` last.
 - `evaluated`: the results of the `Evaluate` actions, in order.

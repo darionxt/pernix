@@ -12,6 +12,7 @@ from urllib.parse import urldefrag, urlsplit
 from pernix.browser import Render, RenderResult
 from pernix.cookies import request_cookies
 from pernix.errors import (
+    ActionError,
     ComponentError,
     ConnectError,
     FetchError,
@@ -360,11 +361,16 @@ class BrowserFetcher:
         if document is None:
             raise FetchError(f"loading {request.url} gave no document")
         action_timeout = self._settings.action_timeout
-        outputs = await run_render(page, load.render, action_timeout=action_timeout, url=request.url)
-        if watch.refused is not None:
-            raise _refused(watch.refused, request) from None
-        if watch.failed is not None:
-            raise _failed_navigation(watch.failed, request) from None
+        try:
+            outputs = await run_render(page, load.render, action_timeout=action_timeout, url=request.url)
+        except ActionError as exc:
+            failure = _navigation_failure(watch, request)
+            if failure is not None:
+                raise failure from exc  # the action failed as the page it acted on did not load
+            raise
+        failure = _navigation_failure(watch, request)
+        if failure is not None:
+            raise failure
         document = watch.shown or document  # an action may have led to another one
         result = RenderResult(
             document=await captured_response(document),
@@ -647,8 +653,13 @@ def _fetch_error(error: Exception, request: Request) -> FetchError:
     return _error_kind(message)(f"loading {request.url} failed: {message}")
 
 
-def _failed_navigation(failed: PageRequest, request: Request) -> FetchError:
-    """The error of a navigation of the main frame that did not load, after the page had loaded."""
+def _navigation_failure(watch: _PageLoad, request: Request) -> FetchError | None:
+    """The error of a navigation of the main frame, after the page had loaded, that was refused or did not load."""
+    if watch.refused is not None:
+        return _refused(watch.refused, request)
+    failed = watch.failed
+    if failed is None:
+        return None
     failure = failed.failure or "the browser tells no reason"
     return _error_kind(failure)(f"the page of {request.url} navigated to {failed.url}, which did not load: {failure}")
 
