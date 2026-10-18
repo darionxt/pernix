@@ -67,6 +67,7 @@ async def test_with_every_lease_each_lease_binds_another_proxy_while_there_is_on
 GONE: list[tuple[BindingReason, ProxyHealth | None]] = [
     ("cooldown", "cooldown"),
     ("retired", "retired"),
+    ("expired", "expired"),
     ("unlisted", None),
 ]
 """Why a Session bound to A is bound again, and the health of A then; `None` once A is no longer listed."""

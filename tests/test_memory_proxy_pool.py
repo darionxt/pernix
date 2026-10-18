@@ -178,10 +178,12 @@ async def test_a_proxy_listed_again_takes_its_new_tags_and_the_first_given_twice
 
     await pool.replace([Proxy(A, tags=frozenset({"old"})), Proxy(A, tags=frozenset({"twice"}))])
     first = await pool.candidates()
-    await pool.replace([Proxy(A, tags=frozenset({"new"}), expires=NOW)])
+    await pool.replace([Proxy(A, tags=frozenset({"new"}), expires=NOW + 60)])
 
     assert [candidate.tags for candidate in first] == [frozenset({"old"})]
-    assert [(candidate.tags, candidate.expires) for candidate in await pool.candidates()] == [(frozenset({"new"}), NOW)]
+    assert [(candidate.tags, candidate.expires) for candidate in await pool.candidates()] == [
+        (frozenset({"new"}), NOW + 60)
+    ]
 
 
 async def test_ready_in_tells_how_long_until_one_is_available_or_that_none_ever_will_be() -> None:
@@ -307,3 +309,72 @@ async def test_the_candidates_tell_when_a_proxy_cooling_down_is_available_again(
     await pool.report(B, failed=True, since=clock.now)
 
     assert [candidate.until for candidate in await pool.candidates()] == [None, NOW + 10]
+
+
+async def test_a_proxy_expires_and_leaves_the_pool_once_no_session_occupies_it() -> None:
+    clock = Clock()
+    stats = Stats()
+    pool = await _pool(clock=clock, stats=stats)
+    await pool.add([Proxy(A, expires=NOW + 10), Proxy(B)])
+    await pool.bind("one", A)
+    clock.now += 10
+
+    taken = [await pool.take() for _ in range(2)]
+    seen = [(candidate.url, candidate.health) for candidate in await pool.candidates()]
+    refused = await pool.bind("two", A)
+    await pool.release("one", A)
+    await pool.unbind("one")
+
+    assert taken == [B, B]
+    assert sorted(seen) == [(A, "expired"), (B, "available")]  # while "one" is bound to it
+    assert not refused
+    assert [candidate.url for candidate in await pool.candidates()] == [B]
+    assert pool.health(A) is None
+    assert pool.counts() == ProxyCounts(available=1, cooldown=0, retired=0)
+    assert stats.get("proxies.expirations") == 1
+    assert await pool.ready_in() == 0
+
+
+async def test_adding_proxies_keeps_those_listed_and_a_later_expiry_renews_one() -> None:
+    clock = Clock()
+    pool = await _pool(A, clock=clock, cooldown=0)
+    await pool.add([Proxy(B, expires=NOW + 10)])
+    await pool.bind("one", B)
+    await pool.report(B, failed=True, since=clock.now)
+    clock.now += 10
+    expired = pool.health(B)
+
+    await pool.add([Proxy(B, expires=NOW + 60)])
+
+    assert expired == "expired"
+    assert pool.health(B) == "available"
+    assert [(candidate.url, candidate.failures) for candidate in await pool.candidates()] == [(A, 0), (B, 1)]
+
+
+async def test_a_retired_proxy_that_expired_stays_retired_should_a_source_give_it_again() -> None:
+    clock = Clock()
+    pool = await _pool(clock=clock, max_failures=1)
+    await pool.add([Proxy(A, expires=NOW + 10)])
+    await pool.report(A, failed=True, since=clock.now)
+    clock.now += 10
+
+    await pool.add([Proxy(A, expires=NOW + 60)])
+
+    assert pool.health(A) == "retired"
+
+
+async def test_a_proxy_of_its_own_expires_and_a_record_given_again_renews_it() -> None:
+    clock = Clock()
+    pool = await _pool(clock=clock)
+    await pool.bind("one", Proxy(OWN, expires=NOW + 10))
+    clock.now += 10
+
+    [own] = await pool.candidates("one")
+    by_url = await pool.bind("one", OWN)
+    expired_again = await pool.bind("one", Proxy(OWN, expires=NOW + 5))
+
+    assert (own.health, own.own) == ("expired", True)
+    assert not by_url
+    assert not expired_again
+    assert await pool.bind("one", Proxy(OWN, expires=NOW + 60))
+    assert pool.health(OWN) == "available"

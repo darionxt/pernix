@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import time
 from contextlib import suppress
@@ -14,7 +15,7 @@ from pernix import Account, Request
 from pernix.errors import ConnectError, ProxyError, SettingsError
 from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool, Proxy, ProxyCandidate
 from pernix.proxies.proxy_sources import StaticProxies
-from pernix.proxies.run_proxies import FollowedProxy, NoProxyYet, RunProxies
+from pernix.proxies.run_proxies import FollowedProxy, NoProxyYet, ProxySupply, RunProxies
 from pernix.sending import Sending
 from pernix.settings import ProxySettings
 from pernix.stats import Stats
@@ -47,17 +48,29 @@ class Listed:
         return self.given
 
 
-def _count(stats: Stats, key: str) -> int:
-    value = stats.get(key)
+def _count(stats: Stats, key: str, *, default: int | None = None) -> int:
+    value = stats.get(key, default)
     assert isinstance(value, int)
     return value
+
+
+class Watched(Stats):
+    """Stats that tell when they change."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.changed = asyncio.Event()
+
+    def inc(self, key: str, count: float = 1) -> None:
+        super().inc(key, count)
+        self.changed.set()
 
 
 class Run:
     """What the proxies use of their Run: its stats, a stop, and the log masks."""
 
     def __init__(self) -> None:
-        self.stats = Stats()
+        self.stats = Watched()
         self.stops = 0
         self.masked: set[str] = set()
 
@@ -73,6 +86,7 @@ class Run:
         refresh: float | None = None,
         pool: MemoryProxyPool | None = None,
         policy: BindingPolicy | None = None,
+        supply: ProxySupply | None = None,
     ) -> RunProxies:
         return RunProxies(
             MemoryProxyPool(stats=self.stats) if pool is None else pool,
@@ -82,6 +96,7 @@ class Run:
             stats=self.stats,
             stop=self.stop,
             mask=self.mask,
+            supply=supply,
         )
 
 
@@ -206,7 +221,7 @@ async def test_once_no_proxy_ever_will_be_available_the_run_is_stopped_once(capl
                 await proxies.take()
 
     assert run.stops == 1
-    assert "No proxy can be used: every proxy is retired, and none are loaded again; stopping the Run" in caplog.text
+    assert "No proxy can be used: every proxy is retired or expired, and none are loaded again" in caplog.text
 
 
 async def test_with_no_proxy_given_the_run_is_stopped(caplog: pytest.LogCaptureFixture) -> None:
@@ -663,3 +678,259 @@ async def test_the_run_drains_for_want_of_proxies_once_no_session_has_one_of_its
 
     assert (meanwhile.value.delay, stops) == (1.0, 0)  # "one" goes on through its own
     assert (exhausted.value.delay, run.stops) == (5.0, 1)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class Extracting:
+    """An extraction API of one's own: each call gives as many new proxies as wanted, until it runs dry."""
+
+    def __init__(self) -> None:
+        self.asked: list[int] = []
+        self.dry = False
+        self._made = itertools.count(1)
+
+    async def proxies(self, wanted: int = 1) -> list[Proxy]:
+        self.asked.append(wanted)
+        if self.dry:
+            return []
+        return [Proxy(f"http://p{next(self._made)}.example:8080") for _ in range(wanted)]
+
+
+def _extracting(*, sources: int = 1, **options: float) -> ProxySupply:
+    extracting = frozenset(f"source {number}" for number in range(1, sources + 1))
+    return ProxySupply(add=True, extracting=extracting, interval=0, **options)  # pyright: ignore[reportArgumentType]
+
+
+async def _extracted(run: Run, extractions: int) -> None:
+    """Wait for the extractions under way to end, until `extractions` of them are counted."""
+    async with asyncio.timeout(5):
+        while _count(run.stats, "proxies.extractions", default=0) < extractions:
+            run.stats.changed.clear()
+            await run.stats.changed.wait()
+    await asyncio.sleep(0)  # the extraction ends
+
+
+async def test_with_add_each_load_adds_the_proxies_and_a_session_keeps_its_own() -> None:
+    run = Run()
+    source = Listed(B)
+    pool = MemoryProxyPool()
+    proxies = run.proxies(source, refresh=0.01, pool=pool, supply=_extracting())
+    await proxies.open()
+    bound = await proxies.bind("one", None)
+    source.given = [C]
+    source.called.clear()
+
+    await asyncio.wait_for(source.called.wait(), timeout=5)
+    await asyncio.sleep(0)  # the refresh adds them
+    again = await proxies.bind("one", bound)
+    listed = {candidate.url for candidate in await pool.candidates()}
+    await proxies.close()
+
+    assert (bound, again) == (B, B)
+    assert listed == {B, C}
+    assert _count(run.stats, "proxies.extractions") >= 2
+
+
+@pytest.mark.parametrize("rebind", ["unavailable", "never"])
+async def test_a_session_whose_proxy_expired_is_bound_as_its_policy_says(
+    rebind: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = Clock()
+    pool = MemoryProxyPool(clock=clock)
+    policy = Told(rebind)
+    proxies = Run().proxies(StaticProxies([Proxy(A, expires=NOW + 10), Proxy(B)]), pool=pool, policy=policy)
+    await proxies.open()
+    first = await proxies.bind("one", None)
+    clock.now += 10
+
+    with caplog.at_level(logging.INFO, logger="pernix"):
+        if rebind == "never":
+            with pytest.raises(FollowedProxy) as following:
+                await proxies.bind("one", first)
+            assert following.value.until is None
+        else:
+            assert await proxies.bind("one", first) == B
+
+    assert first == A
+    assert policy.told[-1].reason == "expired"
+    assert "The proxy of the Session 'one' has expired" in caplog.text
+
+
+async def test_on_demand_proxies_are_extracted_below_the_level_within_the_limit_then_the_run_drains(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run = Run()
+    source = Extracting()
+    pool = MemoryProxyPool(max_failures=1, stats=run.stats)
+    proxies = run.proxies(source, pool=pool, supply=_extracting(min_available=2, max_extracted=5))
+
+    async def retire(*urls: str) -> None:
+        for url in urls:
+            await pool.report(url, failed=True, since=time.time())
+
+    with caplog.at_level(logging.WARNING, logger="pernix"):
+        await proxies.open()  # 2 wanted, to reach the level
+        first = await proxies.take()
+        await retire(first)
+        await proxies.take()  # one available, below the level
+        await _extracted(run, 2)
+        available = {candidate.url for candidate in await pool.candidates() if candidate.health == "available"}
+        await retire(*available)
+        with pytest.raises(NoProxyYet) as waiting:
+            await proxies.take()  # none available: 2 wanted, as many as the limit leaves
+        await _extracted(run, 3)
+        await retire(*[candidate.url for candidate in await pool.candidates() if candidate.health == "available"])
+        stops_before = run.stops
+        with pytest.raises(NoProxyYet):
+            await proxies.take()
+
+    assert source.asked == [2, 1, 2]
+    assert len(available) == 2
+    assert waiting.value.delay == pytest.approx(0.5)
+    assert (stops_before, run.stops) == (0, 1)
+    assert _count(run.stats, "proxies.extracted") == 5
+    assert "The sources extracted 5 proxies, reaching the limit; no more are extracted" in caplog.text
+
+
+async def test_the_run_drains_once_extractions_in_a_row_gave_no_proxy(caplog: pytest.LogCaptureFixture) -> None:
+    run = Run()
+    source = Extracting()
+    source.dry = True
+    proxies = run.proxies(source, supply=_extracting(min_available=1, attempts=3))
+
+    with caplog.at_level(logging.WARNING, logger="pernix"):
+        await proxies.open()
+        for extractions in (2, 3):
+            with pytest.raises(NoProxyYet):
+                await proxies.take()
+            await _extracted(run, extractions)
+        stops_before = run.stops
+        with pytest.raises(NoProxyYet):
+            await proxies.take()
+
+    assert (stops_before, run.stops) == (0, 1)
+    assert len(source.asked) == 3
+    assert "3 extractions in a row gave no proxy; no more are made on demand" in caplog.text
+    assert "and no more can be extracted" in caplog.text
+
+
+async def test_a_session_no_proxy_fits_has_one_more_extracted() -> None:
+    run = Run()
+    source = Extracting()
+    proxies = run.proxies(source, pool=MemoryProxyPool(max_sessions=1), supply=_extracting(min_available=1))
+    await proxies.open()
+    first = await proxies.bind("one", None)
+
+    with pytest.raises(NoProxyYet, match="no proxy fits the Session"):
+        await proxies.bind("two", None)
+    await _extracted(run, 2)
+    second = await proxies.bind("two", None)
+
+    assert (first, second) == ("http://p1.example:8080", "http://p2.example:8080")
+    assert source.asked == [1, 1]
+
+
+async def test_a_provider_that_takes_no_wanted_is_asked_as_before() -> None:
+    run = Run()
+    source = Listed(B)
+    proxies = run.proxies(source, supply=_extracting(min_available=3))
+
+    await proxies.open()
+
+    assert await proxies.take() == B
+    assert source.calls >= 1
+
+
+class Gated(Extracting):
+    """An extraction API that answers only once let to."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.gate.set()
+
+    async def proxies(self, wanted: int = 1) -> list[Proxy]:
+        await self.gate.wait()
+        return await super().proxies(wanted)
+
+
+async def test_the_limit_is_counted_source_by_source_and_the_proxies_wanted_asked_of_them_in_all() -> None:
+    run = Run()
+    first, second = Extracting(), Extracting()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = run.proxies(first, second, pool=pool, supply=_extracting(sources=2, min_available=3, max_extracted=4))
+    first.dry = True
+
+    await proxies.open()  # 3 wanted: the first gives none, the second all
+    first.dry = False
+    for candidate in await pool.candidates():
+        await pool.report(candidate.url, failed=True, since=time.time())
+    with pytest.raises(NoProxyYet):
+        await proxies.take()  # 3 wanted, but 1 left within the limit
+    await _extracted(run, 3)
+
+    assert (first.asked, second.asked) == ([3, 1], [3])
+    assert _count(run.stats, "proxies.extracted") == 4
+
+
+async def test_a_refresh_waits_for_an_extraction_under_way_so_the_limit_holds() -> None:
+    run = Run()
+    source = Gated()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = run.proxies(source, refresh=0.01, pool=pool, supply=_extracting(min_available=1, max_extracted=2))
+    await proxies.open()
+    await pool.report("http://p1.example:8080", failed=True, since=time.time())
+    source.gate.clear()
+
+    with pytest.raises(NoProxyYet):
+        await proxies.take()  # an extraction starts, and waits at the gate
+    await asyncio.sleep(0.1)  # refreshes are due meanwhile
+    source.gate.set()
+    await _extracted(run, 2)
+    await asyncio.sleep(0.1)  # and the refreshes after it
+    await proxies.close()
+
+    assert source.asked == [1, 1]
+    assert _count(run.stats, "proxies.extracted") == 2
+
+
+async def test_once_refreshes_can_extract_no_more_the_run_drains_rather_than_wait_for_them() -> None:
+    run = Run()
+    pool = MemoryProxyPool(max_failures=1)
+    proxies = run.proxies(Extracting(), refresh=60, pool=pool, supply=_extracting(max_extracted=1))
+    await proxies.open()
+    await pool.report("http://p1.example:8080", failed=True, since=time.time())
+
+    with pytest.raises(NoProxyYet):
+        await proxies.take()
+    await proxies.close()
+
+    assert run.stops == 1
+
+
+async def test_an_expired_proxy_of_its_own_does_not_keep_the_run_from_draining() -> None:
+    clock = Clock()
+    run = Run()
+
+    class ExpiringOwn:
+        async def bind(self, binding: Binding) -> Proxy | None:
+            return Proxy(OWN, expires=NOW + 10) if binding.session == "one" else None
+
+    pool = MemoryProxyPool(clock=clock, max_failures=1)
+    proxies = run.proxies(StaticProxies([B]), pool=pool, policy=ExpiringOwn())
+    await proxies.open()
+    await proxies.bind("one", None)
+    clock.now += 10  # its own expired, while it is still bound to it
+    await pool.report(B, failed=True, since=clock.now)
+
+    with pytest.raises(NoProxyYet):
+        await proxies.bind("two", None)
+
+    assert run.stops == 1
