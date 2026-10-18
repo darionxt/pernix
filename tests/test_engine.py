@@ -560,6 +560,132 @@ async def test_requests_claimed_for_a_cooling_domain_go_back_without_counting_an
     assert throttle.stats.refused >= 1
 
 
+# Browser workers
+
+
+class Mixed(Spider):
+    """Starts with six rendered pages, then six others, on two hosts."""
+
+    async def start(self) -> AsyncIterator[Request]:
+        for render in (True, False):
+            for n in range(6):
+                yield Request(f"https://{('a.example', 'b.example')[n % 2]}/{n}", render=render, dont_filter=True)
+
+    async def parse(self, response: Response) -> None:
+        pass
+
+
+class KindProbe:
+    """A download chain that holds rendered fetches until released, recording how many of each kind run at once."""
+
+    def __init__(self, *, others: int = 6) -> None:
+        self.release = asyncio.Event()
+        self.others_done = asyncio.Event()
+        """Set once `others` fetches that do not render are done."""
+        self._others = others
+        self.active = {True: 0, False: 0}
+        self.most = {True: 0, False: 0}
+        self.most_in_all = 0
+        self.done = {True: 0, False: 0}
+
+    async def __call__(self, request: Request) -> Response:
+        rendered = bool(request.render)
+        self.active[rendered] += 1
+        self.most[rendered] = max(self.most[rendered], self.active[rendered])
+        self.most_in_all = max(self.most_in_all, sum(self.active.values()))
+        try:
+            if rendered:
+                await self.release.wait()
+            await asyncio.sleep(0)
+        finally:
+            self.active[rendered] -= 1
+            self.done[rendered] += 1
+            if self.done[False] == self._others:
+                self.others_done.set()
+        return Response(url=request.url, status=200, headers=[], body=b"", request=request)
+
+
+async def test_requests_that_do_not_render_never_wait_for_the_browser_workers() -> None:
+    probe = KindProbe()
+    engine = _engine(Mixed(), probe, MemoryFrontier(), Throttle(DomainSettings()), concurrency=2, browser_concurrency=2)
+
+    async with asyncio.timeout(10), asyncio.TaskGroup() as tasks:
+        running = tasks.create_task(engine.run())
+        await probe.others_done.wait()
+        assert probe.done[True] == 0  # every rendered fetch is still held
+        probe.release.set()
+        await running
+
+    assert probe.done == {True: 6, False: 6}
+    assert probe.most == {True: 2, False: 2}
+
+
+class KindRecording(MemoryFrontier):
+    """A Frontier that records which kind of Requests each Lease was claimed for."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.kinds: list[tuple[bool | None, bool]] = []
+
+    async def claim(self, *args: Any, rendered: bool | None = None, **kwargs: Any) -> list[Lease]:
+        leases = await super().claim(*args, rendered=rendered, **kwargs)
+        self.kinds.extend((rendered, lease.rendered) for lease in leases)
+        return leases
+
+
+async def test_browser_workers_claim_only_rendered_requests_and_the_others_only_the_rest() -> None:
+    probe = KindProbe()
+    probe.release.set()
+    frontier = KindRecording()
+
+    async with asyncio.timeout(10):
+        await _engine(Mixed(), probe, frontier, Throttle(DomainSettings()), concurrency=1, browser_concurrency=1).run()
+
+    assert sorted(frontier.kinds) == [(False, False)] * 6 + [(True, True)] * 6
+
+
+async def test_without_browser_workers_every_worker_claims_any_request() -> None:
+    probe = KindProbe()
+    probe.release.set()
+    frontier = KindRecording()
+
+    async with asyncio.timeout(10):
+        await _engine(Mixed(), probe, frontier, Throttle(DomainSettings()), concurrency=3).run()
+
+    assert sorted(frontier.kinds) == [(None, False)] * 6 + [(None, True)] * 6
+    assert probe.most_in_all <= 3
+
+
+async def test_rendered_and_other_requests_share_the_slots_of_their_domains() -> None:
+    probe = Probe()
+
+    class Both(Hosts):
+        async def start(self) -> AsyncIterator[Request]:
+            async for request in super().start():
+                yield request
+                yield request.replace(render=True, dont_filter=True)
+
+    async with asyncio.timeout(10):
+        await _engine(
+            Both(),
+            probe,
+            MemoryFrontier(),
+            Throttle(DomainSettings(concurrency=2)),
+            concurrency=4,
+            browser_concurrency=4,
+        ).run()
+
+    assert probe.most == {"a.example": 2, "b.example": 2}
+    assert len(probe.started) == 24
+
+
+def test_a_negative_number_of_browser_workers_is_rejected() -> None:
+    spider = Links()
+
+    with pytest.raises(ValueError, match="must not be negative"):
+        _engine(spider, _site({}).fetch, MemoryFrontier(), Throttle(DomainSettings()), browser_concurrency=-1)
+
+
 async def test_requests_added_while_workers_start_waiting_are_not_missed() -> None:
     class Late(Links):
         async def start(self) -> AsyncIterator[Request]:
@@ -586,7 +712,7 @@ async def test_a_lease_claimed_while_a_worker_stops_waiting_goes_back_if_cancell
     await frontier.add([Request(f"{SITE}/a")])
     engine = _engine(spider, _site({}).fetch, frontier, Throttle(DomainSettings()))
 
-    task = asyncio.create_task(engine._wait_for_work())  # pyright: ignore[reportPrivateUsage]
+    task = asyncio.create_task(engine._wait_for_work(None))  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(asyncio.CancelledError):
         async with asyncio.timeout(5):
             await task
