@@ -1,4 +1,4 @@
-"""How the HTTP Fetcher sends `Request.cookies`, to every kind of host, over HTTP/1.1 and HTTP/2."""
+"""How the HTTP Fetcher sends cookies, to every kind of host and redirect hop, over HTTP/1.1 and HTTP/2."""
 
 from __future__ import annotations
 
@@ -85,20 +85,22 @@ async def test_request_cookies_reach_any_host_in_the_order_given(
 
 
 @PROTOCOLS
-async def test_longer_cookie_names_go_first(server: CookieServer, scheme: str, protocol: str) -> None:
+async def test_request_cookies_keep_their_order_whatever_the_length_of_their_names(
+    server: CookieServer, scheme: str, protocol: str
+) -> None:
     async with HTTPFetcher() as fetcher:
         await fetcher.fetch(_request(server, "localhost", "/", scheme, {"a": "1", "long": "2", "mid": "3"}))
 
     [received] = server.received
-    assert (received.protocol, _sent(received.cookies)) == (protocol, ["long=2", "mid=3", "a=1"])
+    assert (received.protocol, _sent(received.cookies)) == (protocol, ["a=1", "long=2", "mid=3"])
 
 
 @pytest.mark.parametrize(
     ("scheme", "host", "expected"),
     [
-        ("https", DOTLESS, ["__Secure-a=1", "__Host-b=2", "plain=3"]),
+        ("https", DOTLESS, ["plain=3", "__Host-b=2", "__Secure-a=1"]),
         ("http", DOTLESS, ["plain=3"]),
-        ("http", "localhost", ["__Secure-a=1", "__Host-b=2", "plain=3"]),  # loopback HTTP counts as secure
+        ("http", "localhost", ["plain=3", "__Host-b=2", "__Secure-a=1"]),  # loopback HTTP counts as secure
     ],
 )
 async def test_secure_only_prefixes_go_over_https_only(
@@ -211,15 +213,55 @@ async def test_a_host_whatwg_urls_reject_fails_the_fetch_before_connecting(serve
 
 
 @PROTOCOLS
-async def test_cookies_set_on_the_way_join_those_of_the_request(
+async def test_cookies_set_on_the_way_join_those_of_the_request_in_browser_order(
     server: CookieServer, scheme: str, protocol: str
 ) -> None:
-    server.routes["/start"] = [("Location", "/end"), ("Set-Cookie", "a=new; Path=/"), ("Set-Cookie", "fresh=1")]
+    server.routes["/start"] = [
+        ("Location", "/end"),
+        ("Set-Cookie", "deep=4; Path=/end"),
+        ("Set-Cookie", "a=new"),
+        ("Set-Cookie", "z=5; Path=/"),
+    ]
+    cookies = {"session": "1", "a": "2", "lang": "3"}  # curl alone would send the longest names first
 
     async with HTTPFetcher() as fetcher:
-        response = await fetcher.fetch(_request(server, DOTLESS, "/start", scheme, {"a": "1", "b": "2"}))
+        response = await fetcher.fetch(_request(server, "localhost", "/start", scheme, cookies))
 
     start, end = server.received
-    assert (start.protocol, _sent(start.cookies)) == (protocol, ["a=1", "b=2"])
-    assert sorted(_sent(end.cookies)) == ["a=new", "b=2", "fresh=1"]
-    assert dict(response.cookies) == {"a": "new", "b": "2", "fresh": "1"}
+    assert (start.protocol, start.cookies) == (
+        protocol,
+        ["session=1; a=2; lang=3"] if protocol == "HTTP/1.1" else ["session=1", "a=2", "lang=3"],
+    )
+    assert (end.protocol, _sent(end.cookies)) == (
+        protocol,
+        ["deep=4", "session=1", "a=new", "lang=3", "z=5"],  # the longer path first; the replaced cookie in its place
+    )
+    assert dict(response.cookies) == {"session": "1", "a": "new", "lang": "3", "deep": "4", "z": "5"}
+
+
+@PROTOCOLS
+async def test_a_cookie_header_is_sent_as_the_requests_cookies(
+    server: CookieServer, other_server: CookieServer, scheme: str, protocol: str
+) -> None:
+    other_scheme = "https" if scheme == "http" else "http"
+    server.routes["/start"] = [
+        ("Location", server.url("/again", host="localhost", scheme=other_scheme)),
+        ("Set-Cookie", "set=3"),
+    ]
+    server.routes["/again"] = [("Location", other_server.url("/elsewhere", host="localhost", scheme=scheme))]
+    other_server.routes["/elsewhere"] = [("Location", server.url("/away", host="127.0.0.1"))]
+    request = Request(server.url("/start", host="localhost", scheme=scheme), headers={"Cookie": "b=2; a=1"})
+
+    async with HTTPFetcher() as fetcher:
+        response = await fetcher.fetch(request)
+
+    hops = [*server.received[:2], *other_server.received, *server.received[2:]]
+    assert [(hop.path, _sent(hop.cookies)) for hop in hops] == [
+        ("/start", ["b=2", "a=1"]),
+        ("/again", ["b=2", "a=1", "set=3"]),  # another scheme
+        ("/elsewhere", ["b=2", "a=1", "set=3"]),  # another port
+        ("/away", []),  # another host
+    ]
+    assert hops[0].protocol == protocol
+    assert all(len(hop.cookies) <= 1 for hop in hops if hop.protocol == "HTTP/1.1")  # one Cookie header only
+    assert dict(response.cookies) == {"b": "2", "a": "1", "set": "3"}

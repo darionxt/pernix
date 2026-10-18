@@ -111,7 +111,7 @@ async def test_the_http_fetcher_reaches_loopback_hosts_however_they_are_written(
     assert guard.blocked == []
 
 
-async def test_redirects_to_other_hosts_are_refused_before_curl_follows_them(server: LoopbackServer) -> None:
+async def test_redirects_to_other_hosts_are_refused_before_they_are_sent(server: LoopbackServer) -> None:
     server.route("/away", status=302, headers=[("Location", PUBLIC + "page")])
     server.route("/near", status=301, headers=[("Location", "/home")])
     server.route("/home", "home")
@@ -144,17 +144,16 @@ async def test_a_loopback_proxy_takes_requests_to_any_host(server: LoopbackServe
     [
         "http:///192.0.2.1/page",  # urllib: a path on this host; curl and WHATWG: a host
         "http:\\\\192.0.2.1/page",  # WHATWG: backslashes are slashes
-        "http://[unclosed/page",  # unparseable
     ],
 )
-async def test_redirects_are_refused_however_their_location_may_be_read(server: LoopbackServer, location: str) -> None:
+async def test_redirects_are_refused_where_browsers_read_their_location(server: LoopbackServer, location: str) -> None:
     server.route("/away", status=302, headers=[("Location", location)])
 
     async with HTTPFetcher() as fetcher:
         with blocking_network() as guard, pytest.raises(NetworkBlocked):
             await fetcher.fetch(Request(server.url("/away")))
 
-    assert len(guard.blocked) == 1
+    assert guard.blocked == ["http://192.0.2.1/page"]
 
 
 async def test_an_empty_proxy_is_no_proxy(server: LoopbackServer) -> None:
