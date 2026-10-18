@@ -18,10 +18,14 @@ class BrowserSettings(Section):
         headless: Run the browser without a window, in Chrome's new headless mode.
         timeout: Seconds a page may take to load, until its `load` event;
             `Request(timeout=...)` overrides it.
-        deadline: Seconds a whole fetch may take, starting the browser included.
+        deadline: Seconds a whole fetch may take, starting the browser included,
+            from when `max_pages` lets it open its page.
         launch_options: Options passed as they are to patchright's
             `BrowserType.launch()`, such as `executable_path` or `args`, over those
             Pernix chooses.
+        max_pages: Pages open at once, each that of one fetch, at most; a fetch
+            waits for one to close before it opens its own. A Run processes this
+            many rendered Requests at once, apart from `concurrency`.
         max_idle_contexts: Browser contexts kept idle for Sessions between their
             fetches, at most; beyond that, the least recently used is closed. 0
             closes each after its fetch.
@@ -41,6 +45,7 @@ class BrowserSettings(Section):
     timeout: Annotated[float, msgspec.Meta(gt=0)] = 30.0
     deadline: Annotated[float, msgspec.Meta(gt=0)] = 180.0
     launch_options: dict[str, Any] = msgspec.field(default_factory=dict[str, Any])
+    max_pages: Annotated[int, msgspec.Meta(ge=1)] = 8
     max_idle_contexts: Annotated[int, msgspec.Meta(ge=0)] = 8
     context_idle: Annotated[float, msgspec.Meta(gt=0)] = 300.0
     block: tuple[str, ...] = ()

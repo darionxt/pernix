@@ -29,6 +29,7 @@ from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.page_actions import run_render
+from pernix.fetchers.page_slots import PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.session_contexts import SessionContexts
 from pernix.headers import Headers
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from pernix.fetchers.session_contexts import SessionContext
     from pernix.request import Request
     from pernix.session import Session
+    from pernix.stats import Stats
 
 __all__ = ["BrowserFetcher"]
 
@@ -124,15 +126,17 @@ class BrowserFetcher:
     closed once idle for `browser.context_idle` seconds; a Retired Session is
     never leased again, so its context goes that way too.
 
-    The page is loaded until its `load` event, within
-    `browser.timeout` (or `request.timeout`); `browser.deadline` limits the whole
-    fetch. A `Render` in `request.render` then waits for its `wait_for`, runs its
-    actions, and takes its screenshot, each within `browser.action_timeout` unless
-    an action sets its own. The page may not load the resource types of its
-    `block`, or of `browser.block` without one, nor register service workers then,
-    and the XHR and fetch responses matching its `capture` are kept;
-    `response.browser` holds what they gave, with the document as received. When
-    an action leads to another document, the Response describes that one.
+    At most `browser.max_pages` pages are open at once, each that of one fetch,
+    which waits for one to close before it opens its own; `browser.deadline` then
+    limits the whole fetch. The page is loaded until its `load` event, within
+    `browser.timeout` (or `request.timeout`). A `Render` in `request.render` then
+    waits for its `wait_for`, runs its actions, and takes its screenshot, each
+    within `browser.action_timeout` unless an action sets its own. The page may not
+    load the resource types of its `block`, or of `browser.block` without one, nor
+    register service workers then, and the XHR and fetch responses matching its
+    `capture` are kept; `response.browser` holds what they gave, with the document
+    as received. When an action leads to another document, the Response describes
+    that one.
 
     A Request other than a plain GET, or with headers, changes the first
     request of the page accordingly. The browser keeps those headers on the
@@ -154,6 +158,11 @@ class BrowserFetcher:
     other hosts are recorded in the guard; a refused document raises
     `NetworkBlocked`.
 
+    In `stats`, if given, `browser.pages` and `browser.contexts` count the pages and
+    the contexts opened, `browser.pages_open` and `browser.contexts_open` tell how
+    many are open, and `browser.page_waits` and `browser.page_wait_seconds` count the
+    fetches that waited for a page, and how long.
+
     Attributes:
         schemes: None: the browser Fetcher renders only Requests that need it.
         settings_sections: Registers `BrowserSettings`.
@@ -162,24 +171,34 @@ class BrowserFetcher:
     schemes: ClassVar[frozenset[str]] = frozenset()
     settings_sections: ClassVar[tuple[type[Section], ...]] = (BrowserSettings,)
 
-    def __init__(self, settings: BrowserSettings | None = None, *, default_encoding: str = "utf-8") -> None:
+    def __init__(
+        self,
+        settings: BrowserSettings | None = None,
+        *,
+        default_encoding: str = "utf-8",
+        stats: Stats | None = None,
+    ) -> None:
         """Configure the fetcher.
 
         Args:
             settings: The browser settings; the defaults when `None`.
             default_encoding: The `default_encoding` of the Responses whose body is
                 not a rendered DOM.
+            stats: Where the pages and the contexts are counted.
         """
         self._settings = settings or BrowserSettings()
         self._default_encoding = default_encoding
+        self._stats = stats
         self._open = False
         self._launch: asyncio.Task[LaunchedBrowser] | None = None
         self._unavailable: ComponentError | None = None
         self._closing: set[asyncio.Task[None]] = set()
+        self._pages = PageSlots(self._settings.max_pages, stats=stats)
+        self._contexts_open = 0
         self._contexts = SessionContexts(
             kept=self._settings.max_idle_contexts,
             idle=self._settings.context_idle,
-            new_context=_session_context,
+            new_context=self._session_context,
             discard=self._discard,
         )
 
@@ -192,16 +211,18 @@ class BrowserFetcher:
 
         Returns:
             A fetcher with the `browser.*` settings, whose Responses use
-            `response.default_encoding`.
+            `response.default_encoding`, counting in the Run's stats.
         """
         return cls(
             crawler.settings.section(BrowserSettings),
             default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
+            stats=crawler.stats,
         )
 
     async def __aenter__(self) -> Self:
         self._open = True
         self._unavailable = None
+        self._pages = PageSlots(self._settings.max_pages, stats=self._stats)  # waiters bind to this event loop
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -216,7 +237,7 @@ class BrowserFetcher:
                 await _close_launched(launch)
 
     async def fetch(self, request: Request, *, session: Session | None = None) -> Response:
-        """Load a Request in the browser.
+        """Load a Request in the browser, once fewer than `browser.max_pages` pages are open.
 
         Args:
             request: The Request to load.
@@ -256,13 +277,17 @@ class BrowserFetcher:
         guard = current_guard()
         if guard is not None:
             guard.check(request.url, proxy=proxy)
-        async with self._deadline(request):
-            try:
-                return await self._fetch(request, guard, proxy, session)
-            except PernixError:
-                raise
-            except Exception as exc:  # the browser's own errors
-                raise _fetch_error(exc, request) from exc
+        page = await self._pages.take()
+        try:
+            async with self._deadline(request):
+                try:
+                    return await self._fetch(request, guard, proxy, session)
+                except PernixError:
+                    raise
+                except Exception as exc:  # the browser's own errors
+                    raise _fetch_error(exc, request) from exc
+        finally:
+            page.release()  # its page is closed, or closing with its context in a task of its own
 
     async def _fetch(
         self, request: Request, guard: NetworkGuard | None, proxy: str | None, session: Session | None
@@ -280,7 +305,7 @@ class BrowserFetcher:
         load = _Load(request, render, blocked, proxy=proxy, guarded=launched.guarded, started=started)
         workers = bool(blocked)  # service workers would load what is blocked, unseen by the page's routes
         if session is None:
-            context = await launched.new_context(proxy=proxy, blocks_service_workers=workers)
+            context = self._opened(await launched.new_context(proxy=proxy, blocks_service_workers=workers))
             try:
                 return await self._load(context, load)
             finally:
@@ -315,6 +340,8 @@ class BrowserFetcher:
     ) -> Response:
         """Load a Request in a page of its own, keeping what it changed in its Session, if any."""
         page = await context.new_page()
+        if self._stats is not None:
+            self._stats.inc("browser.pages")
         watch = _PageLoad(page, proxy=load.proxy, guarded=load.guarded)
         try:
             response = await self._loaded(page, watch, load, kept, session)
@@ -481,8 +508,33 @@ class BrowserFetcher:
         """Start closing a context in a task of its own, which closing the fetcher waits for."""
         closing = asyncio.create_task(_quietly(context.close(), "closing a browser context"))
         self._closing.add(closing)
-        closing.add_done_callback(self._closing.discard)
+        closing.add_done_callback(self._closed)
         return closing
+
+    async def _session_context(
+        self, launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
+    ) -> BrowserContext:
+        """A context for a Session, with its localStorage, a proxy, and service workers blocked or not."""
+        context = await launched.new_context(
+            proxy=proxy, local_storage=session.local_storage, blocks_service_workers=blocks_service_workers
+        )
+        return self._opened(context)
+
+    def _opened(self, context: BrowserContext) -> BrowserContext:
+        """Count a context created; every context is closed with `_discard()`, which counts it closed."""
+        if self._stats is not None:
+            self._stats.inc("browser.contexts")
+        self._count_open(1)
+        return context
+
+    def _closed(self, closing: asyncio.Task[None]) -> None:
+        self._closing.discard(closing)
+        self._count_open(-1)
+
+    def _count_open(self, change: int) -> None:
+        self._contexts_open += change
+        if self._stats is not None:
+            self._stats.set("browser.contexts_open", self._contexts_open)
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,12 +755,3 @@ def _socks_with_credentials(proxy: str) -> bool:
     """Whether a proxy is a SOCKS one with credentials, which Chrome does not support."""
     parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
     return parts.scheme.lower().startswith("socks") and "@" in parts.netloc
-
-
-async def _session_context(
-    launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
-) -> BrowserContext:
-    """A context for a Session, with its localStorage, a proxy, and service workers blocked or not."""
-    return await launched.new_context(
-        proxy=proxy, local_storage=session.local_storage, blocks_service_workers=blocks_service_workers
-    )

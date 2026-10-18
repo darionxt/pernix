@@ -35,6 +35,11 @@ logger = logging.getLogger(__name__)
 class Engine:
     """Runs a fixed number of workers that claim Requests from the Frontier and process them.
 
+    With `browser_concurrency` workers of their own for the Requests that go to the
+    browser Fetcher, the other workers claim only the Requests that do not, so those
+    never wait for the browser, nor the browser for them; both kinds still share
+    their domains' slots in the Throttle.
+
     Each worker claims one Request at a time under a Lease, skipping the slots the
     Throttle blocks, renews the Lease while it works, and makes one attempt at the
     Request with a `RequestProcessor`: fetching, retry decision, Callback or
@@ -69,6 +74,7 @@ class Engine:
         put_item: PutItem,
         events: EventBus,
         concurrency: int,
+        browser_concurrency: int = 0,
         lease_ttl: float = 60.0,
         retry_policy: RetryPolicy | None = None,
         throttle: Throttle | None = None,
@@ -86,8 +92,12 @@ class Engine:
             put_item: Takes every Item the Callbacks and errbacks produce, with
                 where it came from.
             events: Where Request and Response Events are emitted.
-            concurrency: The number of workers, which is also the maximum number of
-                Requests processed at once.
+            concurrency: The number of workers, each processing one Request at a
+                time, for the Requests that do not go to the browser Fetcher, or
+                for every Request without `browser_concurrency`.
+            browser_concurrency: The number of workers more, for the Requests that
+                go to the browser Fetcher, as `pernix.fetchers.is_rendered()` tells;
+                0 to have the `concurrency` workers process them too.
             lease_ttl: Seconds a claimed Request stays leased without renewal; Leases
                 are renewed every third of it.
             retry_policy: Decides which attempts are retried; defaults to
@@ -101,16 +111,22 @@ class Engine:
                 that are independent and go through no proxy.
 
         Raises:
-            ValueError: `concurrency` is less than 1, or `lease_ttl` is not positive.
+            ValueError: `concurrency` is less than 1, `browser_concurrency` is
+                negative, or `lease_ttl` is not positive.
         """
         if concurrency < 1:
             raise ValueError(f"concurrency must be at least 1, got {concurrency}")
+        if browser_concurrency < 0:
+            raise ValueError(f"browser_concurrency must not be negative, got {browser_concurrency}")
         if lease_ttl <= 0:
             raise ValueError(f"lease_ttl must be positive, got {lease_ttl}")
         self._spider = spider
         self._frontier = frontier
         self._events = events
-        self._concurrency = concurrency
+        self._kinds: tuple[bool | None, ...] = (
+            (False,) * concurrency + (True,) * browser_concurrency if browser_concurrency else (None,) * concurrency
+        )
+        """What each worker claims: rendered Requests, the others, or any (`None`)."""
         self._lease_ttl = lease_ttl
         self._throttle = throttle or Throttle(DomainSettings())
         self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
@@ -130,7 +146,7 @@ class Engine:
     async def run(self) -> None:
         """Run until the Run is idle and `Spider.on_idle()` adds no more Requests, or until drained."""
         async with asyncio.TaskGroup() as tasks:
-            workers = [tasks.create_task(self._work()) for _ in range(self._concurrency)]
+            workers = [tasks.create_task(self._work(rendered)) for rendered in self._kinds]
             feeding = tasks.create_task(self._feed())
             draining = tasks.create_task(self._draining.wait())
             await asyncio.wait([feeding, draining], return_when=asyncio.FIRST_COMPLETED)
@@ -185,18 +201,21 @@ class Engine:
         while (await self._frontier.counts()).unfinished:
             await self._frontier.wait()
 
-    async def _work(self) -> None:
+    async def _work(self, rendered: bool | None) -> None:
+        """Process Requests of a kind, one at a time: rendered ones, the others, or any (`None`)."""
         while not self._draining.is_set():
-            lease = await self._claim() or await self._wait_for_work()
+            lease = await self._claim(rendered) or await self._wait_for_work(rendered)
             if lease is not None:
                 with request_context(lease.id):  # records logged for the Request, its Callback's included
                     await self._process(lease)
 
-    async def _claim(self) -> Lease | None:
-        leases = await self._frontier.claim(self._worker_id, 1, self._lease_ttl, skip_slots=self._throttle.blocked())
+    async def _claim(self, rendered: bool | None) -> Lease | None:
+        leases = await self._frontier.claim(
+            self._worker_id, 1, self._lease_ttl, skip_slots=self._throttle.blocked(), rendered=rendered
+        )
         return leases[0] if leases else None
 
-    async def _wait_for_work(self) -> Lease | None:
+    async def _wait_for_work(self, rendered: bool | None) -> Lease | None:
         """Wait until the Frontier changes, a blocked slot may start again, or a Drain begins; return a Lease found meanwhile."""
         loop = asyncio.get_running_loop()
         # Started eagerly, the waits register for changes before the claim below, so a
@@ -209,7 +228,7 @@ class Engine:
         lease: Lease | None = None
         try:
             if not self._draining.is_set():
-                lease = await self._claim()
+                lease = await self._claim(rendered)
             if lease is None:
                 await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         finally:
