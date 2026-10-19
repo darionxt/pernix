@@ -7,15 +7,16 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
-from browser_kills import browsers, kill
+from browser_kills import browsers, drivers, kill
 from pernix import Request, Response, Spider
 from pernix.browser import Render
 from pernix.crawler import Crawler
 from pernix.testing import crawl
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator, Callable, Mapping
 
+    import psutil
     from patchright.async_api import Page
 
     from pernix.testing import LoopbackServer
@@ -162,7 +163,12 @@ async def test_a_callback_whose_kept_page_crashed_is_retried(site: str) -> None:
     assert report.stats["requests.failed"] == 0
 
 
-async def test_a_callback_whose_browser_was_lost_is_retried_under_its_budget(site: str) -> None:
+@pytest.mark.parametrize(
+    ("victims", "lost"), [(browsers, "disconnected"), (drivers, "driver")], ids=["browser", "driver"]
+)
+async def test_a_callback_whose_browser_was_lost_is_retried_under_its_budget(
+    site: str, victims: Callable[[], list[psutil.Process]], lost: str
+) -> None:
     class Losing(Kept):
         attempts = 0
 
@@ -171,11 +177,12 @@ async def test_a_callback_whose_browser_was_lost_is_retried_under_its_budget(sit
             assert page is not None
             self.attempts += 1
             if self.attempts == 1:
-                kill(browsers())
+                kill(victims())
             yield {"text": await page.text_content("#next"), "attempt": self.attempts}
 
     report = await crawl(Losing, base=site)
 
     assert report.items == [{"text": "next", "attempt": 2}]
     assert report.stats["requests.retried_by_budget.browser_lost"] == 1
+    assert report.stats[f"browser.lost_by_reason.{lost}"] == 1
     assert report.stats["browser.generations"] == 2

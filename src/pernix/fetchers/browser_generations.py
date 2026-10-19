@@ -192,7 +192,7 @@ class Generations:
         try:
             async with generation.tripwire.guarding(
                 lambda reason: BrowserLost(f"rendering {url} failed: {_LOSSES[reason]}"),
-                may_trip=lambda error: self._may_be_lost(generation, error),
+                may_trip=lambda error: self.may_be_lost(generation, error),
             ):
                 yield generation
         finally:
@@ -326,8 +326,20 @@ class Generations:
         self._retire(generation.launched)
         self._close_if_done(generation)
 
-    def _may_be_lost(self, generation: Generation, error: BaseException) -> bool:
-        """Tell whether a fetch failed as its Generation went away, losing the Generation if it is plain it did."""
+    def may_be_lost(self, generation: Generation, error: BaseException) -> bool:
+        """Tell whether a failure in a Generation may be its going away, losing the Generation if it plainly is.
+
+        Args:
+            generation: The Generation the failure happened in.
+            error: The failure, such as the error of a fetch, or of a Callback
+                working with a page kept in the Generation.
+
+        Returns:
+            Whether the error names a page, a browser, or a driver that went away,
+            so that the event that tells which may still come; the Generation is lost
+            at once when the error tells its driver died, or its browser is no
+            longer connected.
+        """
         processes = generation.launched.processes
         if _driver_gone(error) or (processes is not None and not processes.driver_alive()):
             self._lose(generation, "driver")

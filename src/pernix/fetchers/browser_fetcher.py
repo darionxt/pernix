@@ -35,7 +35,7 @@ from pernix.fetchers.page_actions import run_page_method, run_render
 from pernix.fetchers.page_slots import PageSlot, PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.session_contexts import SessionContexts
-from pernix.fetchers.tripwire import Tripwire
+from pernix.fetchers.tripwire import GRACE, Tripwire, first_tripped
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
 from pernix.settings import ResponseSettings, Section
@@ -621,7 +621,10 @@ class BrowserFetcher:
 
             self._discard(context).add_done_callback(closed)
 
-        def broken() -> Exception | None:
+        async def broken(error: BaseException) -> Exception | None:
+            gone = self._generations.may_be_lost(generation, error) or _page_gone(error)
+            if gone:  # the error may come before the event that tells why
+                await first_tripped([opened.crash, generation.tripwire], within=GRACE)
             if opened.crash.reason is not None:
                 return PageCrashed(f"the page of {url}, kept for its Callback, crashed")
             return generation.lost_error(url)

@@ -16,7 +16,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Generator
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 
     from patchright.async_api import Page
 
@@ -30,23 +30,37 @@ class KeptPage:
         page: The page.
     """
 
-    def __init__(self, page: Page, *, close: Callable[[], None], broken: Callable[[], Exception | None]) -> None:
+    def __init__(
+        self,
+        page: Page,
+        *,
+        close: Callable[[], None],
+        broken: Callable[[BaseException], Awaitable[Exception | None]],
+    ) -> None:
         """Keep a page.
 
         Args:
             page: The page.
             close: Starts closing the page and what it holds, without waiting.
-            broken: Tells why the page went away while kept, as it crashed or its
-                browser was lost: the error the fetch would have failed with, or
-                `None`.
+            broken: Tells, given what the Callback raised, whether the page went
+                away while kept, as it crashed or its browser was lost: the error a
+                fetch would have failed with, or `None`.
         """
         self.page = page
         self._close: Callable[[], None] | None = close
         self._broken = broken
 
-    def broken(self) -> Exception | None:
-        """Why the page went away while kept, if it did: a `PageCrashed` or a `BrowserLost`."""
-        return self._broken()
+    async def broken(self, error: BaseException) -> Exception | None:
+        """Why the page went away while kept, if it did, as a Callback failing with an error tells.
+
+        Args:
+            error: What the Callback raised, which may tell of the page or its
+                browser going away before their events do.
+
+        Returns:
+            A `PageCrashed` or a `BrowserLost`, or `None` if the page is as it was.
+        """
+        return await self._broken(error)
 
     def close(self) -> None:
         """Start closing the page, its context, and releasing its slot; closing it again does nothing."""
@@ -58,23 +72,31 @@ class KeptPage:
 class PageKeeping:
     """The pages kept for the Callback of one Request, closed together once it ends.
 
+    A task the Callback started may outlive it, and still see the scope: once
+    closed, the scope keeps no page, and a page kept in it then is closed at once.
+
     Attributes:
         pages: The pages kept, in the order kept.
+        closed: Whether the scope ended, its pages closed.
     """
 
     def __init__(self) -> None:
         """Keep no page yet."""
         self.pages: list[KeptPage] = []
+        self.closed = False
 
     def keep(self, page: KeptPage) -> None:
-        """Keep a page until the scope ends.
+        """Keep a page until the scope ends, or close it at once if it ended.
 
         Args:
             page: The page.
         """
+        if self.closed:
+            page.close()
+            return
         self.pages.append(page)
 
-    def failure(self, error: Exception) -> Exception | None:
+    async def failure(self, error: Exception) -> Exception | None:
         """The error a Callback failed with in place of its own, when a page it kept went away meanwhile.
 
         Args:
@@ -85,14 +107,15 @@ class PageKeeping:
             caused by `error`; `None` if none did.
         """
         for page in self.pages:
-            broken = page.broken()
+            broken = await page.broken(error)
             if broken is not None:
                 broken.__cause__ = error
                 return broken
         return None
 
     def close(self) -> None:
-        """Start closing every page kept."""
+        """Start closing every page kept, and keep no more."""
+        self.closed = True
         for page in self.pages:
             page.close()
 
@@ -135,11 +158,12 @@ def without_keeping() -> Generator[None]:
 
 
 def page_keeping() -> PageKeeping | None:
-    """Where a fetch made now may keep its page; `None` where it cannot."""
-    return None if _refused.get() else _keeping.get()
+    """Where a fetch made now may keep its page; `None` where it cannot, as after the scope ended."""
+    keeping = _keeping.get()
+    return None if _refused.get() or keeping is None or keeping.closed else keeping
 
 
 def sharing_a_kept_slot() -> bool:
     """Whether a rendered fetch made now shares the page slot of a page kept, rather than take one of its own."""
     keeping = _keeping.get()
-    return keeping is not None and bool(keeping.pages)
+    return keeping is not None and not keeping.closed and bool(keeping.pages)

@@ -188,7 +188,7 @@ class RequestProcessor:
         error = await self._handle_response(request, response)
         if error is None:
             return Done()
-        failure = None if isinstance(error, Retry) else keeping.failure(error)  # its kept page went away under it
+        failure = None if isinstance(error, Retry) else await keeping.failure(error)  # its kept page went away under it
         judged = error if isinstance(error, Retry) else failure
         if judged is not None:
             decision = self._decide(request, judged, lease.attempt)

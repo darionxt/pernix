@@ -32,10 +32,13 @@ class Kept:
         self.broken = broken
 
     def page(self) -> KeptPage:
-        return KeptPage(cast("Page", self), close=self.close, broken=lambda: self.broken)
+        return KeptPage(cast("Page", self), close=self.close, broken=self.went_away)
 
     def close(self) -> None:
         self.closed += 1
+
+    async def went_away(self, _error: BaseException) -> Exception | None:
+        return self.broken
 
 
 async def test_a_page_is_kept_until_the_scope_ends() -> None:
@@ -82,6 +85,24 @@ async def test_fetches_refused_keeping_still_share_the_slot_of_a_page_kept() -> 
             return sharing_a_kept_slot()
 
         assert await asyncio.create_task(in_a_subtask())
+
+
+async def test_a_scope_that_ended_keeps_no_page_for_a_task_that_outlived_it() -> None:
+    later = Kept()
+    ended = asyncio.Event()
+
+    async def outliving() -> tuple[object, bool]:
+        await ended.wait()
+        return page_keeping(), sharing_a_kept_slot()
+
+    async with keeping_pages() as keeping:
+        keeping.keep(Kept().page())
+        task = asyncio.create_task(outliving())  # it sees the scope, as a Callback's subtask does
+    ended.set()
+
+    assert await task == (None, False)
+    keeping.keep(later.page())  # as a fetch that ends once the scope did
+    assert (later.closed, keeping.pages[1:]) == (1, [])
 
 
 async def test_no_page_is_kept_outside_a_scope() -> None:

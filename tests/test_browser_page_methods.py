@@ -218,7 +218,7 @@ async def test_a_kept_page_that_crashes_tells_its_scope(server: LoopbackServer) 
         async with asyncio.timeout(10):
             await crashed.wait()
         crashing.cancel()
-        failure = keeping.failure(RuntimeError("Page.title: Page crashed"))
+        failure = await keeping.failure(RuntimeError("Page.title: Page crashed"))
 
     assert isinstance(failure, PageCrashed)
     assert isinstance(failure.__cause__, RuntimeError)
