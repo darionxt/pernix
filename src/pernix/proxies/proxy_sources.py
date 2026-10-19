@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+import msgspec
+
 from pernix.errors import FetchError, SettingsError
+from pernix.proxies.json_answers import read_json_answer
 from pernix.proxies.proxy import Proxy
 from pernix.proxies.proxy_url import proxy_url
 from pernix.request import Request
@@ -17,9 +21,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable
 
     from pernix.fetchers import HTTPFetcher
+    from pernix.proxies.json_answers import JsonAnswer
     from pernix.secret import Secret
 
 __all__ = ["ProxyAPI", "ProxyFile", "ProxyProvider", "StaticProxies", "proxy_lines", "read_proxies"]
+
+logger = logging.getLogger(__name__)
 
 
 class ProxyProvider(Protocol):
@@ -96,13 +103,15 @@ class ProxyFile:
 
 
 class ProxyAPI:
-    """The proxies an API answers with, one per line, such as a proxy vendor's, fetched anew each time.
+    """The proxies an API answers with, one per line, or in JSON, such as a proxy vendor's, fetched anew each time.
 
     The API is fetched over HTTP with a fetcher of its own, opened and closed with
     the Run, and never through a proxy. `{count}` in its URL is replaced by how many
-    proxies are wanted, or 1 when that is not known. Blank lines and those starting
-    with `#` are skipped. With a lifetime, each proxy it gives expires that long
-    after it answered, as an answer of one per line tells no expiry.
+    proxies are wanted, or 1 when that is not known. An answer of one per line skips
+    blank lines and those starting with `#`. A JSON answer is read as its
+    `JsonAnswer` says; one that does not match it gives no proxy, with a warning
+    naming the field it lacks, never the API's URL. With a lifetime, each proxy whose
+    answer tells no expiry expires that long after the API answered.
     """
 
     def __init__(
@@ -111,6 +120,7 @@ class ProxyAPI:
         fetcher: HTTPFetcher,
         *,
         lifetime: float | None = None,
+        answer: JsonAnswer | None = None,
         mask: Callable[[Iterable[str]], None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -119,7 +129,9 @@ class ProxyAPI:
         Args:
             url: The API's URL, a `Secret` as it often holds a key.
             fetcher: The fetcher to fetch it with, not opened yet.
-            lifetime: Seconds each proxy it gives works for; `None` for no expiry.
+            lifetime: Seconds each proxy it gives works for, unless its answer tells
+                when it expires; `None` for no expiry.
+            answer: How to read its answers, in JSON; `None` for one proxy per line.
             mask: Masks values in the Run's log from now on, given each URL fetched,
                 whose count the `Secret` does not hold.
             clock: The current time, in seconds since the epoch.
@@ -127,6 +139,7 @@ class ProxyAPI:
         self._url = url
         self._fetcher = fetcher
         self._lifetime = lifetime
+        self._answer = answer
         self._mask = mask
         self._clock = clock
 
@@ -146,8 +159,9 @@ class ProxyAPI:
                 `None`.
 
         Returns:
-            The lines of the answer that are not blank or comments, in order, as
-            records expiring after the lifetime, if set.
+            The proxies of the answer, in order: the lines that are not blank or
+            comments, or the entries of a JSON answer, as records expiring when the
+            answer tells, or after the lifetime, if set.
 
         Raises:
             pernix.errors.FetchError: The API could not be fetched, or answered with
@@ -159,11 +173,29 @@ class ProxyAPI:
         response = await self._fetcher.fetch(Request(url))
         if not 200 <= response.status < 300:
             raise FetchError(f"the proxy API answered with the status {response.status}")
+        arrived = self._clock()
+        if self._answer is not None:
+            return self._read_json(response.text, self._answer, arrived)
         lines = [proxy for _, proxy in proxy_lines(response.text)]
         if self._lifetime is None:
             return list(lines)
-        expires = self._clock() + self._lifetime
+        expires = arrived + self._lifetime
         return [Proxy(line, expires=expires) for line in lines]
+
+    def _read_json(self, text: str, answer: JsonAnswer, arrived: float) -> list[str | Proxy]:
+        """The proxies of a JSON answer, those without an expiry expiring after the lifetime, if set."""
+        proxies, problems = read_json_answer(text, answer, now=arrived)
+        if not proxies and problems:
+            logger.warning("The answer of the proxy API gives no proxy: %s", "; ".join(problems))
+        elif problems:
+            logger.warning("Skipped the entries of the proxy API's answer that cannot be read: %s", ", ".join(problems))
+        if self._lifetime is None:
+            return list(proxies)
+        lifetime = arrived + self._lifetime
+        return [
+            proxy if proxy.expires is not None else msgspec.structs.replace(proxy, expires=lifetime)
+            for proxy in proxies
+        ]
 
 
 def proxy_lines(text: str) -> list[tuple[int, str]]:
