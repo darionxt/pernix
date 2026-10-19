@@ -35,7 +35,7 @@ from pernix.fetchers.loopback_listener import LoopbackListener
 from pernix.urls import url_host
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
     from pernix.fetchers.address_guard import AddressGuard
     from pernix.fetchers.browser_settings import BrowserSettings
@@ -377,7 +377,9 @@ async def _connected(addresses: tuple[str, ...], port: int) -> tuple[socket.sock
 
     The next address is tried as soon as one fails, or once one has not connected
     within `_STAGGER`, the attempts under way going on, so an address that never
-    answers does not keep the others from being tried.
+    answers does not keep the others from being tried. The attempts left once one
+    connected, or once this is cancelled, are abandoned at once, a connection one
+    makes all the same being closed.
 
     Raises:
         OSError: None did; the error of the last.
@@ -401,7 +403,7 @@ async def _connected(addresses: tuple[str, ...], port: int) -> tuple[socket.sock
                     failure = exc
         raise failure or OSError(f"no address to connect to port {port}")
     finally:
-        await _abandoned(attempts)
+        _abandon(attempts)  # without waiting, so that nothing interrupts it
 
 
 async def _attempt(address: str, port: int) -> socket.socket:
@@ -417,15 +419,16 @@ async def _attempt(address: str, port: int) -> socket.socket:
     return upstream
 
 
-async def _abandoned(attempts: Mapping[asyncio.Task[socket.socket], str]) -> None:
-    """Stop the attempts to connect left, closing the connections they made all the same."""
+def _abandon(attempts: Iterable[asyncio.Task[socket.socket]]) -> None:
+    """Stop attempts to connect, closing the connection each makes all the same, now or once it ends."""
     for attempt in attempts:
         attempt.cancel()
-    if attempts:
-        await asyncio.wait(attempts)
-    for attempt in attempts:
-        if not attempt.cancelled() and attempt.exception() is None:
-            attempt.result().close()
+        attempt.add_done_callback(_close_made)
+
+
+def _close_made(attempt: asyncio.Task[socket.socket]) -> None:
+    if not attempt.cancelled() and attempt.exception() is None:
+        attempt.result().close()
 
 
 async def _splice(loop: asyncio.AbstractEventLoop, client: socket.socket, upstream: socket.socket) -> None:

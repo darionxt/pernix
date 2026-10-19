@@ -186,6 +186,58 @@ async def test_an_address_that_never_answers_does_not_keep_the_next_from_being_t
     assert proxy.address(f"http://dual.example:{port}/") == "127.0.0.1"
 
 
+class _Made:
+    """Stands in for a connection made, telling when it is closed."""
+
+    def __init__(self, address: str, closed: list[str], closing: asyncio.Event) -> None:
+        self.address = address
+        self._closed = closed
+        self._closing = closing
+
+    def close(self) -> None:
+        self._closed.append(self.address)
+        self._closing.set()
+
+
+async def test_a_race_to_connect_leaves_no_connection_open_whenever_it_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+    closing = asyncio.Event()
+    made = asyncio.Event()
+
+    async def attempt(address: str, _port: int) -> _Made:
+        if address == "203.0.113.1":
+            made.set()
+            return _Made(address, closed, closing)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(1)  # connects all the same, as the cancellation came too late
+        return _Made(address, closed, closing)
+
+    monkeypatch.setattr(address_guard_proxy, "_attempt", attempt)
+    monkeypatch.setattr(address_guard_proxy, "_STAGGER", 0.0)
+    connected = address_guard_proxy._connected  # pyright: ignore[reportPrivateUsage]
+    racing = asyncio.create_task(connected(("198.51.100.1", "203.0.113.1"), 80))
+
+    await made.wait()
+    await asyncio.sleep(0.05)  # the race has its winner, while the other attempt takes a second to end
+    racing.cancel()
+    try:
+        winner, _address = await racing
+    except asyncio.CancelledError:
+        pass  # cancelled before it gave its winner, which then must not be left open
+    else:
+        winner.close()  # as the proxy does once done with it
+    async with asyncio.timeout(5):
+        while len(closed) < 2:
+            await closing.wait()
+            closing.clear()
+
+    assert sorted(closed) == ["198.51.100.1", "203.0.113.1"]
+
+
 async def test_hosts_that_cannot_be_reached_fail_as_curl_would(
     resolver: Callable[[Mapping[str, list[str]]], None],
 ) -> None:
