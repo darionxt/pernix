@@ -120,6 +120,7 @@ async def test_a_browser_that_stops_answering_is_killed_with_its_driver(
             await loading
         held.release.set()
         left = await gone(first)
+        monkeypatch.setattr(browser_generations, "PROBE_TIMEOUT", 10.0)  # the next browser, starting, may answer late
         response = await fetcher.fetch(_render(server.url("/")))
 
     assert left == []
