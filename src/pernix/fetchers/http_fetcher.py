@@ -404,7 +404,8 @@ class HTTPFetcher:
                 pinned=pinned,
                 sent=sent,
             )
-            set_cookies += _set_cookies(result)
+            if sent is None or sent.credentials:  # a response no cookie goes with sets none
+                set_cookies += _set_cookies(result)
             try:
                 target = redirect_target(result.url, result.status_code, _location(result))
             except FetchError:

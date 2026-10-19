@@ -24,13 +24,14 @@ async def test_a_fetch_takes_the_sessions_cookies_to_its_pages_origin_only(
     page = server.url("/page").replace("127.0.0.1", page_host, 1)
 
     async with HTTPFetcher() as fetcher:
-        await fetcher.fetch(
+        response = await fetcher.fetch(
             Request(server.url("/api"), json={}, cookies={"own": "2"}, headers={"Referer": page}), session=session
         )
 
     sent = server.received[-1].header("Cookie")
     assert sent == ("sid=1; own=2" if credentials else "own=2")
     assert ("late" in {cookie.name for cookie in session.cookies}) == credentials
+    assert ("late" in response.cookies) == credentials
     assert server.received[-1].header("Origin") == page.removesuffix("/page")
 
 

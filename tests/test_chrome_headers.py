@@ -237,3 +237,32 @@ def test_the_requests_own_headers_go_first_among_those_a_page_adds() -> None:
     names = [name for name, _ in made.headers]
     assert names[:3] == ["Connection", "X-Trace", "sec-ch-ua-platform"]
     assert names.count("Sec-Fetch-Dest") == 1
+
+
+def test_a_fetch_back_from_another_origin_takes_no_cookies_and_sends_a_null_origin() -> None:
+    chain = ["https://shop.example/api", "https://api.example/v1", "https://shop.example/api/2"]
+
+    made = _made("fetch", chain)
+
+    assert not made.credentials
+    assert _headers(made)["origin"] == "null"
+
+
+def test_the_referer_stays_cut_once_a_redirect_cut_it() -> None:
+    back = ["https://shop.example/a", "https://other.example/b", "https://shop.example/c"]
+    secure_again = ["https://shop.example/a", "http://other.example/b", "https://shop.example/c"]
+
+    assert _headers(_made("navigation", back))["referer"] == "https://shop.example/"
+    assert "referer" not in _headers(_made("navigation", secure_again))
+
+
+def test_a_form_without_a_page_redirected_to_a_get_stays_on_its_own_origin() -> None:
+    made = _made("form", ["https://shop.example/submit", "https://shop.example/done"], referrer=None)
+
+    assert _headers(made)["sec-fetch-site"] == "same-origin"
+
+
+def test_a_form_from_an_https_page_to_another_scheme_sends_a_null_origin() -> None:
+    made = _made("form", "http://shop.example/submit", method="POST")
+
+    assert _headers(made)["origin"] == "null"

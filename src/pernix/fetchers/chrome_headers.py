@@ -200,8 +200,8 @@ class ChromeRequest:
             comma-separated, as `CURLOPT_HTTPHEADER_ORDER` takes them.
         weight: The HTTP/2 stream weight, which Chrome makes of `Priority`.
         credentials: Whether cookies go with it, and are taken from its response:
-            not for a `fetch()` to another origin than its page's, as `fetch()`
-            sends them to its own only.
+            not for a `fetch()` that has gone to another origin than its page's,
+            as `fetch()` sends them to its own only, even once back.
     """
 
     headers: list[tuple[str, str]]
@@ -236,12 +236,12 @@ def chrome_request(
         The headers and how curl sends them.
     """
     url = chain[-1]
-    if kind == "form" and method == "GET":
-        kind = "navigation"  # a form submission redirected to a GET
-    shape = _SHAPES[kind]
     initiator = _origin(referrer) if referrer else None
     if initiator is None and kind != "navigation":
         initiator = _origin(chain[0])  # a page of its own origin, sending no Referer
+    if kind == "form" and method == "GET":
+        kind = "navigation"  # a form submission redirected to a GET
+    shape = _SHAPES[kind]
     site = _chain_site(initiator, chain)
     values: dict[str, str] = {name.lower(): value for name, value in client}
     values |= {
@@ -262,17 +262,18 @@ def chrome_request(
         values["cache-control"] = "max-age=0"
     if site == "cross-site" and kind in ("iframe", "style", "script", "image"):
         values["sec-fetch-storage-access"] = "active"
-    origin = _sent_origin(kind, method, initiator, chain)
+    cors = kind == "fetch" and any(_origin(hop) != initiator for hop in chain)
+    origin = _sent_origin(kind, method, initiator, chain, cors=cors)
     if origin is not None:
         values["origin"] = origin
-    if referrer and (sent := _sent_referrer(referrer, url)) is not None:
-        values["referer"] = sent
+    sent_referrer = _chain_referrer(referrer, chain)
+    if sent_referrer is not None:
+        values["referer"] = sent_referrer
     if not _trustworthy(url):
         for name in _SECURE_ONLY:
             values.pop(name, None)
         values["accept-encoding"] = "gzip, deflate"
-    credentials = kind != "fetch" or _origin(url) == initiator
-    return _arranged(shape, values, own, document=document, credentials=credentials)
+    return _arranged(shape, values, own, document=document, credentials=not cors)
 
 
 def site_relation(initiator: str | None, url: str) -> str:
@@ -335,20 +336,42 @@ def _chain_site(initiator: str | None, chain: Sequence[str]) -> str:
     return max((site_relation(initiator, url) for url in chain), key=rank.index)
 
 
-def _sent_origin(kind: RequestKind, method: str, initiator: str | None, chain: Sequence[str]) -> str | None:
-    """The `Origin` Chrome sends: for a form, and for a `fetch()` other than a GET or a HEAD, or to another origin.
+def _sent_origin(
+    kind: RequestKind, method: str, initiator: str | None, chain: Sequence[str], *, cors: bool
+) -> str | None:
+    """The `Origin` Chrome sends, as the Fetch standard serializes it.
 
-    It is `null` once a redirect led from another origin than the page's to yet
-    another, as the Fetch standard taints it.
+    A form sends its page's origin, and a `fetch()` too, unless it is a GET or a
+    HEAD that never left its page's origin. It is `null` once a redirect led from
+    another origin than the page's to yet another, and for a form from an HTTPS
+    page to another scheme, by `strict-origin-when-cross-origin`.
+
+    Args:
+        kind: The kind of request.
+        method: The hop's method.
+        initiator: The page's origin.
+        chain: The URLs of the redirect chain so far.
+        cors: Whether a `fetch()` has gone to another origin than its page's.
     """
-    url = chain[-1]
-    sent = kind == "form" or (kind == "fetch" and (method not in ("GET", "HEAD") or _origin(url) != initiator))
-    if initiator is None or not sent:
+    if initiator is None or kind not in ("form", "fetch"):
+        return None
+    if method in ("GET", "HEAD") and not cors:
         return None
     for current, location in itertools.pairwise(chain):
         if _origin(current) != _origin(location) and initiator != _origin(current):
             return "null"
+    if kind == "form" and initiator.startswith("https:") and not chain[-1].lower().startswith("https:"):
+        return "null"
     return initiator
+
+
+def _chain_referrer(referrer: str | None, chain: Sequence[str]) -> str | None:
+    """The `Referer` of the last hop of a chain: each hop's made of the one before, as a redirect keeps it."""
+    for url in chain:
+        if referrer is None:
+            return None
+        referrer = _sent_referrer(referrer, url)
+    return referrer
 
 
 def _sent_referrer(referrer: str, url: str) -> str | None:
