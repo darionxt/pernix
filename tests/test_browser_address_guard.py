@@ -11,7 +11,7 @@ import pytest
 
 from pernix import Request, Session
 from pernix.browser import Click, Evaluate, Render
-from pernix.errors import NetworkBlocked, ProxyError
+from pernix.errors import ConnectError, NetworkBlocked, ProxyError
 from pernix.fetchers import BrowserFetcher
 from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.address_guard_proxy import AddressGuardProxy
@@ -19,6 +19,8 @@ from pernix.settings import NetworkSettings
 from pernix.stats import Stats
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     from pernix.testing import LoopbackServer
 
 pytestmark = pytest.mark.usefixtures("browser_engine")
@@ -130,6 +132,7 @@ async def test_a_name_answering_with_a_private_address_once_checked_cannot_reach
 
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr("pernix.fetchers.address_guard.is_public_address", lambda address: str(address) == "127.0.0.1")
+    monkeypatch.setattr("pernix.fetchers.address_guard_proxy._CACHED_FOR", 0.0)  # the name is asked at each connection
     url = f"http://rebind.invalid:{port}/page"
 
     with private:
@@ -146,6 +149,20 @@ async def test_a_name_answering_with_a_private_address_once_checked_cannot_reach
     assert (
         str(refused.value) == f"network.public_only refused {url}: rebind.invalid resolves to ::1, a loopback address"
     )
+
+
+@pytest.mark.pernix_network  # the host is no loopback name, and never resolves
+async def test_a_host_that_does_not_resolve_fails_as_with_the_http_fetcher(
+    resolver: Callable[[Mapping[str, list[str]]], None],
+) -> None:
+    resolver({})
+
+    async with BrowserFetcher(network=NetworkSettings(public_only=True)) as fetcher:
+        with pytest.raises(ConnectError) as raised:
+            await fetcher.fetch(_render("http://nothing.invalid/"))
+
+    assert raised.value.code == 6
+    assert str(raised.value).startswith("loading http://nothing.invalid/ failed: could not resolve nothing.invalid: ")
 
 
 async def test_requests_through_a_proxy_of_their_own_or_of_their_session_are_refused(server: LoopbackServer) -> None:

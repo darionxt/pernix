@@ -15,8 +15,12 @@ if TYPE_CHECKING:
 
 __all__ = ["ProxyRefusals"]
 
-_PROXY_FAILED = "net::ERR_SOCKS_CONNECTION_FAILED"
-"""What fails in the browser that the address guard's proxy did not connect, whatever the reason."""
+_PROXY_FAILED = "net::ERR_SOCKS_CONNECTION_"
+"""What fails in the browser that the address guard's proxy did not connect.
+
+Chrome reports `ERR_SOCKS_CONNECTION_FAILED` whatever the reply, and keeps
+`ERR_SOCKS_CONNECTION_HOST_UNREACHABLE` for SOCKS4, but may tell the two apart one day.
+"""
 
 
 class ProxyRefusals:

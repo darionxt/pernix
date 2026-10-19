@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from pernix.errors import ConnectError, NetworkBlocked, SettingsError, Timeout
-from pernix.fetchers import BrowserFetcher, BrowserSettings
+from pernix.fetchers import BrowserFetcher, BrowserSettings, address_guard_proxy
 from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.address_guard_proxy import AddressGuardProxy, ProxiedFailure
 from pernix.fetchers.network_guard import NetworkGuard
@@ -120,6 +120,7 @@ async def test_a_name_is_resolved_once_and_connected_to_at_the_address_checked(
 
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr("pernix.fetchers.address_guard.is_public_address", lambda address: str(address) == "127.0.0.1")
+    monkeypatch.setattr("pernix.fetchers.address_guard_proxy._CACHED_FOR", 0.0)  # asked again at once
 
     async with _echo() as (port, received), _proxy(AddressGuard()) as proxy:
         first, reader, writer = await _socks5(proxy, "rebind.example", port)
@@ -133,6 +134,56 @@ async def test_a_name_is_resolved_once_and_connected_to_at_the_address_checked(
     assert proxy.address(f"http://rebind.example:{port}/") == "127.0.0.1"
     failure = proxy.failure(f"http://rebind.example:{port}/")
     assert failure == ProxiedFailure("rebind.example resolves to 10.0.0.5, a private address", NetworkBlocked)
+
+
+async def test_the_addresses_checked_are_kept_for_a_while(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[str] = []
+
+    def getaddrinfo(host: str, port: int, *_args: object, **_kwargs: object) -> list[object]:
+        asked.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+    async with _echo() as (port, received), _proxy(AddressGuard(frozenset({"shop.example"}))) as proxy:
+        for text in (b"one", b"two"):
+            code, reader, writer = await _socks5(proxy, "shop.example", port)
+            writer.write(text)
+            assert await reader.read() == text
+            await _closed(writer)
+            assert code == SUCCEEDED
+
+    assert (asked, received) == (["shop.example"], [b"one", b"two"])
+
+
+async def test_an_address_that_never_answers_does_not_keep_the_next_from_being_tried(
+    resolver: Callable[[Mapping[str, list[str]]], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver({"dual.example": ["198.51.100.1", "127.0.0.1"]})
+    attempt = address_guard_proxy._attempt  # pyright: ignore[reportPrivateUsage]
+    abandoned: list[str] = []
+
+    async def unanswered(address: str, port: int) -> socket.socket:
+        if address != "198.51.100.1":
+            return await attempt(address, port)
+        try:
+            await asyncio.Event().wait()  # as a host dropping the connection attempt
+        except asyncio.CancelledError:
+            abandoned.append(address)
+            raise
+        raise AssertionError("never answered")
+
+    monkeypatch.setattr(address_guard_proxy, "_attempt", unanswered)
+
+    async with _echo() as (port, received), _proxy(AddressGuard(frozenset({"dual.example"}))) as proxy:
+        async with asyncio.timeout(5):  # well before the 30 s connecting may take
+            code, reader, writer = await _socks5(proxy, "dual.example", port)
+            writer.write(b"ping")
+            assert await reader.read() == b"ping"
+        await _closed(writer)
+
+    assert (code, received, abandoned) == (SUCCEEDED, [b"ping"], ["198.51.100.1"])
+    assert proxy.address(f"http://dual.example:{port}/") == "127.0.0.1"
 
 
 async def test_hosts_that_cannot_be_reached_fail_as_curl_would(

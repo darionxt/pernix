@@ -22,6 +22,7 @@ import contextlib
 import ipaddress
 import re
 import socket
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
@@ -48,8 +49,14 @@ _HANDSHAKE_TIMEOUT = 10.0
 _CONNECT_TIMEOUT = 30.0
 """Seconds to resolve a host and connect to it, at most."""
 
+_STAGGER = 0.25
+"""Seconds a connection to one address has before the next address is tried too, as browsers do (Happy Eyeballs)."""
+
+_CACHED_FOR = 60.0
+"""Seconds a host's addresses, once checked, are connected to without resolving it again, as Chrome caches them."""
+
 _REMEMBERED = 1024
-"""The hosts and ports whose latest failure, and latest address, are kept, at most."""
+"""The hosts whose addresses, and the hosts and ports whose latest failure and latest address, are kept, at most."""
 
 _CHUNK = 65536
 
@@ -126,9 +133,12 @@ class ProxiedFailure:
 class AddressGuardProxy:
     """A SOCKS5 proxy that connects only to hosts on public addresses, at the addresses it checked.
 
-    Hosts of `network.allow_hosts` are resolved and connected to whatever their
-    addresses. Under the network guard of tests, only the hosts it admits are
-    reached, whatever the address guard says.
+    A host's addresses are kept for a minute once checked, as Chrome keeps those it
+    resolves, so the connections a page makes to a host meanwhile go to the same
+    address, and a name answering otherwise meanwhile is not asked again. Hosts of
+    `network.allow_hosts` are resolved and connected to whatever their addresses.
+    Under the network guard of tests, only the hosts it admits are reached,
+    whatever the address guard says.
     """
 
     def __init__(self, guard: AddressGuard, *, network_guard: NetworkGuard | None = None) -> None:
@@ -143,6 +153,8 @@ class AddressGuardProxy:
         self._listener = LoopbackListener(self._serve)
         self._failures: dict[_Key, ProxiedFailure] = {}
         self._addresses: dict[_Key, str] = {}
+        self._checked: dict[str, tuple[float, tuple[str, ...]]] = {}
+        """The addresses of each host lately checked, with when they expire."""
 
     @property
     def url(self) -> str:
@@ -218,7 +230,7 @@ class AddressGuardProxy:
             if self._network_guard is not None and not self._network_guard.admits(_url(host, port)):
                 raise HostRefused(f"the network guard admits only loopback hosts, such as localhost, not {host}")
             async with asyncio.timeout(_CONNECT_TIMEOUT):
-                addresses = await self._guard.addresses(host, port)
+                addresses = await self._addresses_of(host, port)
                 upstream, address = await _connected(addresses, port)
         except HostRefused as exc:
             return self._failed(key, ProxiedFailure(exc.reason, NetworkBlocked), _NOT_ALLOWED)
@@ -233,6 +245,16 @@ class AddressGuardProxy:
             return self._failed(key, failure, _CONNECTION_REFUSED)
         _remember(self._addresses, key, address)
         return upstream, _SUCCEEDED
+
+    async def _addresses_of(self, host: str, port: int) -> tuple[str, ...]:
+        """The addresses of a host, checked: those kept, unless they expired, or those the address guard gives."""
+        now = time.monotonic()
+        kept = self._checked.get(host)
+        if kept is not None and kept[0] > now:
+            return kept[1]
+        addresses = await self._guard.addresses(host, port)
+        _remember(self._checked, host, (now + _CACHED_FOR, addresses))
+        return addresses
 
     def _failed(self, key: _Key, failure: ProxiedFailure, reply: int) -> tuple[None, int]:
         _remember(self._failures, key, failure)
@@ -353,26 +375,57 @@ def _reply(code: int) -> bytes:
 async def _connected(addresses: tuple[str, ...], port: int) -> tuple[socket.socket, str]:
     """A connection to the first of the addresses that takes one, and its address.
 
+    The next address is tried as soon as one fails, or once one has not connected
+    within `_STAGGER`, the attempts under way going on, so an address that never
+    answers does not keep the others from being tried.
+
     Raises:
         OSError: None did; the error of the last.
     """
-    loop = asyncio.get_running_loop()
+    waiting = list(addresses)
+    attempts: dict[asyncio.Task[socket.socket], str] = {}
     failure: OSError | None = None
-    for address in addresses:
-        upstream = socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        while waiting or attempts:
+            if waiting:
+                address = waiting.pop(0)
+                attempts[asyncio.create_task(_attempt(address, port))] = address
+            done, _pending = await asyncio.wait(
+                attempts, timeout=_STAGGER if waiting else None, return_when=asyncio.FIRST_COMPLETED
+            )
+            for attempt in done:
+                address = attempts.pop(attempt)
+                try:
+                    return attempt.result(), address
+                except OSError as exc:
+                    failure = exc
+        raise failure or OSError(f"no address to connect to port {port}")
+    finally:
+        await _abandoned(attempts)
+
+
+async def _attempt(address: str, port: int) -> socket.socket:
+    """A connection to an address, closed unless made."""
+    upstream = socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM)
+    try:
         upstream.setblocking(False)
-        try:
-            await loop.sock_connect(upstream, (address, port))
-            upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError as exc:
-            upstream.close()
-            failure = exc
-            continue
-        except BaseException:
-            upstream.close()
-            raise
-        return upstream, address
-    raise failure or OSError(f"no address to connect to port {port}")
+        await asyncio.get_running_loop().sock_connect(upstream, (address, port))
+        upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except BaseException:
+        upstream.close()
+        raise
+    return upstream
+
+
+async def _abandoned(attempts: Mapping[asyncio.Task[socket.socket], str]) -> None:
+    """Stop the attempts to connect left, closing the connections they made all the same."""
+    for attempt in attempts:
+        attempt.cancel()
+    if attempts:
+        await asyncio.wait(attempts)
+    for attempt in attempts:
+        if not attempt.cancelled() and attempt.exception() is None:
+            attempt.result().close()
 
 
 async def _splice(loop: asyncio.AbstractEventLoop, client: socket.socket, upstream: socket.socket) -> None:
@@ -391,7 +444,7 @@ async def _splice(loop: asyncio.AbstractEventLoop, client: socket.socket, upstre
     await asyncio.gather(carry(client, upstream), carry(upstream, client))
 
 
-def _remember[V](kept: dict[_Key, V], key: _Key, value: V) -> None:
+def _remember[K, V](kept: dict[K, V], key: K, value: V) -> None:
     """Keep the latest value for a key, forgetting the oldest key beyond `_REMEMBERED`."""
     kept.pop(key, None)
     kept[key] = value
