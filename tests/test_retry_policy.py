@@ -7,6 +7,7 @@ import pytest
 
 from pernix import Request, Response, Retry
 from pernix.errors import (
+    Blocked,
     BrowserLost,
     ConnectError,
     DecodeError,
@@ -17,8 +18,16 @@ from pernix.errors import (
     TLSError,
     TooManyRedirects,
 )
-from pernix.retry_policy import Action, Decision, DefaultRetryPolicy, RetryBudget, budget_spent, retry_after_seconds
-from pernix.settings import RetrySettings
+from pernix.retry_policy import (
+    Action,
+    Decision,
+    DefaultRetryPolicy,
+    RetryBudget,
+    budget_spent,
+    retried_instead,
+    retry_after_seconds,
+)
+from pernix.settings import BlockedSettings, RetrySettings
 
 URL = "https://example.com/"
 NOW = dt.datetime(2026, 10, 13, 12, 0, 0, tzinfo=dt.UTC)
@@ -168,3 +177,44 @@ def test_retry_after_values() -> None:
     assert retry_after_seconds("Tue, 13 Oct 2026 12:01:00 GMT", now=NOW) == 60.0
     assert retry_after_seconds("Tue, 13 Oct 2026 12:01:00", now=NOW) == 60.0
     assert retry_after_seconds("1.5", now=NOW) is None
+
+
+def _blocked(request: Request, session: str | None = "alice") -> Blocked:
+    return Blocked(Response(url=request.url, status=403, headers=[], body=b"", request=request, session=session))
+
+
+@pytest.mark.parametrize("attempt", [1, 4])
+def test_blocked_is_retried_at_once_under_its_own_budget_taking_no_ordinary_retry(attempt: int) -> None:
+    request = Request(URL)
+
+    decision = _policy(times=3, blocked=2).decide(request, _blocked(request), attempt)
+
+    assert decision == Decision.retry(0.0, "Blocked: the Session 'alice' is blocked", budget=RetryBudget("blocked", 2))
+
+
+@pytest.mark.parametrize(
+    ("request_", "rendered"),
+    [
+        (Request(URL), True),
+        (Request(URL, render=True), False),  # rendered already
+        (Request(URL, fetcher="http"), False),  # it names its Fetcher
+    ],
+    ids=["http", "rendered", "fetcher named"],
+)
+def test_with_render_a_blocked_http_request_is_retried_rendered(request_: Request, *, rendered: bool) -> None:
+    policy = DefaultRetryPolicy(RetrySettings(), blocked=BlockedSettings(render=True))
+
+    decision = policy.decide(request_, _blocked(request_), 1)
+
+    assert decision.request == (request_.replace(render=True) if rendered else None)
+    assert decision.budget == RetryBudget("blocked", 3)
+
+
+def test_a_retried_request_keeps_the_session_and_proxy_it_was_scheduled_with() -> None:
+    scheduled = Request(URL)
+    sent = scheduled.replace(session="alice", proxy="http://proxy.example:8080")
+
+    retried = retried_instead(scheduled, Decision.retry(0.0, "Blocked", request=sent.replace(render=True)))
+
+    assert retried == scheduled.replace(render=True)
+    assert retried_instead(scheduled, Decision.retry(0.0, "HTTP 503")) is None

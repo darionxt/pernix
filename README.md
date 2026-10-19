@@ -138,6 +138,16 @@ With Accounts, the pool holds one Session per Account, under its id, and no othe
 
 `login()` runs before a Session is first used, in the fetch that leases it, and fetches that want the same Session wait for it to finish, so each Session logs in once at a time; the Inline Fetches it makes, over HTTP or rendered, are sent under the Session. Sessions without an Account log in too, with `account=None`. A Response that `is_logged_out()`, a 401 by default, has its Session log in again, and the Request is retried at once, counting as a retry. A login that raises cools its Session down for `sessions.cooldown` and is tried again; after `sessions.login_attempts` failures in a row the Session is Retired. See [`docs/design.md`](docs/design.md) §5.3.
 
+```python
+class Shop(Spider):
+    settings = {"sessions.enabled": True, "blocked.render": True}
+
+    def is_blocked(self, response):
+        return response.status == 403 or bool(response.css("#challenge"))  # a challenge page, served with 200
+```
+
+A Response in which the site refuses its Session, Blocked, a 403 by default or whatever `is_blocked()` says, is not handed to its Callback: the Request is retried at once with another Session, and its proxy, under a budget of its own, `retry.blocked` (3), which takes none of its ordinary retries, and the Session is Retired after `sessions.max_blocks` (3) Blocked Responses in a row. Without a Session Pool, a Response is judged only when the retry can go through another proxy; with `blocked.render`, an HTTP Request found Blocked is retried rendered, with the browser. Once the budget is spent, the Request fails, and its errback gets `RetriesExhausted`. A 429 is not Blocked: it cools its Session down. See [`docs/design.md`](docs/design.md) §5.3.
+
 ## Proxies
 
 ```python
@@ -307,6 +317,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `sessions.lease_ttl` | `300.0` | Seconds a Session stays leased without renewal; leases are renewed while their fetch runs |
 | `sessions.accounts` / `sessions.accounts_file` | `()` / none | Accounts to bind Sessions to, and a JSON Lines or CSV file of more |
 | `sessions.login_attempts` | `3` | Failed logins in a row after which a Session is Retired |
+| `sessions.max_blocks` | `3` | Blocked Responses in a row after which a Session is Retired |
 | `proxies.urls` | `()` | Proxies Requests go through, such as `http://user:password@proxy:8080`, or tables with a `url` and `tags` |
 | `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`, `{count}` in it replaced by how many are wanted), and a `ProxyProvider` |
 | `proxies.refresh` | `None` | Seconds between loads of the file, the API, and the provider; `None` loads them once |
@@ -332,6 +343,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `retry.retry_after_max` | `300.0` | The longest wait a `Retry-After` header can set |
 | `retry.delay_scale` | `1.0` | Multiplies every retry delay; `0` retries at once, as in tests |
 | `retry.browser_lost` | `3` | Retries after a browser went away (`BrowserLost`), at once, apart from `retry.times` |
+| `retry.blocked` | `3` | Retries after a Response was found Blocked, at once, with another Session, through another proxy, or rendered, apart from `retry.times` |
+| `blocked.statuses` / `blocked.render` | `[403]` / `false` | The statuses the default `Spider.is_blocked()` finds Blocked; whether an HTTP Request found Blocked is retried rendered |
 | `retry.policy` | `None` | A replacement retry policy, an object with `decide(request, outcome, attempt)` |
 | `log.output` | `"auto"` | `"stderr"`, `"stdout"`, or `"root"` (the application's handlers); `"auto"` is `"root"` if logging is configured, else `"stderr"` |
 | `log.format` | `"auto"` | `"text"`, `"json"` (JSON lines), or `"auto"`: text on a terminal, JSON lines otherwise |
@@ -470,6 +483,7 @@ src/pernix/
 ├── run_result.py        RunResult, how a Run ended
 ├── callbacks.py         runs Callbacks and errbacks, collects their outputs
 ├── retry_policy.py      retry decisions, retry budgets, backoff, Retry-After
+├── blocked_responses.py telling Blocked Responses, and the Request a retry renders instead
 ├── throttle.py          per-domain slots: concurrency, delay, rate, cooldowns
 ├── request.py           Request
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name

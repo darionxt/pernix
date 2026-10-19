@@ -63,6 +63,8 @@ class _Entry:
     logins: int = 0
     login_failures: int = 0
     """Failed logins since the last that worked."""
+    blocks: int = 0
+    """Blocked Responses in a row."""
 
     def state(self) -> SessionState:
         return SessionState(
@@ -109,8 +111,9 @@ class MemorySessionPool:
     merged per cookie, by modification time.
 
     An outcome with an `until`, such as `rate_limited`, cools its Session down
-    until then, and `proxy_retired` Retires it. Each Session Retired is counted as
-    `sessions.retirements`, whatever the reason.
+    until then, and `proxy_retired` Retires it. A `blocked` outcome counts toward the
+    Session's Retirement, after `max_blocks` in a row; an `ok` one ends the row. Each
+    Session Retired is counted as `sessions.retirements`, whatever the reason.
 
     With `logs_in`, a Session logs in before it is first used: its first Lease must
     log it in, and no other is given on it until the holder reports `logged_in()`.
@@ -135,6 +138,7 @@ class MemorySessionPool:
         eager: bool = False,
         logs_in: bool = False,
         login_attempts: int = 3,
+        max_blocks: int = 3,
         stats: Stats | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -149,6 +153,7 @@ class MemorySessionPool:
             eager: Create all `size` Sessions now.
             logs_in: Whether Sessions log in before they are used.
             login_attempts: Failed logins in a row after which a Session is Retired.
+            max_blocks: Blocked outcomes in a row after which a Session is Retired.
             stats: Where created and Retired Sessions are counted, as
                 `sessions.created` and `sessions.retirements`.
             clock: The current time, in seconds since the epoch.
@@ -159,6 +164,7 @@ class MemorySessionPool:
         self._lease_ttl = lease_ttl
         self._logs_in = logs_in
         self._login_attempts = login_attempts
+        self._max_blocks = max_blocks
         self._stats = stats
         self._clock = clock
         self._entries: dict[str, _Entry] = {}
@@ -332,6 +338,12 @@ class MemorySessionPool:
             entry.login_failures = 0  # its fetch, after the login, went on logged in
         if outcome.kind == "proxy_retired":
             self._retire(entry)
+        elif outcome.kind == "blocked":
+            entry.blocks += 1
+            if entry.blocks >= self._max_blocks:
+                self._retire(entry)
+        elif outcome.kind == "ok":
+            entry.blocks = 0
         self._notify()
         return True
 

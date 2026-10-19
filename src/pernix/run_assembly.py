@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from pernix.addons import setup_addon
+from pernix.blocked_responses import BlockedResponses
 from pernix.callbacks import run_callbacks
 from pernix.engine import Engine
 from pernix.errors import CONFIGURATION_ERRORS, ComponentError, SettingsError
@@ -29,6 +30,7 @@ from pernix.sessions import MemorySessionPool
 from pernix.sessions.session_leasing import SessionLeasing
 from pernix.sessions.session_login import SessionLogin
 from pernix.settings import (
+    BlockedSettings,
     CoreSettings,
     DomainSettings,
     FeedOptions,
@@ -57,6 +59,7 @@ if TYPE_CHECKING:
     from pernix.middlewares import Download
     from pernix.proxies import BindingPolicy, ProxyProvider
     from pernix.request import Request
+    from pernix.response import Response
     from pernix.retry_policy import RetryPolicy
     from pernix.spider import Spider
     from pernix.stats import Gauge, Stats, StatsSink
@@ -211,10 +214,18 @@ class RunAssembly:
         frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
         proxies = proxying.proxies
+        blocked = BlockedResponses(crawler.spider.is_blocked, stats=crawler.stats)
         sessions = _session_leasing(
-            settings.section(SessionSettings), crawler.stats, crawler.spider, accounts, proxies=proxies
+            settings.section(SessionSettings),
+            crawler.stats,
+            crawler.spider,
+            accounts,
+            proxies=proxies,
+            is_blocked=blocked.blocked,
         )
-        sender = sessions or IndependentSending(proxies)
+        sender = sessions or IndependentSending(
+            proxies, is_blocked=blocked.blocked, render_blocked=settings.section(BlockedSettings).render
+        )
         download = core_stats.count_downloads(downloading.download)
         engine = Engine(
             crawler.spider,
@@ -378,12 +389,14 @@ def _session_leasing(
     accounts: Sequence[Account],
     *,
     proxies: RunProxies | None,
+    is_blocked: Callable[[Response], bool],
 ) -> SessionLeasing | None:
     """The leasing of the Run's Session Pool, held in this process; `None` when Requests are independent.
 
     With Accounts, the pool holds one Session per Account, under its id, and no
-    other. Sessions log in if the Spider defines `login()`, and are bound to the
-    Run's proxies, if it has any.
+    other. Sessions log in if the Spider defines `login()`, are bound to the Run's
+    proxies, if it has any, and are Retired after `sessions.max_blocks` Blocked
+    Responses in a row.
     """
     logs_in = overrides(spider.login)
     if not settings.enabled:
@@ -410,12 +423,15 @@ def _session_leasing(
         eager=settings.eager and not accounts,
         logs_in=logs_in,
         login_attempts=settings.login_attempts,
+        max_blocks=settings.max_blocks,
         stats=stats,
     )
     for account in accounts:
         pool.add(Session(account.id, account=account.id), max_concurrency=account.max_concurrency)
     login = SessionLogin(spider.login, spider.is_logged_out, accounts=accounts) if logs_in else None
-    return SessionLeasing(pool, settings, stats=stats, login=login, proxies=proxies, accounts=accounts)
+    return SessionLeasing(
+        pool, settings, stats=stats, login=login, proxies=proxies, accounts=accounts, is_blocked=is_blocked
+    )
 
 
 class _Problems:

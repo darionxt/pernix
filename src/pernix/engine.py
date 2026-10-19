@@ -280,9 +280,9 @@ class Engine:
 
     async def _settle(self, lease: Lease, settlement: Settlement) -> bool:
         match settlement:
-            case Again(delay, reason, count_attempt, budget):
+            case Again(delay, reason, count_attempt, budget, request):
                 return await self._frontier.nack(
-                    lease, delay=delay, count_attempt=count_attempt, reason=reason, budget=budget
+                    lease, delay=delay, count_attempt=count_attempt, reason=reason, budget=budget, request=request
                 )
             case Dead(reason):
                 return await self._frontier.dead(lease, reason)

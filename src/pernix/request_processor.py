@@ -13,7 +13,7 @@ from pernix.inline_fetch import handling
 from pernix.items import ItemContext, is_item
 from pernix.request import Request
 from pernix.response import expect_response
-from pernix.retry_policy import Action, budget_spent, consult
+from pernix.retry_policy import Action, budget_spent, consult, retried_instead
 from pernix.sending import IndependentSending, NotYet
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
@@ -48,12 +48,17 @@ class Done:
 
 @dataclass(frozen=True, slots=True)
 class Again:
-    """Return the Request to the Frontier for another attempt, counted as one, under a retry budget, or not at all."""
+    """Return the Request to the Frontier for another attempt, counted as one, under a retry budget, or not at all.
+
+    With `request`, that Request is kept in place of the one tried, such as the same
+    rendered.
+    """
 
     delay: float
     reason: str
     count_attempt: bool = True
     budget: str | None = None
+    request: Request | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,13 +248,19 @@ class RequestProcessor:
             await self._events.emit(
                 RequestRetried(request, lease.attempt, decision.delay, decision.reason, budget=budget.name)
             )
-            return Again(decision.delay, decision.reason, count_attempt=False, budget=budget.name)
+            return Again(
+                decision.delay,
+                decision.reason,
+                count_attempt=False,
+                budget=budget.name,
+                request=retried_instead(lease.request, decision),
+            )
         if decision.action is Action.RETRY:
             logger.info(
                 "Retrying %r in %.2f s after attempt %d: %s", request, decision.delay, lease.attempt, decision.reason
             )
             await self._events.emit(RequestRetried(request, lease.attempt, decision.delay, decision.reason))
-            return Again(decision.delay, decision.reason)
+            return Again(decision.delay, decision.reason, request=retried_instead(lease.request, decision))
         logger.error("Gave up on %r after %d attempts: %s", request, lease.attempt, decision.reason)
         return await self._exhausted(request, decision.reason, response, cause)
 

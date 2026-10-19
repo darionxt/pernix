@@ -221,6 +221,21 @@ class FrontierConformance:
         [again] = await frontier.claim("worker-1", 10, TTL, rendered=True)
         assert (again.id, again.rendered, again.attempt) == (lease.id, True, 2)
 
+    async def test_a_request_returned_with_another_is_handed_out_as_that_one(self, frontier: Frontier) -> None:
+        await frontier.add([_page(1), _page(2)])
+        [lease] = await frontier.claim("worker-1", 1, TTL, rendered=False)
+
+        assert await frontier.nack(lease, budget="blocked", request=lease.request.replace(render=True))
+
+        [again] = await frontier.claim("worker-1", 10, TTL, rendered=True)
+        assert (again.id, again.rendered, again.request.render, dict(again.spent)) == (
+            lease.id,
+            True,
+            True,
+            {"blocked": 1},
+        )
+        assert await frontier.add([_page(1)]) == [False]  # its Fingerprint is the same
+
     async def test_skipped_slots_apply_to_either_kind(self, frontier: Frontier) -> None:
         await frontier.add([Request("https://a.example/1", render=True), Request("https://b.example/1", render=True)])
 

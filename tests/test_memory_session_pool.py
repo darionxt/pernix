@@ -423,3 +423,22 @@ async def test_a_failed_login_of_a_login_replaced_since_changes_nothing() -> Non
     assert pool.health("s") == "available"
     assert after is not None
     assert not after.must_log_in
+
+
+async def test_a_session_blocked_in_a_row_is_retired_and_a_fetch_that_went_well_ends_the_row() -> None:
+    stats = Stats()
+    pool, _ = _pool(size=1, max_blocks=2, stats=stats)
+
+    async def fare(kind: str) -> None:
+        lease = await pool.acquire(session="alice", timeout=0)
+        assert lease is not None
+        await pool.release(lease, Outcome(kind))  # type: ignore[arg-type]
+
+    for kind in ("blocked", "ok", "blocked"):
+        await fare(kind)
+    available = pool.health("alice")
+    await fare("blocked")
+
+    assert available == "available"
+    assert pool.health("alice") == "retired"
+    assert stats.get("sessions.retirements") == 1

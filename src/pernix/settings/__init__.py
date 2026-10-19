@@ -1,6 +1,7 @@
 from pernix.secret import Secret
 from pernix.settings.core_settings import (
     CORE_SECTIONS,
+    BlockedSettings,
     CoreSettings,
     DomainSettings,
     EventSettings,
@@ -24,6 +25,7 @@ from pernix.settings.settings import Settings
 
 __all__ = [
     "CORE_SECTIONS",
+    "BlockedSettings",
     "ComponentMap",
     "CoreSettings",
     "DomainSettings",

@@ -154,6 +154,7 @@ class Frontier(Protocol):
         count_attempt: bool = True,
         reason: str = "",
         budget: str | None = None,
+        request: Request | None = None,
     ) -> bool:
         """Return a leased Request, to be claimed again after a delay.
 
@@ -166,6 +167,10 @@ class Frontier(Protocol):
             budget: Count this as a retry under the retry budget of this name,
                 in `Lease.spent`, instead of as an attempt, whatever
                 `count_attempt` says.
+            request: Keep this Request in place of the leased one, as a retry
+                policy may have it retried, such as rendered, which then goes to
+                the workers of rendered Requests; it keeps the Fingerprint and the
+                slot of the leased one.
 
         Returns:
             `False` if the Lease is no longer valid, and nothing changed.

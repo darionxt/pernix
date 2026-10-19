@@ -10,6 +10,7 @@ __all__ = [
     "ActionError",
     "ActionTimeout",
     "AddonError",
+    "Blocked",
     "BrowserLost",
     "ComponentError",
     "ConnectError",
@@ -280,6 +281,29 @@ class LoginExpired(Retry):
             response: The Response that shows the Session logged out.
         """
         super().__init__(f"the Session {response.session!r} is logged out", delay=0)
+        self.response = response
+
+
+class Blocked(Retry):
+    """The Response shows the site refusing the Session it was fetched under, or its proxy, as `Spider.is_blocked()` judges.
+
+    The Request is retried at once, with another Session, through another proxy, or
+    rendered, under the retry budget `blocked`, which takes none of its ordinary
+    retries, while the retry policy allows; the Session counts it toward its
+    Retirement.
+
+    Attributes:
+        response: The Response.
+    """
+
+    def __init__(self, response: Response) -> None:
+        """Create the exception.
+
+        Args:
+            response: The Response that shows the site refusing its sender.
+        """
+        refused = "the Response" if response.session is None else f"the Session {response.session!r}"
+        super().__init__(f"{refused} is blocked", delay=0)
         self.response = response
 
 

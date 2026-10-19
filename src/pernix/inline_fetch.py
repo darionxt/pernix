@@ -9,13 +9,13 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
-from pernix.errors import IgnoreRequest, LoginExpired, RetriesExhausted, SessionError
+from pernix.errors import Blocked, IgnoreRequest, LoginExpired, RetriesExhausted, SessionError
 from pernix.events import RequestRetried
 from pernix.fetchers import StreamedResponse
 from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
 from pernix.frontiers import host_slot
 from pernix.response import Response, expect_response
-from pernix.retry_policy import Action, budget_spent, consult
+from pernix.retry_policy import Action, budget_spent, consult, retried_instead
 from pernix.sending import IndependentSending, NotYet
 from pernix.sessions.session_leasing import sending_session
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
@@ -142,6 +142,8 @@ class InlineFetch:
                 Request, or it names one while no Session Pool is enabled.
             pernix.errors.LoginExpired: The fetch shares the Lease of the fetch it
                 is nested in, and the Response shows the Session logged out.
+            pernix.errors.Blocked: The fetch shares the Lease of the fetch it is
+                nested in, and the Response shows the site refusing the Session.
             Exception: Fetching raised what the policy does not retry, such as a
                 `FetchError`.
         """
@@ -156,6 +158,7 @@ class InlineFetch:
             if decision.action is Action.ACCEPT:
                 return _accepted(outcome)
             await self._retry_later(request, outcome, decision, attempt, spent)
+            request = retried_instead(request, decision) or request
             attempt += decision.budget is None
 
     @asynccontextmanager
@@ -179,6 +182,8 @@ class InlineFetch:
                 Request, or it names one while no Session Pool is enabled.
             pernix.errors.LoginExpired: The fetch shares the Lease of the fetch it
                 is nested in, and the Response shows the Session logged out.
+            pernix.errors.Blocked: The fetch shares the Lease of the fetch it is
+                nested in, and the Response shows the site refusing the Session.
             Exception: Fetching raised what the policy does not retry, such as a
                 `FetchError`.
         """
@@ -198,6 +203,7 @@ class InlineFetch:
                 finally:
                     await streams.close()
             await self._retry_later(request, outcome, decision, attempt, spent)
+            request = retried_instead(request, decision) or request
             attempt += decision.budget is None
 
     @asynccontextmanager
@@ -260,10 +266,10 @@ class InlineFetch:
         self._throttle.observe(slot, response, statuses=statuses)
         try:
             sending.received(response)
-        except LoginExpired as exc:
+        except (LoginExpired, Blocked) as exc:
             if sending.nested:
-                raise  # retrying under the expired login is futile; the fetch holding the Lease retries
-            return exc  # retried, once the Session logged in again
+                raise  # retrying under the expired login, or the refused Session, is futile; the outer fetch retries
+            return exc  # retried, once the Session logged in again, or with another
         return response
 
     async def _retry_later(

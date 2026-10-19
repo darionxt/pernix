@@ -91,7 +91,7 @@ The state of a Session or a proxy that has been permanently taken out of use: a 
 _Avoid_: banned, dead
 
 **Blocked**:
-A response in which the target site refuses to serve the current Session. It causes a switch to another Session.
+A response in which the target site refuses to serve the current Session, or its proxy. It causes a switch to another Session, or another proxy, under a retry budget of its own; a Session Blocked too many times in a row is Retired.
 _Avoid_: banned
 
 **Rate Limited**:
