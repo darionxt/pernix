@@ -625,6 +625,8 @@ class BrowserFetcher:
             # The error may come of a fetch in another browser, so this one's own state tells whether it went away.
             self._generations.check(generation)
             if names_closed_target(error) or _page_gone(error):  # it may come before the event that tells why
+                if generation.lost is None and generation.launched.processes is None:
+                    await self._generations.ask(generation)  # its driver's process cannot tell whether it died
                 await first_tripped([opened.crash, generation.tripwire], within=GRACE)
             if opened.crash.reason is not None:
                 return PageCrashed(f"the page of {url}, kept for its Callback, crashed")

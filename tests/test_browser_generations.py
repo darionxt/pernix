@@ -256,6 +256,33 @@ async def test_a_browser_is_checked_by_its_own_state() -> None:
     await generations.close()
 
 
+@pytest.mark.parametrize(
+    ("probe", "lost"),
+    [
+        (None, None),
+        (Exception("CDPSession.send: Connection closed while reading from the driver"), "driver"),
+    ],
+)
+async def test_a_browser_whose_processes_are_not_known_is_asked(probe: Exception | None, lost: str | None) -> None:
+    launcher = Launcher()
+    generations, _, _ = _generations(launcher)
+    assert await _number(generations) == 1
+    [first] = launcher.launched
+    generation = generations._current  # pyright: ignore[reportPrivateUsage]
+    assert generation is not None
+    first.processes = None  # pyright: ignore[reportAttributeAccessIssue]  # as without psutil
+
+    async def answer() -> None:
+        if probe is not None:
+            raise probe
+
+    first.probe = answer  # pyright: ignore[reportAttributeAccessIssue]
+    await generations.ask(generation)
+
+    assert generation.lost == lost
+    await generations.close()
+
+
 async def test_other_errors_leave_the_browser_as_it_is() -> None:
     launcher = Launcher()
     generations, _, stats = _generations(launcher)

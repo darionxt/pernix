@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from pernix.errors import BrowserLost, ComponentError, PageCrashed
 from pernix.fetchers.launched_browser import launch_browser
-from pernix.fetchers.tripwire import Tripwire
+from pernix.fetchers.tripwire import GRACE, Tripwire
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -356,6 +356,25 @@ class Generations:
             self._lose(generation, "driver")
         elif not generation.launched.browser.is_connected():
             self._lose(generation, "disconnected")
+
+    async def ask(self, generation: Generation) -> None:
+        """Probe a Generation at once, and lose it if the probe fails, for a failure its state cannot tell of.
+
+        A driver that died is told by its process, but without psutil, or for a
+        browser whose processes are not known, only a call through the driver
+        finds it out. The probe takes `tripwire.GRACE` seconds at most; one that
+        takes longer tells nothing, as the health probe waits longer.
+
+        Args:
+            generation: The Generation.
+        """
+        if generation.lost is not None or generation.closing:
+            return
+        probe = _unattended(generation.launched.probe())
+        done, _ = await asyncio.wait([probe], timeout=GRACE)
+        failure = probe.exception() if done else None
+        if failure is not None:
+            self._lose(generation, "driver" if _driver_gone(failure) else self._loss_reason(generation))
 
     async def _probe(self, generation: Generation) -> None:
         """Probe a Generation's health, and its memory, periodically, until it is lost or closed."""

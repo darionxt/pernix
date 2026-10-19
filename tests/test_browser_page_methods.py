@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from browser_kills import drivers, kill
 from pernix import Request, Retry, Session
 from pernix.browser import Evaluate, PageMethod, Render
-from pernix.errors import ActionError, ActionTimeout, PageCrashed
+from pernix.errors import ActionError, ActionTimeout, BrowserLost, PageCrashed
 from pernix.fetchers import BrowserFetcher, BrowserSettings
 from pernix.fetchers.kept_pages import keeping_pages
 from pernix.stats import Stats
@@ -237,3 +238,23 @@ async def test_an_error_of_another_browser_leaves_a_kept_page_as_it_is(server: L
 
     assert failure is None
     assert stats.get("browser.lost") is None
+
+
+async def test_a_kept_pages_driver_found_dead_by_a_probe_where_its_process_is_not_known(
+    server: LoopbackServer,
+) -> None:
+    server.route("/", "<p>up</p>", headers=HTML)
+
+    async with BrowserFetcher() as fetcher, keeping_pages() as keeping:
+        response = await fetcher.fetch(Request(server.url("/"), render=Render(keep_page=True)))
+        generation = fetcher._generations._current  # pyright: ignore[reportPrivateUsage]
+        assert generation is not None
+        generation.launched.processes = None  # as without psutil
+        kill(drivers())
+        assert response.page is not None
+        with pytest.raises(Exception, match="Connection closed while reading from the driver") as error:
+            await response.page.text_content("p")
+        failure = await keeping.failure(error.value)
+
+    assert isinstance(failure, BrowserLost)
+    assert "patchright's driver died" in str(failure)
