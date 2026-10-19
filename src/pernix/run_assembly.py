@@ -313,7 +313,11 @@ def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
         sources.append((ProxySettings.key("file"), ProxyFile(options.file)))
     if options.api is not None:
         api = ProxyAPI(
-            options.api, HTTPFetcher(_http_settings(crawler)), lifetime=options.api_lifetime, mask=run_log.mask
+            options.api,
+            HTTPFetcher(_http_settings(crawler)),
+            lifetime=options.api_lifetime,
+            answer=options.api_json,
+            mask=run_log.mask,
         )
         sources.append((ProxySettings.key("api"), api))
         opened.append(api)

@@ -1,6 +1,7 @@
 """Proxies: the Proxy Pool Requests are sent through, its sources, the health of each proxy, and how Sessions are bound."""
 
 from pernix.proxies.binding_policy import Binding, BindingPolicy, BindingReason, DefaultBindingPolicy
+from pernix.proxies.json_answers import JsonAnswer
 from pernix.proxies.memory_proxy_pool import MemoryProxyPool
 from pernix.proxies.proxy import Proxy
 from pernix.proxies.proxy_pool import ProxyCandidate, ProxyCounts, ProxyHealth, ProxyPool
@@ -12,6 +13,7 @@ __all__ = [
     "BindingPolicy",
     "BindingReason",
     "DefaultBindingPolicy",
+    "JsonAnswer",
     "MemoryProxyPool",
     "Proxy",
     "ProxyCandidate",

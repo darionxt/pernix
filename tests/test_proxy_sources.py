@@ -8,7 +8,7 @@ import pytest
 
 from pernix.errors import FetchError, SettingsError
 from pernix.fetchers import HTTPFetcher
-from pernix.proxies import Proxy, read_proxies
+from pernix.proxies import JsonAnswer, Proxy, read_proxies
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies, proxy_lines
 from pernix.secret import Secret
 
@@ -128,3 +128,44 @@ async def test_the_proxies_of_an_api_with_a_lifetime_expire_that_long_after_it_a
         Proxy("a.example:1", expires=1_800_000_300.0),
         Proxy("b.example:2:user:pw", expires=1_800_000_300.0),
     ]
+
+
+async def test_an_api_answering_in_json_gives_its_entries_those_without_an_expiry_expiring_after_the_lifetime(
+    server: LoopbackServer,
+) -> None:
+    server.route(
+        "/proxies",
+        '{"data": [{"ip": "a.example", "port": 1, "ttl": 60}, {"ip": "b.example", "port": 2}, {"ip": "c.example"}]}',
+    )
+    answer = JsonAnswer(list="data", host="ip", port="port", expires="ttl", expires_format="seconds")
+    api = ProxyAPI(
+        Secret(server.url("/proxies?key=k")), HTTPFetcher(), lifetime=300, answer=answer, clock=lambda: 1_800_000_000.0
+    )
+
+    await api.open()
+    try:
+        proxies = await api.proxies()
+    finally:
+        await api.close()
+
+    assert proxies == [
+        Proxy("http://a.example:1", expires=1_800_000_060.0),
+        Proxy("http://b.example:2", expires=1_800_000_300.0),
+    ]
+
+
+async def test_a_json_answer_that_does_not_match_gives_no_proxy_with_a_warning_that_names_no_url(
+    server: LoopbackServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.route("/proxies", '{"code": 1, "msg": "out of credit"}')
+    api = ProxyAPI(Secret(server.url("/proxies?key=k")), HTTPFetcher(), answer=JsonAnswer(list="data.proxy_list"))
+
+    await api.open()
+    try:
+        proxies = await api.proxies()
+    finally:
+        await api.close()
+
+    assert proxies == []
+    assert "The answer of the proxy API gives no proxy: it has no `data.proxy_list`" in caplog.text
+    assert "key=k" not in caplog.text

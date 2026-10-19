@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from pernix.errors import SettingsError
-from pernix.proxies import Proxy
+from pernix.proxies import JsonAnswer, Proxy
 from pernix.secret import Secret
 from pernix.settings import ProxySettings, load_settings
 
@@ -104,3 +104,19 @@ def test_proxies_are_replaced_at_each_load_and_not_extracted_on_demand_unless_se
 def test_extraction_settings_that_cannot_apply_are_refused(given: dict[str, object], problem: str) -> None:
     with pytest.raises(SettingsError, match=problem):
         load_settings(spider_settings=given)
+
+
+def test_the_api_is_read_one_proxy_per_line_unless_a_json_table_maps_its_answers() -> None:
+    assert ProxySettings().api_json is None
+    settings = load_settings(
+        spider_settings={
+            "proxies.api": "https://vendor.example/get?num={count}",
+            "proxies.api_json": {"list": "data", "host": "ip", "port": "port"},
+        }
+    ).section(ProxySettings)
+
+    assert settings.api_json == JsonAnswer(list="data", host="ip", port="port")
+    with pytest.raises(SettingsError, match=r"proxies\.api_json: it tells how to read the answers of proxies\.api"):
+        load_settings(spider_settings={"proxies.urls": ["a.example:1"], "proxies.api_json": {"list": "data"}})
+    with pytest.raises(SettingsError, match=r"proxies\.api_json: host and port"):
+        load_settings(spider_settings={"proxies.api": "https://vendor.example/", "proxies.api_json": {"host": "ip"}})
