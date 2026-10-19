@@ -131,3 +131,28 @@ def test_entries_that_cannot_be_read_are_named_by_position_and_field_never_by_va
 def test_a_mapping_that_cannot_be_read_is_refused(mapping: dict[str, str], problem: str) -> None:
     with pytest.raises((ValueError, msgspec.ValidationError), match=problem):
         msgspec.convert(mapping, JsonAnswer)
+
+
+def test_a_user_holding_a_colon_keeps_it_apart_from_the_password() -> None:
+    answer = [{"ip": "a.example", "port": 1, "user": "user:region", "pass": "secret"}]
+
+    assert _read(answer, host="ip", port="port", username="user", password="pass") == (
+        [Proxy("http://user%3Aregion:secret@a.example:1")],
+        [],
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "problem"),
+    [
+        ('"NaN"', "#1 (`deadline` is not a timestamp)"),
+        ('"Infinity"', "#1 (`deadline` is not a timestamp)"),
+        ("1e999", "it is not JSON"),  # out of range for a number
+    ],
+    ids=["nan", "infinity", "overflow"],
+)
+def test_an_expiry_that_is_not_a_finite_number_is_refused(value: str, problem: str) -> None:
+    text = f'[{{"ip": "a.example", "port": 1, "deadline": {value}}}]'
+    answer = JsonAnswer(host="ip", port="port", expires="deadline", expires_format="timestamp")
+
+    assert read_json_answer(text, answer, now=NOW) == ([], [problem])

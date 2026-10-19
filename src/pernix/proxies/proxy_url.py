@@ -92,13 +92,16 @@ def proxy_from_parts(
         host = f"[{host}]"
     userinfo = ""
     if username:
-        userinfo = _userinfo(username) + ("" if password is None else f":{_userinfo(password)}") + "@"
+        userinfo = _userinfo(username, user=True) + ("" if password is None else f":{_userinfo(password)}") + "@"
     return f"{scheme}://{userinfo}{host}:{port}"
 
 
-def _userinfo(text: str) -> str:
-    """A user or a password as a URL's credentials hold it: what they cannot hold as it is percent-encoded."""
-    return quote(text, safe="!$&'()*+,;=:")
+def _userinfo(text: str, *, user: bool = False) -> str:
+    """A user or a password as a URL's credentials hold it: what they cannot hold as it is percent-encoded.
+
+    A user's colons are encoded too, as the first colon ends the user.
+    """
+    return quote(text, safe="!$&'()*+,;=" if user else "!$&'()*+,;=:")
 
 
 def proxy_credentials(url: str) -> tuple[str, ...]:

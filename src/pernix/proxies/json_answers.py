@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -109,7 +110,7 @@ def read_json_answer(text: str, answer: JsonAnswer, *, now: float) -> tuple[list
     """
     try:
         whole = msgspec.json.decode(text)
-    except msgspec.DecodeError:
+    except msgspec.DecodeError:  # numbers out of range included
         return [], ["it is not JSON"]
     entries = _at(whole, answer.list)
     if entries is _MISSING:
@@ -236,7 +237,10 @@ def _expires(entry: object, answer: JsonAnswer, now: float) -> float | None:
 def _number(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         raise TypeError(value)
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number):  # such as NaN, which would never expire
+        raise ValueError(value)
+    return number
 
 
 def _text(entry: object, path: str) -> str:
