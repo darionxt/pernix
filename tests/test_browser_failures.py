@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import psutil
 import pytest
 
-from browser_kills import HELD_PAGE, HTML, Held, browsers, descendants, drivers, gone, kill, renderers
+from browser_kills import HELD_PAGE, HTML, Held, browsers, descendants, drivers, gone, kill
 from pernix import Request, Session
 from pernix.errors import BrowserLost, PageCrashed
 from pernix.fetchers import BrowserFetcher, BrowserSettings, browser_generations
@@ -19,6 +19,8 @@ from pernix.stats import Stats
 from pernix.testing import ReceivedRequest, Reply
 
 if TYPE_CHECKING:
+    from patchright.async_api import Page
+
     from pernix.testing import LoopbackServer
 
 pytestmark = pytest.mark.usefixtures("browser_engine")
@@ -40,16 +42,20 @@ def held(server: LoopbackServer) -> Held:
 
 @pytest.mark.parametrize("session", [None, Session("alice")])
 async def test_a_page_whose_renderer_dies_fails_with_page_crashed(
-    server: LoopbackServer, held: Held, session: Session | None
+    server: LoopbackServer, held: Held, session: Session | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(browser_generations, "PROBE_INTERVAL", 3600.0)  # a slow runner's browser is not the subject
     stats = Stats()
 
     async with BrowserFetcher(stats=stats) as fetcher:
         loading = asyncio.create_task(fetcher.fetch(_render(server.url("/held")), session=session))
         await held.wait()
-        kill(renderers())
+        page = _page_loading(fetcher, "/held")
+        devtools = await page.context.new_cdp_session(page)
+        crashing = asyncio.create_task(devtools.send("Page.crash"))  # its own renderer, which never answers
         with pytest.raises(PageCrashed, match=r"the page of http://127\.0\.0\.1:\d+/held crashed"):
             await loading
+        crashing.cancel()
         held.release.set()
         response = await fetcher.fetch(_render(server.url("/")), session=session)  # in the same browser
 
@@ -158,6 +164,15 @@ async def test_a_browser_over_its_memory_is_replaced(server: LoopbackServer, mon
         await fetcher.fetch(_render(server.url("/")))
 
     assert stats.get("browser.generations") == 2
+
+
+def _page_loading(fetcher: BrowserFetcher, path: str) -> Page:
+    """The page of the fetcher's browser that is loading a path."""
+    generation = fetcher._generations._current  # pyright: ignore[reportPrivateUsage]
+    assert generation is not None
+    pages = [page for context in generation.launched.browser.contexts for page in context.pages]
+    [page] = [page for page in pages if page.url.endswith(path)]
+    return page
 
 
 def _slowly(_request: ReceivedRequest) -> Reply:
