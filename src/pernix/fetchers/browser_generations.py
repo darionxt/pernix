@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from pernix.fetchers.launched_browser import LaunchedBrowser
     from pernix.stats import Stats
 
-__all__ = ["Generation", "Generations"]
+__all__ = ["Generation", "Generations", "names_closed_target"]
 
 logger = logging.getLogger(__name__)
 
@@ -327,25 +327,35 @@ class Generations:
         self._close_if_done(generation)
 
     def may_be_lost(self, generation: Generation, error: BaseException) -> bool:
-        """Tell whether a failure in a Generation may be its going away, losing the Generation if it plainly is.
+        """Tell whether a fetch in a Generation failed as it went away, losing the Generation if it plainly did.
 
         Args:
-            generation: The Generation the failure happened in.
-            error: The failure, such as the error of a fetch, or of a Callback
-                working with a page kept in the Generation.
+            generation: The Generation the fetch ran in, which its error comes from.
+            error: The fetch's error.
 
         Returns:
             Whether the error names a page, a browser, or a driver that went away,
             so that the event that tells which may still come; the Generation is lost
-            at once when the error tells its driver died, or its browser is no
-            longer connected.
+            at once when the error tells its driver died, or its own state tells it
+            went away, as `check()` finds.
+        """
+        if _driver_gone(error):
+            self._lose(generation, "driver")
+        else:
+            self.check(generation)
+        return not isinstance(error, PageCrashed) and names_closed_target(error)
+
+    def check(self, generation: Generation) -> None:
+        """Lose a Generation whose driver died, or whose browser is no longer connected, as their state tells.
+
+        Args:
+            generation: The Generation.
         """
         processes = generation.launched.processes
-        if _driver_gone(error) or (processes is not None and not processes.driver_alive()):
+        if processes is not None and not processes.driver_alive():
             self._lose(generation, "driver")
         elif not generation.launched.browser.is_connected():
             self._lose(generation, "disconnected")
-        return not isinstance(error, PageCrashed) and _browser_closed(error)
 
     async def _probe(self, generation: Generation) -> None:
         """Probe a Generation's health, and its memory, periodically, until it is lost or closed."""
@@ -395,10 +405,14 @@ class Generations:
     async def _closed(self, generation: Generation) -> None:
         """Close a Generation's browser and driver, then kill what is left of its processes.
 
-        A driver that does not close within `CLOSE_TIMEOUT` is killed, so that the
-        close, which waits for it even when cancelled, ends.
+        The processes of a lost Generation are killed first, as its browser may have
+        outlived its driver. A driver that does not close within `CLOSE_TIMEOUT` is
+        killed, so that the close, which waits for it even when cancelled, ends.
         """
         processes = generation.launched.processes
+        if generation.lost is not None and processes is not None:
+            # One whose driver died still runs, and may connect to the proxy of the network guard as it closes.
+            await asyncio.to_thread(processes.kill)
         closing = _unattended(generation.launched.close())
         try:
             done, _ = await asyncio.wait([closing], timeout=CLOSE_TIMEOUT)
@@ -420,8 +434,15 @@ def _unattended(work: Awaitable[None]) -> asyncio.Future[None]:
     return future
 
 
-def _browser_closed(error: BaseException) -> bool:
-    """Whether an error, or one that caused it, tells of a page, a browser, or a driver that went away."""
+def names_closed_target(error: BaseException) -> bool:
+    """Tell whether an error, or one that caused it, names a page, a browser, or a driver that went away.
+
+    Args:
+        error: The error.
+
+    Returns:
+        Whether patchright's message for such a failure is in its chain.
+    """
     return any(marker in str(cause) for cause in _causes(error) for marker in _CLOSED_MARKERS)
 
 

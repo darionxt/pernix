@@ -238,6 +238,24 @@ async def test_a_fetch_failing_as_the_driver_died_loses_the_browser() -> None:
     await generations.close()
 
 
+async def test_a_browser_is_checked_by_its_own_state() -> None:
+    launcher = Launcher()
+    generations, _, stats = _generations(launcher)
+    assert await _number(generations) == 1
+    [first] = launcher.launched
+    generation = generations._current  # pyright: ignore[reportPrivateUsage]
+    assert generation is not None
+
+    generations.check(generation)  # as for a Callback failing with an error of another browser
+    assert generation.lost is None
+    first.processes.driver_killed = True
+    generations.check(generation)
+
+    assert generation.lost == "driver"
+    assert stats.get("browser.lost_by_reason.driver") == 1
+    await generations.close()
+
+
 async def test_other_errors_leave_the_browser_as_it_is() -> None:
     launcher = Launcher()
     generations, _, stats = _generations(launcher)

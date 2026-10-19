@@ -26,7 +26,7 @@ from pernix.errors import (
     TooManyRedirects,
 )
 from pernix.fetchers.browser_cookies import request_cookie
-from pernix.fetchers.browser_generations import Generations
+from pernix.fetchers.browser_generations import Generations, names_closed_target
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.kept_pages import KeptPage, page_keeping, sharing_a_kept_slot
@@ -622,8 +622,9 @@ class BrowserFetcher:
             self._discard(context).add_done_callback(closed)
 
         async def broken(error: BaseException) -> Exception | None:
-            gone = self._generations.may_be_lost(generation, error) or _page_gone(error)
-            if gone:  # the error may come before the event that tells why
+            # The error may come of a fetch in another browser, so this one's own state tells whether it went away.
+            self._generations.check(generation)
+            if names_closed_target(error) or _page_gone(error):  # it may come before the event that tells why
                 await first_tripped([opened.crash, generation.tripwire], within=GRACE)
             if opened.crash.reason is not None:
                 return PageCrashed(f"the page of {url}, kept for its Callback, crashed")

@@ -222,3 +222,18 @@ async def test_a_kept_page_that_crashes_tells_its_scope(server: LoopbackServer) 
 
     assert isinstance(failure, PageCrashed)
     assert isinstance(failure.__cause__, RuntimeError)
+
+
+async def test_an_error_of_another_browser_leaves_a_kept_page_as_it_is(server: LoopbackServer) -> None:
+    server.route("/", "<p>up</p>", headers=HTML)
+    stats = Stats()
+    elsewhere = Exception("Page.goto: Connection closed while reading from the driver")  # of a browser replaced
+
+    async with BrowserFetcher(stats=stats) as fetcher, keeping_pages() as keeping:
+        response = await fetcher.fetch(Request(server.url("/"), render=Render(keep_page=True)))
+        failure = await keeping.failure(elsewhere)
+        assert response.page is not None
+        assert await response.page.text_content("p") == "up"
+
+    assert failure is None
+    assert stats.get("browser.lost") is None

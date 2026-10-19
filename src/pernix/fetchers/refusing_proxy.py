@@ -37,10 +37,11 @@ class RefusingProxy:
         self._server = await asyncio.start_server(_refuse, "127.0.0.1", 0)
 
     async def close(self) -> None:
-        """Stop listening."""
+        """Stop listening, and close the connections still open, as those of a browser that went away are."""
         server, self._server = self._server, None
         if server is not None:
             server.close()
+            server.close_clients()
             await server.wait_closed()
 
 
