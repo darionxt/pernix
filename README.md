@@ -171,7 +171,7 @@ class Shop(Spider):
     }
 ```
 
-Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart. `proxies.urls` and providers also take `Proxy` records, tables in settings, whose `tags` binding policies select them by.
+Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, or `host:port:user:password`, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart. `proxies.urls` and providers also take `Proxy` records, tables in settings, whose `tags` binding policies select them by, and whose `expires` tells when they stop working: an expired proxy is used no more, and its Sessions are bound to others.
 
 Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down, unless `proxies.max_sessions` limits how many share one: with 1, no two do, and the Sessions that find none wait. `proxies.rebind = "every_lease"` binds a Session to another proxy at each Lease, so its Leases go through the proxies in turn. For sites that tie an Account to one address, `proxies.rebind = "retired"` has a Session wait for its proxy while it cools down, cooling down with it, and bind it to another only once it is Retired or no longer listed, and `"never"` Retires the Session with it, while the Run goes on with the others. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats.
 
@@ -206,7 +206,22 @@ class OwnAddress:
         return Proxy(binding.account.extra["proxy"].reveal())  # or f"http://user-{binding.session}:pw@gate.example:7777"
 ```
 
-With the default policy, a Session thus changes address, keeping its cookies, whenever its proxy cools down, is Retired, or is no longer listed, or with `retired` once it is Retired or no longer listed: a refresh replaces the proxies, so with an API that answers with a new batch each time, every Session changes address at each refresh, or with `never` is Retired. Bindings last one Run. Refreshes that add proxies rather than replace them are not provided yet. See [`docs/design.md`](docs/design.md) §5.3.
+With the default policy, a Session thus changes address, keeping its cookies, whenever its proxy cools down, is Retired, expires, or is no longer listed, or with `retired` once it is Retired, expired, or no longer listed: a refresh replaces the proxies, so with an API that answers with a new batch each time, every Session would change address at each refresh. Bindings last one Run.
+
+APIs that hand out new short-lived proxies on request, extraction APIs, call for adding the proxies rather than replacing them, and extracting more as they run low, within limits, as extraction costs:
+
+```python
+class Shop(Spider):
+    settings = {
+        "proxies.api": "https://vendor.example/get?key=...&num={count}",  # {count}: how many are wanted
+        "proxies.supply": "add",  # keep each proxy until it expires, so Sessions keep theirs
+        "proxies.api_lifetime": 300,  # the answer, one per line, tells no expiry
+        "proxies.min_available": 10,  # extract more while fewer are available, or when none fits
+        "proxies.max_extracted": 20_000,  # at most this many in the Run
+    }
+```
+
+With `proxies.supply = "add"`, each load adds the proxies the sources give, which stay until they expire, at the time their source gives, or after `proxies.api_lifetime` for those of the API. With `proxies.min_available` set too, the API and the provider are asked for more while fewer proxies are available, and when a fetch or a Session finds none: one extraction at a time, `proxies.extract_interval` seconds apart at least, each for as many as the level lacks, told through `{count}`, or to a provider whose `proxies()` takes a `wanted` keyword. Extraction stops at `proxies.max_extracted` proxies, and on demand after `proxies.extract_attempts` extractions in a row that gave none, as a vendor out of credit answers with an error; the Run drains for want of proxies only then. An API answering in JSON, which often tells each proxy's expiry, takes a provider setting the records' `expires`. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Running and stopping
 
@@ -310,8 +325,12 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `sessions.accounts` / `sessions.accounts_file` | `()` / none | Accounts to bind Sessions to, and a JSON Lines or CSV file of more |
 | `sessions.login_attempts` | `3` | Failed logins in a row after which a Session is Retired |
 | `proxies.urls` | `()` | Proxies Requests go through, such as `http://user:password@proxy:8080`, or tables with a `url` and `tags` |
-| `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`), and a `ProxyProvider` |
+| `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`, `{count}` in it replaced by how many are wanted), and a `ProxyProvider` |
 | `proxies.refresh` | `None` | Seconds between loads of the file, the API, and the provider; `None` loads them once |
+| `proxies.supply` | `"replace"` | Whether each load replaces the proxies listed, or `add`s to them, keeping each until it expires |
+| `proxies.api_lifetime` | `None` | Seconds each proxy of the API works for, as an answer of one per line tells no expiry |
+| `proxies.min_available` | `None` | With `add`, extract more from the API and the provider while fewer proxies are available, and when none fits |
+| `proxies.extract_interval` / `proxies.max_extracted` / `proxies.extract_attempts` | `1.0` / `None` / `3` | Seconds between extractions on demand at least; proxies extracted in a Run at most; extractions in a row giving none, after which no more are made on demand |
 | `proxies.cooldown` / `proxies.cooldown_max` | `60.0` / `600.0` | Seconds a failed proxy cools down, doubled with each failure in a row, and the longest it does |
 | `proxies.max_failures` | `5` | Failures in a row after which a proxy is Retired |
 | `proxies.max_sessions` | `None` | Sessions a proxy is bound to at most; with `1`, no two share one, and those that find none wait |
