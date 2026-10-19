@@ -241,8 +241,9 @@ class SessionPool(Protocol):
     async def release(self, lease: SessionLease, outcome: Outcome) -> bool:
         """End a Lease, reporting how its Session fared.
 
-        An outcome with an `until` cools the Session down until then, and
-        `proxy_retired` Retires it. In a pool whose Sessions log in, `auth_expired`
+        An outcome with an `until` cools the Session down until then,
+        `proxy_retired` Retires it, and `blocked` counts toward its Retirement, as
+        the pool's threshold says, such as a number in a row. In a pool whose Sessions log in, `auth_expired`
         has the Session log in again; `login_failed` has it log in again too, once
         it cooled down, and Retires it after too many in a row. Neither changes
         anything, nor cools the Session down, if the Session logged in again since

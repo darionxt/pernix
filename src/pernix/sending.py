@@ -6,7 +6,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from pernix.errors import LoginExpired, SessionError
+from pernix.blocked_responses import rendered_instead
+from pernix.errors import Blocked, LoginExpired, SessionError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -54,9 +55,13 @@ class Sending:
             inside the block, which tells how they fared too.
         is_logged_out: Whether a Response shows the Session logged out; `None`
             when no Response is judged, as without a login, or during one.
+        is_blocked: Whether a Response shows the site refusing the Session, or the
+            proxy; `None` when no Response is judged, as during a login, or when a
+            retry could change nothing.
         nested: Whether the fetch shares the Lease of a fetch it is nested in, such
             as one a download Middleware makes. Its Session logs in again only once
-            that fetch ends, so a `LoginExpired` is for that fetch to retry.
+            that fetch ends, so a `LoginExpired` is for that fetch to retry, as is a
+            `Blocked`, with another Session.
     """
 
     request: Request
@@ -64,6 +69,7 @@ class Sending:
     response: Response | None = None
     error: BaseException | None = None
     is_logged_out: Callable[[Response], bool] | None = field(default=None, repr=False)
+    is_blocked: Callable[[Response], bool] | None = field(default=None, repr=False)
     nested: bool = False
 
     def received(self, response: Response) -> None:
@@ -75,10 +81,15 @@ class Sending:
         Raises:
             pernix.errors.LoginExpired: The Response shows the Session logged out;
                 it is recorded as the `error` too.
+            pernix.errors.Blocked: The Response shows the site refusing its sender;
+                it is recorded as the `error` too.
         """
         self.response = response
         if self.is_logged_out is not None and self.is_logged_out(response):
             self.error = LoginExpired(response)
+            raise self.error
+        if self.is_blocked is not None and self.is_blocked(response):
+            self.error = Blocked(response)
             raise self.error
 
 
@@ -112,16 +123,29 @@ class IndependentSending:
     A Request with a proxy of its own, an empty one included, goes through it, or
     without one, instead. How each attempt went through its proxy is reported to the
     Run's proxies. A Request naming a Session is refused, as no Session Pool is
-    enabled.
+    enabled. A Response is judged Blocked only when a retry could change something:
+    go through another of the Run's proxies, as one other is available, or be
+    rendered, with `render_blocked`; otherwise it is left to its Callback.
     """
 
-    def __init__(self, proxies: RunProxies | None = None) -> None:
+    def __init__(
+        self,
+        proxies: RunProxies | None = None,
+        *,
+        is_blocked: Callable[[Response], bool] | None = None,
+        render_blocked: bool = False,
+    ) -> None:
         """Create the sender.
 
         Args:
             proxies: The Run's proxies; `None` without any.
+            is_blocked: Whether a Response shows the site refusing its sender;
+                `None` to judge none.
+            render_blocked: Whether a Request found Blocked is retried rendered.
         """
         self._proxies = proxies
+        self._is_blocked = is_blocked
+        self._render_blocked = render_blocked
 
     @asynccontextmanager
     async def sending(self, request: Request, *, wait: float | None) -> AsyncGenerator[Sending]:
@@ -144,9 +168,12 @@ class IndependentSending:
                 "enable one with sessions.enabled"
             )
         if self._proxies is None or request.proxy is not None:
-            yield Sending(request)
+            renders = self._render_blocked and rendered_instead(request) is not None
+            yield Sending(request, is_blocked=self._is_blocked if renders else None)
             return
         proxy = await self._proxies.take()
-        sending = Sending(request.replace(proxy=proxy))
+        rotates = self._is_blocked is not None and await self._proxies.available() > 1  # the retry goes through another
+        renders = self._render_blocked and rendered_instead(request) is not None
+        sending = Sending(request.replace(proxy=proxy), is_blocked=self._is_blocked if rotates or renders else None)
         async with self._proxies.reporting(proxy, sending):
             yield sending

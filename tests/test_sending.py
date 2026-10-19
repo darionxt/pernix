@@ -8,16 +8,19 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pernix import Request
-from pernix.errors import ProxyError, SessionError
+from pernix.errors import Blocked, ProxyError, SessionError
 from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import StaticProxies
 from pernix.proxies.run_proxies import NoProxyYet, RunProxies
 from pernix.sending import IndependentSending
 from pernix.settings import ProxySettings
 from pernix.stats import Stats
+from pernix.testing import make_response
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from pernix import Response
 
 SITE = "https://site.example"
 A, B = "http://a.example:8080", "http://b.example:8080"
@@ -103,3 +106,37 @@ async def test_with_no_proxy_available_the_request_waits() -> None:
     with pytest.raises(NoProxyYet):
         async with sender.sending(Request(f"{SITE}/"), wait=0):
             pass
+
+
+def _forbidden(request: Request) -> Response:
+    return make_response(request.url, status=403, request=request)
+
+
+@pytest.mark.parametrize(
+    ("proxied", "render_blocked", "request_", "judged"),
+    [
+        (True, False, Request(f"{SITE}/"), True),  # the next attempt goes through another proxy
+        (False, True, Request(f"{SITE}/"), True),  # it is retried rendered
+        (False, True, Request(f"{SITE}/", fetcher="http"), False),  # it names its Fetcher, so is not rendered
+        (False, False, Request(f"{SITE}/"), False),  # nothing would change
+        (True, False, Request(f"{SITE}/", proxy="http://own.example:1"), False),  # it goes through its own
+        (None, False, Request(f"{SITE}/"), False),  # the Run has a single proxy, the next attempt goes through
+    ],
+    ids=["proxied", "rendered", "fetcher named", "nothing to change", "a proxy of its own", "a single proxy"],
+)
+async def test_without_a_session_a_response_is_judged_blocked_only_when_a_retry_can_change_something(
+    request_: Request, *, proxied: bool | None, render_blocked: bool, judged: bool
+) -> None:
+    proxies = await _proxies(A, B) if proxied else await _proxies(A) if proxied is None else None
+    sender = IndependentSending(
+        proxies, is_blocked=lambda response: response.status == 403, render_blocked=render_blocked
+    )
+
+    async with sender.sending(request_, wait=0) as sending:
+        if judged:
+            with pytest.raises(Blocked, match="the Response is blocked"):
+                sending.received(_forbidden(sending.request))
+        else:
+            sending.received(_forbidden(sending.request))
+
+    assert isinstance(sending.error, Blocked) == judged

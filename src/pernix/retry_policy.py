@@ -6,8 +6,9 @@ back in the Frontier (`nack` with a delay), so they hold no concurrency slot.
 
 A retry counts as an attempt, which the policy is told of, unless it names a
 `RetryBudget`: for failures that are not the Request's own, such as a browser that
-went away, a policy retries under a budget that counts those retries apart, and
-takes nothing from the attempts. The Frontier keeps the count of each budget with
+went away, or a site refusing its Session, a policy retries under a budget that
+counts those retries apart, and takes nothing from the attempts. A retry may also
+be of another Request than the one tried, such as the same rendered. The Frontier keeps the count of each budget with
 the Request (`Lease.spent`), as it keeps its attempts, and the Engine, or the
 Inline Fetch, gives up once a retry would go past the budget's limit, failing the
 Request with `RetriesExhausted`.
@@ -23,8 +24,10 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
-from pernix.errors import BrowserLost, ConnectError, PageCrashed, ProxyError, Retry, Timeout
+from pernix.blocked_responses import rendered_instead
+from pernix.errors import Blocked, BrowserLost, ConnectError, PageCrashed, ProxyError, Retry, Timeout
 from pernix.response import Response
+from pernix.settings import BlockedSettings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
     from pernix.settings import RetrySettings
 
 __all__ = [
+    "BLOCKED",
     "BROWSER_LOST",
     "Action",
     "Decision",
@@ -42,6 +46,7 @@ __all__ = [
     "budget_spent",
     "consult",
     "full_jitter",
+    "retried_instead",
     "retry_after_seconds",
 ]
 
@@ -51,6 +56,10 @@ _RETRIED_ERRORS = (Timeout, ConnectError, ProxyError, PageCrashed)
 
 BROWSER_LOST = "browser_lost"
 """The retry budget of the Requests whose browser went away; `retry.browser_lost` is its limit."""
+BLOCKED = "blocked"
+"""The retry budget of the Requests found Blocked; `retry.blocked` is its limit."""
+_UNSET_BLOCKED = BlockedSettings()
+"""How Blocked Responses are handled when the policy is told nothing: without rendering them."""
 _MAX_DOUBLINGS = 64
 """Backoff stops doubling here, long past any cap, so the delay stays a finite float."""
 
@@ -89,12 +98,16 @@ class Decision:
         delay: Seconds to wait before the retry.
         reason: Why the attempt is retried or given up, for logs and Events.
         budget: The budget a retry counts against instead of the attempts, if any.
+        request: The Request to retry in place of the one tried, such as the same
+            rendered, if any; it keeps the Session and the proxy the one tried was
+            scheduled with, not those it was sent under, and its Fingerprint.
     """
 
     action: Action
     delay: float = 0.0
     reason: str = ""
     budget: RetryBudget | None = None
+    request: Request | None = None
 
     @classmethod
     def accept(cls) -> Decision:
@@ -102,7 +115,9 @@ class Decision:
         return cls(Action.ACCEPT)
 
     @classmethod
-    def retry(cls, delay: float, reason: str, *, budget: RetryBudget | None = None) -> Decision:
+    def retry(
+        cls, delay: float, reason: str, *, budget: RetryBudget | None = None, request: Request | None = None
+    ) -> Decision:
         """Fetch the Request again.
 
         Args:
@@ -111,11 +126,14 @@ class Decision:
             budget: Count the retry against this budget instead of as an attempt;
                 once the Request has had `budget.limit` retries under it, it fails
                 with `RetriesExhausted` instead.
+            request: Retry this Request in place of the one tried, from then on,
+                such as `request.replace(render=True)`; it keeps the Session and the
+                proxy the one tried was scheduled with.
 
         Returns:
             The Decision.
         """
-        return cls(Action.RETRY, delay, reason, budget)
+        return cls(Action.RETRY, delay, reason, budget, request)
 
     @classmethod
     def give_up(cls, reason: str) -> Decision:
@@ -161,6 +179,27 @@ def budget_spent(reason: str, budget: RetryBudget) -> str:
     return f"{reason} ({budget.name}: {budget.limit} retries spent)"
 
 
+def retried_instead(scheduled: Request, decision: Decision) -> Request | None:
+    """The Request to retry in place of one tried, as a Decision names it.
+
+    The policy is told of the Request as it was sent, naming the Session and the
+    proxy it went through, so the one it names keeps those of `scheduled` instead,
+    and its retry may go through others.
+
+    Args:
+        scheduled: The Request tried, as it was scheduled, or as an Inline Fetch was
+            asked for it.
+        decision: The Decision on it.
+
+    Returns:
+        The Request the Decision names, with the Session and the proxy of
+        `scheduled`; `None` if it names none.
+    """
+    if decision.request is None:
+        return None
+    return decision.request.replace(session=scheduled.session, proxy=scheduled.proxy)
+
+
 def consult(policy: RetryPolicy, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
     """Ask a retry policy to judge an attempt; a policy that raises keeps the outcome.
 
@@ -193,13 +232,16 @@ class DefaultRetryPolicy:
     fails.
 
     `BrowserLost` is retried at once, under the `browser_lost` budget, up to
-    `retry.browser_lost` times, which take none of the retries of `retry.times`.
+    `retry.browser_lost` times, and `Blocked` at once, under the `blocked` budget, up
+    to `retry.blocked` times, rendered with `blocked.render`; neither takes any of the
+    retries of `retry.times`.
     """
 
     def __init__(
         self,
         settings: RetrySettings,
         *,
+        blocked: BlockedSettings = _UNSET_BLOCKED,
         rng: random.Random | None = None,
         now: Callable[[], dt.datetime] | None = None,
     ) -> None:
@@ -207,10 +249,12 @@ class DefaultRetryPolicy:
 
         Args:
             settings: The retry settings.
+            blocked: How Blocked Responses are handled: rendered, with `render`.
             rng: The source of backoff jitter.
             now: The current time, for `Retry-After` dates.
         """
         self._settings = settings
+        self._render_blocked = blocked.render
         self._rng = rng or random.Random()  # noqa: S311  # jitter, not cryptography
         self._now = now or (lambda: dt.datetime.now(dt.UTC))
 
@@ -228,6 +272,10 @@ class DefaultRetryPolicy:
         if isinstance(outcome, BrowserLost):
             budget = RetryBudget(BROWSER_LOST, self._settings.browser_lost)
             return Decision.retry(0.0, f"BrowserLost: {outcome}", budget=budget)
+        if isinstance(outcome, Blocked):
+            budget = RetryBudget(BLOCKED, self._settings.blocked)
+            rendered = rendered_instead(request) if self._render_blocked else None
+            return Decision.retry(0.0, f"Blocked: {outcome}", budget=budget, request=rendered)
         reason = self._retry_reason(outcome)
         if reason is None:
             return Decision.accept()

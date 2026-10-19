@@ -423,3 +423,37 @@ async def test_a_failed_login_of_a_login_replaced_since_changes_nothing() -> Non
     assert pool.health("s") == "available"
     assert after is not None
     assert not after.must_log_in
+
+
+async def test_a_session_blocked_in_a_row_is_retired_and_a_fetch_that_went_well_ends_the_row() -> None:
+    stats = Stats()
+    pool, _ = _pool(size=1, max_blocks=2, stats=stats)
+
+    async def fare(kind: str) -> None:
+        lease = await pool.acquire(session="alice", timeout=0)
+        assert lease is not None
+        await pool.release(lease, Outcome(kind))  # type: ignore[arg-type]
+
+    for kind in ("blocked", "ok", "blocked"):
+        await fare(kind)
+    available = pool.health("alice")
+    await fare("blocked")
+
+    assert available == "available"
+    assert pool.health("alice") == "retired"
+    assert stats.get("sessions.retirements") == 1
+
+
+@pytest.mark.parametrize(("size", "next_session"), [(3, "default-2"), (1, "default-1")], ids=["room", "full"])
+async def test_a_session_blocked_last_time_is_leased_again_only_once_no_other_can_be_created(
+    size: int, next_session: str
+) -> None:
+    pool, _ = _pool(size=size)
+    lease = await pool.acquire(timeout=0)
+    assert lease is not None
+    await pool.release(lease, Outcome("blocked"))
+
+    again = await pool.acquire(timeout=0)
+
+    assert again is not None
+    assert again.session == next_session

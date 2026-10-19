@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from pernix import Account, Cookie, Request, Session
-from pernix.errors import ConnectError, LoginExpired, ProxyError, SessionError
+from pernix.errors import Blocked, ConnectError, LoginExpired, ProxyError, SessionError
 from pernix.fetchers import FetcherDispatch
 from pernix.fetchers.fetcher_dispatch import sending_as
 from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool, Proxy
@@ -69,6 +69,7 @@ def _leasing(
     login: SessionLogin | None = None,
     proxies: RunProxies | None = None,
     accounts: tuple[Account, ...] = (),
+    is_blocked: Callable[[Response], bool] | None = None,
     **settings: Any,
 ) -> tuple[SessionLeasing, MemorySessionPool, Stats, Clock]:
     clock, stats = clock or Clock(), Stats()
@@ -79,10 +80,20 @@ def _leasing(
         lease_ttl=config.lease_ttl,
         logs_in=login is not None,
         login_attempts=config.login_attempts,
+        max_blocks=config.max_blocks,
         stats=stats,
         clock=clock,
     )
-    leasing = SessionLeasing(pool, config, stats=stats, login=login, proxies=proxies, accounts=accounts, clock=clock)
+    leasing = SessionLeasing(
+        pool,
+        config,
+        stats=stats,
+        login=login,
+        proxies=proxies,
+        accounts=accounts,
+        is_blocked=is_blocked,
+        clock=clock,
+    )
     return leasing, pool, stats, clock
 
 
@@ -961,3 +972,46 @@ async def test_a_session_given_a_proxy_of_its_own_goes_through_it_and_keeps_it()
 
     assert through == [own, own]
     assert await _state_proxy(pool, "a") == own
+
+
+def _forbidden_is_blocked(response: Response) -> bool:
+    return response.status == 403
+
+
+async def test_a_response_found_blocked_raises_blocked_and_the_session_is_retired_after_some_in_a_row() -> None:
+    leasing, pool, stats, _ = _leasing(is_blocked=_forbidden_is_blocked, max_blocks=2)
+    forbidding = FetcherDispatch({"site": Site(status=403)})
+
+    for _ in range(2):
+        with pytest.raises(Blocked, match="the Session 'a' is blocked"):
+            await _send(leasing, forbidding, Request(f"{SITE}/", session="a"))
+
+    assert pool.health("a") == "retired"
+    assert (stats.get("sessions.outcomes.blocked"), stats.get("sessions.retirements")) == (2, 1)
+
+
+async def test_the_responses_of_a_login_are_not_judged_blocked() -> None:
+    seen: list[int] = []
+
+    async def log_in(session: Session, account: Account | None) -> None:
+        seen.append((await _send(leasing, forbidding, Request(f"{SITE}/login", session=session.id))).status)
+
+    forbidding = FetcherDispatch({"site": Site(status=403)})
+    leasing, _, _, _ = _leasing(login=_login(log_in), is_blocked=_forbidden_is_blocked)
+
+    with pytest.raises(Blocked):
+        await _send(leasing, forbidding, Request(f"{SITE}/", session="a"))
+
+    assert seen == [403]
+
+
+async def test_a_nested_fetch_found_blocked_raises_to_the_one_holding_the_lease() -> None:
+    leasing, pool, stats, _ = _leasing(is_blocked=_forbidden_is_blocked, max_blocks=1)
+    forbidding = FetcherDispatch({"site": Site(status=403)})
+
+    with pytest.raises(Blocked):
+        async with leasing.sending(Request(f"{SITE}/outer", session="a"), wait=0):
+            await _send(leasing, forbidding, Request(f"{SITE}/token", session="a"))
+
+    assert pool.health("a") == "retired"
+    assert stats.get("sessions.outcomes.blocked") == 2  # the nested fetch, and the outer one it failed
