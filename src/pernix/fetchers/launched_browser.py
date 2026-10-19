@@ -155,7 +155,7 @@ async def launch_browser(settings: BrowserSettings, *, locale: Sequence[str] = D
         from patchright.async_api import Error, async_playwright  # an optional dependency, imported when needed
     except ImportError as exc:
         raise ComponentError(_EXTRA_HINT) from exc
-    args = [str(arg) for arg in settings.launch_options.get("args", ())]
+    args = [str(arg) for arg in settings.launch_options.get("args") or ()]  # patchright takes None for none
     if not any(arg.startswith("--accept-lang=") for arg in args):
         args.append(f"--accept-lang={','.join(locale)}")
     options: dict[str, Any] = {

@@ -413,13 +413,18 @@ async def test_the_browser_names_itself_as_with_a_window_and_presents_the_locale
     assert server.received[-1].header("Accept-Language") == "zh-CN,zh;q=0.9"
 
 
-async def test_languages_set_in_the_launch_options_win(server: LoopbackServer) -> None:
+@pytest.mark.parametrize(
+    ("args", "languages"), [(["--accept-lang=fr"], "fr"), (None, "en-US,en;q=0.9")], ids=["their own", "none"]
+)
+async def test_languages_set_in_the_launch_options_win(
+    server: LoopbackServer, args: list[str] | None, languages: str
+) -> None:
     server.route("/", "<p>page</p>", headers=[("Content-Type", "text/html")])
 
-    async with BrowserFetcher(BrowserSettings(launch_options={"args": ["--accept-lang=fr"]})) as fetcher:
+    async with BrowserFetcher(BrowserSettings(launch_options={"args": args})) as fetcher:
         await fetcher.fetch(_render(server.url("/")))
 
-    assert server.received[-1].header("Accept-Language") == "fr"
+    assert server.received[-1].header("Accept-Language") == languages
 
 
 async def test_languages_chrome_replaces_are_warned_about_once_a_run(
