@@ -105,10 +105,12 @@ class MemorySessionPool:
     Request naming a Session the pool does not hold yet has it created under that
     id, while there is room. `eager` creates them all at once. Each Session takes up
     to `max_concurrency` Leases at once, and the least recently leased of the free
-    ones is leased first. A `rate_limited` outcome cools its Session down until the
-    time it gives. A Lease expires after `lease_ttl` seconds unless renewed, and a
-    release or a save from one that expired or was released is rejected. States are
-    merged per cookie, by modification time.
+    ones is leased first, unless it was Blocked last time while another can still be
+    created, so that a Request found Blocked is retried with another Session. A
+    `rate_limited` outcome cools its Session down until the time it gives. A Lease
+    expires after `lease_ttl` seconds unless renewed, and a release or a save from
+    one that expired or was released is rejected. States are merged per cookie, by
+    modification time.
 
     An outcome with an `until`, such as `rate_limited`, cools its Session down
     until then, and `proxy_retired` Retires it. A `blocked` outcome counts toward the
@@ -407,11 +409,12 @@ class MemorySessionPool:
             return entry if _free(entry, now) else None
         entries = self._fitting(None, tags)
         free = [entry for entry in entries if _free(entry, now)]
+        room = len(self._entries) < self._size and not tags
         if free:
-            return min(free, key=lambda entry: entry.last_leased)
-        if len(self._entries) < self._size and not tags:
-            return self._create(None)
-        return None
+            entry = min(free, key=lambda entry: entry.last_leased)
+            if not (entry.blocks and room):
+                return entry
+        return self._create(None) if room else None  # rather than one the site refused, so a Request switches
 
     def _fitting(self, session: str | None, tags: frozenset[str]) -> list[_Entry]:
         """The Sessions that fit and are not retired; empty when one is still to be created.

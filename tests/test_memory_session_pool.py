@@ -442,3 +442,18 @@ async def test_a_session_blocked_in_a_row_is_retired_and_a_fetch_that_went_well_
     assert available == "available"
     assert pool.health("alice") == "retired"
     assert stats.get("sessions.retirements") == 1
+
+
+@pytest.mark.parametrize(("size", "next_session"), [(3, "default-2"), (1, "default-1")], ids=["room", "full"])
+async def test_a_session_blocked_last_time_is_leased_again_only_once_no_other_can_be_created(
+    size: int, next_session: str
+) -> None:
+    pool, _ = _pool(size=size)
+    lease = await pool.acquire(timeout=0)
+    assert lease is not None
+    await pool.release(lease, Outcome("blocked"))
+
+    again = await pool.acquire(timeout=0)
+
+    assert again is not None
+    assert again.session == next_session

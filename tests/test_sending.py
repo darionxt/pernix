@@ -120,13 +120,14 @@ def _forbidden(request: Request) -> Response:
         (False, True, Request(f"{SITE}/", fetcher="http"), False),  # it names its Fetcher, so is not rendered
         (False, False, Request(f"{SITE}/"), False),  # nothing would change
         (True, False, Request(f"{SITE}/", proxy="http://own.example:1"), False),  # it goes through its own
+        (None, False, Request(f"{SITE}/"), False),  # the Run has a single proxy, the next attempt goes through
     ],
-    ids=["proxied", "rendered", "fetcher named", "nothing to change", "a proxy of its own"],
+    ids=["proxied", "rendered", "fetcher named", "nothing to change", "a proxy of its own", "a single proxy"],
 )
 async def test_without_a_session_a_response_is_judged_blocked_only_when_a_retry_can_change_something(
-    request_: Request, *, proxied: bool, render_blocked: bool, judged: bool
+    request_: Request, *, proxied: bool | None, render_blocked: bool, judged: bool
 ) -> None:
-    proxies = await _proxies(A, B) if proxied else None
+    proxies = await _proxies(A, B) if proxied else await _proxies(A) if proxied is None else None
     sender = IndependentSending(
         proxies, is_blocked=lambda response: response.status == 403, render_blocked=render_blocked
     )

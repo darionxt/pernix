@@ -124,8 +124,8 @@ class IndependentSending:
     without one, instead. How each attempt went through its proxy is reported to the
     Run's proxies. A Request naming a Session is refused, as no Session Pool is
     enabled. A Response is judged Blocked only when a retry could change something:
-    go through another of the Run's proxies, or be rendered, with `render_blocked`;
-    otherwise it is left to its Callback.
+    go through another of the Run's proxies, as one other is available, or be
+    rendered, with `render_blocked`; otherwise it is left to its Callback.
     """
 
     def __init__(
@@ -172,6 +172,8 @@ class IndependentSending:
             yield Sending(request, is_blocked=self._is_blocked if renders else None)
             return
         proxy = await self._proxies.take()
-        sending = Sending(request.replace(proxy=proxy), is_blocked=self._is_blocked)
+        rotates = self._is_blocked is not None and await self._proxies.available() > 1  # the retry goes through another
+        renders = self._render_blocked and rendered_instead(request) is not None
+        sending = Sending(request.replace(proxy=proxy), is_blocked=self._is_blocked if rotates or renders else None)
         async with self._proxies.reporting(proxy, sending):
             yield sending

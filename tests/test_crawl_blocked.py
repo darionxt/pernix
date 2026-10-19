@@ -101,7 +101,6 @@ async def test_a_session_switch_takes_no_ordinary_retry_and_the_budget_holds(ser
         settings: ClassVar[Mapping[str, Any]] = {
             "sessions.enabled": True,
             "sessions.size": 3,
-            "sessions.eager": True,
             "sessions.max_blocks": 10,
             "retry.times": 0,
             "retry.blocked": 2,
@@ -119,6 +118,7 @@ async def test_a_session_switch_takes_no_ordinary_retry_and_the_budget_holds(ser
     assert isinstance(error, RetriesExhausted)
     assert "blocked: 2 retries spent" in str(error)
     assert len(server.received) == 3  # the first attempt, then a retry with each other Session
+    assert report.stats["sessions.created"] == 3  # each retry with a new one, though the first was free
     assert report.stats["requests.retried_by_budget.blocked"] == 2
     assert report.stats["requests.failed"] == 1
 

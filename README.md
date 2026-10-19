@@ -146,7 +146,7 @@ class Shop(Spider):
         return response.status == 403 or bool(response.css("#challenge"))  # a challenge page, served with 200
 ```
 
-A Response in which the site refuses its Session, Blocked, a 403 by default or whatever `is_blocked()` says, is not handed to its Callback: the Request is retried at once with another Session, and its proxy, under a budget of its own, `retry.blocked` (3), which takes none of its ordinary retries, and the Session is Retired after `sessions.max_blocks` (3) Blocked Responses in a row. Without a Session Pool, a Response is judged only when the retry can go through another proxy; with `blocked.render`, an HTTP Request found Blocked is retried rendered, with the browser. Once the budget is spent, the Request fails, and its errback gets `RetriesExhausted`. A 429 is not Blocked: it cools its Session down. See [`docs/design.md`](docs/design.md) §5.3.
+A Response in which the site refuses its Session, Blocked, a 403 by default or whatever `is_blocked()` says, is not handed to its Callback: the Request is retried at once with another Session, and its proxy, under a budget of its own, `retry.blocked` (3), which takes none of its ordinary retries, and the Session is Retired after `sessions.max_blocks` (3) Blocked Responses in a row. Without a Session Pool, a Response is judged only when the retry can go through another proxy, as one is available; with `blocked.render`, an HTTP Request found Blocked is retried rendered, with the browser. Once the budget is spent, the Request fails, and its errback gets `RetriesExhausted`. A 429 is not Blocked: it cools its Session down. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Proxies
 
