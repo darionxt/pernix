@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import time
@@ -25,24 +26,28 @@ from pernix.errors import (
     TLSError,
     TooManyRedirects,
 )
+from pernix.fetchers.address_guard import AddressGuard
+from pernix.fetchers.address_guard_proxy import check_launch_options
 from pernix.fetchers.browser_cookies import request_cookie
 from pernix.fetchers.browser_generations import Generations, names_closed_target
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.kept_pages import KeptPage, page_keeping, sharing_a_kept_slot
+from pernix.fetchers.launched_browser import launch_browser
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.page_actions import run_page_method, run_render
 from pernix.fetchers.page_slots import PageSlot, PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
+from pernix.fetchers.proxy_refusals import ProxyRefusals
 from pernix.fetchers.session_contexts import SessionContexts
 from pernix.fetchers.tripwire import GRACE, Tripwire, first_tripped
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
-from pernix.settings import ResponseSettings, Section
+from pernix.settings import NetworkSettings, ResponseSettings, Section
 from pernix.urls import url_host
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Iterable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 
     from patchright._impl._api_structures import NameValue, SetCookieParam
     from patchright.async_api import BrowserContext, Frame, Page, Route, WebSocket
@@ -50,6 +55,7 @@ if TYPE_CHECKING:
     from patchright.async_api import Response as PageResponse
 
     from pernix.crawler import Crawler
+    from pernix.fetchers.address_guard_proxy import AddressGuardProxy
     from pernix.fetchers.browser_generations import Generation
     from pernix.fetchers.kept_pages import PageKeeping
     from pernix.fetchers.launched_browser import LaunchedBrowser
@@ -81,6 +87,7 @@ _PAGE_GONE = ("Target crashed", "Page crashed", "Target page, context or browser
 
 _NET_ERROR_KINDS: tuple[tuple[str, type[FetchError]], ...] = (
     ("ERR_PROXY_", ProxyError),
+    ("ERR_SOCKS_", ProxyError),
     ("ERR_TUNNEL_CONNECTION_FAILED", ProxyError),
     ("ERR_MANDATORY_PROXY_", ProxyError),
     ("ERR_CERT_", TLSError),
@@ -165,12 +172,26 @@ class BrowserFetcher:
     them, every value kept but not in wire order; `history` holds the redirects of
     the navigation.
 
+    With `network.public_only`, the browser sends all its traffic, its own
+    background requests included, through a proxy that resolves each host, checks
+    its addresses as the HTTP Fetcher does, and connects only to the addresses it
+    checked (`pernix.fetchers.address_guard_proxy`); WebRTC is kept off UDP, which
+    would go around it. A Request's host written as an address, or a loopback name,
+    is refused before anything is launched. A refused document, or redirect, raises
+    `NetworkBlocked`, as does a navigation of the page to such a host; any other
+    request refused fails in the page, which renders on without it, and is counted
+    as `browser.requests_refused`. `response.ip_address` is the address the proxy
+    connected the document's host to. A Request with a proxy of its own, or of its
+    Session, is refused with `NetworkBlocked`, as the browser would reach hosts
+    through it unchecked, and `browser.launch_options` that would take the browser
+    around the proxy raise a `SettingsError` when the fetcher is created.
+
     Under a network guard (`pernix.fetchers.network_guard`), as in tests, a browser
     launched while it is on reaches only loopback hosts, or any host through a
     loopback proxy of the Request's own: everything else, its own background
-    requests included, goes to a proxy that refuses it. Requests a page makes to
-    other hosts are recorded in the guard; a refused document raises
-    `NetworkBlocked`.
+    requests included, goes to a proxy that refuses it, and WebRTC is kept off UDP.
+    Requests a page makes to other hosts are recorded in the guard; a refused
+    document raises `NetworkBlocked`.
 
     The browser is replaced by a new one once it is `browser.generation_age`
     seconds old, opened `browser.generation_pages` pages, or its processes take
@@ -203,6 +224,7 @@ class BrowserFetcher:
         *,
         default_encoding: str = "utf-8",
         stats: Stats | None = None,
+        network: NetworkSettings | None = None,
     ) -> None:
         """Configure the fetcher.
 
@@ -211,8 +233,18 @@ class BrowserFetcher:
             default_encoding: The `default_encoding` of the Responses whose body is
                 not a rendered DOM.
             stats: Where the pages and the contexts are counted.
+            network: Which hosts may be reached; any when `None`.
+
+        Raises:
+            pernix.errors.SettingsError: `network.public_only` is on, and
+                `browser.launch_options` would take the browser around the proxy
+                that checks hosts.
         """
         self._settings = settings or BrowserSettings()
+        self._address_guard: AddressGuard | None = None
+        if network is not None and network.public_only:
+            check_launch_options(self._settings)
+            self._address_guard = AddressGuard(frozenset(network.allow_hosts))
         self._default_encoding = default_encoding
         self._stats = stats
         self._open = False
@@ -226,7 +258,12 @@ class BrowserFetcher:
             new_context=self._session_context,
             discard=self._discard,
         )
-        self._generations = Generations(self._settings, retire=self._contexts.retire, stats=stats)
+        self._generations = Generations(
+            self._settings,
+            retire=self._contexts.retire,
+            stats=stats,
+            launch=functools.partial(launch_browser, address_guard=self._address_guard),
+        )
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -237,12 +274,14 @@ class BrowserFetcher:
 
         Returns:
             A fetcher with the `browser.*` settings, whose Responses use
-            `response.default_encoding`, counting in the Run's stats.
+            `response.default_encoding`, counting in the Run's stats, reaching the
+            hosts the `network.*` settings allow.
         """
         return cls(
             crawler.settings.section(BrowserSettings),
             default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
             stats=crawler.stats,
+            network=crawler.settings.section(NetworkSettings),
         )
 
     async def __aenter__(self) -> Self:
@@ -276,7 +315,9 @@ class BrowserFetcher:
             RuntimeError: The fetcher was not entered with `async with`.
             pernix.errors.ComponentError: patchright or the browser engine is not
                 installed.
-            pernix.errors.NetworkBlocked: The network guard refused the document.
+            pernix.errors.NetworkBlocked: The network guard, or `network.public_only`,
+                refused the document, or the Request goes through a proxy while
+                `network.public_only` is on.
             pernix.errors.FetchError: The page did not load; a subclass names the kind
                 of failure.
             pernix.errors.ActionError: A step of the Render failed; an
@@ -302,6 +343,13 @@ class BrowserFetcher:
                 f"{request!r} goes through a SOCKS proxy with credentials, which the browser cannot use; "
                 "render it through an HTTP proxy, or fetch it over HTTP"
             )
+        if self._address_guard is not None:
+            if proxy is not None:
+                raise NetworkBlocked(
+                    f"network.public_only refused {request.url}: the browser cannot check the hosts a page reaches "
+                    "through a proxy; render it without one, or fetch it over HTTP"
+                )
+            self._address_guard.check_written(request.url)
         keeping = _keeping_for(request)
         guard = current_guard()
         if guard is not None:
@@ -346,7 +394,15 @@ class BrowserFetcher:
         started = time.monotonic()
         render = request.render if isinstance(request.render, Render) else Render()
         blocked = self._settings.block if render.block is None else render.block
-        load = _Load(request, render, blocked, proxy=proxy, guarded=launched.guarded, started=started)
+        load = _Load(
+            request,
+            render,
+            blocked,
+            proxy=proxy,
+            guarded=launched.guarded,
+            started=started,
+            guard_proxy=launched.guard_proxy,
+        )
         workers = bool(blocked)  # service workers would load what is blocked, unseen by the page's routes
         if session is None:
             context = page.context = self._opened(
@@ -389,8 +445,9 @@ class BrowserFetcher:
             self._stats.inc("browser.pages")
         crash = Tripwire()
         page.on("crash", lambda _page: self._crashed(crash))
-        watch = _PageLoad(page, proxy=load.proxy, guarded=load.guarded)
         url = load.request.url
+        refusals = None if load.guard_proxy is None else ProxyRefusals(page, load.guard_proxy, self._told_refused(url))
+        watch = _PageLoad(page, proxy=load.proxy, guarded=load.guarded, refusals=refusals)
         try:
             async with crash.guarding(lambda _reason: PageCrashed(f"the page of {url} crashed"), may_trip=_page_gone):
                 response = await self._loaded(page, watch, load, kept, session)
@@ -503,6 +560,9 @@ class BrowserFetcher:
         request = load.request
         if watch.refused is not None:
             raise _refused(watch.refused, request) from None
+        failure = watch.proxied_failure(request.url, error=str(error))
+        if failure is not None:
+            raise failure from None
         if isinstance(error, PageTimeout):
             seconds = request.timeout or self._settings.timeout
             raise Timeout(f"{request.url} did not load within {seconds} s") from None
@@ -542,7 +602,7 @@ class BrowserFetcher:
         headers = body_headers(await _headers(document), re_encoded=rendered)
         history = await _history(document)
         held = await page.context.cookies([*(hop.url for hop in history), url])
-        address = await document.server_addr()
+        address = await _server_address(document, load.guard_proxy)
         return Response(
             url=url,
             status=document.status,
@@ -554,7 +614,7 @@ class BrowserFetcher:
             default_encoding=self._default_encoding,
             history=history,
             elapsed=time.monotonic() - load.started,
-            ip_address=address["ipAddress"] if address else None,
+            ip_address=address,
             fetcher="browser",
             session=None if session is None else session.id,
             browser=result,
@@ -659,6 +719,16 @@ class BrowserFetcher:
         if self._stats is not None:
             self._stats.set("browser.contexts_open", self._contexts_open)
 
+    def _told_refused(self, url: str) -> Callable[[str, str], None]:
+        """Count, and log, each request of the page of a URL that `network.public_only` refused."""
+
+        def refused(request_url: str, reason: str) -> None:
+            if self._stats is not None:
+                self._stats.inc("browser.requests_refused")
+            logger.debug("network.public_only refused %s, requested by the page of %s: %s", request_url, url, reason)
+
+        return refused
+
 
 @dataclass(slots=True)
 class _Page:
@@ -690,6 +760,7 @@ class _Load:
     proxy: str | None
     guarded: bool
     started: float
+    guard_proxy: AddressGuardProxy | None = None
 
 
 class _PageLoad:
@@ -708,7 +779,16 @@ class _PageLoad:
             refused, if any.
     """
 
-    def __init__(self, page: Page, *, proxy: str | None, guarded: bool) -> None:
+    def __init__(self, page: Page, *, proxy: str | None, guarded: bool, refusals: ProxyRefusals | None = None) -> None:
+        """Watch a page.
+
+        Args:
+            page: The page.
+            proxy: The proxy of its context, if any.
+            guarded: Whether its browser was launched under the network guard.
+            refusals: What watches the requests the proxy of `network.public_only`
+                refused, if it is on.
+        """
         self.page = page
         self.document: PageResponse | None = None
         self.shown: PageResponse | None = None
@@ -718,6 +798,7 @@ class _PageLoad:
         """The navigation response the main frame has not committed yet."""
         self._proxy = proxy
         self._guarded = guarded
+        self._refusals = refusals
         page.on("response", self._on_response)
         page.on("framenavigated", self._on_navigated)
         page.on("requestfailed", self._on_failed)
@@ -730,6 +811,14 @@ class _PageLoad:
         if self._guarded:
             page_context = self.page.context
             page_context.remove_listener("request", self._on_request)
+        if self._refusals is not None:
+            self._refusals.stop()
+
+    def proxied_failure(self, url: str, *, error: str = "", navigated: bool = False) -> FetchError | None:
+        """The error of the main frame's navigation that the proxy of `network.public_only` did not connect, if any."""
+        if self._refusals is None:
+            return None
+        return self._refusals.navigation_error(self.failed, url, error=error, navigated=navigated)
 
     def _on_response(self, response: PageResponse) -> None:
         if response.request.is_navigation_request() and response.frame == self.page.main_frame:
@@ -834,6 +923,14 @@ async def _headers(response: PageResponse) -> Headers:
     return Headers((header["name"], header["value"]) for header in await response.headers_array())
 
 
+async def _server_address(document: PageResponse, guard_proxy: AddressGuardProxy | None) -> str | None:
+    """The address of the server that sent a document: through the address guard's proxy, the one it connected to."""
+    if guard_proxy is not None:
+        return guard_proxy.address(document.url)
+    address = await document.server_addr()
+    return address["ipAddress"] if address else None
+
+
 async def _history(document: PageResponse) -> list[Redirect]:
     """The redirects that led to a document, oldest first."""
     hops: list[Redirect] = []
@@ -856,6 +953,9 @@ def _navigation_failure(watch: _PageLoad, request: Request) -> FetchError | None
     """The error of a navigation of the main frame, after the page had loaded, that was refused or did not load."""
     if watch.refused is not None:
         return _refused(watch.refused, request)
+    proxied = watch.proxied_failure(request.url, navigated=True)
+    if proxied is not None:
+        return proxied
     failed = watch.failed
     if failed is None:
         return None

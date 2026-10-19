@@ -5,7 +5,7 @@ import os
 import socket
 import sys
 import textwrap
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -15,7 +15,7 @@ from pernix.fetchers import BrowserSettings
 from pernix.fetchers.launched_browser import launch_browser
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
     from pathlib import Path
 
     from pernix.testing import LoopbackServer
@@ -53,6 +53,24 @@ def _restore_import_path(monkeypatch: pytest.MonkeyPatch) -> None:
 def server(loopback_server: LoopbackServer) -> LoopbackServer:
     """The pytest plugin's `loopback_server`, under the shorter name the suite uses."""
     return loopback_server
+
+
+@pytest.fixture
+def resolver(monkeypatch: pytest.MonkeyPatch) -> Callable[[Mapping[str, list[str]]], None]:
+    """Answer the host names given with their addresses, and no other, without asking DNS."""
+
+    def answer(addresses: Mapping[str, list[str]]) -> None:
+        def getaddrinfo(host: str, port: int, *_args: Any, **_kwargs: Any) -> list[Any]:
+            if host not in addresses:
+                raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+            return [
+                (socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+                for address in addresses[host]
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+    return answer
 
 
 @pytest.fixture
