@@ -15,6 +15,7 @@ import orjson
 from pernix.browser.render import Render
 from pernix.cookies import check_cookies
 from pernix.headers import Headers, HeadersInput
+from pernix.request_kinds import check_kind
 from pernix.urls import clean_url, is_absolute
 
 __all__ = ["Callback", "CallbackResult", "FormData", "QueryParams", "QueryValue", "Request", "resolve_relative_urls"]
@@ -39,24 +40,32 @@ _FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 
 _url_resolver: ContextVar[Callable[[str], str] | None] = ContextVar("pernix_url_resolver", default=None)
 
+_referring_page: ContextVar[str | None] = ContextVar("pernix_referring_page", default=None)
+"""The page the Requests constructed in a Callback come from, with `http.inherit_referer`."""
+
 
 @contextmanager
-def resolve_relative_urls(urljoin: Callable[[str], str]) -> Generator[None]:
+def resolve_relative_urls(urljoin: Callable[[str], str], *, referer: str | None = None) -> Generator[None]:
     """Resolve relative URLs of the Requests constructed inside the block with `urljoin`.
 
     The Engine wraps each step of a Callback in this, passing the `urljoin` of the
-    Response being handled.
+    Response being handled, and, with `http.inherit_referer`, the page it belongs
+    to.
 
     Args:
         urljoin: Turns a relative URL into an absolute one.
+        referer: The page the Requests come from, which those without a `Referer`
+            header take as theirs; `None` for none.
 
     Yields:
         Nothing; the block runs with the resolver in effect.
     """
     token = _url_resolver.set(urljoin)
+    page = _referring_page.set(referer)
     try:
         yield
     finally:
+        _referring_page.reset(page)
         _url_resolver.reset(token)
 
 
@@ -75,6 +84,14 @@ class Request:
 
     Without an explicit `method`, a Request with a body (`body`, `json`, or `data`) is
     a POST, and one without is a GET.
+
+    With the pinned Profile, the HTTP Fetcher sends the headers Chrome sends for the
+    kind of request a Request is (`pernix.request_kinds`): a GET is a top-level
+    navigation, a POST of a form a form submission, and anything else a `fetch()`,
+    unless a `Sec-Fetch-Dest` header names the kind. Its `Referer` header names the
+    page it comes from, from which the `Referer`, `Origin`, and `Sec-Fetch-Site` sent
+    are made; an empty one names none. With `http.inherit_referer`, a Request
+    constructed in a Callback without one takes the page the Response belongs to.
 
     Attributes:
         url: The absolute URL to fetch.
@@ -185,8 +202,10 @@ class Request:
             ValueError: `url` is relative outside a Callback; more than one of `body`,
                 `json`, and `data` is given; `cookies` is combined with a `Cookie`
                 header; a cookie name is empty or has `=`, `;`, or a control
-                character, or a cookie value has `;` or a control character; or
-                `timeout` is not positive.
+                character, or a cookie value has `;` or a control character;
+                `timeout` is not positive; `Sec-Fetch-Dest` names an iframe or a load
+                of something other than a GET; or a rendered Request names another
+                destination than `document`.
             TypeError: `callback` or `errback` is not a method of an object, a
                 value of `params` is neither a string nor a number, or `render` is
                 neither a boolean nor a `Render`.
@@ -216,6 +235,10 @@ class Request:
         elif data is not None:
             body = urlencode(data, doseq=True)
             request_headers = _with_default(request_headers, "Content-Type", _FORM_CONTENT_TYPE)
+        check_kind(method.upper(), request_headers, render=bool(render))
+        page = _referring_page.get()
+        if page is not None:
+            request_headers = _with_default(request_headers, "Referer", page)
 
         set_field = object.__setattr__
         set_field(self, "url", url)

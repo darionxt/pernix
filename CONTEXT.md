@@ -21,6 +21,10 @@ _Avoid_: task, job, BrowserRequest
 **Response**:
 The unified result of one fetch, whether it came from HTTP or the browser.
 
+**Request Kind**:
+The kind of request a browser would make a Request as: a top-level navigation, a form submission, an iframe's navigation, a fetch, or the load of a style sheet, a script, or an image. A Request's method and body tell it, or its `Sec-Fetch-Dest` header names it, and it decides the headers the HTTP Fetcher sends with the pinned Profile.
+_Avoid_: request type, resource type (what a rendered page loads, which Render can block)
+
 **Callback**:
 A Spider method that handles a Response and produces Requests and Items.
 _Avoid_: parser, handler

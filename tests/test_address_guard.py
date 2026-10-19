@@ -6,7 +6,7 @@ import ipaddress
 import re
 import socket
 import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import msgspec
@@ -14,10 +14,11 @@ import pytest
 
 from pernix import Request, Response, Spider
 from pernix.errors import ConnectError, NetworkBlocked, ProxyError, SettingsError, Timeout
-from pernix.fetchers import BROWSER_FETCHER, FetcherDispatch, HTTPFetcher
+from pernix.fetchers import HTTPFetcher
 from pernix.fetchers.address_guard import AddressGuard, PinnedHost, is_public_address
+from pernix.fetchers.address_guard_proxy import AddressGuardProxy
 from pernix.settings import CORE_SECTIONS, NetworkSettings, load_settings
-from pernix.testing import FakeFetcher, crawl, make_response
+from pernix.testing import crawl
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Mapping
@@ -26,24 +27,6 @@ if TYPE_CHECKING:
     from pernix.testing import LoopbackServer
 
 GUARDED = NetworkSettings(public_only=True)
-
-
-@pytest.fixture
-def resolver(monkeypatch: pytest.MonkeyPatch) -> Callable[[Mapping[str, list[str]]], None]:
-    """Answer the host names given with their addresses, and no other, without asking DNS."""
-
-    def answer(addresses: Mapping[str, list[str]]) -> None:
-        def getaddrinfo(host: str, port: int, *_args: Any, **_kwargs: Any) -> list[Any]:
-            if host not in addresses:
-                raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
-            return [
-                (socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
-                for address in addresses[host]
-            ]
-
-        monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
-
-    return answer
 
 
 @pytest.mark.parametrize(
@@ -203,6 +186,50 @@ async def test_through_a_proxy_names_are_left_to_the_proxy(
             await fetcher.fetch(Request("http://unknown.example/", proxy=refused_proxy))
 
 
+@pytest.mark.parametrize("scheme", ["socks4", "socks5"])
+async def test_through_a_socks_proxy_that_curl_resolves_names_for_they_are_resolved_and_checked(
+    scheme: str, resolver: Callable[[Mapping[str, list[str]]], None]
+) -> None:
+    resolver({"intranet.example": ["10.0.0.5"], "public.example": ["93.184.215.14"]})
+    proxy = f"{scheme}://127.0.0.1:1080"
+
+    with pytest.raises(NetworkBlocked, match=r"intranet\.example resolves to 10\.0\.0\.5, a private address$"):
+        await AddressGuard().check("http://intranet.example/", proxy=proxy)
+    assert await AddressGuard().check("http://public.example/", proxy=proxy) == PinnedHost(
+        "public.example", 80, ("93.184.215.14",)
+    )
+
+
+@pytest.mark.parametrize("scheme", ["socks4a", "socks5h", "https"])
+async def test_names_are_left_to_the_proxies_that_resolve_them(
+    scheme: str, resolver: Callable[[Mapping[str, list[str]]], None]
+) -> None:
+    resolver({})
+
+    assert await AddressGuard().check("http://intranet.example/", proxy=f"{scheme}://127.0.0.1:1080") is None
+
+
+async def test_curl_hands_a_socks5_proxy_the_address_checked(
+    server: LoopbackServer, resolver: Callable[[Mapping[str, list[str]]], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server.route("/page", "pinned")
+    port = urlsplit(server.base_url).port
+    resolver({"pinned.invalid": ["127.0.0.1"]})  # .invalid never resolves, so curl cannot have resolved it itself
+    monkeypatch.setattr("pernix.fetchers.address_guard.is_public_address", lambda address: str(address) == "127.0.0.1")
+    proxy = AddressGuardProxy(AddressGuard())  # a SOCKS5 proxy that tells what it connected to
+    await proxy.start()
+
+    try:
+        async with HTTPFetcher(network=GUARDED) as fetcher:
+            response = await fetcher.fetch(Request(f"http://pinned.invalid:{port}/page", proxy=proxy.url))
+    finally:
+        await proxy.close()
+
+    assert (response.status, response.body) == (200, b"pinned")
+    assert proxy.address(f"http://127.0.0.1:{port}/") == "127.0.0.1"  # handed the address
+    assert proxy.address(f"http://pinned.invalid:{port}/") is None  # not the name
+
+
 @pytest.mark.pernix_network  # the host is no loopback name, and never resolves
 async def test_resolving_a_host_is_limited_by_the_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     def slow(*_args: Any, **_kwargs: Any) -> list[Any]:
@@ -214,31 +241,6 @@ async def test_resolving_a_host_is_limited_by_the_timeout(monkeypatch: pytest.Mo
     async with HTTPFetcher(network=GUARDED) as fetcher:
         with pytest.raises(Timeout, match=r"resolving the host of http://slow\.example/ took longer than 0\.1 s"):
             await fetcher.fetch(Request("http://slow.example/", timeout=0.1))
-
-
-class _Browser:
-    """Stands in for the browser Fetcher, recording what it is asked to render."""
-
-    schemes: ClassVar[frozenset[str]] = frozenset()
-
-    def __init__(self) -> None:
-        self.rendered: list[Request] = []
-
-    async def fetch(self, request: Request) -> Response:
-        self.rendered.append(request)
-        return make_response(request.url, "rendered", request=request)
-
-
-async def test_rendering_is_refused_while_only_public_hosts_may_be_reached() -> None:
-    browser = _Browser()
-    dispatch = FetcherDispatch({"http": FakeFetcher(), BROWSER_FETCHER: browser}, public_only=True)
-
-    with pytest.raises(NetworkBlocked, match="the browser resolves hosts itself"):
-        await dispatch(Request("https://example.com/", render=True))
-    with pytest.raises(NetworkBlocked):
-        await dispatch(Request("https://example.com/", fetcher=BROWSER_FETCHER))
-    assert browser.rendered == []
-    assert (await dispatch(Request("https://example.com/"))).status == 404  # the HTTP Fetcher still fetches
 
 
 async def test_tests_reach_loopback_hosts_unless_they_turn_the_setting_on(

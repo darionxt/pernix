@@ -42,15 +42,19 @@ class ChainCookies:
         """
         self._session = session
         self._jar = CookieJar(() if session is None else session.cookies)
+        self._own = CookieJar()
         host = url_host(request.url)
         if host is not None:  # a URL naming no host, such as http:///path, holds none
             self._hold(host, request_cookies(request))
 
-    def header(self, url: str) -> str | None:
+    def header(self, url: str, *, credentials: bool = True) -> str | None:
         """Return the cookies to send to a hop, as the value of its `Cookie` header.
 
         Args:
             url: The URL of the hop.
+            credentials: Whether the hop takes the cookies of the Session and of the
+                chain; without, only the Request's own go, as a `fetch()` sends no
+                others to another origin than its page's.
 
         Returns:
             The cookies matching the URL, in the order a browser sends them: longer
@@ -60,7 +64,7 @@ class ChainCookies:
         """
         pairs = [
             f"{cookie.name}={cookie.value}"
-            for cookie in self._jar.matching(url)
+            for cookie in (self._jar if credentials else self._own).matching(url)
             if not _NOT_IN_HEADER.search(cookie.name + cookie.value)
         ]
         return "; ".join(pairs) or None
@@ -84,6 +88,8 @@ class ChainCookies:
         for name, value in cookies.items():
             replaced = held.get((host, True, "/", name))
             created = now if replaced is None else replaced.created
-            self._jar.set(
-                Cookie(name=name, value=value, domain=host, secure=requires_secure(name), created=created, modified=now)
+            cookie = Cookie(
+                name=name, value=value, domain=host, secure=requires_secure(name), created=created, modified=now
             )
+            self._jar.set(cookie)
+            self._own.set(cookie)

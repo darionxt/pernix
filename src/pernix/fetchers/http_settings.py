@@ -57,6 +57,12 @@ class HTTPSettings(Section):
         pool_size: curl sessions kept at most, one per Profile; the least recently
             used is closed first.
         pool_idle: Seconds a curl session is kept unused before it is closed.
+        inherit_referer: Whether a Request constructed in a Callback without a
+            `Referer` header takes the page the Response belongs to as its own: the
+            Response's URL when it is a document, a navigation or an iframe's, and
+            the `Referer` of its Request otherwise, so the API calls paged from an
+            API Response keep the page that started them. Requests from `start()`
+            take none. Off, Requests carry only the `Referer` they are given.
     """
 
     __prefix__ = "http"
@@ -68,6 +74,7 @@ class HTTPSettings(Section):
     max_body_size: Annotated[int, msgspec.Meta(ge=0)] = 100 * 1024 * 1024
     pool_size: Annotated[int, msgspec.Meta(ge=1)] = 8
     pool_idle: Annotated[float, msgspec.Meta(gt=0)] = 300.0
+    inherit_referer: bool = False
 
     def __post_init__(self) -> None:
         try:

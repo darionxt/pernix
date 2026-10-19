@@ -378,8 +378,10 @@ class NetworkSettings(Section):
             redirect hop, the first included, before it is sent, and connects only
             to the addresses it checked; through a proxy, which resolves hosts
             itself, only hosts written as addresses, and loopback names, are
-            checked. The browser Fetcher refuses to render while it is on, as the
-            browser resolves hosts itself. A refused hop raises `NetworkBlocked`.
+            checked, unless curl resolves them, as for `socks4://` and `socks5://`
+            ones. The browser sends all its traffic through a proxy that checks
+            every host it reaches alike, and refuses to render through a proxy of
+            the Request's or the Session's. A refused hop raises `NetworkBlocked`.
         allow_hosts: Host names reached whatever their addresses, such as an
             internal service, each matched exactly.
     """

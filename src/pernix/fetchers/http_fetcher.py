@@ -25,6 +25,7 @@ from pernix.errors import (
 )
 from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.chain_cookies import ChainCookies
+from pernix.fetchers.chrome_headers import ChromeRequest, chrome_request
 from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings, check_profile
@@ -33,6 +34,7 @@ from pernix.fetchers.pinned_pair import client_headers
 from pernix.fetchers.redirects import Hop, redirect_target, redirected
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
+from pernix.request_kinds import request_kind
 from pernix.response import Redirect, Response
 from pernix.settings import DEFAULT_LOCALE, CoreSettings, NetworkSettings, ResponseSettings, Section, locale_languages
 from pernix.urls import with_ascii_host
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
     from pernix.crawler import Crawler
     from pernix.fetchers.address_guard import PinnedHost
     from pernix.request import Request
+    from pernix.request_kinds import RequestKind
     from pernix.session import Session
 
 __all__ = ["HTTPFetcher"]
@@ -155,13 +158,19 @@ class HTTPFetcher:
     browsers refuse such a URL. Redirects are resolved as WHATWG URLs resolve them,
     so their hosts are converted alike.
 
-    With the Profile of the Pinned Pair (ADR 0010), the headers that name the
-    client, `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`, `User-Agent`,
-    and `Accept-Language`, are those the bundled browser sends on the platform the
-    Run is on, for the languages of `locale` (`pernix.fetchers.pinned_pair`), each
-    in the place of the Profile's own, on every hop; a header of the Request's own
-    replaces one of them. Another Profile, from the settings, the Request, or the
-    Session, sends its own.
+    With the Profile of the Pinned Pair (ADR 0010), each hop carries the headers
+    Chrome sends for the kind of request the Request is (`pernix.request_kinds`),
+    in Chrome's order, with its HTTP/2 stream weight
+    (`pernix.fetchers.chrome_headers`): those that name the client are the bundled
+    browser's on the platform the Run is on, for the languages of `locale`
+    (`pernix.fetchers.pinned_pair`), and the `Referer`, `Origin`, and
+    `Sec-Fetch-Site` are made from the page the Request's `Referer` names. A
+    header of the Request's own replaces the kind's of its name in place; another
+    goes after them in a navigation, and first among those a page adds in the
+    other kinds. A `fetch()` to another origin than its page's sends only the
+    Request's own cookies, and keeps none it is sent. Another Profile, from the
+    settings, the Request, or the Session, sends the Request's headers as they are,
+    after its own.
 
     A Request sent under a Session (`session=`) also sends the Session's cookies that
     match each hop, and the cookies set during the fetch, on redirects included, are
@@ -179,7 +188,9 @@ class HTTPFetcher:
     host resolved unless written as an address, and curl connects only to the
     addresses checked; others raise `NetworkBlocked`. Through a proxy, which
     resolves hosts itself, only hosts written as addresses, and loopback names,
-    are checked. The hosts of `network.allow_hosts` are not checked.
+    are checked; curl resolves them itself for a `socks4://` or `socks5://` one,
+    so through one they are resolved, checked, and pinned too. The hosts of
+    `network.allow_hosts` are not checked.
 
     Attributes:
         schemes: The URL schemes it fetches by default: `http` and `https`.
@@ -273,8 +284,9 @@ class HTTPFetcher:
 
         Raises:
             RuntimeError: The fetcher was not entered with `async with`.
-            ValueError: The Profile to use is not a pinned one, or `request.session`
-                names another Session.
+            ValueError: The Profile to use is not a pinned one, `request.session`
+                names another Session, or, with the pinned Profile, its
+                `Sec-Fetch-Dest` names no kind of request pernix makes.
             pernix.errors.FetchError: The transfer failed, or WHATWG URLs reject the
                 host; a subclass names the kind of failure, and `code` is libcurl's
                 error code, or 0.
@@ -375,16 +387,27 @@ class HTTPFetcher:
         timeout = request.timeout or self._settings.timeout
         max_redirects = self._settings.max_redirects
         cookies = ChainCookies(request, session)
-        hop = Hop(request.method, _curl_url(request), self._headers(request, profile), request.body)
+        hop = Hop(request.method, _curl_url(request), _without_cookies(request.headers), request.body)
+        chrome = _ChromeHops(request, self._client_headers) if profile == DEFAULT_PROFILE else None
         history: list[Redirect] = []
         set_cookies: list[str] = []
         redirected_from: str | None = None
         while True:
             pinned = await self._check_hop(hop.url, proxy, resolve_timeout=timeout, redirected_from=redirected_from)
+            sent = None if chrome is None else chrome.next(hop)
             result, transfer = await self._send(
-                curl, hop, cookies, proxy=proxy, profile=profile, curl_timeout=timeout, limit=limit, pinned=pinned
+                curl,
+                hop,
+                cookies,
+                proxy=proxy,
+                profile=profile,
+                curl_timeout=timeout,
+                limit=limit,
+                pinned=pinned,
+                sent=sent,
             )
-            set_cookies += _set_cookies(result)
+            if sent is None or sent.credentials:  # a response no cookie goes with sets none
+                set_cookies += _set_cookies(result)
             try:
                 target = redirect_target(result.url, result.status_code, _location(result))
             except FetchError:
@@ -397,18 +420,6 @@ class HTTPFetcher:
             if len(history) > max_redirects:
                 raise TooManyRedirects(f"{request.url} redirected more than http.max_redirects ({max_redirects}) times")
             redirected_from, hop = result.url, redirected(hop, result.status_code, requote_uri(target))
-
-    def _headers(self, request: Request, profile: str) -> Headers:
-        """The headers of a Request's first hop: with the pinned Profile, those that name the client before its own.
-
-        A header of the Request's own replaces one of them; its `Cookie` header goes
-        with the other cookies instead.
-        """
-        own = _without_cookies(request.headers)
-        if profile != DEFAULT_PROFILE:
-            return own
-        named = {name.lower() for name, _ in own}
-        return Headers([*((name, value) for name, value in self._client_headers if name.lower() not in named), *own])
 
     async def _check_hop(
         self, url: str, proxy: str | None, *, resolve_timeout: float, redirected_from: str | None
@@ -457,23 +468,33 @@ class HTTPFetcher:
         curl_timeout: float,
         limit: int | None,
         pinned: PinnedHost | None,
+        sent: ChromeRequest | None,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Send one hop of a redirect chain and wait for its response headers, without following a redirect.
 
         Waiting for the headers is limited precisely with asyncio; once they arrived,
         curl limits each pause in the body to whole seconds. A pinned host is
-        reached at the addresses it was checked at.
+        reached at the addresses it was checked at. With the pinned Profile, `sent`
+        holds the headers Chrome sends, which replace curl's own.
         """
+        credentials = sent is None or sent.credentials
+        shaped: dict[str, Any] = {}
+        if sent is not None:
+            shaped = {
+                "default_headers": False,
+                "header_order": sent.order,
+                "stream_weight": sent.weight,
+            }
         scope = asyncio.timeout(curl_timeout)
         try:
             async with scope:
                 result, transfer = await curl.start(
                     cast("HttpMethod", hop.method),
                     hop.url,
-                    headers=hop.headers.items(),
+                    headers=hop.headers.items() if sent is None else sent.headers,
                     data=hop.body,
-                    cookie=cookies.header(hop.url),
-                    on_headers=cookies.receive,
+                    cookie=cookies.header(hop.url, credentials=credentials),
+                    on_headers=cookies.receive if credentials else None,
                     discard_cookies=True,
                     allow_redirects=False,
                     quote=False,  # the URL is quoted already, so cookies match the one sent
@@ -483,6 +504,7 @@ class HTTPFetcher:
                     http_version=_http_version(hop.url),
                     body_limit=limit,
                     resolve=_resolve_entries(pinned),
+                    **shaped,
                 )
         except TimeoutError:
             if scope.expired():
@@ -524,6 +546,33 @@ class HTTPFetcher:
             session=None if session is None else session.id,
             fetcher="http",
             streamed=streamed,
+        )
+
+
+class _ChromeHops:
+    """Makes the headers Chrome sends on each hop of a Request's redirect chain, with the pinned Profile."""
+
+    def __init__(self, request: Request, client: list[tuple[str, str]]) -> None:
+        """Read the kind of a Request, and the page it comes from.
+
+        Raises:
+            ValueError: Its `Sec-Fetch-Dest` names no kind pernix makes.
+        """
+        self._kind: RequestKind = request_kind(request)
+        self._referrer = request.headers.get("Referer") or None
+        self._client = client
+        self._chain: list[str] = []
+
+    def next(self, hop: Hop) -> ChromeRequest:
+        """The headers of the next hop, the first included."""
+        self._chain.append(hop.url)
+        return chrome_request(
+            self._kind,
+            chain=self._chain,
+            method=hop.method,
+            own=hop.headers.items(),
+            referrer=self._referrer,
+            client=self._client,
         )
 
 

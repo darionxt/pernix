@@ -62,6 +62,31 @@ class Account(Spider):
 
 `await self.fetch()` is an Inline Fetch: the Request goes through the download Middleware and the per-domain limits, and is retried in place, but it skips the Frontier, so it is neither deduplicated nor stored, and no Callback runs for it. Once its retries run out it raises `RetriesExhausted`. It sends only the cookies you pass, unless the Request being handled has a Session. `self.stream()` reads a body as it arrives: a slow reader keeps about 1 MiB of it in memory, and the transfer holds its domain's slot until the block ends. A Force Stop cancels Inline Fetches with the Request they belong to. See [`docs/design.md`](docs/design.md) §4.6.
 
+## Requests as the browser makes them
+
+With the pinned Profile, an HTTP Request carries the headers Chrome sends for the kind of request it is, in Chrome's order, with its `Priority` and HTTP/2 stream weight. Its method and body tell the kind, or a `Sec-Fetch-Dest` header names it; its `Referer` header names the page it comes from.
+
+```python
+yield Request(url)                                            # a link: a top-level navigation
+yield Request(url, data={"q": "dune"})                        # a form submission
+yield Request(api, json={"page": 2}, headers={"Referer": response.url})        # a fetch() from the page
+yield Request(api, headers={"Sec-Fetch-Dest": "empty", "Referer": response.url})  # a GET by fetch() or XMLHttpRequest
+yield Request(frame, headers={"Sec-Fetch-Dest": "iframe", "Referer": response.url})
+yield Request(image, headers={"Sec-Fetch-Dest": "image", "Referer": response.url})  # or style, script
+```
+
+| Kind | Told by | Sends |
+| --- | --- | --- |
+| Top-level navigation | a GET, or `Sec-Fetch-Dest: document` | `Upgrade-Insecure-Requests`, `Sec-Fetch-User: ?1`, the HTML `Accept` |
+| Form submission | a POST of `application/x-www-form-urlencoded`, `multipart/form-data`, or `text/plain` | also `Origin` and `Cache-Control: max-age=0` |
+| iframe | `Sec-Fetch-Dest: iframe` | as a navigation, without `Sec-Fetch-User` |
+| `fetch()` or `XMLHttpRequest` | any other method or body, or `Sec-Fetch-Dest: empty` | `Accept: */*`, `Sec-Fetch-Mode: cors`, `Origin` but to its own origin by GET |
+| Style sheet, script, image | `Sec-Fetch-Dest: style`, `script`, or `image` | their `Accept`, `Sec-Fetch-Mode: no-cors` |
+
+The `Referer` sent is the page's, by Chrome's default policy: whole to its own origin, its origin alone to another, and none from HTTPS to plain HTTP; `Sec-Fetch-Site` tells how the page and the URL relate, `none` for a navigation without a page. An empty `Referer` names no page. With `http.inherit_referer`, a Request a Callback constructs without a `Referer` takes the page its Response belongs to: that Response's URL when it is a page, or the page its own Request came from, so API calls keep the page that started them. A header a Request sets replaces the kind's of its name in place; another goes after them in a navigation, and first among those the page adds in the other kinds. A `fetch()` to another origin than its page's sends no Session cookies, as `fetch()` does by default. To a plain `http://` host other than a loopback one, Chrome's reduced set goes: no client hints, no `Sec-Fetch-*`, and `Accept-Encoding: gzip, deflate`. Other Profiles send a Request's headers as they are.
+
+The browser renders top-level navigations only, as typed in: a rendered Request's `Referer` is not sent. The contract tests compare each kind with what a page makes Chrome send, and `docs/design.md` §5.4 lists what still differs, such as the order of headers a page sets itself.
+
 ## Rendering in the browser
 
 ```python
@@ -165,7 +190,7 @@ class Shop(Spider):
         return response.status == 403 or bool(response.css("#challenge"))  # a challenge page, served with 200
 ```
 
-A Response in which the site refuses its Session, Blocked, a 403 by default or whatever `is_blocked()` says, is not handed to its Callback: the Request is retried at once with another Session, and its proxy, under a budget of its own, `retry.blocked` (3), which takes none of its ordinary retries, and the Session is Retired after `sessions.max_blocks` (3) Blocked Responses in a row. Without a Session Pool, a Response is judged only when the retry can go through another proxy, as one is available; with `blocked.render`, an HTTP Request found Blocked is retried rendered, with the browser. Once the budget is spent, the Request fails, and its errback gets `RetriesExhausted`. A 429 is not Blocked: it cools its Session down. See [`docs/design.md`](docs/design.md) §5.3.
+A Response in which the site refuses its Session, Blocked, a 403 by default or whatever `is_blocked()` says, is not handed to its Callback: the Request is retried at once with another Session, and its proxy, under a budget of its own, `retry.blocked` (3), which takes none of its ordinary retries, and the Session is Retired after `sessions.max_blocks` (3) Blocked Responses in a row. Without a Session Pool, a Response is judged only when the retry can go through another proxy, as one is available; with `blocked.render`, an HTTP navigation found Blocked is retried rendered, with the browser. Once the budget is spent, the Request fails, and its errback gets `RetriesExhausted`. A 429 is not Blocked: it cools its Session down. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Proxies
 
@@ -302,7 +327,7 @@ pernix browser install                                               # install t
 
 `run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it; it also tells whether the Profile and the browser are those of the Pinned Pair. `python -m pernix` works too.
 
-`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved; the browser does not render then. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved, and the browser renders through a proxy that checks every host its pages reach. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
 ## Configuration
 
@@ -368,7 +393,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `proxies.rebind` | `"unavailable"` | When the default binding policy binds a Session to another proxy: once its own is `unavailable`, at `every_lease`, once it is `retired` (waiting for it while it cools down), or `never` (Retiring the Session with it) |
 | `proxies.binding` | `None` | A replacement binding policy, with `async bind(binding)`; it may give Sessions proxies of their own, with no source |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
-| `network.public_only` | `false` | Refuses hosts whose addresses are not public, after resolving them, on every redirect hop; the browser does not render meanwhile |
+| `network.public_only` | `false` | Refuses hosts whose addresses are not public, after resolving them, on every redirect hop; the browser goes through a proxy that checks every host it reaches, and renders nothing through a proxy of a Request or a Session |
 | `network.allow_hosts` | `()` | Host names `network.public_only` lets through, such as an internal service |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -381,7 +406,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `retry.delay_scale` | `1.0` | Multiplies every retry delay; `0` retries at once, as in tests |
 | `retry.browser_lost` | `3` | Retries after a browser went away (`BrowserLost`), at once, apart from `retry.times` |
 | `retry.blocked` | `3` | Retries after a Response was found Blocked, at once, with another Session, through another proxy, or rendered, apart from `retry.times` |
-| `blocked.statuses` / `blocked.render` | `[403]` / `false` | The statuses the default `Spider.is_blocked()` finds Blocked; whether an HTTP Request found Blocked is retried rendered |
+| `blocked.statuses` / `blocked.render` | `[403]` / `false` | The statuses the default `Spider.is_blocked()` finds Blocked; whether an HTTP navigation found Blocked is retried rendered |
 | `retry.policy` | `None` | A replacement retry policy, an object with `decide(request, outcome, attempt)` |
 | `log.output` | `"auto"` | `"stderr"`, `"stdout"`, or `"root"` (the application's handlers); `"auto"` is `"root"` if logging is configured, else `"stderr"` |
 | `log.format` | `"auto"` | `"text"`, `"json"` (JSON lines), or `"auto"`: text on a terminal, JSON lines otherwise |
@@ -401,6 +426,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `http.max_redirects` | `20` | Redirects followed at most, as browsers follow them, before `TooManyRedirects` |
 | `http.max_body_size` | `104857600` | Bytes a body may have at most (100 MiB); `0` for no limit |
 | `http.pool_size` / `http.pool_idle` | `8` / `300.0` | curl sessions kept, one per Profile, and seconds one is kept unused |
+| `http.inherit_referer` | `false` | Whether a Request constructed in a Callback without a `Referer` takes the page its Response belongs to |
 | `browser.headless` | `true` | Runs the browser without a window, in Chrome's new headless mode |
 | `browser.timeout` | `30.0` | Seconds a page may take to load; `Request(timeout=...)` overrides it |
 | `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included, once it may open its page |
@@ -526,6 +552,7 @@ src/pernix/
 ├── blocked_responses.py telling Blocked Responses, and the Request a retry renders instead
 ├── throttle.py          per-domain slots: concurrency, delay, rate, cooldowns
 ├── request.py           Request
+├── request_kinds.py     the kind of request a Request is: a navigation, a form, a fetch, or a load
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
 ├── response.py          Response, selectors, URL joining
 ├── headers.py           Headers
@@ -599,6 +626,7 @@ src/pernix/
 │   ├── chain_cookies.py the cookies of a fetch, sent to each redirect hop in Chrome's order
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── pinned_pair.py   the Pinned Pair: the bundled build's User-Agent, client hints, and Accept-Language
+│   ├── chrome_headers.py the headers Chrome sends for each kind of request, and from which page
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
 │   ├── page_slots.py    the pages open at once, browser.max_pages, each taken by one fetch
 │   ├── browser_generations.py the browsers one Generation after another: replaced, lost, probed, closed
@@ -612,6 +640,9 @@ src/pernix/
 │   ├── page_traffic.py  blocks resource types and captures responses of a page
 │   ├── launched_browser.py starts patchright and its browser, under the network guard if on, as with a window, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
+│   ├── address_guard_proxy.py network.public_only for the browser: a SOCKS5 proxy that checks every host it reaches
+│   ├── proxy_refusals.py what that proxy refused a page, told as errors, stats, and logs
+│   ├── loopback_listener.py accepts the connections of those proxies on 127.0.0.1
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
 │   ├── address_guard.py network.public_only: refuses hosts not on public addresses, once resolved

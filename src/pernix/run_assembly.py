@@ -39,7 +39,6 @@ from pernix.settings import (
     FrontierSettings,
     ItemSettings,
     LoopSettings,
-    NetworkSettings,
     ProxySettings,
     RetrySettings,
     SessionSettings,
@@ -103,8 +102,7 @@ class DownloadAssembly:
         """
         fetchers = _build_named(crawler, "fetchers")
         middlewares = _build_all(crawler, "middlewares")
-        public_only = crawler.settings.section(NetworkSettings).public_only
-        download = build_download_chain(middlewares, FetcherDispatch(fetchers, public_only=public_only))
+        download = build_download_chain(middlewares, FetcherDispatch(fetchers))
         return cls(components=(*fetchers.values(), *middlewares), download=download)
 
 
@@ -191,7 +189,13 @@ class RunAssembly:
         retry_policy = problems.attempt(_retry_policy, crawler)
         handle = None
         if spider_middlewares is not None:
-            handle = problems.attempt(build_spider_chain, spider_middlewares, run_callbacks(crawler.spider))
+            inherit = _inherits_referer(crawler)
+            handle = problems.attempt(
+                build_spider_chain,
+                spider_middlewares,
+                run_callbacks(crawler.spider, inherit_referer=inherit),
+                inherit_referer=inherit,
+            )
         items = None
         if pipelines is not None and failed_pipelines is not None and feeds is not None:
             items = problems.attempt(_item_processor, crawler, pipelines, failed_pipelines, feeds, outlet)
@@ -554,6 +558,13 @@ def _item_processor(
         timeout=options.timeout,
         delay_scale=crawler.settings.section(RetrySettings).delay_scale,
     )
+
+
+def _inherits_referer(crawler: Crawler) -> bool:
+    """Whether Requests constructed in Callbacks take the page they come from as their `Referer` (`http.inherit_referer`)."""
+    if HTTPSettings not in crawler.settings.sections():  # the http Fetcher is another component's
+        return False
+    return crawler.settings.section(HTTPSettings).inherit_referer
 
 
 def _fingerprint_function(crawler: Crawler) -> Callable[[Request], str]:
