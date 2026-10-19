@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING
 from pernix.cli.options import command_crawler, settings_parser, spider_arguments_parser
 from pernix.cli.spider_loader import load_spider
 from pernix.errors import ComponentError
-from pernix.fetchers import BrowserFetcher, BrowserSettings
+from pernix.fetchers import DEFAULT_PROFILE, BrowserFetcher, BrowserSettings, HTTPFetcher, HTTPSettings
 from pernix.fetchers.launched_browser import probe_browser, require_patchright
 from pernix.logs import RunContext, RunLog
 from pernix.run_assembly import RunAssembly
 from pernix.runner import ExitCode
-from pernix.settings import LogSettings
+from pernix.settings import CoreSettings, LogSettings
 from pernix.settings.sources import find_project_file
 
 if TYPE_CHECKING:
@@ -42,7 +42,8 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         description=(
             "Load the settings and build every component without opening any, reporting every problem found. "
             "With TARGET, also find the Spider and convert its arguments. With the browser Fetcher, launch the "
-            "browser once, if pernix[browser] is installed. Exits with 0 when everything is valid, and 2 otherwise."
+            "browser once, if pernix[browser] is installed. Tell whether the Profile and the browser are those of "
+            "the Pinned Pair. Exits with 0 when everything is valid, and 2 otherwise."
         ),
     )
     parser.add_argument(
@@ -71,17 +72,25 @@ def run(args: argparse.Namespace) -> int:
     crawler = command_crawler(args.settings, spider_type, args.spider_args)
     run_log = RunLog(crawler.settings.section(LogSettings), RunContext(crawler.run_id, crawler.spider.name))
     assembly = RunAssembly.build(crawler, run_log)
-    browser = None
+    profile = browser = None
+    if any(isinstance(component, HTTPFetcher) for component in assembly.components):
+        profile = _profile(crawler)
     if any(isinstance(component, BrowserFetcher) for component in assembly.components):
         browser = _browser(crawler)
     project = find_project_file(Path.cwd())
     lines = ["OK", f"Project file: {project.origin if project is not None else 'none'}"]
     if spider_type is not None:
         lines.append(f"Spider: {spider_type.__qualname__} (name {spider_type.name!r})")
-    lines.extend(_components(crawler, browser))
+    lines.extend(_components(crawler, profile, browser))
     lines.append(f"Feeds: {', '.join(str(feed.path) for feed in assembly.feeds) or 'none'}")
     sys.stdout.write("\n".join(lines) + "\n")
     return ExitCode.COMPLETED
+
+
+def _profile(crawler: Crawler) -> str:
+    """Describe the Profile the HTTP Fetcher impersonates, and whether it is that of the Pinned Pair."""
+    profile = crawler.settings.section(HTTPSettings).impersonate
+    return f"{profile} (pinned)" if profile == DEFAULT_PROFILE else f"{profile} (not the pinned {DEFAULT_PROFILE})"
 
 
 def _browser(crawler: Crawler) -> str:
@@ -98,13 +107,16 @@ def _browser(crawler: Crawler) -> str:
         require_patchright()
     except ComponentError as exc:
         return f"not installed ({exc})"
-    return asyncio.run(probe_browser(crawler.settings.section(BrowserSettings)))
+    locale = crawler.settings.section(CoreSettings).locale
+    return asyncio.run(probe_browser(crawler.settings.section(BrowserSettings), locale=locale))
 
 
-def _components(crawler: Crawler, browser: str | None) -> list[str]:
+def _components(crawler: Crawler, profile: str | None, browser: str | None) -> list[str]:
     settings = crawler.settings
     fetchers = [f"{name} ({_label(spec)})" for name, spec in settings.named_components("fetchers").items()]
     lines = [f"Fetchers: {', '.join(fetchers) or 'none'}"]
+    if profile is not None:
+        lines.append(f"Profile: {profile}")
     if browser is not None:
         lines.append(f"Browser: {browser}")
     for title, key in _ROLES:

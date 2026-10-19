@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +44,7 @@ def test_the_defaults_are_valid(capsys: pytest.CaptureFixture[str]) -> None:
         "OK",
         "Project file: none",
         "Fetchers: http (HTTPFetcher), browser (BrowserFetcher)",
+        "Profile: chrome150 (pinned)",
         "Browser: not installed (rendering needs patchright; install it with: pip install 'pernix[browser]')",
         "Stats Sinks: none",
         "Extensions: OffsiteFilter",
@@ -130,3 +132,17 @@ def test_project_modules_import_from_the_working_directory(tmp_path: Path) -> No
 
     assert completed.returncode == 0, completed.stderr
     assert "Pipelines: Store" in completed.stdout.splitlines()
+
+
+def test_a_profile_and_a_browser_other_than_the_pinned_pair_are_reported(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = ["-s", "http.impersonate=chrome146", "-s", 'browser.launch_options={"channel": "chrome"}']
+
+    with caplog.at_level(logging.WARNING, logger="pernix.fetchers"):
+        assert main(["check", *settings]) == 0
+
+    assert "Profile: chrome146 (not the pinned chrome150)" in capsys.readouterr().out.splitlines()
+    warnings = [record.getMessage() for record in caplog.records]
+    assert warnings[0].startswith("http.impersonate is 'chrome146', not 'chrome150', the Profile of the Pinned Pair")
+    assert warnings[1].startswith("browser.launch_options names another browser than the bundled build")

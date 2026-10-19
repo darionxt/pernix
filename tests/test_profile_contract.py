@@ -15,6 +15,7 @@ import pytest
 import trustme
 
 from pernix import Session
+from pernix.fetchers.pinned_pair import accept_language
 from profile_contract import Capture, Step, assert_one_client, capture_http, differences, run_both
 from wire_server import WireServer
 
@@ -54,6 +55,16 @@ async def test_the_http_fetcher_and_the_browser_present_one_client(server: WireS
     resumed = [False] + [True] * sum(step.closes for step in steps)
     assert http.resumptions() == browser.resumptions() == resumed
     assert_one_client(http, browser)
+
+
+@pytest.mark.usefixtures("browser_engine")
+@pytest.mark.parametrize("locale", [("zh-CN", "zh"), ("de-DE", "de", "en-US", "en"), ("fr",)], ids=str)
+async def test_both_present_the_languages_of_the_locale(server: WireServer, locale: tuple[str, ...]) -> None:
+    http, browser = await run_both(server, [Step("/")], locale=locale)
+
+    assert_one_client(http, browser)
+    [connection] = http.connections
+    assert ("accept-language", accept_language(locale)) in connection.requests[0].headers
 
 
 @pytest.mark.usefixtures("browser_engine")
@@ -126,11 +137,14 @@ async def test_a_header_order_changed_on_one_side_is_named(server: WireServer) -
     assert "\n  +sec-fetch-mode: navigate\n   sec-fetch-site: none\n  -sec-fetch-mode: navigate\n" in found
 
 
-async def test_the_values_of_identity_headers_are_left_out_for_now(server: WireServer) -> None:
+async def test_a_user_agent_changed_on_one_side_is_named(server: WireServer) -> None:
     http = await capture_http(server, [Step("/")], Session())
     [connection] = http.connections
     [request] = connection.requests
     renamed = [(name, "Other/1.0" if name == "user-agent" else value) for name, value in request.headers]
     changed = dataclasses.replace(connection, requests=[dataclasses.replace(request, headers=renamed)])
 
-    assert differences(http, Capture([changed])) == []
+    [found] = differences(http, Capture([changed]))
+
+    assert found.startswith("request 1 > headers:\n")
+    assert "\n  +user-agent: Other/1.0\n" in found
