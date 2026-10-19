@@ -24,7 +24,8 @@ def convert_value(value: object, target: Any, *, lenient: bool) -> Any:
     Strict conversion accepts only values of the type itself, such as an `int` for an
     `int`. Lenient conversion, meant for text from the environment or a command line,
     also converts strings: `"3"` to `3`, `"true"` to `True`, and JSON to containers,
-    dataclasses, Structs, and TypedDicts.
+    dataclasses, Structs, and TypedDicts. A string that is not JSON stays a string
+    where the type also admits one, as `str | tuple[str, ...]` does.
 
     Args:
         value: The value to convert.
@@ -42,7 +43,8 @@ def convert_value(value: object, target: Any, *, lenient: bool) -> Any:
         try:
             value = orjson.loads(value)
         except orjson.JSONDecodeError as exc:
-            raise msgspec.ValidationError(f"invalid JSON: {exc}") from exc
+            if not _admits_text(target):
+                raise msgspec.ValidationError(f"invalid JSON: {exc}") from exc
     return msgspec.convert(value, target, strict=not lenient, dec_hook=_decode_custom)
 
 
@@ -71,6 +73,18 @@ def _is_container(target: Any) -> bool:
     if isinstance(target, type) and _is_record(cast("type[Any]", target)):
         return True
     return (origin or target) in _CONTAINERS
+
+
+def _admits_text(target: Any) -> bool:
+    """Whether a type admits a string as it is: `str`, or a union with it."""
+    if isinstance(target, TypeAliasType):
+        return _admits_text(target.__value__)
+    origin = get_origin(target)
+    if origin is Annotated:
+        return _admits_text(get_args(target)[0])
+    if origin in (Union, UnionType):
+        return any(_admits_text(member) for member in get_args(target))
+    return target is str
 
 
 def _is_record(target: type[Any]) -> bool:

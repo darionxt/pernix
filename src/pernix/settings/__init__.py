@@ -1,6 +1,7 @@
 from pernix.secret import Secret
 from pernix.settings.core_settings import (
     CORE_SECTIONS,
+    DEFAULT_LOCALE,
     BlockedSettings,
     CoreSettings,
     DomainSettings,
@@ -18,6 +19,7 @@ from pernix.settings.core_settings import (
     SessionSettings,
     ShutdownSettings,
     StatsSettings,
+    locale_languages,
 )
 from pernix.settings.loader import load_settings
 from pernix.settings.section import ComponentMap, NamedComponents, Section
@@ -25,6 +27,7 @@ from pernix.settings.settings import Settings
 
 __all__ = [
     "CORE_SECTIONS",
+    "DEFAULT_LOCALE",
     "BlockedSettings",
     "ComponentMap",
     "CoreSettings",
@@ -48,4 +51,5 @@ __all__ = [
     "ShutdownSettings",
     "StatsSettings",
     "load_settings",
+    "locale_languages",
 ]
