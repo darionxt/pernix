@@ -71,6 +71,9 @@ _NO_CONTENT = frozenset({204, 205})
 
 _NETWORK_SCHEMES = frozenset({"http", "https", "ws", "wss"})
 
+_PAGE_ONLY = frozenset({"cookie", "referer", "sec-fetch-dest"})
+"""Request headers the first request of a page does not take: its cookies go to its context, and a page is loaded as typed in."""
+
 _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 """Headers the browser would send on to every host a redirect leads to."""
 
@@ -157,7 +160,10 @@ class BrowserFetcher:
     redirects that follow, to any host, as the HTTP Fetcher does, so it refuses
     `Authorization` and `Proxy-Authorization`, which the HTTP Fetcher drops on the
     way to another host; the method and body follow the browser's redirect rules,
-    and the page's own requests are untouched.
+    and the page's own requests are untouched. The page is loaded as if typed in:
+    its `Referer` and `Sec-Fetch-Dest` headers, which tell the HTTP Fetcher the page
+    a Request comes from and its kind, are not sent, as a navigation the browser
+    starts with a `Referer` would name a page without coming from it.
 
     The body of an HTML or XHTML document is its rendered DOM, encoded as UTF-8;
     that of any other document, which Chrome would show in a viewer page of its own,
@@ -834,7 +840,7 @@ class _FirstRequest:
         Returns:
             A route handler for the page, or `None`.
         """
-        headers = [(name, value) for name, value in request.headers if name.lower() != "cookie"]
+        headers = [(name, value) for name, value in request.headers if name.lower() not in _PAGE_ONLY]
         if request.method == "GET" and request.body is None and not headers:
             return None
         return cls(page, request, headers)

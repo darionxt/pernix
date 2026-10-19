@@ -39,7 +39,7 @@ HOST = "localhost"
 """The host name clients reach the server by, so that their ClientHello names it."""
 
 PAGE = b'<!doctype html><html><head><link rel="icon" href="data:,"></head><body><p>page</p></body></html>'
-"""The page every request gets; its empty icon keeps the browser from asking for `/favicon.ico`."""
+"""The page a request gets unless a route answers it; its empty icon keeps the browser from asking for `/favicon.ico`."""
 
 _ANNOUNCED = (h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS, h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE)
 """The settings the server announces: those of h2 that are not the protocol's defaults, as many servers announce only those."""
@@ -110,16 +110,18 @@ class WireServer:
     recorded before the handshake goes on, then it speaks HTTP/2 or HTTP/1.1 as
     ALPN chooses. Any other connection is HTTP/1.1. Over HTTP/2, each frame the
     client sends is recorded, with the HPACK representations of each header block.
-    Every request gets the same small page, uncached; after answering one for a
-    path in `closing`, the server closes the connection, with a GOAWAY over HTTP/2,
-    so the client connects again for its next request, resuming the TLS session it
-    was given a ticket for.
+    A request gets what `routes` has for its path, or else a small page, uncached;
+    after answering one for a path in `closing`, the server closes the connection,
+    with a GOAWAY over HTTP/2, so the client connects again for its next request,
+    resuming the TLS session it was given a ticket for.
 
-    The certificate comes from a CA curl can be made to trust; a browser trusts it
-    through `spki`.
+    The certificate, for `localhost`, `127.0.0.1`, and `::1`, comes from a CA curl
+    can be made to trust; a browser trusts it through `spki`.
 
     Attributes:
         closing: The paths after which the server closes the connection.
+        routes: What a path is answered with, as its content type and body, such as
+            a page that makes a request of its own.
     """
 
     def __init__(
@@ -138,6 +140,7 @@ class WireServer:
                 4096, the size the protocol starts with.
         """
         self.closing: set[str] = set()
+        self.routes: dict[str, tuple[str, bytes]] = {}
         self._announces_header_table_size = announces_header_table_size
         self._socket = socket.create_server(("127.0.0.1", 0))
         leaf = ca.issue_cert(HOST, "127.0.0.1", "::1")
@@ -160,17 +163,19 @@ class WireServer:
         """The SHA-256 hash of its certificate's public key, in base64, as Chrome's `--ignore-certificate-errors-spki-list` takes it."""
         return self._spki
 
-    def url(self, path: str = "/", *, scheme: str = "https") -> str:
-        """Return the URL of a path on the server, under its host name.
+    def url(self, path: str = "/", *, scheme: str = "https", host: str = HOST) -> str:
+        """Return the URL of a path on the server.
 
         Args:
             path: The path.
             scheme: `https`, or `http` for cleartext HTTP/1.1.
+            host: The host name, its own by default; `127.0.0.1` names it as
+                another site.
 
         Returns:
             The URL.
         """
-        return f"{scheme}://{HOST}:{self.port}{path}"
+        return f"{scheme}://{host}:{self.port}{path}"
 
     @property
     def connections(self) -> list[CapturedConnection]:
@@ -265,9 +270,10 @@ class WireServer:
             path = urlsplit(request_line.split(" ")[1]).path
             captured.requests.append(CapturedRequest(self._next(), path, headers, request_line=request_line))
             closes = path in self.closing
-            fields = "Content-Type: text/html\r\nCache-Control: no-store\r\n"
-            fields += f"Content-Length: {len(PAGE)}\r\n{'Connection: close' if closes else 'Keep-Alive: timeout=5'}\r\n"
-            connection.sendall(f"HTTP/1.1 200 OK\r\n{fields}\r\n".encode() + PAGE)
+            kind, body = self.routes.get(path, ("text/html", PAGE))
+            fields = f"Content-Type: {kind}\r\nCache-Control: no-store\r\n"
+            fields += f"Content-Length: {len(body)}\r\n{'Connection: close' if closes else 'Keep-Alive: timeout=5'}\r\n"
+            connection.sendall(f"HTTP/1.1 200 OK\r\n{fields}\r\n".encode() + body)
             if closes:
                 return
 
@@ -290,7 +296,7 @@ class WireServer:
                     path = urlsplit(dict(headers).get(":path", "")).path
                     block = reader.blocks.get(event.stream_id)
                     captured.requests.append(CapturedRequest(self._next(), path, headers, block=block))
-                    _answer_stream(h2_connection, event.stream_id)
+                    _answer_stream(h2_connection, event.stream_id, *self.routes.get(path, ("text/html", PAGE)))
                     closing = closing or path in self.closing
                 elif isinstance(event, h2.events.ConnectionTerminated):
                     return
@@ -313,17 +319,17 @@ class WireServer:
         return len(payload).to_bytes(3) + bytes([4, 0]) + bytes(4) + payload
 
 
-def _answer_stream(connection: h2.connection.H2Connection, stream_id: int) -> None:
+def _answer_stream(connection: h2.connection.H2Connection, stream_id: int, kind: str, body: bytes) -> None:
     connection.send_headers(
         stream_id,
         [
             (":status", "200"),
-            ("content-type", "text/html"),
+            ("content-type", kind),
             ("cache-control", "no-store"),
-            ("content-length", str(len(PAGE))),
+            ("content-length", str(len(body))),
         ],
     )
-    connection.send_data(stream_id, PAGE, end_stream=True)
+    connection.send_data(stream_id, body, end_stream=True)
 
 
 def _linger(connection: ssl.SSLSocket, reader: Http2Reader) -> None:

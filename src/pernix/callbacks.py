@@ -9,6 +9,7 @@ from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, cast
 
 from pernix.middlewares import resolving_against
+from pernix.request_kinds import referring_page
 from pernix.urls import join_url
 
 if TYPE_CHECKING:
@@ -22,12 +23,16 @@ if TYPE_CHECKING:
 __all__ = ["iterate_and_close", "run_callbacks", "run_errback"]
 
 
-def run_callbacks(spider: Spider) -> HandleResponse:
+def run_callbacks(spider: Spider, *, inherit_referer: bool = False) -> HandleResponse:
     """Return the innermost step of the spider chain, which runs Callbacks.
 
     Args:
         spider: The Spider whose `parse` handles Responses whose Request names no
             Callback.
+        inherit_referer: Whether the Requests a Callback constructs without a
+            `Referer` header take the page its Response belongs to
+            (`pernix.request_kinds.referring_page()`), as `http.inherit_referer`
+            asks.
 
     Returns:
         A function that calls the Callback of a Response's Request, with the
@@ -38,7 +43,9 @@ def run_callbacks(spider: Spider) -> HandleResponse:
 
     def run_callback(response: Response) -> AsyncGenerator[object]:
         callback = response.request.callback or spider.parse
-        return resolving_against(response.urljoin, _outputs(lambda: callback(response, **response.request.kwargs)))
+        referer = referring_page(response) if inherit_referer else None
+        outputs = _outputs(lambda: callback(response, **response.request.kwargs))
+        return resolving_against(response.urljoin, outputs, referer=referer)
 
     return run_callback
 

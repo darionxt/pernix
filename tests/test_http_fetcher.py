@@ -188,18 +188,26 @@ def _headers_echo(request: ReceivedRequest) -> Reply:
     return Reply(body=orjson.dumps(request.headers))
 
 
-async def test_request_headers_keep_their_order_case_and_duplicates(server: LoopbackServer) -> None:
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("chrome146", [("X-B", "1"), ("x-a", "2"), ("X-B", "3")]),
+        ("chrome150", [("X-B", "1"), ("X-B", "3"), ("x-a", "2")]),  # Chrome's order, by name
+    ],
+    ids=["another Profile", "the pinned Profile"],
+)
+async def test_request_headers_keep_their_case_and_duplicates(
+    server: LoopbackServer, profile: str, expected: list[tuple[str, str]]
+) -> None:
     server.route("/echo", handler=_headers_echo)
 
     async with HTTPFetcher() as fetcher:
-        await fetcher.fetch(Request(server.url("/echo"), headers=[("X-B", "1"), ("x-a", "2"), ("X-B", "3")]))
+        await fetcher.fetch(
+            Request(server.url("/echo"), headers=[("X-B", "1"), ("x-a", "2"), ("X-B", "3")], impersonate=profile)
+        )
 
     received = server.received[-1].headers
-    assert [(name, value) for name, value in received if name.lower() in ("x-a", "x-b")] == [
-        ("X-B", "1"),
-        ("x-a", "2"),
-        ("X-B", "3"),
-    ]
+    assert [(name, value) for name, value in received if name.lower() in ("x-a", "x-b")] == expected
 
 
 async def test_response_headers_keep_every_value(server: LoopbackServer) -> None:
@@ -234,6 +242,7 @@ async def test_the_pinned_profile_names_the_client_as_the_bundled_browser_does(s
     assert [(name, value) for name, value in received if name in named] == list(named.items())
     assert [name for name, _ in received] == [
         "Host",
+        "Connection",
         "sec-ch-ua",
         "sec-ch-ua-mobile",
         "sec-ch-ua-platform",
