@@ -175,7 +175,10 @@ def _belongs_to_page(element: Element) -> bool:
 
 
 class _LinkDensity:
-    """How much of the text of each element of a tree is in links, measured in one pass over it."""
+    """How much of the text each element of a tree shows is in links, measured in one pass over it.
+
+    Hidden elements show nothing, so neither their text nor their links count.
+    """
 
     def __init__(self, root: Element) -> None:
         self._measured: dict[Element, tuple[int, int, int]] = {}
@@ -192,7 +195,7 @@ class _LinkDensity:
         linked = links = 0
         for child in element:
             node = as_element(child)
-            if node is not None and tag_name(node) not in UNRENDERED:
+            if node is not None and tag_name(node) not in UNRENDERED and not is_hidden(node):
                 child_text, child_linked, child_links = self._measure(node)
                 text, linked, links = text + child_text, linked + child_linked, links + child_links
             text += _length(child.tail)
