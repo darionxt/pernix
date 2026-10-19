@@ -62,6 +62,7 @@ def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
         "pipelines",
         "failed_pipelines",
         "run_id",
+        "locale",
         "test.plugins",
         *(f"http.{name}" for name in HTTP_KEYS),  # registered by the default HTTP Fetcher
         *(f"browser.{name}" for name in BROWSER_KEYS),  # and by the default browser Fetcher

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import codecs
 import logging
+import re
 import string
 from pathlib import PurePath
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import msgspec
 from msgspec import structs
@@ -17,8 +18,12 @@ from pernix.settings.section import ComponentMap, NamedComponents, Section
 from pernix.text_decoding import codec_for
 from pernix.urls import url_host
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 __all__ = [
     "CORE_SECTIONS",
+    "DEFAULT_LOCALE",
     "FEED_FORMATS",
     "PATH_FIELDS",
     "BlockedSettings",
@@ -39,7 +44,13 @@ __all__ = [
     "SessionSettings",
     "ShutdownSettings",
     "StatsSettings",
+    "locale_languages",
 ]
+
+DEFAULT_LOCALE = ("en-US", "en")
+"""The languages presented by default, as Chrome presents them for American English."""
+
+_LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
 
 
 class CoreSettings(Section):
@@ -66,6 +77,12 @@ class CoreSettings(Section):
             `FailedItemsFile`, enabled by default, writes them to `items.failed_output`.
         run_id: Identifies the Run in logs, Events, and stats; `None` generates one.
             A Platform passes its own, for example as `PERNIX_RUN_ID`.
+        locale: The languages the client presents, in order of preference, as a
+            list or a comma-separated string, such as `"de-DE,de,en-US,en"`: the
+            browser's `navigator.languages`, from which Chrome makes its
+            `Accept-Language`, which the HTTP Fetcher sends too with the pinned
+            Profile. Chrome adds languages to some lists, such as English to
+            `"de-DE,de"`; the browser Fetcher then warns, naming the list to set.
     """
 
     concurrency: Annotated[int, msgspec.Meta(ge=1)] = 16
@@ -79,6 +96,36 @@ class CoreSettings(Section):
     pipelines: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     failed_pipelines: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.items.FailedItemsFile": 100})
     run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+    locale: str | tuple[str, ...] = DEFAULT_LOCALE
+
+    def __post_init__(self) -> None:
+        try:
+            structs.force_setattr(self, "locale", locale_languages(self.locale))
+        except ValueError as exc:
+            raise ValueError(f"{self.key('locale')}: {exc}") from None
+
+
+def locale_languages(locale: str | Sequence[str]) -> tuple[str, ...]:
+    """Read the languages a `locale` names.
+
+    Args:
+        locale: The languages, in order of preference, as a list or a
+            comma-separated string, such as `"en-US,en"`.
+
+    Returns:
+        The languages, in order, blank entries left out.
+
+    Raises:
+        ValueError: It names none, or something other than a language tag.
+    """
+    tags = [tag.strip() for tag in (locale.split(",") if isinstance(locale, str) else locale)]
+    languages = tuple(tag for tag in tags if tag)
+    if not languages:
+        raise ValueError(f"name at least one language, such as {','.join(DEFAULT_LOCALE)!r}")
+    for tag in languages:
+        if _LANGUAGE_TAG.fullmatch(tag) is None:
+            raise ValueError(f"{tag!r} is not a language tag, such as 'en-US' or 'de'")
+    return languages
 
 
 class EventSettings(Section):

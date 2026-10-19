@@ -209,11 +209,11 @@ async def test_the_session_profile_applies_unless_the_request_names_its_own(cook
 
     async with HTTPFetcher() as fetcher:
         await fetcher.fetch(Request(cookie_server.url("/session")), session=session)
-        await fetcher.fetch(Request(cookie_server.url("/request"), impersonate="chrome150"), session=session)
+        await fetcher.fetch(Request(cookie_server.url("/request"), impersonate="chrome146"), session=session)
 
     by_session, by_request = cookie_server.received
     assert "Firefox/147" in by_session.user_agent
-    assert "Chrome/150" in by_request.user_agent
+    assert "Chrome/146" in by_request.user_agent
     assert by_session.peer != by_request.peer
 
 

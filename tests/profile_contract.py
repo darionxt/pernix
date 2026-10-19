@@ -23,8 +23,6 @@ Left out of the comparison:
   such as WINDOW_UPDATE and GOAWAY, which follow the sizes of the answers and how
   the connection ends.
 - Connections that carry no request, which a browser may open ahead of need.
-- The values of the headers in `UNCOMPARED_VALUES`, which the HTTP side does not
-  derive from the browser yet; their names and places are compared.
 
 The server announces no `SETTINGS_HEADER_TABLE_SIZE`, as many servers do not:
 curl's HPACK encoder answers one with a dynamic table size update that Chrome
@@ -41,6 +39,7 @@ from typing import TYPE_CHECKING
 
 from pernix import Request, Session
 from pernix.fetchers import BrowserFetcher, BrowserSettings, HTTPFetcher
+from pernix.settings import DEFAULT_LOCALE
 from wire_capture import GREASE
 
 if TYPE_CHECKING:
@@ -48,14 +47,6 @@ if TYPE_CHECKING:
 
     from wire_capture import ClientHello, Extension, Frame
     from wire_server import CapturedConnection, CapturedRequest, WireServer
-
-UNCOMPARED_VALUES = {
-    "user-agent": "the Profile's own, while the headless browser names HeadlessChrome",
-    "sec-ch-ua": "the Profile's own brands, while Chrome for Testing names only Chromium",
-    "sec-ch-ua-platform": "the Profile's own platform, while the browser names the one it runs on",
-    "accept-language": "the Profile's own languages, while the browser takes those of the system",
-}
-"""Headers whose values are not compared yet, and why each differs."""
 
 type Observed = str | tuple[str, ...]
 """What a capture shows under one name: a value, or lines compared as a list."""
@@ -104,7 +95,11 @@ class Capture:
 
 
 async def run_both(
-    server: WireServer, steps: Sequence[Step], *, impersonate: str | None = None
+    server: WireServer,
+    steps: Sequence[Step],
+    *,
+    impersonate: str | None = None,
+    locale: Sequence[str] = DEFAULT_LOCALE,
 ) -> tuple[Capture, Capture]:
     """Make the requests of a case with the HTTP Fetcher, then with the browser Fetcher, under one Session.
 
@@ -112,17 +107,23 @@ async def run_both(
         server: The server, whose CA curl trusts.
         steps: The requests, in order.
         impersonate: The Profile the HTTP Fetcher uses instead of the default one.
+        locale: The languages both present.
 
     Returns:
         What the HTTP Fetcher put on the wire, and what the browser did.
     """
     session = Session()
-    http = await capture_http(server, steps, session, impersonate=impersonate)
-    return http, await capture_browser(server, steps, session)
+    http = await capture_http(server, steps, session, impersonate=impersonate, locale=locale)
+    return http, await capture_browser(server, steps, session, locale=locale)
 
 
 async def capture_http(
-    server: WireServer, steps: Sequence[Step], session: Session, *, impersonate: str | None = None
+    server: WireServer,
+    steps: Sequence[Step],
+    session: Session,
+    *,
+    impersonate: str | None = None,
+    locale: Sequence[str] = DEFAULT_LOCALE,
 ) -> Capture:
     """Make the requests of a case with an HTTP Fetcher of its own.
 
@@ -131,32 +132,36 @@ async def capture_http(
         steps: The requests, in order.
         session: The Session to send them under.
         impersonate: The Profile to use instead of the default one.
+        locale: The languages to present.
 
     Returns:
         What the HTTP Fetcher put on the wire.
     """
     since = _closing(server, steps)
-    async with HTTPFetcher() as fetcher:
+    async with HTTPFetcher(locale=locale) as fetcher:
         for step in steps:
             await fetcher.fetch(Request(server.url(step.path), impersonate=impersonate), session=session)
             await _after(server, step)
     return await _captured(server, since)
 
 
-async def capture_browser(server: WireServer, steps: Sequence[Step], session: Session) -> Capture:
+async def capture_browser(
+    server: WireServer, steps: Sequence[Step], session: Session, *, locale: Sequence[str] = DEFAULT_LOCALE
+) -> Capture:
     """Make the requests of a case with a browser Fetcher of its own, which trusts the server's certificate.
 
     Args:
         server: The server.
         steps: The requests, in order.
         session: The Session to load them under.
+        locale: The languages to present.
 
     Returns:
         What the browser put on the wire.
     """
     since = _closing(server, steps)
     trusting = BrowserSettings(launch_options={"args": [f"--ignore-certificate-errors-spki-list={server.spki}"]})
-    async with BrowserFetcher(trusting) as fetcher:
+    async with BrowserFetcher(trusting, locale=locale) as fetcher:
         for step in steps:
             await fetcher.fetch(Request(server.url(step.path), render=True), session=session)
             await _after(server, step)
@@ -238,7 +243,7 @@ def describe(capture: Capture) -> dict[str, Observed]:
             observed[f"{prefix} > HPACK"] = tuple(
                 str(representation) for representation in request.block.representations
             )
-        observed[f"{prefix} > headers"] = tuple(_field(name, value) for name, value in request.headers)
+        observed[f"{prefix} > headers"] = tuple(f"{name}: {value}" for name, value in request.headers)
     return observed
 
 
@@ -299,10 +304,6 @@ def _preface(frames: list[Frame]) -> Iterator[str]:
             return
         if not frame.is_ack:
             yield frame.describe()
-
-
-def _field(name: str, value: str) -> str:
-    return f"{name}: (not compared)" if name.lower() in UNCOMPARED_VALUES else f"{name}: {value}"
 
 
 def _code(value: int) -> str:

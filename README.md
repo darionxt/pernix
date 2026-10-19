@@ -118,6 +118,8 @@ class Shop(Spider):
 
 Page methods run any patchright code on the page: `setup` before it loads, and `action` once `wait_for` and the actions are done, before the screenshot; `PageMethod(method, optional=True, timeout=5)` lets one fail, logged, or limits its time. Like Callbacks, they are Spider methods, persisted by name, and they run in rendered Inline Fetches too. With `keep_page=True`, the Callback gets the page as `response.page`; the Run closes it, with its context, once the Callback ends, however it ends. It counts toward `browser.max_pages` meanwhile, and the rendered fetches the Callback makes share its slot. Only the Callback of a Request the Run fetches can keep a page: an Inline Fetch raises `ValueError`. A Callback that fails as its kept page crashed, or its browser was lost, is retried as the fetch would be.
 
+HTTP and the browser present one client: with the pinned Profile, HTTP requests carry the `User-Agent` and client hints of the bundled Chrome for Testing build on the platform the Run is on, and the browser, in headless mode, drops `HeadlessChrome` from its own User-Agent, as it is with a window. Both present the languages of `locale`. A Run warns about a Profile or a browser other than the Pinned Pair, and `pernix check` tells whether they are. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
+
 ## Sessions
 
 ```python
@@ -282,7 +284,7 @@ pernix check books.py                                                # validate 
 pernix browser install                                               # install the browser engine
 ```
 
-`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it. `python -m pernix` works too.
+`run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it; it also tells whether the Profile and the browser are those of the Pinned Pair. `python -m pernix` works too.
 
 `fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved; the browser does not render then. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
@@ -321,6 +323,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `failed_pipelines` | `{FailedItemsFile: 100}` | Pipelines that receive the Items a Pipeline failed on, as `FailedItem`s |
 | `feeds` | `{}` | Files Items are written to, as `{path_template: options}` |
 | `run_id` | `None` | Identifies the Run in logs and stats; `None` generates one |
+| `locale` | `["en-US", "en"]` | The languages the browser presents, as a list or `"en-US,en"`; the HTTP Fetcher sends the `Accept-Language` Chrome makes of them |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
 | `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |
@@ -375,7 +378,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
 | `items.failed_output` | `None` | The JSON-lines file where `FailedItemsFile` writes failed Items, with the error |
-| `http.impersonate` | `"chrome150"` | The browser Profile HTTP requests impersonate, a pinned version; `Request(impersonate=...)` overrides it |
+| `http.impersonate` | `"chrome150"` | The browser Profile HTTP requests impersonate, a pinned version; `Request(impersonate=...)` overrides it. With the pinned one, the User-Agent, client hints, and `Accept-Language` are those of the bundled browser |
 | `http.timeout` | `30.0` | Seconds to connect and receive the headers, those of each redirect apart, and between two pieces of the body |
 | `http.deadline` | `180.0` | Seconds a whole fetch may take, waiting for a connection included |
 | `http.max_redirects` | `20` | Redirects followed at most, as browsers follow them, before `TooManyRedirects` |
@@ -578,6 +581,7 @@ src/pernix/
 │   ├── redirects.py     which responses redirect, where to, and how the request changes, as in browsers
 │   ├── chain_cookies.py the cookies of a fetch, sent to each redirect hop in Chrome's order
 │   ├── http_settings.py the http.* settings and the pinned Profile
+│   ├── pinned_pair.py   the Pinned Pair: the bundled build's User-Agent, client hints, and Accept-Language
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
 │   ├── page_slots.py    the pages open at once, browser.max_pages, each taken by one fetch
 │   ├── browser_generations.py the browsers one Generation after another: replaced, lost, probed, closed
@@ -589,7 +593,7 @@ src/pernix/
 │   ├── page_actions.py  runs a Render's page methods, wait, actions, and screenshot on its page
 │   ├── kept_pages.py    the pages kept open for Callbacks, and the scope that closes them
 │   ├── page_traffic.py  blocks resource types and captures responses of a page
-│   ├── launched_browser.py starts patchright and its browser, under the network guard if on, and probes it
+│   ├── launched_browser.py starts patchright and its browser, under the network guard if on, as with a window, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pernix.cli import main
+from pernix.fetchers.pinned_pair import BUNDLED_BROWSER
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -16,12 +17,15 @@ def _in_empty_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.usefixtures("browser_engine")
-def test_the_browser_is_launched_and_named(capsys: pytest.CaptureFixture[str]) -> None:
+def test_the_browser_is_launched_and_named_with_the_pinned_pair(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["check"]) == 0
 
     lines = capsys.readouterr().out.splitlines()
     fetchers = lines.index("Fetchers: http (HTTPFetcher), browser (BrowserFetcher)")
-    assert lines[fetchers + 1].startswith("Browser: chromium ")
+    assert lines[fetchers + 1 : fetchers + 3] == [
+        "Profile: chrome150 (pinned)",
+        f"Browser: chromium {BUNDLED_BROWSER.version} (bundled)",
+    ]
 
 
 @pytest.mark.usefixtures("without_browser_engine")
