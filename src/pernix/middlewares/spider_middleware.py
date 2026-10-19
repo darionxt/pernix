@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pernix.errors import ComponentError
 from pernix.request import resolve_relative_urls
+from pernix.request_kinds import referring_page
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -90,7 +91,9 @@ class _FunctionSpiderMiddleware(SpiderMiddleware):
         return f"<spider_middleware {self.__wrapped__.__module__}.{self.__wrapped__.__qualname__}>"
 
 
-def build_spider_chain(middlewares: Sequence[object], handle: HandleResponse) -> HandleResponse:
+def build_spider_chain(
+    middlewares: Sequence[object], handle: HandleResponse, *, inherit_referer: bool = False
+) -> HandleResponse:
     """Wrap the Callback runner in spider Middleware.
 
     Args:
@@ -98,6 +101,9 @@ def build_spider_chain(middlewares: Sequence[object], handle: HandleResponse) ->
             generator function, or an object whose `__call__` is one, taking
             `(response, call_next)`.
         handle: The innermost step, which runs the Callback.
+        inherit_referer: Whether the Requests a layer constructs without a `Referer`
+            header take the page its Response belongs to, as `http.inherit_referer`
+            asks.
 
     Returns:
         A function that handles a Response through every layer.
@@ -112,20 +118,24 @@ def build_spider_chain(middlewares: Sequence[object], handle: HandleResponse) ->
                 "'async def __call__(self, response, call_next)' that yields, or decorate a function "
                 "with @spider_middleware"
             )
-        handle = _link(cast("Callable[[Response, HandleResponse], AsyncIterator[Any]]", layer), handle)
+        handle = _link(cast("Callable[[Response, HandleResponse], AsyncIterator[Any]]", layer), handle, inherit_referer)
     return handle
 
 
-def resolving_against(urljoin: Callable[[str], str], outputs: AsyncIterator[Any]) -> AsyncGenerator[Any]:
+def resolving_against(
+    urljoin: Callable[[str], str], outputs: AsyncIterator[Any], *, referer: str | None = None
+) -> AsyncGenerator[Any]:
     """Iterate outputs with relative URLs resolving through `urljoin`.
 
     Each step, and the closing of `outputs` once iteration ends or is abandoned, runs
-    with Requests constructed in it resolving relative URLs through `urljoin`.
+    with Requests constructed in it resolving relative URLs through `urljoin`, and
+    taking `referer` as their `Referer` unless they have one.
 
     Args:
         urljoin: Resolves a relative URL, such as the `urljoin` of the Response the
             code producing `outputs` handles.
         outputs: The outputs of a spider Middleware layer, a Callback, or an errback.
+        referer: The page the Requests come from; `None` for none.
 
     Returns:
         An async generator of the same outputs.
@@ -134,24 +144,27 @@ def resolving_against(urljoin: Callable[[str], str], outputs: AsyncIterator[Any]
     async def resolving() -> AsyncGenerator[Any]:
         try:
             while True:
-                with resolve_relative_urls(urljoin):
+                with resolve_relative_urls(urljoin, referer=referer):
                     try:
                         output = await anext(outputs)
                     except StopAsyncIteration:
                         return
                 yield output
         finally:
-            with resolve_relative_urls(urljoin):
+            with resolve_relative_urls(urljoin, referer=referer):
                 await _aclose(outputs)
 
     return resolving()
 
 
-def _link(layer: Callable[[Response, HandleResponse], AsyncIterator[Any]], call_next: HandleResponse) -> HandleResponse:
+def _link(
+    layer: Callable[[Response, HandleResponse], AsyncIterator[Any]], call_next: HandleResponse, inherit_referer: bool
+) -> HandleResponse:
     """Run `layer` with `call_next` as its inner chain.
 
     The layer resolves relative URLs against the Response it received (see
-    `resolving_against()`).
+    `resolving_against()`), and its Requests take the page that Response belongs to
+    as their `Referer` with `inherit_referer`.
     When it ends, however it ends, the inner iterators it opened through `call_next`
     are closed too, so their cleanup runs before the chain is done rather than
     whenever they are garbage collected.
@@ -165,7 +178,8 @@ def _link(layer: Callable[[Response, HandleResponse], AsyncIterator[Any]], call_
             opened.append(inner)
             return inner
 
-        outputs = resolving_against(response.urljoin, layer(response, tracked_call_next))
+        referer = referring_page(response) if inherit_referer else None
+        outputs = resolving_against(response.urljoin, layer(response, tracked_call_next), referer=referer)
         try:
             async for output in outputs:
                 yield output

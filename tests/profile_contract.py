@@ -35,16 +35,19 @@ import asyncio
 import difflib
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pernix import Request, Session
+from pernix.browser import Render
 from pernix.fetchers import BrowserFetcher, BrowserSettings, HTTPFetcher
 from pernix.settings import DEFAULT_LOCALE
 from wire_capture import GREASE
+from wire_server import HOST
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Collection, Iterator, Mapping, Sequence
 
+    from pernix.browser import Action
     from wire_capture import ClientHello, Extension, Frame
     from wire_server import CapturedConnection, CapturedRequest, WireServer
 
@@ -57,16 +60,53 @@ _CLOSE_TIMEOUT = 5.0
 
 @dataclass(frozen=True)
 class Step:
-    """One request of a case: a top-level navigation to a path of the server.
+    """One request of a case.
+
+    The HTTP Fetcher sends it as a Request. The browser loads it as a page, running
+    `actions` on it, unless a page an earlier step loaded makes it, as its links,
+    frames, forms, scripts, and loads do.
 
     Attributes:
         path: The path.
         closes: Whether the server closes the connection once it answered, so the
             next step connects again, resuming the TLS session.
+        host: The host name it goes to: the server's own, or another, such as
+            `127.0.0.1` for another site.
+        scheme: `https`, or `http` for cleartext HTTP/1.1.
+        method: The method.
+        body: The body.
+        headers: The Request's own headers, such as `Sec-Fetch-Dest`, which names
+            its kind.
+        referrer: The path of the page it comes from, which the Request's `Referer`
+            names; `None` for none.
+        referrer_host: The host name of that page.
+        by_page: Whether the browser makes it from the page of an earlier step.
+        actions: What the browser does on the page once it loaded, such as clicking
+            a link.
     """
 
     path: str
     closes: bool = False
+    host: str = HOST
+    scheme: str = "https"
+    method: str = "GET"
+    body: bytes | None = None
+    headers: tuple[tuple[str, str], ...] = ()
+    referrer: str | None = None
+    referrer_host: str = HOST
+    by_page: bool = False
+    actions: tuple[Action, ...] = ()
+
+    def url(self, server: WireServer) -> str:
+        """Its URL on a server."""
+        return server.url(self.path, scheme=self.scheme, host=self.host)
+
+    def request(self, server: WireServer, *, impersonate: str | None) -> Request:
+        """The Request the HTTP Fetcher sends for it."""
+        headers = list(self.headers)
+        if self.referrer is not None:
+            headers.append(("Referer", server.url(self.referrer, scheme=self.scheme, host=self.referrer_host)))
+        return Request(self.url(server), method=self.method, body=self.body, headers=headers, impersonate=impersonate)
 
 
 @dataclass(frozen=True)
@@ -100,6 +140,7 @@ async def run_both(
     *,
     impersonate: str | None = None,
     locale: Sequence[str] = DEFAULT_LOCALE,
+    launch_options: Mapping[str, Any] | None = None,
 ) -> tuple[Capture, Capture]:
     """Make the requests of a case with the HTTP Fetcher, then with the browser Fetcher, under one Session.
 
@@ -108,13 +149,15 @@ async def run_both(
         steps: The requests, in order.
         impersonate: The Profile the HTTP Fetcher uses instead of the default one.
         locale: The languages both present.
+        launch_options: Options the browser is launched with, over those that make
+            it trust the server.
 
     Returns:
         What the HTTP Fetcher put on the wire, and what the browser did.
     """
     session = Session()
     http = await capture_http(server, steps, session, impersonate=impersonate, locale=locale)
-    return http, await capture_browser(server, steps, session, locale=locale)
+    return http, await capture_browser(server, steps, session, locale=locale, launch_options=launch_options)
 
 
 async def capture_http(
@@ -140,40 +183,54 @@ async def capture_http(
     since = _closing(server, steps)
     async with HTTPFetcher(locale=locale) as fetcher:
         for step in steps:
-            await fetcher.fetch(Request(server.url(step.path), impersonate=impersonate), session=session)
+            await fetcher.fetch(step.request(server, impersonate=impersonate), session=session)
             await _after(server, step)
     return await _captured(server, since)
 
 
 async def capture_browser(
-    server: WireServer, steps: Sequence[Step], session: Session, *, locale: Sequence[str] = DEFAULT_LOCALE
+    server: WireServer,
+    steps: Sequence[Step],
+    session: Session,
+    *,
+    locale: Sequence[str] = DEFAULT_LOCALE,
+    launch_options: Mapping[str, Any] | None = None,
 ) -> Capture:
     """Make the requests of a case with a browser Fetcher of its own, which trusts the server's certificate.
 
     Args:
         server: The server.
-        steps: The requests, in order.
+        steps: The requests, in order; those an earlier step's page makes are not
+            loaded.
         session: The Session to load them under.
         locale: The languages to present.
+        launch_options: Options the browser is launched with, over those that make
+            it trust the server.
 
     Returns:
         What the browser put on the wire.
     """
     since = _closing(server, steps)
-    trusting = BrowserSettings(launch_options={"args": [f"--ignore-certificate-errors-spki-list={server.spki}"]})
-    async with BrowserFetcher(trusting, locale=locale) as fetcher:
+    options = dict(launch_options or {})
+    options["args"] = [f"--ignore-certificate-errors-spki-list={server.spki}", *options.get("args", ())]
+    async with BrowserFetcher(BrowserSettings(launch_options=options), locale=locale) as fetcher:
         for step in steps:
-            await fetcher.fetch(Request(server.url(step.path), render=True), session=session)
+            if step.by_page:
+                continue
+            render = Render(actions=step.actions) if step.actions else True
+            await fetcher.fetch(Request(step.url(server), render=render), session=session)
             await _after(server, step)
     return await _captured(server, since)
 
 
-def differences(http: Capture, browser: Capture) -> list[str]:
+def differences(http: Capture, browser: Capture, *, leaving_out: Collection[str] = ()) -> list[str]:
     """Compare what the two Fetchers put on the wire.
 
     Args:
         http: What the HTTP Fetcher did.
         browser: What the browser Fetcher did.
+        leaving_out: The observations not compared, by the end of their names,
+            such as `HPACK`, for a known difference.
 
     Returns:
         Each difference, naming what differs and showing both sides; none when
@@ -182,6 +239,8 @@ def differences(http: Capture, browser: Capture) -> list[str]:
     sent, shown = describe(http), describe(browser)
     found: list[str] = []
     for name in dict.fromkeys([*sent, *shown]):
+        if any(name.endswith(f"> {left_out}") for left_out in leaving_out):
+            continue
         ours, theirs = sent.get(name), shown.get(name)
         if ours == theirs:
             continue
@@ -197,17 +256,18 @@ def differences(http: Capture, browser: Capture) -> list[str]:
     return found
 
 
-def assert_one_client(http: Capture, browser: Capture) -> None:
+def assert_one_client(http: Capture, browser: Capture, *, leaving_out: Collection[str] = ()) -> None:
     """Fail unless the two Fetchers presented one client.
 
     Args:
         http: What the HTTP Fetcher did.
         browser: What the browser Fetcher did.
+        leaving_out: The observations not compared, by the end of their names.
 
     Raises:
         AssertionError: They differ; the message names each difference.
     """
-    found = differences(http, browser)
+    found = differences(http, browser, leaving_out=leaving_out)
     assert not found, "the HTTP Fetcher and the browser differ on the wire:\n" + "\n".join(found)
 
 

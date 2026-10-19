@@ -641,6 +641,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "http.max_body_size": 100 * 1024 * 1024,
         "http.pool_size": 8,
         "http.pool_idle": 300.0,
+        "http.inherit_referer": False,
         # and by the default browser Fetcher
         "browser.headless": True,
         "browser.timeout": 30.0,

@@ -459,3 +459,15 @@ async def test_a_browser_other_than_the_bundled_build_is_warned_about(
         f"The browser is {BUNDLED_BROWSER.version}, not the bundled build 150.0.1.2, which the HTTP Fetcher presents "
         "with the pinned Profile, so the two present different clients"
     )
+
+
+async def test_a_page_is_loaded_as_typed_in_without_the_referer_of_its_request(server: LoopbackServer) -> None:
+    server.route("/", "<p>page</p>", headers=[("Content-Type", "text/html")])
+    headers = {"Referer": "https://shop.example/", "Sec-Fetch-Dest": "document", "X-Trace": "1"}
+
+    async with BrowserFetcher() as fetcher:
+        await fetcher.fetch(_render(server.url("/"), headers=headers))
+
+    received = server.received[-1]
+    assert (received.header("Referer"), received.header("Sec-Fetch-Site")) == (None, "none")
+    assert received.header("X-Trace") == "1"

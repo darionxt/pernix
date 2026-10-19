@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pernix.request_kinds import request_kind
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -63,9 +65,14 @@ def rendered_instead(request: Request) -> Request | None:
         request: The Request found Blocked.
 
     Returns:
-        The Request with `render=True`; `None` if it renders already, or names its
-        Fetcher.
+        The Request with `render=True`; `None` if it renders already, names its
+        Fetcher, or is no top-level navigation or form submission, which the browser
+        alone loads as a page (`pernix.request_kinds`).
     """
     if request.render or request.fetcher is not None:
         return None
-    return request.replace(render=True)
+    try:
+        kind = request_kind(request)
+    except ValueError:
+        return None
+    return request.replace(render=True) if kind in ("navigation", "form") else None

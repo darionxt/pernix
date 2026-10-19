@@ -4,8 +4,8 @@
 
 - Uses a pinned Chrome Profile whose TLS and HTTP/2 are those of the bundled browser engine.
 - Does not use aliases such as `chrome` that drift when dependencies are upgraded, so the Profile only changes on an explicit upgrade.
-
 - Sends the headers that name the client as the bundled browser sends them: `User-Agent`, `sec-ch-ua`, `sec-ch-ua-mobile`, and `sec-ch-ua-platform` for the platform the Run is on, and the `Accept-Language` Chrome makes of the `locale` setting. They are recorded for the pinned build in `pernix.fetchers.pinned_pair`, so that a Run that never renders needs no browser, and replace the Profile's own in place. Another Profile, chosen in the settings, by a Request, or by a Session, sends its own.
+- Sends the headers Chrome sends for each kind of request, measured on the bundled build: a top-level navigation, a form submission, an iframe's navigation, a `fetch()` or `XMLHttpRequest`, and the loads of a style sheet, a script, and an image, in Chrome's order, with their `Priority` and HTTP/2 stream weight, and with the `Referer`, `Origin`, and `Sec-Fetch-Site` made from the page the request comes from. A Request names no kind: its method and body tell it, or its `Sec-Fetch-Dest` header, and its `Referer` header names the page, so that what it sends is plain from its headers and persists with them.
 
 **Browser**
 
@@ -30,6 +30,9 @@ Randomly generated headers or page properties only change the surface; they cann
 - An upgrade of patchright or curl-cffi, or a change of the default Profile, lands only with the contract tests passing on macOS and Linux, as CI runs them. A browser build that changes what it sends moves the default Profile to the curl-cffi target that matches it, in the same change, and an upgrade of patchright updates the recorded version and brands.
 - A difference the contract finds and pernix cannot remove, being inside curl or the browser, is kept as a test expected to fail, with its reason, so that the upgrade that removes it shows.
 
-**Known difference**
+**Known differences**
 
 - Once a server announces `SETTINGS_HEADER_TABLE_SIZE`, curl's HPACK encoder starts its next header block with a dynamic table size update, even when the size is unchanged; Chrome sends one only when the size changes, and grows its table to a larger size announced, where curl keeps 4096. The difference shows from the second request on a connection, to servers that announce the setting; the contract server does not, as many do not, and a test expected to fail records it.
+- curl's HPACK encoder never adds `content-length` to the dynamic table, which Chrome's does, so a request with a body is represented otherwise from that field on; the contract compares its headers and leaves its HPACK out, and a test expected to fail records it.
+- Chrome orders the headers a page sets among its own by a hash of their names; a Request's own new headers go first among those instead, and a test expected to fail records it.
+- Where a page puts an image, a script, or a style sheet changes the priority Chrome gives it, and Chrome chains concurrent HTTP/2 streams, pools connections across hosts sharing an address and a certificate, and sends CORS preflights; the HTTP Fetcher sends each kind's default priority, one request at a time on its stream, and no preflight.

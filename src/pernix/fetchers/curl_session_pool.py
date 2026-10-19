@@ -77,6 +77,8 @@ class _Start:
     cookie: str | None
     on_headers: HeadersCallback | None
     resolve: Sequence[str] = ()
+    header_order: str | None = None
+    stream_weight: int | None = None
     transfer: Transfer | None = None
 
 
@@ -121,6 +123,8 @@ class CurlSession(AsyncSession):
         cookie: str | None = None,
         on_headers: HeadersCallback | None = None,
         resolve: Sequence[str] = (),
+        header_order: str | None = None,
+        stream_weight: int | None = None,
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
@@ -139,6 +143,11 @@ class CurlSession(AsyncSession):
             resolve: `CURLOPT_RESOLVE` entries, such as `+example.com:443:192.0.2.7`:
                 curl connects to those addresses for those hosts and ports instead
                 of resolving them.
+            header_order: The order of every header, curl's own included, as
+                lower-cased names separated by commas (`CURLOPT_HTTPHEADER_ORDER`);
+                `None` for the Profile's.
+            stream_weight: The weight of the request's HTTP/2 stream; `None` for the
+                Profile's.
             **options: The options of `AsyncSession.request()`, but `stream` and
                 `cookies`.
 
@@ -150,7 +159,7 @@ class CurlSession(AsyncSession):
             pernix.errors.ResponseTooLarge: The limit stopped the transfer before the
                 headers came back.
         """
-        start = _Start(url, body_limit, cookie, on_headers, resolve)
+        start = _Start(url, body_limit, cookie, on_headers, resolve, header_order, stream_weight)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -192,7 +201,9 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
     """Wrap a handle's `setopt()` so that the callbacks it installs meter the body and report cookies.
 
     It also sets the `Cookie` header of the request once curl-cffi has cleared the
-    cookies the handle held, and the addresses its hosts resolve to with its URL.
+    cookies the handle held, the addresses its hosts resolve to with its URL, and
+    the order of its headers and the weight of its HTTP/2 stream once curl-cffi has
+    set the Profile's.
     """
 
     def watched_setopt(option: CurlOpt, value: Any) -> int:
@@ -211,7 +222,11 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
                 return write(chunk)
 
             value = metered
-        elif option == CurlOpt.HEADERDATA:
+        elif option == CurlOpt.HEADERDATA:  # set once curl-cffi has impersonated the Profile, which sets these too
+            if start.header_order is not None:
+                setopt(CurlOpt.HTTPHEADER_ORDER, start.header_order.encode())
+            if start.stream_weight is not None:
+                setopt(CurlOpt.STREAM_WEIGHT, start.stream_weight)
             option, value = CurlOpt.HEADERFUNCTION, _HeaderWatch(value, start.on_headers, transfer)
         elif option == CurlOpt.COOKIELIST and value == "ALL" and start.cookie:
             result = setopt(option, value)

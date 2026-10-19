@@ -32,7 +32,16 @@ def settings(tmp_path: Path) -> Settings:
     )
 
 
-HTTP_KEYS = ("impersonate", "timeout", "deadline", "max_redirects", "max_body_size", "pool_size", "pool_idle")
+HTTP_KEYS = (
+    "impersonate",
+    "timeout",
+    "deadline",
+    "max_redirects",
+    "max_body_size",
+    "pool_size",
+    "pool_idle",
+    "inherit_referer",
+)
 BROWSER_KEYS = (
     "headless",
     "timeout",
