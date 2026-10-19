@@ -233,7 +233,23 @@ class Shop(Spider):
     }
 ```
 
-With `proxies.supply = "add"`, each load adds the proxies the sources give, which stay until they expire, at the time their source gives, or after `proxies.api_lifetime` for those of the API. With `proxies.min_available` set too, the API and the provider are asked for more while fewer proxies are available, and when a fetch or a Session finds none: one extraction at a time, `proxies.extract_interval` seconds apart at least, each for as many as the level lacks, told through `{count}`, or to a provider whose `proxies()` takes a `wanted` keyword. Extraction stops at `proxies.max_extracted` proxies, and on demand after `proxies.extract_attempts` extractions in a row that gave none, as a vendor out of credit answers with an error; the Run drains for want of proxies only then. An API answering in JSON, which often tells each proxy's expiry, takes a provider setting the records' `expires`. See [`docs/design.md`](docs/design.md) §5.3.
+With `proxies.supply = "add"`, each load adds the proxies the sources give, which stay until they expire, at the time their source gives, or after `proxies.api_lifetime` for those of the API. With `proxies.min_available` set too, the API and the provider are asked for more while fewer proxies are available, and when a fetch or a Session finds none: one extraction at a time, `proxies.extract_interval` seconds apart at least, each for as many as the level lacks, told through `{count}`, or to a provider whose `proxies()` takes a `wanted` keyword. Extraction stops at `proxies.max_extracted` proxies, and on demand after `proxies.extract_attempts` extractions in a row that gave none, as a vendor out of credit answers with an error; the Run drains for want of proxies only then. An API answering in JSON is read through `proxies.api_json`, which maps its fields: where the list of proxies is, as a path of keys joined by dots, a key of digits indexing a list; and, in each entry, the whole address, either the entry itself as a string or one of its fields, or else its host and port, with a user and a password if any; and when it expires, which overrides `proxies.api_lifetime`:
+
+```toml
+[proxies]
+api = "https://vendor.example/get?key=...&num={count}&format=json"
+supply = "add"
+
+[proxies.api_json]      # an answer such as {"data": [{"ip": "...", "port": 8080, "deadline": "2027-01-01 12:00:00"}]}
+list = "data"
+host = "ip"
+port = "port"
+expires = "deadline"
+expires_format = "datetime"   # or timestamp, timestamp_ms, or seconds, left
+timezone = "Asia/Shanghai"    # of a date and time written without an offset; or a fixed offset, such as +08:00
+```
+
+An answer that does not match, such as an error, gives no proxy, with a warning naming the field it lacks, never the API's URL, and counts toward `proxies.extract_attempts`. Time zone names need the system's time zone data, which Windows lacks unless the `tzdata` package is installed; a fixed offset needs none. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Running and stopping
 
@@ -342,7 +358,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`, `{count}` in it replaced by how many are wanted), and a `ProxyProvider` |
 | `proxies.refresh` | `None` | Seconds between loads of the file, the API, and the provider; `None` loads them once |
 | `proxies.supply` | `"replace"` | Whether each load replaces the proxies listed, or `add`s to them, keeping each until it expires |
-| `proxies.api_lifetime` | `None` | Seconds each proxy of the API works for, as an answer of one per line tells no expiry |
+| `proxies.api_lifetime` | `None` | Seconds each proxy of the API works for, unless its answer tells when it expires |
+| `proxies.api_json` | `None` | How to read the API's answers in JSON: `list`, `address` or `host` and `port`, `username`, `password`, `scheme`, `expires`, `expires_format`, and `timezone` |
 | `proxies.min_available` | `None` | With `add`, extract more from the API and the provider while fewer proxies are available, and when none fits |
 | `proxies.extract_interval` / `proxies.max_extracted` / `proxies.extract_attempts` | `1.0` / `None` / `3` | Seconds between extractions on demand at least; proxies extracted in a Run at most; extractions in a row giving none, after which no more are made on demand |
 | `proxies.cooldown` / `proxies.cooldown_max` | `60.0` / `600.0` | Seconds a failed proxy cools down, doubled with each failure in a row, and the longest it does |

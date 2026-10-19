@@ -6,7 +6,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from pernix.logs.redaction import MASK
 
-__all__ = ["PROXY_SCHEMES", "proxy_address", "proxy_credentials", "proxy_url"]
+__all__ = ["PROXY_SCHEMES", "proxy_address", "proxy_credentials", "proxy_from_parts", "proxy_url"]
 
 PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks4a", "socks5", "socks5h"})
 """The proxy schemes both Fetchers can use, but SOCKS with credentials, which the browser cannot."""
@@ -72,9 +72,36 @@ def _host_and_port(text: str) -> bool:
     return bool(colon and host and port.isdigit())
 
 
-def _userinfo(text: str) -> str:
-    """A user or a password as a URL's credentials hold it: what they cannot hold as it is percent-encoded."""
-    return quote(text, safe="!$&'()*+,;=:")
+def proxy_from_parts(
+    host: str, port: int | str, *, scheme: str = "http", username: str | None = None, password: str | None = None
+) -> str:
+    """Return a proxy written as a URL from its parts, for `proxy_url()` to check.
+
+    Args:
+        host: Its host name or address; an IPv6 address is bracketed.
+        port: Its port.
+        scheme: Its scheme.
+        username: The user it authenticates as, if any.
+        password: The password, if any; it is left out without a user.
+
+    Returns:
+        The proxy URL, such as `http://user:password@proxy:8080`, its credentials
+        percent-encoded where a URL's cannot hold them as they are.
+    """
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    userinfo = ""
+    if username:
+        userinfo = _userinfo(username, user=True) + ("" if password is None else f":{_userinfo(password)}") + "@"
+    return f"{scheme}://{userinfo}{host}:{port}"
+
+
+def _userinfo(text: str, *, user: bool = False) -> str:
+    """A user or a password as a URL's credentials hold it: what they cannot hold as it is percent-encoded.
+
+    A user's colons are encoded too, as the first colon ends the user.
+    """
+    return quote(text, safe="!$&'()*+,;=" if user else "!$&'()*+,;=:")
 
 
 def proxy_credentials(url: str) -> tuple[str, ...]:
