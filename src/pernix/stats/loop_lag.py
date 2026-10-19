@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pernix.stats.loop_watchdog import LoopWatchdog
 
 __all__ = ["LoopLag", "LoopLagStats"]
 
@@ -23,21 +27,26 @@ class LoopLag:
     """Samples how late the event loop wakes up a sleeping task.
 
     A loop busy with blocking code, such as slow parsing or synchronous I/O, wakes
-    timers late; the lag is how much later than asked.
+    timers late; the lag is how much later than asked. Each sample is a beat of the
+    `LoopWatchdog`, if one is given, which watches the loop while it is sampled.
     """
 
-    def __init__(self, interval: float = 1.0) -> None:
+    def __init__(self, interval: float = 1.0, *, watchdog: LoopWatchdog | None = None) -> None:
         """Configure the sampling.
 
         Args:
-            interval: Seconds between two samples.
+            interval: Seconds between two samples. With a watchdog, they are at most
+                a quarter of its threshold, so that blocks are measured to within a
+                quarter of it.
+            watchdog: Watches the loop for blocks, beating with each sample.
 
         Raises:
             ValueError: `interval` is not positive.
         """
         if interval <= 0:
             raise ValueError(f"interval must be positive, got {interval}")
-        self._interval = interval
+        self._interval = interval if watchdog is None else min(interval, watchdog.threshold / 4)
+        self._watchdog = watchdog
         self._samples = 0
         self._total = 0.0
         self._max = 0.0
@@ -48,12 +57,21 @@ class LoopLag:
         return LoopLagStats(lag_avg=average, lag_max=self._max)
 
     async def run(self) -> None:
-        """Sample until cancelled."""
+        """Sample until cancelled; the watchdog, if any, watches the loop meanwhile."""
         loop = asyncio.get_running_loop()
-        while True:
-            started = loop.time()
-            await asyncio.sleep(self._interval)
-            lag = max(0.0, loop.time() - started - self._interval)
-            self._samples += 1
-            self._total += lag
-            self._max = max(self._max, lag)
+        watchdog = self._watchdog
+        if watchdog is not None:
+            watchdog.start(self._interval)
+        try:
+            while True:
+                started = loop.time()
+                await asyncio.sleep(self._interval)
+                lag = max(0.0, loop.time() - started - self._interval)
+                self._samples += 1
+                self._total += lag
+                self._max = max(self._max, lag)
+                if watchdog is not None:
+                    watchdog.beat(self._interval)
+        finally:
+            if watchdog is not None:
+                watchdog.stop()
