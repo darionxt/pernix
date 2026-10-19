@@ -11,6 +11,7 @@ import msgspec
 from msgspec import structs
 
 from pernix.account import ACCOUNT_FILE_SUFFIXES, Account
+from pernix.proxies.json_answers import JsonAnswer  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.proxies.proxy import Proxy  # noqa: TC001  # msgspec resolves the field types at runtime
 from pernix.proxies.proxy_url import proxy_url
 from pernix.secret import Secret  # noqa: TC001  # msgspec resolves the field types at runtime
@@ -256,9 +257,13 @@ class ProxySettings(Section):
             listed before, or `add` to them, keeping each until it expires, as for
             an API that answers with new short-lived proxies each time, so that
             Sessions keep theirs.
-        api_lifetime: Seconds each proxy of `api` works for, as an answer of one
-            per line tells no expiry; `None` for no expiry. Providers set their
-            records' `expires`.
+        api_lifetime: Seconds each proxy of `api` works for, unless its answer tells
+            when it expires, as an answer of one per line does not; `None` for no
+            expiry. Providers set their records' `expires`.
+        api_json: How to read the answers of `api` in JSON, a
+            `pernix.proxies.JsonAnswer` table: where the list of proxies is, how
+            each entry is written, and when it expires; `None` to read one proxy
+            per line.
         min_available: With `supply = "add"`, extract more proxies from the API
             and the provider while fewer than this many are available, and when a
             fetch finds none; `None` to extract only at the loads.
@@ -300,6 +305,7 @@ class ProxySettings(Section):
     binding: Any = None
     supply: Literal["replace", "add"] = "replace"
     api_lifetime: Annotated[float, msgspec.Meta(gt=0)] | None = None
+    api_json: JsonAnswer | None = None
     min_available: Annotated[int, msgspec.Meta(ge=1)] | None = None
     extract_interval: Annotated[float, msgspec.Meta(ge=0)] = 1.0
     max_extracted: Annotated[int, msgspec.Meta(ge=1)] | None = None
@@ -321,6 +327,8 @@ class ProxySettings(Section):
                 f"{self.key('min_available')}: proxies are extracted from {self.key('api')} "
                 f"or {self.key('provider')}, and neither is set"
             )
+        if self.api_json is not None and self.api is None:
+            problems.append(f"{self.key('api_json')}: it tells how to read the answers of {self.key('api')}, unset")
         if self.api_lifetime is not None and self.api is None:
             problems.append(
                 f"{self.key('api_lifetime')}: it is the lifetime of the proxies of {self.key('api')}, unset"
