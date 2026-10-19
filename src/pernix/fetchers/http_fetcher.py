@@ -188,7 +188,9 @@ class HTTPFetcher:
     host resolved unless written as an address, and curl connects only to the
     addresses checked; others raise `NetworkBlocked`. Through a proxy, which
     resolves hosts itself, only hosts written as addresses, and loopback names,
-    are checked. The hosts of `network.allow_hosts` are not checked.
+    are checked; curl resolves them itself for a `socks4://` or `socks5://` one,
+    so through one they are resolved, checked, and pinned too. The hosts of
+    `network.allow_hosts` are not checked.
 
     Attributes:
         schemes: The URL schemes it fetches by default: `http` and `https`.

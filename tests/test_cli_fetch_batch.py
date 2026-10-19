@@ -272,15 +272,23 @@ def test_with_the_address_guard_loopback_urls_and_redirects_to_them_are_refused(
     assert [request.path for request in site.received] == ["/hop"]
 
 
-def test_the_address_guard_refuses_to_render(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
-    argv = ["fetch", site.url("/a"), "--fetcher", "browser", "--json", "-s", "network.public_only=true"]
+@pytest.mark.usefixtures("browser_engine")
+def test_with_the_address_guard_the_browser_renders_allowed_hosts_and_refuses_loopback_ones(
+    site: LoopbackServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    allowed = f"http://localhost:{urlsplit(site.base_url).port}/a"
+    guarded = ["-s", "network.public_only=true", "-s", 'network.allow_hosts=["localhost"]']
 
-    assert main(argv) == 1
+    assert main(["fetch", site.url("/a"), allowed, "--fetcher", "browser", "--json", *guarded]) == 1
 
-    error = orjson.loads(capsys.readouterr().out)["error"]
-    assert error["type"] == "NetworkBlocked"
-    assert "the browser resolves hosts itself" in error["message"]
-    assert site.received == []
+    rows = _rows(capsys)
+    assert rows[site.url("/a")]["error"] == {
+        "type": "NetworkBlocked",
+        "message": f"network.public_only refused {site.url('/a')}: 127.0.0.1 is a loopback address",
+        "code": 0,
+    }
+    assert rows[allowed]["status"] == 200
+    assert [request.path for request in site.received] == ["/a"]  # through localhost alone
 
 
 @pytest.mark.usefixtures("browser_engine")

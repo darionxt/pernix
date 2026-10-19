@@ -38,7 +38,6 @@ from pernix.settings import (
     FingerprintSettings,
     FrontierSettings,
     ItemSettings,
-    NetworkSettings,
     ProxySettings,
     RetrySettings,
     SessionSettings,
@@ -102,8 +101,7 @@ class DownloadAssembly:
         """
         fetchers = _build_named(crawler, "fetchers")
         middlewares = _build_all(crawler, "middlewares")
-        public_only = crawler.settings.section(NetworkSettings).public_only
-        download = build_download_chain(middlewares, FetcherDispatch(fetchers, public_only=public_only))
+        download = build_download_chain(middlewares, FetcherDispatch(fetchers))
         return cls(components=(*fetchers.values(), *middlewares), download=download)
 
 
@@ -321,7 +319,11 @@ def _proxying(crawler: Crawler, run_log: RunLog) -> _Proxying:
         sources.append((ProxySettings.key("file"), ProxyFile(options.file)))
     if options.api is not None:
         api = ProxyAPI(
-            options.api, HTTPFetcher(_http_settings(crawler)), lifetime=options.api_lifetime, mask=run_log.mask
+            options.api,
+            HTTPFetcher(_http_settings(crawler)),
+            lifetime=options.api_lifetime,
+            answer=options.api_json,
+            mask=run_log.mask,
         )
         sources.append((ProxySettings.key("api"), api))
         opened.append(api)

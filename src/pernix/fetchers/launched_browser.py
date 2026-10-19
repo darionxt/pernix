@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import unquote, urlsplit
 
 from pernix.errors import ComponentError
+from pernix.fetchers.address_guard_proxy import AddressGuardProxy
 from pernix.fetchers.browser_processes import BrowserProcesses
 from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.pinned_pair import BUNDLED_BROWSER
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from patchright.async_api import Browser, BrowserContext, CDPSession, Playwright, ProxySettings
     from patchright.async_api._context_manager import PlaywrightContextManager
 
+    from pernix.fetchers.address_guard import AddressGuard
     from pernix.fetchers.browser_settings import BrowserSettings
 
 __all__ = [
@@ -37,6 +39,12 @@ __all__ = [
 
 LOOPBACK_BYPASS = "<-loopback>,localhost,*.localhost,127.0.0.1/8,[::1]"
 """Proxy bypass rules for loopback hosts and nothing else; Chrome's implicit ones would also bypass link-local addresses."""
+
+_NO_BYPASS = "<-loopback>"
+"""Proxy bypass rules that send loopback hosts to the proxy too, which Chrome would otherwise reach directly."""
+
+_WEBRTC_PROXIED_ONLY = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
+"""Keeps WebRTC off UDP, which no proxy carries, so that it goes through the proxy, over TCP, or nowhere."""
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +71,8 @@ class LaunchedBrowser:
             cannot be found, as without psutil.
         user_agent: The User-Agent its contexts present: its own, without
             `HeadlessChrome`, in headless mode; `None` for its own.
+        guard_proxy: Where a browser launched while `network.public_only` is on
+            sends all its traffic, the proxy that checks every host it reaches.
     """
 
     playwright: Playwright
@@ -72,6 +82,7 @@ class LaunchedBrowser:
     devtools: CDPSession | None = None
     processes: BrowserProcesses | None = None
     user_agent: str | None = None
+    guard_proxy: AddressGuardProxy | None = None
 
     async def new_context(
         self,
@@ -84,7 +95,8 @@ class LaunchedBrowser:
 
         Args:
             proxy: The proxy URL every request of the context goes through, loopback
-                ones included; without one, the browser's own applies.
+                ones included; without one, the browser's own applies, as the
+                proxy that checks hosts for `network.public_only` does.
             local_storage: The localStorage the context starts with, by origin, then
                 by key.
             blocks_service_workers: Keep its pages from registering service
@@ -118,31 +130,37 @@ class LaunchedBrowser:
         await _send(self.devtools, "Browser.getVersion")
 
     async def close(self) -> None:
-        """Close the browser, stop the driver, and stop the refusing proxy."""
+        """Close the browser, stop the driver, and stop the proxy it was launched with."""
         try:
             await self.browser.close()
         finally:
             try:
                 await self.playwright.stop()
             finally:
-                if self.refusing_proxy is not None:
-                    await self.refusing_proxy.close()
+                await _close_proxies(self.refusing_proxy, self.guard_proxy)
 
 
-async def launch_browser(settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE) -> LaunchedBrowser:
+async def launch_browser(
+    settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE, address_guard: AddressGuard | None = None
+) -> LaunchedBrowser:
     """Start patchright and launch a browser.
 
     The browser is Chrome for Testing, in the new headless mode unless
     `browser.headless` is off, with `browser.launch_options` over those defaults.
     It presents the languages of `locale`, through Chrome's `--accept-lang`, unless
     the `args` of `launch_options` set it; its contexts present its User-Agent
-    without `HeadlessChrome`, as it is with a window. Under the network guard,
+    without `HeadlessChrome`, as it is with a window. With an address guard, as
+    `network.public_only` asks, all its traffic goes through a proxy that checks
+    every host (`pernix.fetchers.address_guard_proxy`). Under the network guard,
     every connection to a host other than a loopback one goes to a proxy that
-    refuses it, whatever `launch_options` say.
+    refuses it, whatever `launch_options` say. Under either, WebRTC is kept off
+    UDP, which would go around the proxy.
 
     Args:
         settings: The browser settings.
         locale: The languages to present, in order.
+        address_guard: The address guard that checks the hosts the browser reaches,
+            if any.
 
     Returns:
         The running browser.
@@ -164,13 +182,21 @@ async def launch_browser(settings: BrowserSettings, *, locale: Sequence[str] = D
         "args": args,
         "headless": settings.headless,
     }
+    network_guard = current_guard()
     refusing_proxy: RefusingProxy | None = None
+    guard_proxy: AddressGuardProxy | None = None
     playwright: Playwright | None = None
     try:
-        if current_guard() is not None:
+        if address_guard is not None:
+            guard_proxy = AddressGuardProxy(address_guard, network_guard=network_guard)
+            await guard_proxy.start()
+            options["proxy"] = {"server": guard_proxy.url, "bypass": _NO_BYPASS}
+        elif network_guard is not None:
             refusing_proxy = RefusingProxy()
             await refusing_proxy.start()
             options["proxy"] = {"server": refusing_proxy.url, "bypass": LOOPBACK_BYPASS}
+        if address_guard is not None or network_guard is not None:
+            options["args"] = [*options["args"], _WEBRTC_PROXIED_ONLY]
         playwright = await _start(async_playwright())
         try:
             browser = await playwright.chromium.launch(**options)
@@ -183,12 +209,10 @@ async def launch_browser(settings: BrowserSettings, *, locale: Sequence[str] = D
     except BaseException:
         if playwright is not None:
             await playwright.stop()
-        if refusing_proxy is not None:
-            await refusing_proxy.close()
+        await _close_proxies(refusing_proxy, guard_proxy)
         raise
-    return LaunchedBrowser(
-        playwright, browser, refusing_proxy is not None, refusing_proxy, devtools, processes, user_agent
-    )
+    guarded = network_guard is not None
+    return LaunchedBrowser(playwright, browser, guarded, refusing_proxy, devtools, processes, user_agent, guard_proxy)
 
 
 async def probe_browser(settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE) -> str:
@@ -334,6 +358,16 @@ async def _start(manager: PlaywrightContextManager) -> Playwright:
         if not starting.cancelled() and starting.exception() is None:
             await starting.result().stop()
         raise
+
+
+async def _close_proxies(refusing_proxy: RefusingProxy | None, guard_proxy: AddressGuardProxy | None) -> None:
+    """Stop the proxies a browser was launched with, if any."""
+    try:
+        if refusing_proxy is not None:
+            await refusing_proxy.close()
+    finally:
+        if guard_proxy is not None:
+            await guard_proxy.close()
 
 
 def _storage_state(local_storage: Mapping[str, Mapping[str, str]]) -> StorageState:

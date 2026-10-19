@@ -258,7 +258,23 @@ class Shop(Spider):
     }
 ```
 
-With `proxies.supply = "add"`, each load adds the proxies the sources give, which stay until they expire, at the time their source gives, or after `proxies.api_lifetime` for those of the API. With `proxies.min_available` set too, the API and the provider are asked for more while fewer proxies are available, and when a fetch or a Session finds none: one extraction at a time, `proxies.extract_interval` seconds apart at least, each for as many as the level lacks, told through `{count}`, or to a provider whose `proxies()` takes a `wanted` keyword. Extraction stops at `proxies.max_extracted` proxies, and on demand after `proxies.extract_attempts` extractions in a row that gave none, as a vendor out of credit answers with an error; the Run drains for want of proxies only then. An API answering in JSON, which often tells each proxy's expiry, takes a provider setting the records' `expires`. See [`docs/design.md`](docs/design.md) §5.3.
+With `proxies.supply = "add"`, each load adds the proxies the sources give, which stay until they expire, at the time their source gives, or after `proxies.api_lifetime` for those of the API. With `proxies.min_available` set too, the API and the provider are asked for more while fewer proxies are available, and when a fetch or a Session finds none: one extraction at a time, `proxies.extract_interval` seconds apart at least, each for as many as the level lacks, told through `{count}`, or to a provider whose `proxies()` takes a `wanted` keyword. Extraction stops at `proxies.max_extracted` proxies, and on demand after `proxies.extract_attempts` extractions in a row that gave none, as a vendor out of credit answers with an error; the Run drains for want of proxies only then. An API answering in JSON is read through `proxies.api_json`, which maps its fields: where the list of proxies is, as a path of keys joined by dots, a key of digits indexing a list; and, in each entry, the whole address, either the entry itself as a string or one of its fields, or else its host and port, with a user and a password if any; and when it expires, which overrides `proxies.api_lifetime`:
+
+```toml
+[proxies]
+api = "https://vendor.example/get?key=...&num={count}&format=json"
+supply = "add"
+
+[proxies.api_json]      # an answer such as {"data": [{"ip": "...", "port": 8080, "deadline": "2027-01-01 12:00:00"}]}
+list = "data"
+host = "ip"
+port = "port"
+expires = "deadline"
+expires_format = "datetime"   # or timestamp, timestamp_ms, or seconds, left
+timezone = "Asia/Shanghai"    # of a date and time written without an offset; or a fixed offset, such as +08:00
+```
+
+An answer that does not match, such as an error, gives no proxy, with a warning naming the field it lacks, never the API's URL, and counts toward `proxies.extract_attempts`. Time zone names need the system's time zone data, which Windows lacks unless the `tzdata` package is installed; a fixed offset needs none. See [`docs/design.md`](docs/design.md) §5.3.
 
 ## Running and stopping
 
@@ -311,7 +327,7 @@ pernix browser install                                               # install t
 
 `run` exits as `Spider.run()` does: 0 completed, 1 failed, 2 configuration error, 130 stopped by a signal. `-s KEY=VALUE` sets any setting, above every other layer, and `-a KEY=VALUE` passes a Spider argument. `fetch` and `shell` use the download Middleware and the Fetchers of the project settings; `--fetcher` picks a registered Fetcher, `browser` to render the page, and in `shell`, `await fetch(url, render=True)` renders one, the keywords going to `Request`. With the browser Fetcher registered, as it is by default, `check` launches the browser once, if the `browser` extra is installed, and reports an engine that is not installed with the command that installs it; it also tells whether the Profile and the browser are those of the Pinned Pair. `python -m pernix` works too.
 
-`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved; the browser does not render then. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
+`fetch` fetches its URLs as one small Run, so retries, the per-domain limits, and `concurrency`, with `browser.max_pages` for rendered pages, apply, but no Feeds, spider Middleware, or Pipelines of the project; `-s retry.times=0` makes one attempt. It reads pages cheaply for agents and scripts: `--extract text` gives the visible text, without scripts, styles, and hidden elements, and `--extract markdown` the main content as Markdown, its headings, lists, tables, and code blocks kept and its links made absolute, without the navigation, footers, and other boilerplate. `--css` and `--xpath`, repeated as needed, read the parts they pick instead, each as markup, or as text or Markdown with `--extract`; `--links` lists the links, as absolute URLs with their text. `--max-chars N` cuts what is read, and the JSON says `"truncated": true`. Several URLs, or `-i FILE` (`-` for stdin, one URL per line), are written as JSON Lines with `--json`, one object per URL, in the order they end, a failure as `{"url": ..., "error": {...}}`. `fetch` exits with 0 when every URL got a Response, whatever its status, 1 when any did not, and 2 when it cannot fetch at all, as without the browser engine. Pointed at untrusted links, `-s network.public_only=true` refuses hosts on private, loopback, link-local, and other addresses that are not public, each redirect hop included, checked once resolved, and the browser renders through a proxy that checks every host its pages reach. See [`docs/design.md`](docs/design.md) §4.12 for the `--json` fields.
 
 ## Configuration
 
@@ -367,7 +383,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `proxies.file` / `proxies.api` / `proxies.provider` | none | More proxies: a text file, an API answering with one per line (a `Secret`, `{count}` in it replaced by how many are wanted), and a `ProxyProvider` |
 | `proxies.refresh` | `None` | Seconds between loads of the file, the API, and the provider; `None` loads them once |
 | `proxies.supply` | `"replace"` | Whether each load replaces the proxies listed, or `add`s to them, keeping each until it expires |
-| `proxies.api_lifetime` | `None` | Seconds each proxy of the API works for, as an answer of one per line tells no expiry |
+| `proxies.api_lifetime` | `None` | Seconds each proxy of the API works for, unless its answer tells when it expires |
+| `proxies.api_json` | `None` | How to read the API's answers in JSON: `list`, `address` or `host` and `port`, `username`, `password`, `scheme`, `expires`, `expires_format`, and `timezone` |
 | `proxies.min_available` | `None` | With `add`, extract more from the API and the provider while fewer proxies are available, and when none fits |
 | `proxies.extract_interval` / `proxies.max_extracted` / `proxies.extract_attempts` | `1.0` / `None` / `3` | Seconds between extractions on demand at least; proxies extracted in a Run at most; extractions in a row giving none, after which no more are made on demand |
 | `proxies.cooldown` / `proxies.cooldown_max` | `60.0` / `600.0` | Seconds a failed proxy cools down, doubled with each failure in a row, and the longest it does |
@@ -376,7 +393,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `proxies.rebind` | `"unavailable"` | When the default binding policy binds a Session to another proxy: once its own is `unavailable`, at `every_lease`, once it is `retired` (waiting for it while it cools down), or `never` (Retiring the Session with it) |
 | `proxies.binding` | `None` | A replacement binding policy, with `async bind(binding)`; it may give Sessions proxies of their own, with no source |
 | `response.default_encoding` | `"utf-8"` | Encoding of a body that declares none, is not UTF-8, and defies detection |
-| `network.public_only` | `false` | Refuses hosts whose addresses are not public, after resolving them, on every redirect hop; the browser does not render meanwhile |
+| `network.public_only` | `false` | Refuses hosts whose addresses are not public, after resolving them, on every redirect hop; the browser goes through a proxy that checks every host it reaches, and renders nothing through a proxy of a Request or a Session |
 | `network.allow_hosts` | `()` | Host names `network.public_only` lets through, such as an internal service |
 | `frontier.lease_ttl` | `60.0` | Seconds a claimed Request stays leased without renewal |
 | `fingerprint.headers` | `()` | Request headers whose values take part in Fingerprints; never `Cookie` |
@@ -620,6 +637,9 @@ src/pernix/
 │   ├── page_traffic.py  blocks resource types and captures responses of a page
 │   ├── launched_browser.py starts patchright and its browser, under the network guard if on, as with a window, and probes it
 │   ├── refusing_proxy.py the proxy that refuses what a guarded browser must not reach
+│   ├── address_guard_proxy.py network.public_only for the browser: a SOCKS5 proxy that checks every host it reaches
+│   ├── proxy_refusals.py what that proxy refused a page, told as errors, stats, and logs
+│   ├── loopback_listener.py accepts the connections of those proxies on 127.0.0.1
 │   ├── curl_session_pool.py one curl session per Profile, LRU and idle eviction; body limits and backpressure
 │   ├── network_guard.py keeps Fetchers on loopback hosts, as in tests
 │   ├── address_guard.py network.public_only: refuses hosts not on public addresses, once resolved

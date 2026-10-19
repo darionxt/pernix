@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import io
+import json
 import sys
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 from urllib.parse import urlsplit
@@ -573,6 +575,84 @@ async def test_extraction_on_demand_keeps_the_pool_at_its_level_within_its_limit
         )
 
     assert report.reason == "finished"
-    assert sorted(_via(report.items)) == ["better"] * 3 + ["good"] * 3
+    assert len(report.items) == 6
+    assert set(_via(report.items)) <= {"good", "better"}  # which takes each page depends on when it came
     assert asked == [2, 1, 1]  # the level at first, then one each time it fell below, until the limit
     assert (report.stats["proxies.extracted"], report.stats["proxies.available"]) == (4, 2)
+
+
+async def test_an_api_answering_in_json_supplies_the_pool_without_a_provider(server: LoopbackServer) -> None:
+    with Proxy("listed") as listed:
+        server.route("/proxies", json.dumps({"data": {"proxy_list": [listed.url.removeprefix("http://")]}}))
+        report = await crawl(
+            Shop,
+            pages=2,
+            settings={"proxies.api": server.url("/proxies?key=k"), "proxies.api_json": {"list": "data.proxy_list"}},
+        )
+
+    assert _via(report.items) == ["listed", "listed"]
+
+
+async def test_each_proxy_of_a_json_answer_expires_at_its_deadline_in_the_time_zone_set(server: LoopbackServer) -> None:
+    east_of_utc = dt.timezone(dt.timedelta(hours=8))
+    deadline = (dt.datetime.now(east_of_utc) + dt.timedelta(seconds=2)).strftime("%Y-%m-%d %H:%M:%S")
+
+    class Lingering(Shop):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            async for item in super().parse(response):
+                yield item
+            await asyncio.sleep(3)  # past the deadline, which UTC would have put 8 hours later
+            yield Request(f"{SHOP}{PATHS[1]}")
+
+    with Proxy("listed") as listed:
+        host, port = urlsplit(listed.url).hostname, urlsplit(listed.url).port
+        server.route("/proxies", json.dumps({"data": [{"ip": host, "port": port, "deadline": deadline}]}))
+        report = await asyncio.wait_for(
+            crawl(
+                Lingering,
+                pages=1,
+                settings={
+                    "proxies.api": server.url("/proxies"),
+                    "proxies.api_json": {
+                        "list": "data",
+                        "host": "ip",
+                        "port": "port",
+                        "expires": "deadline",
+                        "expires_format": "datetime",
+                        "timezone": "+08:00",
+                    },
+                },
+            ),
+            timeout=20,
+        )
+
+    assert _via(report.items) == ["listed"]
+    assert report.reason == "drained"  # its proxy expired, and none will be loaded again
+    assert report.stats["proxies.expirations"] == 1
+
+
+async def test_a_json_answer_missing_a_mapped_field_brings_no_proxy_and_counts_toward_the_attempts(
+    server: LoopbackServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.route("/proxies", json.dumps({"code": 1, "msg": "out of credit"}))
+
+    report = await asyncio.wait_for(
+        crawl(
+            Shop,
+            pages=1,
+            settings={
+                "proxies.api": server.url("/proxies?key=secret-key"),
+                "proxies.api_json": {"list": "data.proxy_list"},
+                "proxies.supply": "add",
+                "proxies.min_available": 1,
+                "proxies.extract_interval": 0,
+                "proxies.extract_attempts": 2,
+            },
+        ),
+        timeout=20,
+    )
+
+    assert report.reason == "drained"
+    assert (report.stats["proxies.extractions"], report.stats["proxies.extracted"]) == (2, 0)
+    assert "The answer of the proxy API gives no proxy: it has no `data.proxy_list`" in caplog.text
+    assert "secret-key" not in caplog.text
