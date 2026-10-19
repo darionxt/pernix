@@ -16,7 +16,14 @@ if TYPE_CHECKING:
     from pernix.request import Request
     from pernix.response import Response
 
-__all__ = ["FetchPlan", "FetchSpider", "InvalidURL"]
+__all__ = ["FetchPlan", "FetchSpider", "InvalidURL", "NotFetched"]
+
+_ENTRY = "pernix.fetch.entry"
+"""The meta key of a Request's place among the entries, which tells which entry a report is for."""
+
+
+class NotFetched(Exception):
+    """A URL the Run ended before reporting, as when it drained for want of proxies."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +68,11 @@ class FetchSpider(Spider):
 
     A Response is reported, whatever its status, and so is the last one once the
     retries for its status ran out; a failure is reported with its error, and so
-    are Requests that were ignored or dropped, and URLs that cannot be fetched. A
-    configuration error, such as a browser engine that is not installed, stops the
-    Run at once, as no fetch can succeed until it is fixed; so does a closed stdout.
+    are Requests that were ignored or dropped, and URLs that cannot be fetched.
+    Those the Run ended before, as when it drained for want of proxies, are left in
+    `unfinished`. A configuration error, such as a browser engine that is not
+    installed, stops the Run at once, as no fetch can succeed until it is fixed; so
+    does a closed stdout.
 
     Attributes:
         configuration_error: The configuration error that stopped the Run, if any.
@@ -79,6 +88,13 @@ class FetchSpider(Spider):
         """
         self._plan = plan
         self.configuration_error: Exception | None = None
+        self._unreported: dict[int, str] = {}
+        """The URLs of the Requests yielded and not reported yet, by their place among the entries."""
+
+    @property
+    def unfinished(self) -> list[str]:
+        """The URLs of the Requests no report was made for, in the order they were given."""
+        return list(self._unreported.values())
 
     async def start(self) -> AsyncIterator[Request]:
         """Yield the Requests of the plan, reporting the URLs that cannot be fetched instead.
@@ -87,14 +103,15 @@ class FetchSpider(Spider):
             The Requests, which fail into `failed()`.
         """
         output = self._plan.output
-        self.crawler.events.on(RequestIgnored, output.ignored)
-        self.crawler.events.on(RequestDropped, output.dropped)
-        for entry in self._plan.entries:
+        self.crawler.events.on(RequestIgnored, self._ignored)
+        self.crawler.events.on(RequestDropped, self._dropped)
+        for index, entry in enumerate(self._plan.entries):
             if isinstance(entry, InvalidURL):
                 output.failed(entry.url, entry.error)
                 self._stop_if_closed()
             else:
-                yield entry.replace(errback=self.failed)
+                self._unreported[index] = entry.url
+                yield entry.replace(errback=self.failed, meta={**entry.meta, _ENTRY: index})
 
     async def parse(self, response: Response) -> None:
         """Report a Response.
@@ -102,6 +119,7 @@ class FetchSpider(Spider):
         Args:
             response: The Response.
         """
+        self._reported(response.request)
         self._plan.output.response(response)
         self._stop_if_closed()
 
@@ -117,11 +135,23 @@ class FetchSpider(Spider):
                 self.configuration_error = error
             self.crawler.stop("force")
             return
+        self._reported(request)
         try:
             self._plan.output.failed(request.url, error)
         except Exception as exc:  # as reporting a Response can fail, which no errback would hear of
             self._plan.output.failed(request.url, exc)
         self._stop_if_closed()
+
+    def _ignored(self, event: RequestIgnored) -> None:
+        self._reported(event.request)
+        self._plan.output.ignored(event)
+
+    def _dropped(self, event: RequestDropped) -> None:
+        self._reported(event.request)
+        self._plan.output.dropped(event)
+
+    def _reported(self, request: Request) -> None:
+        self._unreported.pop(request.meta.get(_ENTRY, -1), None)
 
     def _stop_if_closed(self) -> None:
         if self._plan.output.closed:

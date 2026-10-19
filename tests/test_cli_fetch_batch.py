@@ -102,6 +102,18 @@ def test_each_url_is_one_json_line_and_a_failing_one_exits_with_1(
     assert (failure["schema"], failure["error"]["type"], failure["error"]["code"]) == (1, "ConnectError", 7)
 
 
+def test_a_url_the_run_ended_before_fetching_is_reported_and_exits_with_1(
+    site: LoopbackServer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dead = f"http://127.0.0.1:{_unused_port()}"
+    proxied = ["-s", f'proxies.urls=["{dead}"]', "-s", "proxies.max_failures=1"]  # Retired at once, so the Run drains
+
+    assert main(["fetch", site.url("/a"), "--json", *proxied]) == 1
+
+    error = _rows(capsys)[site.url("/a")]["error"]
+    assert (error["type"], error["code"]) == ("NotFetched", None)
+
+
 def test_every_url_that_got_a_response_exits_with_0(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
     urls = [site.url("/a"), site.url("/missing"), site.url("/a")]
 
