@@ -90,6 +90,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- `LoopLag.start()` and `stop()` replace `LoopLag.run()`: `start()` starts the sampling task and its watchdog at once, so that code blocking the event loop before the task first runs, such as a `SpiderOpened` subscriber, is watched too.
 - `pernix fetch` fetches as a Run of its own, retrying as the retry policy says, even for one URL; `-s retry.times=0` makes one attempt. The project's Feeds, spider Middleware, and Pipelines are left out, and the Run logs only critical records. `--timeout` must be positive. `describe_response()` and `is_text()` moved to `pernix.cli.fetch_output` and `pernix.cli.page_reading`.
 - `crawl()` of `pernix.testing` turns `network.public_only` off, so that tests reach a `LoopbackServer` whatever the project file says; `settings=` turns it back on.
 - `concurrency` is the number of workers for the Requests that do not render; rendered Requests have `browser.max_pages` workers more, so a Run processes up to `concurrency + browser.max_pages` Requests at once. `crawl(browser=...)` registers the `browser.*` settings, so `browser.max_pages` applies with a stand-in browser too.

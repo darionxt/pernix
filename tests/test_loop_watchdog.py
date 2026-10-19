@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 import orjson
 import pytest
 
-from pernix import Response, Spider
+from pernix import Extension, Response, Spider, events
 from pernix.crawler import Crawler
 from pernix.errors import SettingsError
 from pernix.logs import RunContext, current_run, run_context
@@ -70,16 +70,14 @@ async def test_each_block_is_warned_about_once_with_its_stack_and_counted_once_t
     # Sampling beats four times per threshold at least, so the hour asked for here is not waited for.
     lag = LoopLag(interval=3600, watchdog=LoopWatchdog(0.05, stats=stats))
     with run_context(RUN):
-        sampling = asyncio.create_task(lag.run())
-    await asyncio.sleep(0)
+        lag.start()
 
     for _ in range(2):
         block_the_loop_until(watchdog_records.warned)  # blocks the event loop
         assert await asyncio.to_thread(watchdog_records.ran_again.wait, 30), "the loop never beat again"
         watchdog_records.ran_again.clear()
     assert len(watchdog_threads()) == 1  # still watching
-    sampling.cancel()
-    await asyncio.wait([sampling])
+    await lag.stop()
 
     levels = [record.levelno for record in watchdog_records.records]
     assert levels == [logging.WARNING, logging.INFO, logging.WARNING, logging.INFO]
@@ -114,6 +112,21 @@ def test_stopping_ends_the_block_in_progress_and_the_thread(watchdog_records: Wa
     snapshot = stats.snapshot()
     assert snapshot["loop.blocks"] == 1
     assert float(snapshot["loop.block_seconds"]) >= 0.01
+    assert watchdog_threads() == []
+
+
+async def test_the_loop_is_watched_from_the_start_of_the_sampling_before_its_task_runs(
+    watchdog_records: WatchdogRecords,
+) -> None:
+    stats = Stats()
+    lag = LoopLag(watchdog=LoopWatchdog(0.05, stats=stats))
+
+    lag.start()
+    block_the_loop_until(watchdog_records.warned)  # before the sampling task ever ran
+    await lag.stop()
+
+    assert [record.levelno for record in watchdog_records.records] == [logging.WARNING, logging.INFO]
+    assert stats.get("loop.blocks") == 1
     assert watchdog_threads() == []
 
 
@@ -169,6 +182,28 @@ async def test_a_callback_blocking_the_event_loop_is_warned_about_with_its_stack
     assert (report.stats["loop.blocks"], report.stats["log.warning"]) == (1, 1)
     assert float(report.stats["loop.block_seconds"]) >= 0.2
     assert report.items == [{"url": f"{SHOP}/"}]
+
+
+async def test_a_spider_opened_subscriber_blocking_the_event_loop_is_warned_about(
+    watchdog_records: WatchdogRecords,
+) -> None:
+    class Opening(Extension):
+        @events.on(events.SpiderOpened)
+        def opened(self, _event: events.SpiderOpened) -> None:
+            block_the_loop_until(watchdog_records.warned)
+
+    class Quick(Spider):
+        start_urls = (f"{SHOP}/",)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"url": response.url}
+
+    settings = {"loop.block_threshold": 0.2, "extensions": {Opening: 1}}
+    report = await crawl(Quick, fetcher=FakeFetcher({f"{SHOP}/": "ok"}), settings=settings)
+
+    [warning] = [record for record in watchdog_records.records if record.levelno >= logging.WARNING]
+    assert "in opened" in str(warning.stack_info)
+    assert report.stats["loop.blocks"] == 1
 
 
 async def test_a_run_whose_loop_is_never_blocked_long_warns_of_nothing_and_leaves_no_thread(
