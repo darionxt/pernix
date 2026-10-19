@@ -896,7 +896,7 @@ def _keeping_for(request: Request) -> PageKeeping | None:
     if keeping is None:
         raise ValueError(
             f"{request!r} keeps its page, with Render(keep_page=True), for its Callback, but none holds it here: an "
-            "Inline Fetch, pernix fetch, the shell, and a Fetcher called directly cannot keep a page; work with "
+            "Inline Fetch, the shell, and a Fetcher called directly cannot keep a page; work with "
             "it in a page method, as Render(action=...), instead"
         )
     return keeping

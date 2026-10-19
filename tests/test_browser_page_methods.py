@@ -143,7 +143,7 @@ async def test_a_page_is_kept_only_where_a_callback_holds_it(server: LoopbackSer
     server.route("/", "<p>up</p>", headers=HTML)
 
     async with BrowserFetcher() as fetcher:
-        with pytest.raises(ValueError, match=r"keep_page=True.*an Inline Fetch, pernix fetch, the shell"):
+        with pytest.raises(ValueError, match=r"keep_page=True.*an Inline Fetch, the shell"):
             await fetcher.fetch(Request(server.url("/"), render=Render(keep_page=True)))
 
     assert server.received == []
