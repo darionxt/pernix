@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from pernix.errors import BrowserLost, ComponentError, PageCrashed
 from pernix.fetchers.launched_browser import launch_browser
-from pernix.fetchers.tripwire import Tripwire
+from pernix.fetchers.tripwire import GRACE, Tripwire
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from pernix.fetchers.launched_browser import LaunchedBrowser
     from pernix.stats import Stats
 
-__all__ = ["Generation", "Generations"]
+__all__ = ["Generation", "Generations", "names_closed_target"]
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,18 @@ class Generation:
         """Why it was lost, `disconnected`, `driver`, or `unresponsive`, if it was."""
         return self.tripwire.reason
 
+    def lost_error(self, url: str) -> BrowserLost | None:
+        """The error a fetch in it fails with once it is lost; `None` while it is not.
+
+        Args:
+            url: The URL of the fetch, for the message.
+
+        Returns:
+            The `BrowserLost`, naming why it was lost, or `None`.
+        """
+        reason = self.lost
+        return None if reason is None else BrowserLost(f"rendering {url} failed: {_LOSSES[reason]}")
+
     @property
     def taking_pages(self) -> bool:
         """Whether new fetches may use it: it was neither replaced, lost, nor closed."""
@@ -159,14 +171,14 @@ class Generations:
         self._unavailable = None
 
     @asynccontextmanager
-    async def fetching(self, url: str) -> AsyncGenerator[LaunchedBrowser]:
+    async def fetching(self, url: str) -> AsyncGenerator[Generation]:
         """Use the current browser for one fetch, launching one if there is none.
 
         Args:
             url: The URL of the fetch, for errors.
 
         Yields:
-            The browser, which no other fetch closes meanwhile.
+            The Generation, whose browser is not closed meanwhile.
 
         Raises:
             pernix.errors.BrowserLost: The browser was lost before the fetch was
@@ -180,12 +192,33 @@ class Generations:
         try:
             async with generation.tripwire.guarding(
                 lambda reason: BrowserLost(f"rendering {url} failed: {_LOSSES[reason]}"),
-                may_trip=lambda error: self._may_be_lost(generation, error),
+                may_trip=lambda error: self.may_be_lost(generation, error),
             ):
-                yield generation.launched
+                yield generation
         finally:
             generation.fetching -= 1
             self._close_if_done(generation)
+
+    def keep(self, generation: Generation) -> Callable[[], None]:
+        """Count a page kept open past its fetch as a fetch in its Generation, which is then not closed under it.
+
+        Args:
+            generation: The Generation the page is open in.
+
+        Returns:
+            Ends the count, once the page is closed; calling it again does nothing.
+        """
+        generation.fetching += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                generation.fetching -= 1
+                self._close_if_done(generation)
+
+        return release
 
     async def close(self) -> None:
         """Stop a launch in progress, then close every browser, waiting for them."""
@@ -293,14 +326,55 @@ class Generations:
         self._retire(generation.launched)
         self._close_if_done(generation)
 
-    def _may_be_lost(self, generation: Generation, error: BaseException) -> bool:
-        """Tell whether a fetch failed as its Generation went away, losing the Generation if it is plain it did."""
+    def may_be_lost(self, generation: Generation, error: BaseException) -> bool:
+        """Tell whether a fetch in a Generation failed as it went away, losing the Generation if it plainly did.
+
+        Args:
+            generation: The Generation the fetch ran in, which its error comes from.
+            error: The fetch's error.
+
+        Returns:
+            Whether the error names a page, a browser, or a driver that went away,
+            so that the event that tells which may still come; the Generation is lost
+            at once when the error tells its driver died, or its own state tells it
+            went away, as `check()` finds.
+        """
+        if _driver_gone(error):
+            self._lose(generation, "driver")
+        else:
+            self.check(generation)
+        return not isinstance(error, PageCrashed) and names_closed_target(error)
+
+    def check(self, generation: Generation) -> None:
+        """Lose a Generation whose driver died, or whose browser is no longer connected, as their state tells.
+
+        Args:
+            generation: The Generation.
+        """
         processes = generation.launched.processes
-        if _driver_gone(error) or (processes is not None and not processes.driver_alive()):
+        if processes is not None and not processes.driver_alive():
             self._lose(generation, "driver")
         elif not generation.launched.browser.is_connected():
             self._lose(generation, "disconnected")
-        return not isinstance(error, PageCrashed) and _browser_closed(error)
+
+    async def ask(self, generation: Generation) -> None:
+        """Probe a Generation at once, and lose it if the probe fails, for a failure its state cannot tell of.
+
+        A driver that died is told by its process, but without psutil, or for a
+        browser whose processes are not known, only a call through the driver
+        finds it out. The probe takes `tripwire.GRACE` seconds at most; one that
+        takes longer tells nothing, as the health probe waits longer.
+
+        Args:
+            generation: The Generation.
+        """
+        if generation.lost is not None or generation.closing:
+            return
+        probe = _unattended(generation.launched.probe())
+        done, _ = await asyncio.wait([probe], timeout=GRACE)
+        failure = probe.exception() if done else None
+        if failure is not None:
+            self._lose(generation, "driver" if _driver_gone(failure) else self._loss_reason(generation))
 
     async def _probe(self, generation: Generation) -> None:
         """Probe a Generation's health, and its memory, periodically, until it is lost or closed."""
@@ -350,10 +424,14 @@ class Generations:
     async def _closed(self, generation: Generation) -> None:
         """Close a Generation's browser and driver, then kill what is left of its processes.
 
-        A driver that does not close within `CLOSE_TIMEOUT` is killed, so that the
-        close, which waits for it even when cancelled, ends.
+        The processes of a lost Generation are killed first, as its browser may have
+        outlived its driver. A driver that does not close within `CLOSE_TIMEOUT` is
+        killed, so that the close, which waits for it even when cancelled, ends.
         """
         processes = generation.launched.processes
+        if generation.lost is not None and processes is not None:
+            # One whose driver died still runs, and may connect to the proxy of the network guard as it closes.
+            await asyncio.to_thread(processes.kill)
         closing = _unattended(generation.launched.close())
         try:
             done, _ = await asyncio.wait([closing], timeout=CLOSE_TIMEOUT)
@@ -375,8 +453,15 @@ def _unattended(work: Awaitable[None]) -> asyncio.Future[None]:
     return future
 
 
-def _browser_closed(error: BaseException) -> bool:
-    """Whether an error, or one that caused it, tells of a page, a browser, or a driver that went away."""
+def names_closed_target(error: BaseException) -> bool:
+    """Tell whether an error, or one that caused it, names a page, a browser, or a driver that went away.
+
+    Args:
+        error: The error.
+
+    Returns:
+        Whether patchright's message for such a failure is in its chain.
+    """
     return any(marker in str(cause) for cause in _causes(error) for marker in _CLOSED_MARKERS)
 
 

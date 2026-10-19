@@ -7,9 +7,9 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Callable, Sequence
 
-__all__ = ["Tripwire"]
+__all__ = ["GRACE", "Tripwire", "first_tripped"]
 
 GRACE = 1.0
 """Seconds an error that may come of what trips the wire waits for it to be tripped."""
@@ -47,6 +47,10 @@ class Tripwire:
         self._tripped.set()
         for cancel in list(self._cancels):
             cancel()
+
+    async def wait(self) -> None:
+        """Wait until the wire is tripped, if it was not already."""
+        await self._tripped.wait()
 
     @asynccontextmanager
     async def guarding(
@@ -102,8 +106,26 @@ class Tripwire:
             task.uncancel()  # tripped once the block was done
 
     async def _grace(self) -> None:
-        try:
-            async with asyncio.timeout(GRACE):
-                await self._tripped.wait()
-        except TimeoutError:
-            pass
+        await first_tripped([self], within=GRACE)
+
+
+async def first_tripped(wires: Sequence[Tripwire], *, within: float) -> Tripwire | None:
+    """Wait until one of some tripwires is tripped, if it was not already.
+
+    Args:
+        wires: The tripwires.
+        within: Seconds to wait at most.
+
+    Returns:
+        The first tripwire found tripped, or `None` if none was within the time.
+    """
+    for wire in wires:
+        if wire.reason is not None:
+            return wire
+    waits = [asyncio.ensure_future(wire.wait()) for wire in wires]
+    try:
+        await asyncio.wait(waits, timeout=within, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for wait in waits:
+            wait.cancel()
+    return next((wire for wire in wires if wire.reason is not None), None)

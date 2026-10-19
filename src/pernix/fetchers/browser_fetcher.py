@@ -15,24 +15,27 @@ from pernix.errors import (
     ActionError,
     ConnectError,
     FetchError,
+    IgnoreRequest,
     NetworkBlocked,
     PageCrashed,
     PernixError,
     ProxyError,
+    Retry,
     Timeout,
     TLSError,
     TooManyRedirects,
 )
 from pernix.fetchers.browser_cookies import request_cookie
-from pernix.fetchers.browser_generations import Generations
+from pernix.fetchers.browser_generations import Generations, names_closed_target
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
+from pernix.fetchers.kept_pages import KeptPage, page_keeping, sharing_a_kept_slot
 from pernix.fetchers.network_guard import admitted, current_guard
-from pernix.fetchers.page_actions import run_render
+from pernix.fetchers.page_actions import run_page_method, run_render
 from pernix.fetchers.page_slots import PageSlot, PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.session_contexts import SessionContexts
-from pernix.fetchers.tripwire import Tripwire
+from pernix.fetchers.tripwire import GRACE, Tripwire, first_tripped
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
 from pernix.settings import ResponseSettings, Section
@@ -47,6 +50,8 @@ if TYPE_CHECKING:
     from patchright.async_api import Response as PageResponse
 
     from pernix.crawler import Crawler
+    from pernix.fetchers.browser_generations import Generation
+    from pernix.fetchers.kept_pages import PageKeeping
     from pernix.fetchers.launched_browser import LaunchedBrowser
     from pernix.fetchers.network_guard import NetworkGuard
     from pernix.fetchers.session_contexts import SessionContext
@@ -133,10 +138,14 @@ class BrowserFetcher:
 
     At most `browser.max_pages` pages are open at once, each that of one fetch,
     which waits for one to close before it opens its own; `browser.deadline` then
-    limits the whole fetch. The page is loaded until its `load` event, within
-    `browser.timeout` (or `request.timeout`). A `Render` in `request.render` then
-    waits for its `wait_for`, runs its actions, and takes its screenshot, each
-    within `browser.action_timeout` unless an action sets its own. The page may not
+    limits the whole fetch. A `Render` with `keep_page` leaves its page open, as
+    `response.page`, for the Callback of a Request the Run fetches
+    (`pernix.fetchers.kept_pages`), and the rendered fetches made while it is kept
+    share its slot. The page is loaded until its `load` event, within
+    `browser.timeout` (or `request.timeout`), after its `setup` method ran. A
+    `Render` in `request.render` then waits for its `wait_for`, runs its actions,
+    each within `browser.action_timeout` unless an action sets its own, runs its
+    `action` method, and takes its screenshot. The page may not
     load the resource types of its `block`, or of `browser.block` without one, nor
     register service workers then, and the XHR and fetch responses matching its
     `capture` are kept; `response.browser` holds what they gave, with the document
@@ -275,7 +284,9 @@ class BrowserFetcher:
             pernix.errors.PageCrashed: The page crashed.
             pernix.errors.BrowserLost: The browser went away during the fetch.
             ValueError: The Request has an `Authorization` or `Proxy-Authorization`
-                header, or goes through a SOCKS proxy with credentials.
+                header, goes through a SOCKS proxy with credentials, or keeps its
+                page where no Callback holds it, outside `keeping_pages()` or in an
+                Inline Fetch.
         """
         if not self._open:
             raise RuntimeError("BrowserFetcher must be entered with 'async with' before fetching")
@@ -291,15 +302,18 @@ class BrowserFetcher:
                 f"{request!r} goes through a SOCKS proxy with credentials, which the browser cannot use; "
                 "render it through an HTTP proxy, or fetch it over HTTP"
             )
+        keeping = _keeping_for(request)
         guard = current_guard()
         if guard is not None:
             guard.check(request.url, proxy=proxy)
-        page = _Page(await self._pages.take())
+        # A Callback holding a kept page would wait forever for a slot, were they all held so.
+        slot = PageSlot(lambda: None) if sharing_a_kept_slot() else await self._pages.take()
+        page = _Page(slot, keeping=keeping)
         try:
             async with self._deadline(request):
                 try:
                     return await self._fetch(request, guard, proxy, session, page)
-                except PernixError:
+                except (PernixError, Retry, IgnoreRequest):  # those of Pernix, as page methods may raise
                     raise
                 except Exception as exc:  # the browser's own errors
                     raise _fetch_error(exc, request) from exc
@@ -309,19 +323,20 @@ class BrowserFetcher:
     async def _fetch(
         self, request: Request, guard: NetworkGuard | None, proxy: str | None, session: Session | None, page: _Page
     ) -> Response:
-        async with self._generations.fetching(request.url) as launched:
-            return await self._fetch_in(launched, request, guard, proxy, session, page)
+        async with self._generations.fetching(request.url) as generation:
+            return await self._fetch_in(generation, request, guard, proxy, session, page)
 
     async def _fetch_in(
         self,
-        launched: LaunchedBrowser,
+        generation: Generation,
         request: Request,
         guard: NetworkGuard | None,
         proxy: str | None,
         session: Session | None,
         page: _Page,
     ) -> Response:
-        """Fetch in a browser, in a context of its own or one kept for its Session."""
+        """Fetch in a browser, in a context of its own or one kept for its Session, and keep the page if asked."""
+        launched = generation.launched
         if guard is not None and not launched.guarded:
             guard.blocked.append(request.url)
             raise NetworkBlocked(
@@ -338,12 +353,22 @@ class BrowserFetcher:
                 await launched.new_context(proxy=proxy, blocks_service_workers=workers)
             )
             try:
-                return await self._load(context, load)
-            finally:
+                response, opened = await self._load(context, load)
+            except BaseException:
                 await self._close_soon(context)
+                raise
+            if opened is None:
+                await self._close_soon(context)
+            else:
+                self._keep(page, opened, generation, context, request.url)
+            return response
         async with self._contexts.using(launched, session, proxy=proxy, blocks_service_workers=workers) as kept:
             page.context = kept.context
-            return await self._load(kept.context, load, kept=kept, session=session)
+            response, opened = await self._load(kept.context, load, kept=kept, session=session)
+            if opened is not None:
+                kept.handed_over = True  # the page's Callback closes it, never to be used again
+                self._keep(page, opened, generation, kept.context, request.url)
+            return response
 
     async def _load(
         self,
@@ -352,11 +377,12 @@ class BrowserFetcher:
         *,
         kept: SessionContext | None = None,
         session: Session | None = None,
-    ) -> Response:
+    ) -> tuple[Response, _Open | None]:
         """Load a Request in a page of its own, keeping what it changed in its Session, if any.
 
         A page that crashes fails the fetch with `PageCrashed`; its context is closed,
-        if it is kept for a Session, once what the fetch changed is kept.
+        if it is kept for a Session, once what the fetch changed is kept. A page the
+        Render keeps is left open, and given back with what watches it.
         """
         page = await context.new_page()
         if self._stats is not None:
@@ -376,8 +402,9 @@ class BrowserFetcher:
                 kept.broken = True  # what the page held is not known
             await self._done(page, watch, kept, session)
             raise
-        await self._done(page, watch, kept, session)
-        return response
+        keep = load.render.keep_page
+        await self._done(page, watch, kept, session, keep_open=keep)
+        return response, _Open(page, crash, watch) if keep else None
 
     def _crashed(self, crash: Tripwire) -> None:
         if crash.reason is None and self._stats is not None:
@@ -393,6 +420,9 @@ class BrowserFetcher:
             await kept.sync(session, own, now=time.time())
         elif own:
             await page.context.add_cookies(own)
+        setup = load.render.setup
+        if setup is not None:  # before the routes below, which are tried first, as added last
+            await run_page_method(page, setup, step=f"Render(setup={setup.name})", url=request.url)
         if load.blocked:
             await page.route("**/*", ResourceBlocker(load.blocked))
         rewrite = _FirstRequest.of(page, request)
@@ -438,13 +468,26 @@ class BrowserFetcher:
         )
         return await self._response(page, document, load, session, result)
 
-    async def _done(self, page: Page, watch: _PageLoad, kept: SessionContext | None, session: Session | None) -> None:
-        """End a fetch: in a kept context, close its pages and keep what it changed in its Session."""
-        watch.stop()
+    async def _done(
+        self,
+        page: Page,
+        watch: _PageLoad,
+        kept: SessionContext | None,
+        session: Session | None,
+        *,
+        keep_open: bool = False,
+    ) -> None:
+        """End a fetch: in a kept context, close its pages and keep what it changed in its Session.
+
+        A page kept open for its Callback stays open, and watched; what the fetch
+        changed is kept all the same, but not what the Callback changes then.
+        """
+        if not keep_open:
+            watch.stop()
         if kept is None or session is None:
             return  # its context is closed, with the pages
         try:
-            await kept.merge(page, session, now=time.time())
+            await kept.merge(page, session, now=time.time(), close_pages=not keep_open)
         except Exception:
             kept.broken = True
             logger.warning(
@@ -515,6 +558,7 @@ class BrowserFetcher:
             fetcher="browser",
             session=None if session is None else session.id,
             browser=result,
+            page=page if load.render.keep_page else None,
         )
 
     @asynccontextmanager
@@ -544,12 +588,51 @@ class BrowserFetcher:
         return closing
 
     def _release(self, page: _Page) -> None:
-        """Give a fetch's page slot back once its page is closed: at once, or once its context, still closing, is."""
+        """Give a fetch's page slot back once its page is closed: at once, or once its context, still closing, is.
+
+        A page kept open for its Callback gives its slot back once it is closed.
+        """
+        if page.kept:
+            return
         closing = None if page.context is None else self._closing.get(page.context)
         if closing is None:
             page.slot.release()
         else:  # a fetch cancelled, or past browser.deadline, leaves its page open while its context closes
             closing.add_done_callback(lambda _closing: page.slot.release())
+
+    def _keep(self, page: _Page, opened: _Open, generation: Generation, context: BrowserContext, url: str) -> None:
+        """Hand a page left open to the Callback that keeps it, with its slot, its context, and its browser.
+
+        Once the Callback ends, the page is closed with its context, then its slot is
+        given back, and its browser may close.
+        """
+        keeping = page.keeping
+        if keeping is None:  # checked before fetching
+            raise RuntimeError(f"the page of {url} cannot be kept, as no Callback holds it")
+        page.kept = True
+        release_generation = self._generations.keep(generation)
+
+        def close() -> None:
+            opened.watch.stop()
+
+            def closed(_closing: asyncio.Task[None]) -> None:
+                page.slot.release()
+                release_generation()
+
+            self._discard(context).add_done_callback(closed)
+
+        async def broken(error: BaseException) -> Exception | None:
+            # The error may come of a fetch in another browser, so this one's own state tells whether it went away.
+            self._generations.check(generation)
+            if names_closed_target(error) or _page_gone(error):  # it may come before the event that tells why
+                if generation.lost is None and generation.launched.processes is None:
+                    await self._generations.ask(generation)  # its driver's process cannot tell whether it died
+                await first_tripped([opened.crash, generation.tripwire], within=GRACE)
+            if opened.crash.reason is not None:
+                return PageCrashed(f"the page of {url}, kept for its Callback, crashed")
+            return generation.lost_error(url)
+
+        keeping.keep(KeptPage(opened.page, close=close, broken=broken))
 
     async def _session_context(
         self, launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool
@@ -579,10 +662,22 @@ class BrowserFetcher:
 
 @dataclass(slots=True)
 class _Page:
-    """The page slot a fetch holds, and the context it opens its page in, once it has one."""
+    """The page slot a fetch holds, the context it opens its page in, once it has one, and where it keeps it, if it does."""
 
     slot: PageSlot
     context: BrowserContext | None = None
+    keeping: PageKeeping | None = None
+    kept: bool = False
+    """Whether the page was kept for its Callback, which then gives the slot back."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Open:
+    """A page a fetch leaves open for its Callback, with what watches it: whether it crashes, and the network guard."""
+
+    page: Page
+    crash: Tripwire
+    watch: _PageLoad
 
 
 @dataclass(frozen=True, slots=True)
@@ -787,6 +882,24 @@ async def _quietly(closing: Awaitable[None], what: str) -> None:
         await closing
     except Exception:  # a browser that went away closed its contexts with it
         logger.debug("Ignoring an error %s", what, exc_info=True)
+
+
+def _keeping_for(request: Request) -> PageKeeping | None:
+    """Where a Request that keeps its page keeps it; `None` for one that does not.
+
+    Raises:
+        ValueError: It keeps its page where no Callback holds it.
+    """
+    if not (isinstance(request.render, Render) and request.render.keep_page):
+        return None
+    keeping = page_keeping()
+    if keeping is None:
+        raise ValueError(
+            f"{request!r} keeps its page, with Render(keep_page=True), for its Callback, but none holds it here: an "
+            "Inline Fetch, the shell, and a Fetcher called directly cannot keep a page; work with "
+            "it in a page method, as Render(action=...), instead"
+        )
+    return keeping
 
 
 def _page_gone(error: BaseException) -> bool:

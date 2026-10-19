@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from pernix import Request
-from pernix.browser import RESOURCE_TYPES, Click, Evaluate, Render, Screenshot, Scroll, Type, WaitFor
+from pernix.browser import RESOURCE_TYPES, Click, Evaluate, PageMethod, Render, Screenshot, Scroll, Type, WaitFor
 from pernix.browser.url_globs import glob_pattern
 from pernix.errors import SettingsError
 from pernix.fetchers import BrowserSettings
@@ -34,6 +34,37 @@ def test_render_takes_sequences_and_single_values_and_keeps_tuples() -> None:
     assert hash(render) == hash(
         Render(wait_for="div.item", actions=render.actions, block=render.block, capture=render.capture)
     )
+
+
+def test_page_methods_are_kept_as_page_methods() -> None:
+    async def log_in(page: object) -> None:
+        pass
+
+    marked = PageMethod(log_in, optional=True, timeout=5)
+    render = Render(setup=log_in, action=marked, keep_page=True)
+
+    assert render.setup == PageMethod(log_in)
+    assert render.action is marked
+    assert render.keep_page
+    assert (Render().setup, Render().action, Render().keep_page) == (None, None, False)
+    assert render == Render(setup=PageMethod(log_in), action=marked, keep_page=True)
+
+
+def test_page_methods_must_be_async() -> None:
+    def close_banner(page: object) -> None:
+        pass
+
+    with pytest.raises(TypeError, match=r"PageMethod: .* is not an async method"):
+        Render(action=close_banner)  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize("timeout", [0, -1.0])
+def test_a_page_method_timeout_must_be_positive(timeout: float) -> None:
+    async def close_banner(page: object) -> None:
+        pass
+
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        PageMethod(close_banner, timeout=timeout)
 
 
 def test_block_none_defers_to_the_setting_and_empty_blocks_nothing() -> None:

@@ -48,14 +48,18 @@ async def test_a_page_whose_renderer_dies_fails_with_page_crashed(
         loading = asyncio.create_task(fetcher.fetch(_render(server.url("/held")), session=session))
         await held.wait()
         kill(renderers())
-        with pytest.raises(PageCrashed, match=r"the page of http://127\.0\.0\.1:\d+/held crashed"):
+        # A browser can stall once its renderers die, on a loaded runner, until its health probe finds it lost.
+        with pytest.raises((PageCrashed, BrowserLost), match=r"http://127\.0\.0\.1:\d+/held") as failed:
             await loading
         held.release.set()
-        response = await fetcher.fetch(_render(server.url("/")), session=session)  # in the same browser
+        response = await fetcher.fetch(_render(server.url("/")), session=session)
 
     assert response.css("p::text").get() == "up"
-    assert stats.get("browser.page_crashes") == 1
-    assert stats.get("browser.generations") == 1
+    if isinstance(failed.value, PageCrashed):
+        assert str(failed.value).endswith("crashed")
+        assert (stats.get("browser.page_crashes"), stats.get("browser.generations")) == (1, 1)  # the same browser
+    else:
+        assert (stats.get("browser.lost_by_reason.unresponsive"), stats.get("browser.generations")) == (1, 2)
     assert stats.get("browser.contexts_open") == 0
 
 

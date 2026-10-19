@@ -120,8 +120,8 @@ def _generations(
 
 async def _number(generations: Generations) -> int:
     """Fetch once, and tell which browser the fetch used."""
-    async with generations.fetching("https://shop.example/") as launched:
-        return cast("FakeLaunched", launched).number
+    async with generations.fetching("https://shop.example/") as generation:
+        return cast("FakeLaunched", generation.launched).number
 
 
 async def test_the_fetches_that_wait_for_a_browser_share_one_launch() -> None:
@@ -153,10 +153,10 @@ async def test_a_browser_is_replaced_after_its_pages_and_closed_once_its_fetches
     inside, release = asyncio.Event(), asyncio.Event()
 
     async def held() -> int:
-        async with generations.fetching("https://shop.example/") as launched:
+        async with generations.fetching("https://shop.example/") as generation:
             inside.set()
             await release.wait()
-            return cast("FakeLaunched", launched).number
+            return cast("FakeLaunched", generation.launched).number
 
     first = asyncio.create_task(held())
     await inside.wait()
@@ -235,6 +235,51 @@ async def test_a_fetch_failing_as_the_driver_died_loses_the_browser() -> None:
     assert "Connection closed" in str(lost.value.__cause__)
     assert stats.get("browser.lost_by_reason.driver") == 1
     assert await _number(generations) == 2
+    await generations.close()
+
+
+async def test_a_browser_is_checked_by_its_own_state() -> None:
+    launcher = Launcher()
+    generations, _, stats = _generations(launcher)
+    assert await _number(generations) == 1
+    [first] = launcher.launched
+    generation = generations._current  # pyright: ignore[reportPrivateUsage]
+    assert generation is not None
+
+    generations.check(generation)  # as for a Callback failing with an error of another browser
+    assert generation.lost is None
+    first.processes.driver_killed = True
+    generations.check(generation)
+
+    assert generation.lost == "driver"
+    assert stats.get("browser.lost_by_reason.driver") == 1
+    await generations.close()
+
+
+@pytest.mark.parametrize(
+    ("probe", "lost"),
+    [
+        (None, None),
+        (Exception("CDPSession.send: Connection closed while reading from the driver"), "driver"),
+    ],
+)
+async def test_a_browser_whose_processes_are_not_known_is_asked(probe: Exception | None, lost: str | None) -> None:
+    launcher = Launcher()
+    generations, _, _ = _generations(launcher)
+    assert await _number(generations) == 1
+    [first] = launcher.launched
+    generation = generations._current  # pyright: ignore[reportPrivateUsage]
+    assert generation is not None
+    first.processes = None  # pyright: ignore[reportAttributeAccessIssue]  # as without psutil
+
+    async def answer() -> None:
+        if probe is not None:
+            raise probe
+
+    first.probe = answer  # pyright: ignore[reportAttributeAccessIssue]
+    await generations.ask(generation)
+
+    assert generation.lost == lost
     await generations.close()
 
 
