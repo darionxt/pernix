@@ -245,7 +245,7 @@ class RunProxies:
         if proxy is None:
             raise NoProxyYet(await self._unavailable())
         if self._supply.min_available is not None:
-            self._keep_level(await self._available())
+            self._keep_level(await self.available())
         return proxy
 
     async def bind(self, session: str, current: str | None, *, account: Account | None = None) -> str:
@@ -518,7 +518,7 @@ class RunProxies:
                 if self._clock() < self._last_extraction + interval:
                     continue  # a refresh extracted meanwhile
                 level = self._supply.min_available or 0
-                available = await self._available()
+                available = await self.available()
                 if not needed and available >= level:
                     return
                 try:
@@ -528,8 +528,12 @@ class RunProxies:
                     logger.error("Extracting proxies failed", exc_info=exc)
                 return
 
-    async def _available(self) -> int:
-        """How many of the proxies listed, which no Session holds as its own, are available."""
+    async def available(self) -> int:
+        """Return how many of the proxies listed, which no Session holds as its own, are available.
+
+        Returns:
+            The count.
+        """
         return sum(candidate.health == "available" for candidate in await self._pool.candidates())
 
     async def _refreshed(self, interval: float) -> None:

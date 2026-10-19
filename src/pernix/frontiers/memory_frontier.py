@@ -173,12 +173,15 @@ class MemoryFrontier:
         count_attempt: bool = True,
         reason: str = "",
         budget: str | None = None,
+        request: Request | None = None,
     ) -> bool:
         """Return a leased Request; see `Frontier.nack()`."""
         now = self._refresh()
         item = self._leased(lease)
         if item is None:
             return False
+        if request is not None:
+            item.request, item.rendered = request, is_rendered(request)
         if budget is None:
             item.attempts += count_attempt
         else:

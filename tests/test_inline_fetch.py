@@ -11,14 +11,15 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from pernix import IgnoreRequest, Request, Response, events
-from pernix.errors import BrowserLost, ConnectError, ResponseTooLarge, RetriesExhausted, SessionError, TLSError
+from pernix.errors import Blocked, BrowserLost, ConnectError, ResponseTooLarge, RetriesExhausted, SessionError, TLSError
 from pernix.fetchers import FetcherDispatch, StreamedResponse
 from pernix.inline_fetch import InlineFetch, handling
 from pernix.middlewares import build_download_chain
 from pernix.retry_policy import Decision, DefaultRetryPolicy
+from pernix.sending import IndependentSending
 from pernix.sessions import MemorySessionPool, Outcome
 from pernix.sessions.session_leasing import SessionLeasing
-from pernix.settings import DomainSettings, RetrySettings, SessionSettings
+from pernix.settings import BlockedSettings, DomainSettings, RetrySettings, SessionSettings
 from pernix.stats import Stats
 from pernix.testing import FakeFetcher, make_response
 from pernix.throttle import Throttle
@@ -587,3 +588,63 @@ async def test_a_fetch_waiting_for_a_session_gives_up_its_place_to_a_nested_fetc
 
     assert [response.body for response in responses] == [b"outer", b"rival"]
     assert [request.url.rsplit("/", 1)[-1] for request in site.requests] == ["nested", "outer", "rival"]
+
+
+def _forbidden_is_blocked(response: Response) -> bool:
+    return response.status == 403
+
+
+async def test_a_response_found_blocked_is_retried_in_place_rendered_with_render() -> None:
+    sent: list[Request] = []
+
+    async def download(request: Request) -> Response:
+        sent.append(request)
+        return make_response(request.url, status=200 if request.render else 403, request=request)
+
+    sender = IndependentSending(is_blocked=_forbidden_is_blocked, render_blocked=True)
+    policy = DefaultRetryPolicy(RetrySettings(times=0, delay_scale=0), blocked=BlockedSettings(render=True))
+    inline = InlineFetch(
+        download=download,
+        throttle=Throttle(DomainSettings()),
+        retry_policy=policy,
+        events=events.EventBus(timeout=5),
+        stats=Stats(),
+        sender=sender,
+    )
+
+    response = await inline.fetch(Request(f"{SITE}/a"))
+
+    assert response.status == 200
+    assert [bool(request.render) for request in sent] == [False, True]
+
+
+def _blocking_leasing() -> SessionLeasing:
+    return SessionLeasing(
+        MemorySessionPool(max_blocks=10),
+        SessionSettings(enabled=True),
+        stats=Stats(),
+        is_blocked=_forbidden_is_blocked,
+    )
+
+
+async def test_a_session_found_blocked_is_retried_in_place_until_the_budget_is_spent() -> None:
+    site = _site({"/a": [_status(403)]})
+    policy = DefaultRetryPolicy(RetrySettings(times=0, blocked=1, delay_scale=0))
+
+    with pytest.raises(RetriesExhausted, match=r"blocked: 1 retries spent") as exhausted:
+        await _inline(site.fetch, retry_policy=policy, sessions=_blocking_leasing()).fetch(Request(f"{SITE}/a"))
+
+    assert isinstance(exhausted.value.__cause__, Blocked)
+    assert len(site.requests) == 2  # no ordinary retry is left, yet the budget's was made
+
+
+async def test_a_nested_fetch_found_blocked_raises_to_the_one_holding_the_lease() -> None:
+    site = _site({"/token": [_status(403)]})
+    leasing = _blocking_leasing()
+    inline = _inline(site.fetch, sessions=leasing)
+
+    async with leasing.sending(Request(f"{SITE}/outer", session="a"), wait=0):
+        with pytest.raises(Blocked):
+            await inline.fetch(Request(f"{SITE}/token", session="a"))
+
+    assert len(site.requests) == 1

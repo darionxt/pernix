@@ -679,7 +679,9 @@ patchright may fail a call before it emits the event of what failed it, so an er
   - Leases carry a token and expire after `sessions.lease_ttl` (300 s) unless renewed, which happens every third of it while their fetch runs; a release or a save from an expired or released Lease is rejected, counted as `sessions.stale`.
   - A Session also cools down with the proxy it follows, and is Retired with it (see Proxies below).
   - Stats: `sessions.created`, `sessions.leased`, `sessions.outcomes.<outcome>`, `sessions.cooldowns`, `sessions.retirements`, every Session Retired, whatever the reason, and `sessions.stale`; logins add their own (see Login below).
-  - When judged Blocked, the Session is Retired and the Request is retried with another Session; Session switches have their own budget and do not consume ordinary retries.
+  - **Blocked**: `Spider.is_blocked(response)` judges every Response fetched under a Session, but those of a login: by default, whether its status is one of `blocked.statuses`, 403 alone, as 429, Rate Limited, cools the Session down instead, and 401 is for `is_logged_out()`; a Spider overrides it for sites that serve a challenge page instead, such as with status 200. A judgment that raises is logged, and the Response taken not to be Blocked. A Response judged Blocked raises `Blocked`, a `Retry`, is counted as `responses.blocked`, and is not handed to its Callback; the Lease is released as `blocked`, and the Session is Retired after `sessions.max_blocks` (3) in a row, a fetch that went well ending the row. The Request is retried at once under the retry budget `blocked` (§6.4), up to `retry.blocked` (3) times, which take none of its ordinary retries: one naming no Session leases whichever the pool gives next, the least recently leased, so another, with its proxy, and a new one rather than the Session it was Blocked with while the pool has room; one naming its Session, or an Inline Fetch continuing one, is retried with it, until it is Retired. Once the budget is spent, the Request fails with `RetriesExhausted`, naming the budget, and its errback gets it. An Inline Fetch that shares the Lease of the fetch it is nested in raises `Blocked` to that fetch, as `LoginExpired`, which is retried with another Session. A Blocked Response counts against the Session, never against its proxy: as any Response through it, it shows the proxy reachable, ending its row of failures. A Callback that raises `Blocked` itself is retried under the budget too, but its Session's Lease has ended, so it counts toward no Retirement.
+  - **Without a Session Pool**, a Response is judged only when its retry can change something: go through another of the Run's proxies, as the next attempt does while another is available, or be rendered (below); otherwise, as without proxies or with a single one, a 403 reaches its Callback, as any other.
+  - **Rendered instead**: with `blocked.render`, an HTTP Request found Blocked is retried rendered, as `request.replace(render=True)`, under the same budget, unless it names its Fetcher: the retry policy names the Request to retry (`Decision.retry(..., request=...)`), the Frontier keeps it in place of the one tried (`nack(request=...)`), with its Fingerprint, so it goes to the workers of rendered Requests, and an Inline Fetch replaces it in place. The Request a Decision names keeps the Session and the proxy the one tried was scheduled with, not those it was sent under, so its retry may lease another.
 - **Login**: `async def login(self, session, account)` on the Spider logs a Session in; `account` is the Session's Account, or `None` for a Session without one, which can warm up with it, such as to take a guest token. A Spider that defines it has every Session of its pool log in before its first fetch, and again once it is logged out:
   - **Single-flight**: the pool gives a Session that must log in to one fetch at a time, with a Lease whose `must_log_in` is set, and no other Lease on it until the holder reports `logged_in()`; fetches that want the Session wait for it as for a busy one, and lease another meanwhile if they can. The fetch runs the login in its task, holding its place in its slot and the Lease, which the login's Inline Fetches share, so they are sent under the Session, over HTTP or rendered, one after another, and keep the cookies they set; the cookies are saved before the fetch goes on.
   - **Expiry**: `Spider.is_logged_out(response)`, a 401 by default, judges every Response fetched under a Session, but those of the login itself and a streamed one before its body is read. A Response judged logged out raises `LoginExpired`, a `Retry` with no delay, so the Request is retried at once, counting as a retry, on the Frontier's path and in Inline Fetches alike; the Lease is released as `auth_expired`, and the Session logs in again before its next fetch, unless it did since that Lease was given. An Inline Fetch that shares the Lease of the fetch it is nested in, such as one a download Middleware makes, cannot retry under the expired login, so it raises `LoginExpired` to the outer fetch, which is retried once the Session logged in again. A judgment that raises is logged, and the Session taken to be logged in.
@@ -732,7 +734,7 @@ class SessionPool(Protocol):
 4. **Health, Cooldown, and quotas**:
    - Cooldown expiry, error score, use count, daily quota, and minimum interval between uses are all updated atomically in Lua, with time taken from the Redis server clock.
    - `rate_limited` puts the Session in Cooldown until the time given by `Retry-After` or the target site's rate-limit headers; it is not Retired.
-   - `blocked` adds to the error score, and the Session is Retired once the score exceeds a threshold.
+   - `blocked` adds to the error score, and the Session is Retired once the score exceeds a threshold; the in-process pool counts the Blocked outcomes in a row, up to `sessions.max_blocks`.
    - `auth_expired` marks the Session as needing to log in again, unless it logged in since the Lease was given; `login_failed` cools it down too, and Retires it after too many in a row.
    - `proxy_cooldown`, and `proxy_failed` with an `until`, cool the Session down with the proxy it follows; `proxy_retired` Retires it with its proxy.
    - A Cooldown or Retirement detected by one Worker takes effect immediately for all Workers.
@@ -775,8 +777,8 @@ class SessionPool(Protocol):
 
 **Handling Blocked responses**
 
-- Blocked-response detection: built-in status-code rules, plus an overridable `Spider.is_blocked(response)`.
-- Once a Response is identified as Blocked: retry with a different Session or proxy; optionally, it can be configured to "automatically upgrade to Render once HTTP is Blocked".
+- Blocked-response detection: the status codes of `blocked.statuses` (403), plus an overridable `Spider.is_blocked(response)`.
+- Once a Response is identified as Blocked: retry with a different Session or proxy, under a retry budget of its own; with `blocked.render`, an HTTP Request found Blocked is retried rendered (§5.3).
 
 **Browser side**: see the defaults in §5.2. The following must be verified by real-world testing before going live:
 
@@ -794,7 +796,7 @@ Interface semantics:
 - `claim`: claims a Request and obtains a Lease with a token; `claim(rendered=True)` claims only the Requests that go to the browser Fetcher, and `rendered=False` only the others.
 - `renew`: renews the Lease.
 - `ack`: acknowledges completion.
-- `nack(delay)`: returns the Request with a delay, optionally counting it as a failure; `nack(budget=name)` counts it as a retry under a retry budget instead (§6.4), in `Lease.spent`.
+- `nack(delay)`: returns the Request with a delay, optionally counting it as a failure; `nack(budget=name)` counts it as a retry under a retry budget instead (§6.4), in `Lease.spent`; `nack(request=...)` keeps another Request in its place, as a retry policy may have one retried rendered, with the Fingerprint and the slot of the one returned, and the kind of workers the new one needs.
 - `dead`: marks the Request as permanently failed; it is kept as a Dead Request.
 
 Rules:
@@ -856,7 +858,7 @@ Engine integration:
 After every attempt that produced a Response, raised while fetching, or raised `Retry` in the Callback, the Engine asks the retry policy, `decide(request, outcome, attempt) -> Decision`, where `outcome` is the Response or the exception and `attempt` counts from 1. The Decision is one of:
 
 - `accept()`: the outcome stands; a Response goes to the spider chain, an exception fails the Request.
-- `retry(delay, reason, budget=None)`: the Request is fetched again after the delay, and `RequestRetried` is emitted. With a `RetryBudget(name, limit)`, the retry counts against that budget instead of as an attempt: the `attempt` the policy is next told of is the same, and once the Request had `limit` retries under the budget, the next one fails it with `RetriesExhausted`, naming the budget.
+- `retry(delay, reason, budget=None, request=None)`: the Request is fetched again after the delay, and `RequestRetried` is emitted; with `request`, that Request in its place, such as the same rendered, which keeps the Session and the proxy the one tried was scheduled with. With a `RetryBudget(name, limit)`, the retry counts against that budget instead of as an attempt: the `attempt` the policy is next told of is the same, and once the Request had `limit` retries under the budget, the next one fails it with `RetriesExhausted`, naming the budget.
 - `give_up(reason)`: a retry was called for but none is left; the Request fails with `RetriesExhausted`.
 
 Default policy (`DefaultRetryPolicy`, configured by `retry.*`):
@@ -864,6 +866,7 @@ Default policy (`DefaultRetryPolicy`, configured by `retry.*`):
 - At most 3 retries (`retry.times`; 0 turns retrying off).
 - Retried status codes (`retry.statuses`): 408, 429, 500, 502, 503, 504, 522, 524. Retried exceptions: `Timeout`, `ConnectError`, `ProxyError`, `PageCrashed`, and `Retry`, including `LoginExpired` for a Session found logged out (§5.3); other `FetchError`s, such as `TLSError` or `TooManyRedirects`, would fail again.
 - `BrowserLost` is retried at once under the `browser_lost` budget, up to `retry.browser_lost` (3) times, which take none of `retry.times`: the fetch did not fail by itself, but with every fetch in its browser.
+- `Blocked` is retried at once under the `blocked` budget, up to `retry.blocked` (3) times, which take none of `retry.times`, with another Session or through another proxy, and, with `blocked.render`, rendered, the Decision naming `request.replace(render=True)` (§5.3). A custom policy that does not tell `Blocked` retries it as the `Retry` it is.
 - The delay is the one `Retry` names; otherwise a `Retry-After` header's, in either format, up to 300 s (`retry.retry_after_max`); otherwise full-jitter backoff with a 1 s base (`retry.backoff_base`) doubling per retry, up to 60 s (`retry.backoff_max`). `retry.delay_scale` multiplies every delay; tests set it to 0.
 - `retry.policy` replaces the policy with any object that has `decide()`; a class gets `RetrySettings` injected. A policy that raises keeps the outcome.
 
@@ -957,6 +960,7 @@ Rules:
 | `downloads.responses`, `downloads.by_status.<code>`, `downloads.bytes` | Responses fetched, including those retried afterwards and those of Inline Fetches, and their body bytes, streamed ones as they are read |
 | `downloads.errors`, `downloads.errors_by_type.<ErrorType>` | Exceptions fetching raised, other than `IgnoreRequest` and `Retry` |
 | `responses.received` | Responses handed to Callbacks |
+| `responses.blocked` | Responses judged Blocked, retried with another Session, through another proxy, or rendered (§5.3) |
 | `items.scraped`, `items.dropped`, `items.errors`, `items.retried`, `items.failures_lost`, `items.discarded` | Items stored, dropped, or failed; Pipeline calls retried; failed Items a failure Pipeline lost; Items a stopped Run never processed |
 | `frontier.ready`, `frontier.delayed`, `frontier.leased`, `frontier.done`, `frontier.dead` | The Frontier at the snapshot |
 | `throttle.waits`, `throttle.wait_seconds`, `throttle.cooldowns`, `throttle.refused` | Waiting for per-domain slots, and cooldowns |

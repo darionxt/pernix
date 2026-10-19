@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from pernix.errors import IgnoreRequest, LoginExpired, ProxyError, SessionError
+from pernix.errors import Blocked, IgnoreRequest, LoginExpired, ProxyError, SessionError
 from pernix.fetchers.fetcher_dispatch import sending_as
 from pernix.proxies.run_proxies import FollowedProxy
 from pernix.retry_policy import retry_after_seconds
@@ -92,8 +92,11 @@ class SessionLeasing:
     are saved and the Lease is released with its outcome: `rate_limited` for a 429,
     until its `Retry-After` or for `sessions.cooldown` seconds, at most
     `sessions.cooldown_max`; `auth_expired` for a Response the login judges logged
-    out; `proxy_failed` for a `ProxyError`; `error` for other exceptions; and `ok`
-    otherwise. A fetch nested in another of the same Session, in the same task, such
+    out; `blocked` for a Response the Spider's `is_blocked()` finds Blocked, which
+    raises `Blocked`, so the Request is retried with another Session, as the pool
+    counts it toward the Session's Retirement; `proxy_failed` for a `ProxyError`;
+    `error` for other exceptions; and `ok` otherwise. The Responses of a login are
+    judged neither way. A fetch nested in another of the same Session, in the same task, such
     as one a download Middleware makes, shares the outer fetch's Lease and Session;
     the Lease is released with the most severe outcome of them all, so a 429 one of
     them got cools the Session down.
@@ -137,6 +140,7 @@ class SessionLeasing:
         login: SessionLogin | None = None,
         proxies: RunProxies | None = None,
         accounts: Iterable[Account] = (),
+        is_blocked: Callable[[Response], bool] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         """Wire the leasing to its pool.
@@ -151,6 +155,8 @@ class SessionLeasing:
                 any.
             accounts: The Accounts Sessions are bound to, which the binding policy
                 is told of.
+            is_blocked: Whether a Response fetched under a Session shows the site
+                refusing it; `None` to judge none.
             clock: The current time, in seconds since the epoch.
         """
         self.pool = pool
@@ -159,6 +165,7 @@ class SessionLeasing:
         self._login = login
         self._proxies = proxies
         self._accounts = {account.id: account for account in accounts}
+        self._is_blocked = is_blocked
         self._clock = clock
 
     @asynccontextmanager
@@ -188,7 +195,9 @@ class SessionLeasing:
         if held is not None:
             if held.proxy is None:
                 held.proxy = await self._bind_nested(held, request)
-            shared = Sending(request, held.session, is_logged_out=self._judge(held), nested=True)
+            shared = Sending(
+                request, held.session, is_logged_out=self._judge(held), is_blocked=self._blocked(held), nested=True
+            )
             failure: BaseException | None = None
             try:
                 async with self._reporting(shared):
@@ -220,7 +229,12 @@ class SessionLeasing:
         try:
             if lease.must_log_in:
                 before = await self._log_in(lease, before, holding, request)
-            sending = Sending(request.replace(session=lease.session), session, is_logged_out=self._judge(holding))
+            sending = Sending(
+                request.replace(session=lease.session),
+                session,
+                is_logged_out=self._judge(holding),
+                is_blocked=self._blocked(holding),
+            )
             error: BaseException | None = None
             try:
                 async with self._reporting(sending):
@@ -415,7 +429,13 @@ class SessionLeasing:
             return None
         return self._login.logged_out
 
+    def _blocked(self, held: _Held) -> Callable[[Response], bool] | None:
+        """How the Responses fetched under a held Session are judged Blocked; `None` during its login."""
+        return None if held.logging_in else self._is_blocked
+
     def _outcome(self, response: Response | None, error: BaseException | None) -> Outcome:
+        if isinstance(error, Blocked):
+            return Outcome("blocked")
         if isinstance(error, LoginExpired):
             return Outcome("auth_expired")
         if isinstance(error, ProxyError):

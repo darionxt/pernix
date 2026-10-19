@@ -26,6 +26,7 @@ __all__ = [
     "DEFAULT_LOCALE",
     "FEED_FORMATS",
     "PATH_FIELDS",
+    "BlockedSettings",
     "CoreSettings",
     "DomainSettings",
     "EventSettings",
@@ -189,6 +190,8 @@ class SessionSettings(Section):
         accounts_file: A JSON Lines or CSV file of more Accounts, read when the
             Run starts; see `pernix.account.read_accounts()`.
         login_attempts: Failed logins in a row after which a Session is Retired.
+        max_blocks: Blocked Responses in a row after which a Session is Retired; a
+            fetch that went well ends the row.
     """
 
     __prefix__ = "sessions"
@@ -204,6 +207,7 @@ class SessionSettings(Section):
     accounts: tuple[Account, ...] = ()
     accounts_file: PurePath | None = None
     login_attempts: Annotated[int, msgspec.Meta(ge=1)] = 3
+    max_blocks: Annotated[int, msgspec.Meta(ge=1)] = 3
 
     def __post_init__(self) -> None:
         if (self.accounts or self.accounts_file is not None) and not self.enabled:
@@ -450,6 +454,9 @@ class RetrySettings(Section):
             once, as in tests.
         browser_lost: Retries after the browser of a rendered fetch went away
             (`BrowserLost`), at once, apart from `times`; 0 turns them off.
+        blocked: Retries after a Response was found Blocked (`Blocked`), at once,
+            with another Session, through another proxy, or rendered, apart from
+            `times`; 0 turns them off.
         policy: A replacement retry policy, an object with
             `decide(request, outcome, attempt)`, as an object, a class building one,
             or an import path; `None` for the default policy.
@@ -464,7 +471,32 @@ class RetrySettings(Section):
     retry_after_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
     delay_scale: Annotated[float, msgspec.Meta(ge=0)] = 1.0
     browser_lost: Annotated[int, msgspec.Meta(ge=0)] = 3
+    blocked: Annotated[int, msgspec.Meta(ge=0)] = 3
     policy: Any = None
+
+
+class BlockedSettings(Section):
+    """Settings of how Responses in which a site refuses their sender are told and handled.
+
+    A Response the Spider's `is_blocked()` finds Blocked is retried at once, under
+    the retry budget `blocked` (`retry.blocked`): with another Session, with a
+    Session Pool, which counts it toward the Session's Retirement; through another
+    proxy, without one; and rendered, with `render`. Without a Session Pool, a
+    Response is judged only when its retry can go through another proxy, or be
+    rendered; otherwise it reaches its Callback, as any other.
+
+    Attributes:
+        statuses: The status codes the default `Spider.is_blocked()` finds Blocked.
+            429, Rate Limited, cools a Session down instead, and 401 is for
+            `Spider.is_logged_out()`.
+        render: Retry an HTTP Request found Blocked rendered, as
+            `request.replace(render=True)`, unless it names its Fetcher.
+    """
+
+    __prefix__ = "blocked"
+
+    statuses: frozenset[int] = frozenset({403})
+    render: bool = False
 
 
 class ItemSettings(Section):
@@ -638,6 +670,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FrontierSettings,
     FingerprintSettings,
     RetrySettings,
+    BlockedSettings,
     DomainSettings,
     SessionSettings,
     ProxySettings,

@@ -9,7 +9,7 @@ from pernix.account import read_accounts
 from pernix.crawler import Crawler
 from pernix.request import Request
 from pernix.runner import run_spider
-from pernix.settings import SessionSettings
+from pernix.settings import BlockedSettings, SessionSettings
 from pernix.spider_arguments import check_argument_names
 from pernix.spider_hooks import base_hook
 
@@ -204,6 +204,30 @@ class Spider:
             Whether its status is 401, unless overridden.
         """
         return response.status == 401
+
+    def is_blocked(self, response: Response) -> bool:
+        """Tell whether a Response shows the site refusing the Session it was fetched under, or its proxy.
+
+        A Response found Blocked is not handed to its Callback: the Request is
+        retried at once, under the retry budget `blocked` (`retry.blocked`), which
+        takes none of its ordinary retries, with another Session, through another
+        proxy, or rendered, with `blocked.render`; once the budget is spent, it
+        fails, and its errback gets the error. With a Session Pool, every Response
+        fetched under a Session is judged, but those of a login, and the Session is
+        Retired after `sessions.max_blocks` Blocked Responses in a row. Without one,
+        a Response is judged only when its retry can go through another proxy, or
+        be rendered. Override it for sites that serve a challenge page instead, such
+        as with status 200. Rate Limited Responses are not Blocked: a 429 cools its
+        Session down.
+
+        Args:
+            response: The Response.
+
+        Returns:
+            Whether its status is one of `blocked.statuses`, 403 by default, unless
+            overridden.
+        """
+        return response.status in self.crawler.settings.section(BlockedSettings).statuses
 
     def parse(self, response: Response) -> CallbackResult:
         """Handle a Response whose Request names no Callback.
