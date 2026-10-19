@@ -140,6 +140,13 @@ def test_hidden_landmarks_and_table_rows_are_left_out() -> None:
     assert _markdown(body) == "| Shown |\n| --- |\n| 1 |"
 
 
+def test_hidden_links_take_no_part_in_whether_a_block_is_mostly_links() -> None:
+    hidden = "".join(f'<a href="/{n}" hidden>A hidden link, long enough to outweigh the rest {n}</a>' for n in range(3))
+    body = f"<body><h1>Guide</h1><div>{hidden}<p>The visible paragraph.</p></div></body>"
+
+    assert _markdown(body) == "# Guide\n\nThe visible paragraph."
+
+
 def test_the_only_article_is_the_main_content_but_several_are_not() -> None:
     one = _root(_response("<body><p>Intro</p><article><p>Story</p></article></body>"))
     several = _root(_response("<body><article><p>One</p></article><article><p>Two</p></article></body>"))

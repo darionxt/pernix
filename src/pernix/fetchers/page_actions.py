@@ -1,4 +1,4 @@
-"""Running the options of a `Render` on a page once it has loaded: waiting, actions, and the screenshot."""
+"""Running the options of a `Render` on a page: its page methods, and once it has loaded, waiting, actions, and the screenshot."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pernix.browser import Click, Evaluate, Screenshot, Scroll, Type, WaitFor
-from pernix.errors import ActionError, ActionTimeout
+from pernix.errors import ActionError, ActionTimeout, IgnoreRequest, PernixError, Retry
 
 if TYPE_CHECKING:
     from patchright.async_api import Page
 
-    from pernix.browser import Action, Render
+    from pernix.browser import Action, PageMethod, Render
 
-__all__ = ["ActionOutputs", "run_render"]
+__all__ = ["ActionOutputs", "run_page_method", "run_render"]
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +51,10 @@ class ActionOutputs:
 
 
 async def run_render(page: Page, render: Render, *, action_timeout: float, url: str) -> ActionOutputs:
-    """Wait for `render.wait_for`, run the actions in order, then take the screenshot.
+    """Wait for `render.wait_for`, run the actions in order and the `action` method, then take the screenshot.
 
-    An optional action that fails is logged, and gives nothing.
+    An optional action, or an optional `action` method, that fails is logged, and
+    gives nothing.
 
     Args:
         page: The page, loaded.
@@ -80,9 +81,63 @@ async def run_render(page: Page, render: Render, *, action_timeout: float, url: 
             if not action.optional:
                 raise
             logger.warning("%s; going on, as the action is optional", exc)
+    if render.action is not None:
+        await run_page_method(page, render.action, step=f"Render(action={render.action.name})", url=url)
     if render.screenshot:
         await _run(page, Screenshot(), outputs, action_timeout, "Render(screenshot=True)", url)
     return outputs
+
+
+async def run_page_method(page: Page, method: PageMethod, *, step: str, url: str) -> None:
+    """Run a page method on a page, turning what it raises into `ActionError`s that name it.
+
+    `Retry`, `IgnoreRequest`, and the errors of Pernix, such as a `FetchError` the
+    method raised, go through as they are. A method that is optional and fails
+    otherwise is logged, and the fetch goes on.
+
+    Args:
+        page: The page.
+        method: The page method.
+        step: Names the method in messages, such as `Render(setup=Books.log_in)`.
+        url: The URL of the Request, for messages.
+
+    Raises:
+        pernix.errors.ActionTimeout: The method took longer than its `timeout`, or
+            one of its own calls to the browser timed out.
+        pernix.errors.ActionError: The method raised otherwise.
+    """
+    try:
+        await _call(page, method, step, url)
+    except ActionError as exc:
+        if not method.optional:
+            raise
+        logger.warning("%s; going on, as the method is optional", exc, exc_info=exc.__cause__)
+
+
+async def _call(page: Page, method: PageMethod, step: str, url: str) -> None:
+    from patchright.async_api import TimeoutError as PageTimeout  # imported once a browser runs
+
+    timeout = method.timeout
+    scope = asyncio.timeout(timeout)
+    try:
+        async with scope:
+            await method.method(page)
+    except (PernixError, Retry, IgnoreRequest):
+        raise
+    except TimeoutError as exc:
+        if scope.expired():
+            raise ActionTimeout(f"{step} on {url} took longer than {timeout} s") from None
+        raise ActionTimeout(f"{step} on {url} timed out: {_first_line(exc)}") from exc
+    except PageTimeout as exc:
+        raise ActionTimeout(f"{step} on {url} timed out: {_first_line(exc)}") from exc
+    except Exception as exc:
+        raise ActionError(f"{step} on {url} failed: {type(exc).__name__}: {_first_line(exc)}") from exc
+
+
+def _first_line(error: BaseException) -> str:
+    """The first line of an error's message, as the browser's call log follows it."""
+    lines = str(error).splitlines()
+    return lines[0] if lines else type(error).__name__
 
 
 def _described(action: Action) -> str:

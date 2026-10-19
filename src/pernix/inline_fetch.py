@@ -13,6 +13,7 @@ from pernix.errors import Blocked, IgnoreRequest, LoginExpired, RetriesExhausted
 from pernix.events import RequestRetried
 from pernix.fetchers import StreamedResponse
 from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
+from pernix.fetchers.kept_pages import without_keeping
 from pernix.frontiers import host_slot
 from pernix.response import Response, expect_response
 from pernix.retry_policy import Action, budget_spent, consult, retried_instead
@@ -88,6 +89,9 @@ class InlineFetch:
     A fetch nested in another of the same slot, in the same task, such as one a
     download Middleware makes, shares the outer fetch's place instead of waiting for
     another, though it still waits for the delay, the rate, and a cooldown. A
+    rendered fetch runs the page methods of its `Render`, but cannot keep its page
+    (`Render(keep_page=True)` raises `ValueError`); made by a Callback that keeps a
+    page, it shares that page's slot in the browser. A
     streamed fetch holds its slot until the stream is closed, so the
     fetches made in its block share it too, as they share its Session; only the
     attempts up to the response headers are retried.
@@ -255,7 +259,7 @@ class InlineFetch:
         """Fetch once through the download chain, streaming into `streams` if given; return the Response or the exception."""
         request = sending.request
         try:
-            with streaming_into(streams):
+            with streaming_into(streams), without_keeping():
                 response = expect_response(await self._download(request), f"the download chain for {request!r}")
         except (IgnoreRequest, SessionError):
             raise
