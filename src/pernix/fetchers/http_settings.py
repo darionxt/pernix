@@ -5,13 +5,14 @@ from typing import Annotated
 import msgspec
 from curl_cffi.requests import BrowserType
 
+from pernix.fetchers.pinned_pair import PINNED_PROFILE
 from pernix.settings import Section
 from pernix.settings.suggestions import did_you_mean
 
 __all__ = ["DEFAULT_PROFILE", "HTTPSettings", "check_profile"]
 
-DEFAULT_PROFILE = "chrome150"
-"""The Profile the HTTP Fetcher impersonates by default: a pinned Chrome version (ADR 0010)."""
+DEFAULT_PROFILE = PINNED_PROFILE
+"""The Profile the HTTP Fetcher impersonates by default: a pinned Chrome version, that of the Pinned Pair (ADR 0010)."""
 
 _PROFILES = frozenset(browser.value for browser in BrowserType)
 
@@ -43,7 +44,10 @@ class HTTPSettings(Section):
 
     Attributes:
         impersonate: The Profile to impersonate, a pinned browser version such as
-            `"chrome150"`; `Request(impersonate=...)` overrides it.
+            `"chrome150"`; `Request(impersonate=...)` overrides it. With the Profile
+            of the Pinned Pair, the default, the headers that name the client are
+            those of the bundled browser; another sends its own, and a Run that
+            sets one is warned that the two sides then differ.
         timeout: Seconds to connect, and seconds without receiving any data before a
             transfer fails, to the nearest second; `Request(timeout=...)` overrides it.
         deadline: Seconds a whole fetch may take, waiting for a connection included.

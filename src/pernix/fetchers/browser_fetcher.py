@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import re
 import time
@@ -33,7 +32,7 @@ from pernix.fetchers.browser_generations import Generations, names_closed_target
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.kept_pages import KeptPage, page_keeping, sharing_a_kept_slot
-from pernix.fetchers.launched_browser import launch_browser
+from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser, report_unpinned
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.page_actions import run_page_method, run_render
 from pernix.fetchers.page_slots import PageSlot, PageSlots
@@ -43,11 +42,11 @@ from pernix.fetchers.session_contexts import SessionContexts
 from pernix.fetchers.tripwire import GRACE, Tripwire, first_tripped
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
-from pernix.settings import NetworkSettings, ResponseSettings, Section
+from pernix.settings import DEFAULT_LOCALE, CoreSettings, NetworkSettings, ResponseSettings, Section, locale_languages
 from pernix.urls import url_host
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Sequence
 
     from patchright._impl._api_structures import NameValue, SetCookieParam
     from patchright.async_api import BrowserContext, Frame, Page, Route, WebSocket
@@ -58,7 +57,6 @@ if TYPE_CHECKING:
     from pernix.fetchers.address_guard_proxy import AddressGuardProxy
     from pernix.fetchers.browser_generations import Generation
     from pernix.fetchers.kept_pages import PageKeeping
-    from pernix.fetchers.launched_browser import LaunchedBrowser
     from pernix.fetchers.network_guard import NetworkGuard
     from pernix.fetchers.session_contexts import SessionContext
     from pernix.request import Request
@@ -172,6 +170,12 @@ class BrowserFetcher:
     them, every value kept but not in wire order; `history` holds the redirects of
     the navigation.
 
+    The browser presents the languages of `locale`, and, in headless mode, its own
+    User-Agent without `HeadlessChrome`, so that it names itself as it does with a
+    window, and as the HTTP Fetcher names it with the pinned Profile (ADR 0010).
+    The first browser of a Run that is not the bundled build, or that presents
+    other languages, as Chrome does for some lists, is warned about.
+
     With `network.public_only`, the browser sends all its traffic, its own
     background requests included, through a proxy that resolves each host, checks
     its addresses as the HTTP Fetcher does, and connects only to the addresses it
@@ -224,6 +228,7 @@ class BrowserFetcher:
         *,
         default_encoding: str = "utf-8",
         stats: Stats | None = None,
+        locale: str | Sequence[str] = DEFAULT_LOCALE,
         network: NetworkSettings | None = None,
     ) -> None:
         """Configure the fetcher.
@@ -233,14 +238,19 @@ class BrowserFetcher:
             default_encoding: The `default_encoding` of the Responses whose body is
                 not a rendered DOM.
             stats: Where the pages and the contexts are counted.
+            locale: The languages the browser presents, as the `locale` setting
+                names them.
             network: Which hosts may be reached; any when `None`.
 
         Raises:
+            ValueError: `locale` names no language, or something else.
             pernix.errors.SettingsError: `network.public_only` is on, and
                 `browser.launch_options` would take the browser around the proxy
                 that checks hosts.
         """
         self._settings = settings or BrowserSettings()
+        self._locale = locale_languages(locale)
+        self._reported = False
         self._address_guard: AddressGuard | None = None
         if network is not None and network.public_only:
             check_launch_options(self._settings)
@@ -258,12 +268,7 @@ class BrowserFetcher:
             new_context=self._session_context,
             discard=self._discard,
         )
-        self._generations = Generations(
-            self._settings,
-            retire=self._contexts.retire,
-            stats=stats,
-            launch=functools.partial(launch_browser, address_guard=self._address_guard),
-        )
+        self._generations = Generations(self._settings, retire=self._contexts.retire, stats=stats, launch=self._launch)
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -274,18 +279,30 @@ class BrowserFetcher:
 
         Returns:
             A fetcher with the `browser.*` settings, whose Responses use
-            `response.default_encoding`, counting in the Run's stats, reaching the
-            hosts the `network.*` settings allow.
+            `response.default_encoding`, counting in the Run's stats,
+            presenting the languages of `locale`, and reaching the hosts the
+            `network.*` settings allow. Launch options naming another browser
+            than the bundled build are warned about.
         """
+        settings = crawler.settings.section(BrowserSettings)
+        options = settings.launch_options
+        if "executable_path" in options or options.get("channel", "chromium") != "chromium":
+            logger.warning(
+                "%s names another browser than the bundled build, which the HTTP Fetcher presents with the pinned "
+                "Profile, so the two present different clients",
+                settings.key("launch_options"),
+            )
         return cls(
-            crawler.settings.section(BrowserSettings),
+            settings,
             default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
             stats=crawler.stats,
+            locale=crawler.settings.section(CoreSettings).locale,
             network=crawler.settings.section(NetworkSettings),
         )
 
     async def __aenter__(self) -> Self:
         self._open = True
+        self._reported = False
         self._generations.open()
         self._pages = PageSlots(self._settings.max_pages, stats=self._stats)  # waiters bind to this event loop
         return self
@@ -693,6 +710,21 @@ class BrowserFetcher:
             return generation.lost_error(url)
 
         keeping.keep(KeptPage(opened.page, close=close, broken=broken))
+
+    async def _launch(self, settings: BrowserSettings) -> LaunchedBrowser:
+        """Launch a browser presenting the languages of `locale`, warning about the first that differs from the pinned one.
+
+        With `network.public_only`, it goes through the proxy that checks every host it reaches.
+        """
+        launched = await launch_browser(settings, locale=self._locale, address_guard=self._address_guard)
+        if not self._reported:
+            self._reported = True
+            try:
+                await report_unpinned(launched, self._locale)
+            except BaseException:
+                await launched.close()
+                raise
+        return launched
 
     async def _session_context(
         self, launched: LaunchedBrowser, session: Session, proxy: str | None, blocks_service_workers: bool

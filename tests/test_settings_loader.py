@@ -210,6 +210,40 @@ def test_environment_values_are_parsed_by_type(tmp_path: Path) -> None:
     assert settings["concurrency"] == 8
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("de-DE,de,en-US,en", ("de-DE", "de", "en-US", "en")), ('["zh-CN", "zh"]', ("zh-CN", "zh")), ("fr", ("fr",))],
+    ids=["commas", "JSON", "one"],
+)
+def test_a_string_that_is_not_json_is_kept_where_a_string_is_admitted(
+    tmp_path: Path, value: str, expected: tuple[str, ...]
+) -> None:
+    settings = _load(tmp_path, environ={"PERNIX_LOCALE": value})
+
+    assert settings.section(CoreSettings).locale == expected
+
+
+def test_a_locale_is_read_from_a_list_or_a_comma_separated_string(tmp_path: Path) -> None:
+    assert _load(tmp_path, spider_settings={"locale": ["fr-FR", "fr"]}).section(CoreSettings).locale == ("fr-FR", "fr")
+    assert _load(tmp_path, spider_settings={"locale": " ja , en-US,"}).section(CoreSettings).locale == ("ja", "en-US")
+
+
+@pytest.mark.parametrize(
+    ("locale", "problem"),
+    [
+        ("", "name at least one language, such as 'en-US,en'"),
+        ("en US", "'en US' is not a language tag, such as 'en-US' or 'de'"),
+        (["en-US", "fr_FR"], "'fr_FR' is not a language tag, such as 'en-US' or 'de'"),
+    ],
+)
+def test_a_locale_names_language_tags(tmp_path: Path, locale: str | list[str], problem: str) -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        _load(tmp_path, spider_settings={"locale": locale})
+
+    [found] = excinfo.value.problems
+    assert found.startswith(f"locale: {problem} (from ")
+
+
 def test_invalid_environment_values_name_the_variable(tmp_path: Path) -> None:
     with pytest.raises(SettingsError) as excinfo:
         _load(tmp_path, environ={"PERNIX_DOMAIN__DELAY": "soon"})
@@ -593,6 +627,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "pipelines": {},
         "failed_pipelines": {FailedItemsFile: 100},
         "run_id": None,
+        "locale": ("en-US", "en"),
         "domain.delay": 0.0,
         "domain.verify": True,
         "domain.codes": [],

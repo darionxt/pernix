@@ -13,10 +13,12 @@ from pernix.errors import ComponentError
 from pernix.fetchers.address_guard_proxy import AddressGuardProxy
 from pernix.fetchers.browser_processes import BrowserProcesses
 from pernix.fetchers.network_guard import current_guard
+from pernix.fetchers.pinned_pair import BUNDLED_BROWSER
 from pernix.fetchers.refusing_proxy import RefusingProxy
+from pernix.settings import DEFAULT_LOCALE
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from patchright._impl._api_structures import StorageState
     from patchright.async_api import Browser, BrowserContext, CDPSession, Playwright, ProxySettings
@@ -25,7 +27,15 @@ if TYPE_CHECKING:
     from pernix.fetchers.address_guard import AddressGuard
     from pernix.fetchers.browser_settings import BrowserSettings
 
-__all__ = ["LOOPBACK_BYPASS", "LaunchedBrowser", "launch_browser", "probe_browser", "require_patchright"]
+__all__ = [
+    "LOOPBACK_BYPASS",
+    "LaunchedBrowser",
+    "launch_browser",
+    "presented_languages",
+    "probe_browser",
+    "report_unpinned",
+    "require_patchright",
+]
 
 LOOPBACK_BYPASS = "<-loopback>,localhost,*.localhost,127.0.0.1/8,[::1]"
 """Proxy bypass rules for loopback hosts and nothing else; Chrome's implicit ones would also bypass link-local addresses."""
@@ -37,6 +47,9 @@ _WEBRTC_PROXIED_ONLY = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
 """Keeps WebRTC off UDP, which no proxy carries, so that it goes through the proxy, over TCP, or nowhere."""
 
 logger = logging.getLogger(__name__)
+
+_HEADLESS = "HeadlessChrome/"
+"""What names the browser in its User-Agent in headless mode, and `Chrome/` with a window."""
 
 _EXTRA_HINT = "rendering needs patchright; install it with: pip install 'pernix[browser]'"
 _ENGINE_HINT = "the browser engine is not installed; install it with: pernix browser install"
@@ -56,6 +69,8 @@ class LaunchedBrowser:
             goes through; `None` if the browser has none.
         processes: The processes of the browser and of its driver; `None` if they
             cannot be found, as without psutil.
+        user_agent: The User-Agent its contexts present: its own, without
+            `HeadlessChrome`, in headless mode; `None` for its own.
         guard_proxy: Where a browser launched while `network.public_only` is on
             sends all its traffic, the proxy that checks every host it reaches.
     """
@@ -66,6 +81,7 @@ class LaunchedBrowser:
     refusing_proxy: RefusingProxy | None
     devtools: CDPSession | None = None
     processes: BrowserProcesses | None = None
+    user_agent: str | None = None
     guard_proxy: AddressGuardProxy | None = None
 
     async def new_context(
@@ -88,9 +104,11 @@ class LaunchedBrowser:
                 then never completes.
 
         Returns:
-            The context, without pages.
+            The context, without pages, presenting `user_agent`, if set.
         """
         options: dict[str, Any] = {}
+        if self.user_agent is not None:
+            options["user_agent"] = self.user_agent
         if proxy:
             options["proxy"] = _proxy_settings(proxy)
         if local_storage:
@@ -122,19 +140,25 @@ class LaunchedBrowser:
                 await _close_proxies(self.refusing_proxy, self.guard_proxy)
 
 
-async def launch_browser(settings: BrowserSettings, *, address_guard: AddressGuard | None = None) -> LaunchedBrowser:
+async def launch_browser(
+    settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE, address_guard: AddressGuard | None = None
+) -> LaunchedBrowser:
     """Start patchright and launch a browser.
 
     The browser is Chrome for Testing, in the new headless mode unless
     `browser.headless` is off, with `browser.launch_options` over those defaults.
-    With an address guard, as `network.public_only` asks, all its traffic goes
-    through a proxy that checks every host (`pernix.fetchers.address_guard_proxy`).
-    Under the network guard, every connection to a host other than a loopback one
-    goes to a proxy that refuses it, whatever `launch_options` say. Under either,
-    WebRTC is kept off UDP, which would go around the proxy.
+    It presents the languages of `locale`, through Chrome's `--accept-lang`, unless
+    the `args` of `launch_options` set it; its contexts present its User-Agent
+    without `HeadlessChrome`, as it is with a window. With an address guard, as
+    `network.public_only` asks, all its traffic goes through a proxy that checks
+    every host (`pernix.fetchers.address_guard_proxy`). Under the network guard,
+    every connection to a host other than a loopback one goes to a proxy that
+    refuses it, whatever `launch_options` say. Under either, WebRTC is kept off
+    UDP, which would go around the proxy.
 
     Args:
         settings: The browser settings.
+        locale: The languages to present, in order.
         address_guard: The address guard that checks the hosts the browser reaches,
             if any.
 
@@ -149,7 +173,15 @@ async def launch_browser(settings: BrowserSettings, *, address_guard: AddressGua
         from patchright.async_api import Error, async_playwright  # an optional dependency, imported when needed
     except ImportError as exc:
         raise ComponentError(_EXTRA_HINT) from exc
-    options: dict[str, Any] = {"channel": "chromium", **settings.launch_options, "headless": settings.headless}
+    args = [str(arg) for arg in settings.launch_options.get("args") or ()]  # patchright takes None for none
+    if not any(arg.startswith("--accept-lang=") for arg in args):
+        args.append(f"--accept-lang={','.join(locale)}")
+    options: dict[str, Any] = {
+        "channel": "chromium",
+        **settings.launch_options,
+        "args": args,
+        "headless": settings.headless,
+    }
     network_guard = current_guard()
     refusing_proxy: RefusingProxy | None = None
     guard_proxy: AddressGuardProxy | None = None
@@ -164,7 +196,7 @@ async def launch_browser(settings: BrowserSettings, *, address_guard: AddressGua
             await refusing_proxy.start()
             options["proxy"] = {"server": refusing_proxy.url, "bypass": LOOPBACK_BYPASS}
         if address_guard is not None or network_guard is not None:
-            options["args"] = [*options.get("args", ()), _WEBRTC_PROXIED_ONLY]
+            options["args"] = [*options["args"], _WEBRTC_PROXIED_ONLY]
         playwright = await _start(async_playwright())
         try:
             browser = await playwright.chromium.launch(**options)
@@ -173,38 +205,94 @@ async def launch_browser(settings: BrowserSettings, *, address_guard: AddressGua
                 raise ComponentError(_missing_executable(settings)) from exc
             raise
         devtools, processes = await _inspect(browser)
+        user_agent = await _headed_user_agent(devtools)
     except BaseException:
         if playwright is not None:
             await playwright.stop()
         await _close_proxies(refusing_proxy, guard_proxy)
         raise
     guarded = network_guard is not None
-    return LaunchedBrowser(playwright, browser, guarded, refusing_proxy, devtools, processes, guard_proxy)
+    return LaunchedBrowser(playwright, browser, guarded, refusing_proxy, devtools, processes, user_agent, guard_proxy)
 
 
-async def probe_browser(settings: BrowserSettings) -> str:
+async def probe_browser(settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE) -> str:
     """Launch a browser as a fetch would and close it, to tell whether it starts.
+
+    A browser other than the bundled build, or presenting other languages than
+    `locale`, is warned about, as `report_unpinned()` does.
 
     Args:
         settings: The browser settings.
+        locale: The languages to present, in order.
 
     Returns:
-        The browser's name and version, such as `chromium 151.0.7922.34`.
+        The browser's name and version, and whether it is the bundled build, such
+        as `chromium 151.0.7922.34 (bundled)`.
 
     Raises:
         pernix.errors.ComponentError: patchright or its browser engine is not
             installed, or the browser does not start; the message says why.
     """
     try:
-        launched = await launch_browser(settings)
+        launched = await launch_browser(settings, locale=locale)
     except ComponentError:
         raise
     except Exception as exc:  # patchright's own errors, such as for system libraries that are missing
         raise ComponentError(f"the browser does not start: {exc}") from exc
     try:
-        return f"{launched.browser.browser_type.name} {launched.browser.version}"
+        await report_unpinned(launched, locale)
+        version = launched.browser.version
+        bundled = "bundled" if version == BUNDLED_BROWSER.version else f"not the bundled {BUNDLED_BROWSER.version}"
+        return f"{launched.browser.browser_type.name} {version} ({bundled})"
     finally:
         await launched.close()
+
+
+async def report_unpinned(launched: LaunchedBrowser, locale: Sequence[str]) -> None:
+    """Warn about a browser that presents another client than the HTTP Fetcher does with the pinned Profile.
+
+    That is a browser other than the bundled build, or one presenting other
+    languages than `locale`, as Chrome does for some lists, which it replaces.
+
+    Args:
+        launched: The browser.
+        locale: The languages it was launched to present.
+    """
+    version = launched.browser.version
+    if version != BUNDLED_BROWSER.version:
+        logger.warning(
+            "The browser is %s, not the bundled build %s, which the HTTP Fetcher presents with the pinned Profile, "
+            "so the two present different clients",
+            version,
+            BUNDLED_BROWSER.version,
+        )
+    languages = await presented_languages(launched)
+    if languages != tuple(locale):
+        logger.warning(
+            "The browser presents the languages %s for the locale %s, so the HTTP Fetcher presents others; "
+            "set locale to %r for both to present them",
+            ", ".join(languages),
+            ", ".join(locale),
+            ",".join(languages),
+        )
+
+
+async def presented_languages(launched: LaunchedBrowser) -> tuple[str, ...]:
+    """Ask a browser which languages its pages present, as `navigator.languages`.
+
+    Args:
+        launched: The browser.
+
+    Returns:
+        The languages, in order.
+    """
+    context = await launched.browser.new_context()
+    try:
+        page = await context.new_page()
+        languages = cast("list[str]", await page.evaluate("navigator.languages"))
+    finally:
+        await context.close()
+    return tuple(languages)
 
 
 async def _inspect(browser: Browser) -> tuple[CDPSession | None, BrowserProcesses | None]:
@@ -222,6 +310,14 @@ async def _inspect(browser: Browser) -> tuple[CDPSession | None, BrowserProcesse
     processes = cast("list[dict[str, Any]]", info.get("processInfo", []))
     pid = next((int(process["id"]) for process in processes if process.get("type") == "browser"), None)
     return devtools, None if pid is None else BrowserProcesses.of(pid)
+
+
+async def _headed_user_agent(devtools: CDPSession | None) -> str | None:
+    """The User-Agent a browser in headless mode would have with a window; `None` with one, or without DevTools."""
+    if devtools is None:
+        return None
+    user_agent = str((await _send(devtools, "Browser.getVersion")).get("userAgent", ""))
+    return user_agent.replace(_HEADLESS, "Chrome/") if _HEADLESS in user_agent else None
 
 
 async def _send(devtools: CDPSession, method: str) -> dict[str, Any]:

@@ -25,6 +25,7 @@ from pernix.errors import (
     TooManyRedirects,
 )
 from pernix.fetchers import HTTPFetcher, HTTPSettings
+from pernix.fetchers.pinned_pair import BUNDLED_BROWSER, client_headers, running_platform
 from pernix.testing import ReceivedRequest, Reply
 from scripted_server import ScriptedServer
 
@@ -218,8 +219,62 @@ async def test_requests_impersonate_the_pinned_profile_unless_they_name_another(
             await fetcher.fetch(Request(server.url("/echo"), impersonate=impersonate))
 
     agents = [request.header("User-Agent") or "" for request in server.received]
-    assert ["Chrome/150.0" in agents[0], "Chrome/136.0" in agents[1], "Chrome/150.0" in agents[2]] == [True] * 3
-    assert 'v="150"' in (server.received[0].header("sec-ch-ua") or "")
+    assert agents == [BUNDLED_BROWSER.user_agent(running_platform()), agents[1], agents[0]]
+    assert "Chrome/136.0" in agents[1]
+
+
+async def test_the_pinned_profile_names_the_client_as_the_bundled_browser_does(server: LoopbackServer) -> None:
+    server.route("/echo", handler=_headers_echo)
+
+    async with HTTPFetcher(locale="de-DE,de,en-US,en") as fetcher:
+        await fetcher.fetch(Request(server.url("/echo")))
+
+    received = server.received[-1].headers
+    named = dict(client_headers(["de-DE", "de", "en-US", "en"]))
+    assert [(name, value) for name, value in received if name in named] == list(named.items())
+    assert [name for name, _ in received] == [
+        "Host",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "Upgrade-Insecure-Requests",
+        "User-Agent",
+        "Accept",
+        "Sec-Fetch-Site",
+        "Sec-Fetch-Mode",
+        "Sec-Fetch-User",
+        "Sec-Fetch-Dest",
+        "Accept-Encoding",
+        "Accept-Language",
+    ]
+
+
+async def test_a_header_of_the_request_replaces_the_one_naming_the_client_in_its_place(server: LoopbackServer) -> None:
+    server.route("/echo", handler=_headers_echo)
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(server.url("/echo"), headers={"user-agent": "Mine/1.0"}))
+
+    received = server.received[-1].headers
+    names = [name.lower() for name, _ in received]
+    assert server.received[-1].header("User-Agent") == "Mine/1.0"
+    assert names.index("user-agent") == names.index("upgrade-insecure-requests") + 1
+    assert server.received[-1].header("Accept-Language") == "en-US,en;q=0.9"
+
+
+async def test_another_profile_sends_its_own_headers(server: LoopbackServer) -> None:
+    server.route("/echo", handler=_headers_echo)
+
+    async with HTTPFetcher(HTTPSettings(impersonate="chrome146"), locale="de") as fetcher:
+        await fetcher.fetch(Request(server.url("/echo")))
+        await fetcher.fetch(Request(server.url("/echo"), impersonate="chrome150"))
+
+    other, pinned = server.received
+    assert "Chrome/146.0" in (other.header("User-Agent") or "")
+    assert 'v="146"' in (other.header("sec-ch-ua") or "")
+    assert other.header("Accept-Language") == "en-US,en;q=0.9"
+    assert pinned.header("Accept-Language") == "de"
+    assert pinned.header("User-Agent") == BUNDLED_BROWSER.user_agent(running_platform())
 
 
 async def test_cleartext_requests_use_http_1_1_as_browsers_do(server: LoopbackServer) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,17 +27,18 @@ from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.chain_cookies import ChainCookies
 from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.fetcher import request_proxy
-from pernix.fetchers.http_settings import HTTPSettings, check_profile
+from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings, check_profile
 from pernix.fetchers.network_guard import current_guard
+from pernix.fetchers.pinned_pair import client_headers
 from pernix.fetchers.redirects import Hop, redirect_target, redirected
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
-from pernix.settings import CoreSettings, NetworkSettings, ResponseSettings, Section
+from pernix.settings import DEFAULT_LOCALE, CoreSettings, NetworkSettings, ResponseSettings, Section, locale_languages
 from pernix.urls import with_ascii_host
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 
     import curl_cffi
     from curl_cffi.requests.session import HttpMethod
@@ -47,6 +49,8 @@ if TYPE_CHECKING:
     from pernix.session import Session
 
 __all__ = ["HTTPFetcher"]
+
+logger = logging.getLogger(__name__)
 
 
 _HTTP_VERSIONS: dict[int, str] = {
@@ -151,6 +155,14 @@ class HTTPFetcher:
     browsers refuse such a URL. Redirects are resolved as WHATWG URLs resolve them,
     so their hosts are converted alike.
 
+    With the Profile of the Pinned Pair (ADR 0010), the headers that name the
+    client, `sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`, `User-Agent`,
+    and `Accept-Language`, are those the bundled browser sends on the platform the
+    Run is on, for the languages of `locale` (`pernix.fetchers.pinned_pair`), each
+    in the place of the Profile's own, on every hop; a header of the Request's own
+    replaces one of them. Another Profile, from the settings, the Request, or the
+    Session, sends its own.
+
     A Request sent under a Session (`session=`) also sends the Session's cookies that
     match each hop, and the cookies set during the fetch, on redirects included, are
     kept in the Session as the headers of each hop arrive, even if a later hop fails;
@@ -186,6 +198,7 @@ class HTTPFetcher:
         max_clients: int = 16,
         default_encoding: str = "utf-8",
         network: NetworkSettings | None = None,
+        locale: str | Sequence[str] = DEFAULT_LOCALE,
     ) -> None:
         """Configure the fetcher.
 
@@ -194,8 +207,14 @@ class HTTPFetcher:
             max_clients: The maximum number of transfers in flight at once per Profile.
             default_encoding: The `default_encoding` of the Responses.
             network: Which hosts may be reached; any when `None`.
+            locale: The languages presented with the pinned Profile, as the `locale`
+                setting names them.
+
+        Raises:
+            ValueError: `locale` names no language, or something else.
         """
         self._settings = settings or HTTPSettings()
+        self._client_headers = client_headers(locale_languages(locale))
         self._max_clients = max_clients
         self._default_encoding = default_encoding
         self._address_guard = (
@@ -213,13 +232,25 @@ class HTTPFetcher:
         Returns:
             A fetcher with the `http.*` settings, allowing `concurrency` transfers in
             flight, whose Responses use `response.default_encoding`, reaching the
-            hosts the `network.*` settings allow.
+            hosts the `network.*` settings allow, and presenting the languages of
+            `locale`. A Profile other than the pinned one is warned about.
         """
+        settings = crawler.settings.section(HTTPSettings)
+        core = crawler.settings.section(CoreSettings)
+        if settings.impersonate != DEFAULT_PROFILE:
+            logger.warning(
+                "%s is %r, not %r, the Profile of the Pinned Pair: the HTTP Fetcher presents another client than "
+                "the browser, with that Profile's own User-Agent and client hints",
+                HTTPSettings.key("impersonate"),
+                settings.impersonate,
+                DEFAULT_PROFILE,
+            )
         return cls(
-            crawler.settings.section(HTTPSettings),
-            max_clients=crawler.settings.section(CoreSettings).concurrency,
+            settings,
+            max_clients=core.concurrency,
             default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
             network=crawler.settings.section(NetworkSettings),
+            locale=core.locale,
         )
 
     async def __aenter__(self) -> Self:
@@ -346,7 +377,7 @@ class HTTPFetcher:
         timeout = request.timeout or self._settings.timeout
         max_redirects = self._settings.max_redirects
         cookies = ChainCookies(request, session)
-        hop = Hop(request.method, _curl_url(request), _without_cookies(request.headers), request.body)
+        hop = Hop(request.method, _curl_url(request), self._headers(request, profile), request.body)
         history: list[Redirect] = []
         set_cookies: list[str] = []
         redirected_from: str | None = None
@@ -368,6 +399,18 @@ class HTTPFetcher:
             if len(history) > max_redirects:
                 raise TooManyRedirects(f"{request.url} redirected more than http.max_redirects ({max_redirects}) times")
             redirected_from, hop = result.url, redirected(hop, result.status_code, requote_uri(target))
+
+    def _headers(self, request: Request, profile: str) -> Headers:
+        """The headers of a Request's first hop: with the pinned Profile, those that name the client before its own.
+
+        A header of the Request's own replaces one of them; its `Cookie` header goes
+        with the other cookies instead.
+        """
+        own = _without_cookies(request.headers)
+        if profile != DEFAULT_PROFILE:
+            return own
+        named = {name.lower() for name, _ in own}
+        return Headers([*((name, value) for name, value in self._client_headers if name.lower() not in named), *own])
 
     async def _check_hop(
         self, url: str, proxy: str | None, *, resolve_timeout: float, redirected_from: str | None

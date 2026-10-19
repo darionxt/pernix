@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 import time
 from typing import TYPE_CHECKING
@@ -8,10 +9,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pernix import Request
+from pernix.browser import Evaluate, Render
 from pernix.errors import ConnectError, FetchError, NetworkBlocked, Timeout
-from pernix.fetchers import BrowserFetcher, BrowserSettings
+from pernix.fetchers import BrowserFetcher, BrowserSettings, launched_browser
 from pernix.fetchers.launched_browser import LOOPBACK_BYPASS
 from pernix.fetchers.network_guard import blocking_network
+from pernix.fetchers.pinned_pair import BUNDLED_BROWSER, BrowserBuild, running_platform
 from pernix.fetchers.refusing_proxy import RefusingProxy
 from pernix.response import Redirect
 from pernix.stats import Stats
@@ -394,3 +397,65 @@ async def test_a_browser_launched_while_the_network_was_open_is_refused_under_th
         await blackhole.close()
 
     assert guard.blocked == [server.url("/")]
+
+
+async def test_the_browser_names_itself_as_with_a_window_and_presents_the_locale(server: LoopbackServer) -> None:
+    server.route("/", "<p>page</p>", headers=[("Content-Type", "text/html")])
+    render = Render(actions=[Evaluate("navigator.userAgent"), Evaluate("navigator.languages")])
+
+    async with BrowserFetcher(locale="zh-CN,zh") as fetcher:
+        response = await fetcher.fetch(Request(server.url("/"), render=render))
+
+    user_agent = BUNDLED_BROWSER.user_agent(running_platform())
+    assert response.browser is not None
+    assert response.browser.evaluated == (user_agent, ["zh-CN", "zh"])
+    assert server.received[-1].header("User-Agent") == user_agent
+    assert server.received[-1].header("Accept-Language") == "zh-CN,zh;q=0.9"
+
+
+@pytest.mark.parametrize(
+    ("args", "languages"), [(["--accept-lang=fr"], "fr"), (None, "en-US,en;q=0.9")], ids=["their own", "none"]
+)
+async def test_languages_set_in_the_launch_options_win(
+    server: LoopbackServer, args: list[str] | None, languages: str
+) -> None:
+    server.route("/", "<p>page</p>", headers=[("Content-Type", "text/html")])
+
+    async with BrowserFetcher(BrowserSettings(launch_options={"args": args})) as fetcher:
+        await fetcher.fetch(_render(server.url("/")))
+
+    assert server.received[-1].header("Accept-Language") == languages
+
+
+async def test_languages_chrome_replaces_are_warned_about_once_a_run(
+    server: LoopbackServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.route("/", "<p>page</p>", headers=[("Content-Type", "text/html")])
+
+    with caplog.at_level(logging.WARNING, logger="pernix.fetchers.launched_browser"):
+        async with BrowserFetcher(BrowserSettings(generation_pages=1), locale="de-DE,de") as fetcher:
+            for _ in range(2):  # each in a browser of its own
+                await fetcher.fetch(_render(server.url("/")))
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "The browser presents the languages de-DE, de, en-US, en for the locale de-DE, de, so the HTTP Fetcher "
+        "presents others; set locale to 'de-DE,de,en-US,en' for both to present them"
+    ]
+    assert server.received[-1].header("Accept-Language") == "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+
+
+async def test_a_browser_other_than_the_bundled_build_is_warned_about(
+    server: LoopbackServer, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server.route("/", "<p>page</p>", headers=[("Content-Type", "text/html")])
+    monkeypatch.setattr(launched_browser, "BUNDLED_BROWSER", BrowserBuild("150.0.1.2", BUNDLED_BROWSER.brands))
+
+    with caplog.at_level(logging.WARNING, logger="pernix.fetchers.launched_browser"):
+        async with BrowserFetcher() as fetcher:
+            await fetcher.fetch(_render(server.url("/")))
+
+    [warning] = [record.getMessage() for record in caplog.records]
+    assert warning == (
+        f"The browser is {BUNDLED_BROWSER.version}, not the bundled build 150.0.1.2, which the HTTP Fetcher presents "
+        "with the pinned Profile, so the two present different clients"
+    )
