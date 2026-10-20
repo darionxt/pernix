@@ -250,7 +250,9 @@ class _HeaderWatch:
     through still continues the header before it. Informational responses and 407s,
     which answer for a proxy, are not reported, nor are headers after the body,
     trailers. The headers of a redirect, a redirect status with a `Location`, lift
-    the limit of the transfer before curl delivers its body.
+    the limit of the transfer before curl delivers its body, as do those of a
+    response with a `Critical-CH`, which may be dropped to send the navigation again
+    with the client hints it names; the limit is then the caller's to set back.
     """
 
     def __init__(self, buffer: Any, on_headers: HeadersCallback | None, transfer: Transfer) -> None:
@@ -261,13 +263,14 @@ class _HeaderWatch:
         self._set_cookies: list[str] = []
         self._in_set_cookie = False
         self._located = False
+        self._critical = False
 
     def __call__(self, line: bytes) -> int:
         text = line.decode("latin-1").strip()
         if text.startswith("HTTP/"):
             code = text.split(maxsplit=2)[1:2]
             self._status = int(code[0]) if code and code[0].isdigit() else 0
-            self._set_cookies, self._in_set_cookie, self._located = [], False, False
+            self._set_cookies, self._in_set_cookie, self._located, self._critical = [], False, False, False
         elif not text:
             self._end()
         elif self._status < 200:  # an informational response, or trailers
@@ -283,6 +286,8 @@ class _HeaderWatch:
                 self._set_cookies.append(value)
             elif name == "location" and value:
                 self._located = True
+            elif name == "critical-ch" and value:
+                self._critical = True
         self._buffer.write(line)
         return len(line)
 
@@ -292,8 +297,8 @@ class _HeaderWatch:
         return effective.decode("utf-8", "replace")  # a host left unreadable takes no cookies
 
     def _end(self) -> None:
-        """End the headers of a response, reporting its cookies, and lifting the limit for the body of a redirect."""
-        if self._status in REDIRECT_STATUSES and self._located:
+        """End the headers of a response, reporting its cookies, and lifting the limit for a body that may be dropped."""
+        if (self._status in REDIRECT_STATUSES and self._located) or self._critical:
             self._transfer.limit = None
         if self._status >= 200 and self._status != 407 and self._on_headers is not None and self._set_cookies:
             url = self._url()

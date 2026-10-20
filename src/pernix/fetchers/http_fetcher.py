@@ -450,6 +450,7 @@ class HTTPFetcher:
                 await _discard(result)
                 raise
             if target is None:
+                transfer.limit = limit  # lifted for a response that may have been dropped for Critical-CH
                 return _Fetched(result, transfer, history, set_cookies)
             await _discard(result)
             history.append(Redirect(result.url, result.status_code, _headers(result)))

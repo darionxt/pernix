@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from pernix import Request, Session
+from pernix.errors import ResponseTooLarge
 from pernix.fetchers import HTTPFetcher, HTTPSettings
-from pernix.testing import LoopbackServer
+from pernix.testing import LoopbackServer, Reply
 
 if TYPE_CHECKING:
     from pernix.testing.loopback_server import ReceivedRequest
@@ -104,6 +107,24 @@ async def test_critical_ch_sends_the_navigation_again_from_the_requests_url(serv
     assert last.header("Cookie") == "seen=1"
     assert [redirect.url for redirect in response.history] == [server.url("/going")]
     assert (response.text, response.cookies) == ("page", {"seen": "1"})
+
+
+async def test_a_first_answer_dropped_for_critical_ch_is_not_held_to_the_body_limit(server: LoopbackServer) -> None:
+    def answer(request: ReceivedRequest) -> Reply:
+        body = "small" if request.header("sec-ch-ua-arch") else "x" * 200_000
+        return Reply(body, headers=[ARCH, ("Critical-CH", "Sec-CH-UA-Arch")])
+
+    server.route("/critical", handler=answer)
+    server.route("/large", "x" * 200_000, headers=[ARCH, ("Critical-CH", "Sec-CH-UA-Arch")])
+    session = Session(client_hints={server.base_url: ("sec-ch-ua-arch",)})
+
+    async with HTTPFetcher(HTTPSettings(max_body_size=1000)) as fetcher:
+        response = await fetcher.fetch(Request(server.url("/critical")))
+        with pytest.raises(ResponseTooLarge):
+            await fetcher.fetch(Request(server.url("/large")), session=session)  # sent once, and kept to the limit
+
+    assert response.text == "small"
+    assert [received.path for received in server.received] == ["/critical", "/critical", "/large"]
 
 
 async def test_critical_ch_sends_a_navigation_again_once_for_each_origin(server: LoopbackServer) -> None:
