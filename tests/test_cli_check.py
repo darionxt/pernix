@@ -47,6 +47,7 @@ def test_the_defaults_are_valid(capsys: pytest.CaptureFixture[str]) -> None:
         "Profile: chrome150 (pinned)",
         "Browser: not installed (rendering needs patchright; install it with: pip install 'pernix[browser]')",
         "Stats Sinks: none",
+        "Control Sources: none",
         "Extensions: OffsiteFilter",
         "Download Middleware: none",
         "Spider Middleware: none",
@@ -84,6 +85,23 @@ def test_a_misspelled_setting_is_reported_with_a_suggestion(tmp_path: Path, caps
 def test_components_that_cannot_be_built_are_reported(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["check", "-s", "retry.policy=builtins.object"]) == 2
     assert "retry.policy must have decide(request, outcome, attempt)" in capsys.readouterr().err
+
+
+class FromStore:
+    def state(self) -> str:
+        return "running"
+
+
+def test_the_control_file_and_the_control_sources_are_listed(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["check", "-s", "control.file=run/state", "-s", 'control.sources={"test_cli_check.FromStore": 10}'])
+
+    assert code == 0
+    assert "Control Sources: ControlFile (run/state), FromStore" in capsys.readouterr().out
+
+
+def test_a_control_source_without_state_is_reported(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["check", "-s", 'control.sources={"builtins.object": 10}']) == 2
+    assert "control.sources: <object object at" in capsys.readouterr().err
 
 
 def test_the_project_file_in_use_is_named(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
