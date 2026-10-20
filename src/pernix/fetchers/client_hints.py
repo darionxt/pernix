@@ -18,7 +18,9 @@ its pages present them: the high-entropy hints of the User-Agent as the browser
 Fetcher's pages give them in headless mode, its pages' viewport, device pixel ratio,
 and media preferences, and the device memory of the machine, as Chrome rounds it.
 The network hints, which Chrome takes from its estimate of the connection with noise
-of its own for each host, are those of a fast connection with that noise. Chrome
+of its own for each host, are those of a fast connection with that noise. The
+preferences for reduced motion and transparency are those of a system that has
+neither, as Chrome reads them from the system's accessibility settings. Chrome
 sends the width of an image only for the images whose width the page lays out, and
 `Save-Data` only when the user asks to save data, so neither is ever sent.
 """

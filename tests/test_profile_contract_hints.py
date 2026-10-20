@@ -41,6 +41,9 @@ ASKED = (
 NETWORK = ("RTT", "Downlink", "ECT")
 """The hints that tell of the network, whose values follow Chrome's estimate of it, with noise for each host."""
 
+SYSTEM = ("sec-ch-prefers-reduced-motion", "sec-ch-prefers-reduced-transparency")
+"""The hints whose values follow the accessibility settings of the system the browser runs on, as on CI's Macs."""
+
 type Case = Callable[[WireServer], tuple[Step, ...]]
 """Routes a server's pages, and gives the steps of a case."""
 
@@ -178,7 +181,7 @@ async def test_the_hints_an_origin_asked_for_go_out_as_the_browser_sends_them(
 ) -> None:
     http, browser = await run_both(server, case(server), new_session=Session)
 
-    assert_one_client(http, browser)
+    assert_one_client(http, browser, values_left_out=SYSTEM)
     path, sends, times = shown
     there = [request for _, request in http.requests() if request.path == path]
     assert len(there) == times
@@ -190,7 +193,7 @@ async def test_a_form_submission_after_accept_ch_sends_what_the_browser_sends_bu
 ) -> None:
     http, browser = await run_both(server, _form_after_asking(server), new_session=Session)
 
-    assert_one_client(http, browser, leaving_out=("HPACK",))
+    assert_one_client(http, browser, leaving_out=("HPACK",), values_left_out=SYSTEM)
 
 
 async def test_the_network_hints_go_where_the_browser_puts_them(server: WireServer) -> None:
@@ -225,7 +228,7 @@ async def test_a_fetch_to_the_same_origin_after_accept_ch_sends_its_hints_where_
 ) -> None:
     http, browser = await run_both(server, _fetch_after_asking(HOST)(server), new_session=Session)
 
-    assert_one_client(http, browser)
+    assert_one_client(http, browser, values_left_out=SYSTEM)
 
 
 def _cookies(value: str) -> Callable[[], Session]:
