@@ -284,7 +284,7 @@ async def test_the_hints_a_page_is_asked_for_are_kept_in_the_session(server: Loo
 async def test_a_context_is_taught_the_sessions_hints_without_asking_the_server(
     server: LoopbackServer, kept: int
 ) -> None:
-    server.route("/page", "<p>page</p>", headers=HTML)
+    server.route("/page", '<link rel="icon" href="data:,"><p>page</p>', headers=HTML)  # no request for an icon
     session = Session("alice", client_hints={server.base_url: ("sec-ch-ua-arch",)})
 
     async with BrowserFetcher(BrowserSettings(max_idle_contexts=kept)) as fetcher:
