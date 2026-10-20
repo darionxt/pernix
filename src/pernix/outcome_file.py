@@ -5,16 +5,15 @@ import datetime as dt
 import logging
 import os
 import secrets
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import orjson
 
 from pernix.exit_code import ExitCode
-from pernix.feeds.feed import render_path
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
     from pernix.crawler import Crawler
     from pernix.logs import Redactor
@@ -48,18 +47,20 @@ class OutcomeFile:
     and renamed over it, so the file appears complete or not at all, replacing any
     existing one. Missing parent directories are created. A failure to write it is
     logged, and changes nothing else.
+
+    Attributes:
+        path: The file.
     """
 
-    def __init__(self, crawler: Crawler, template: str) -> None:
+    def __init__(self, crawler: Crawler, path: str | os.PathLike[str]) -> None:
         """Configure the outcome file of a Run.
 
         Args:
             crawler: The Crawler of the Run.
-            template: The path, which may contain `{name}`, `{run_id}`, and `{time}`,
-                as Feed paths do.
+            path: The file, its placeholders filled in.
         """
         self._crawler = crawler
-        self._template = template
+        self.path = Path(path)
 
     def write(
         self,
@@ -77,6 +78,14 @@ class OutcomeFile:
             interrupted: Whether a stop signal stopped it.
             redactor: Masks the error message and the stats.
         """
+        try:
+            _replace(self.path, self._document(reason, error=error, interrupted=interrupted, redactor=redactor))
+        except OSError as exc:
+            logger.error("Cannot write the outcome file %s: %s", self.path, exc)
+        except Exception:
+            logger.exception("Writing the outcome file %s failed", self.path)
+
+    def _document(self, reason: str, *, error: BaseException | None, interrupted: bool, redactor: Redactor) -> bytes:
         crawler = self._crawler
         document: dict[str, Any] = {
             "schema": SCHEMA,
@@ -89,17 +98,7 @@ class OutcomeFile:
             "error": _described(error, redactor) if error is not None and reason == "failed" else None,
             "stats": _masked_stats(crawler.stats.snapshot(), redactor),
         }
-        try:
-            path = render_path(
-                self._template, name=crawler.spider.name, run_id=crawler.run_id, started=crawler.started_at
-            )
-        except (KeyError, IndexError, ValueError) as exc:
-            logger.error("Cannot write the outcome file: invalid path template %r: %s", self._template, exc)
-            return
-        try:
-            _replace(path, orjson.dumps(document, option=orjson.OPT_INDENT_2) + b"\n")
-        except OSError as exc:
-            logger.error("Cannot write the outcome file %s: %s", path, exc)
+        return orjson.dumps(document, option=orjson.OPT_INDENT_2) + b"\n"
 
 
 def _replace(path: Path, content: bytes) -> None:

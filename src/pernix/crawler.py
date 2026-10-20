@@ -10,13 +10,13 @@ from pernix.account import collect_accounts
 from pernix.addons import addon_settings, load_addons
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
-from pernix.errors import CONFIGURATION_ERRORS
+from pernix.errors import CONFIGURATION_ERRORS, SettingsError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.items import ItemStream
 from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
 from pernix.outcome_file import OutcomeFile
 from pernix.request import Request
-from pernix.run_assembly import RunAssembly
+from pernix.run_assembly import RunAssembly, outcome_path
 from pernix.run_result import RunResult
 from pernix.settings import (
     CoreSettings,
@@ -383,10 +383,14 @@ class Crawler:
             self._shutdown.end()
 
     def _write_outcome(self, run_log: RunLog, reason: str, error: BaseException | None = None) -> None:
-        """Write the outcome file, if the `outcome_file` setting names one."""
-        template = self.settings.section(CoreSettings).outcome_file
-        if template is not None:
-            outcome = OutcomeFile(self, template)
+        """Write the outcome file, if the `outcome_file` setting names one that no other output writes."""
+        try:
+            path = outcome_path(self, self._output)
+        except SettingsError as exc:
+            logger.error("The outcome file is not written: %s", "; ".join(exc.problems))
+            return
+        if path is not None:
+            outcome = OutcomeFile(self, path)
             outcome.write(reason, error=error, interrupted=self._interrupted, redactor=run_log.redactor)
 
     def _forced_before_start(self) -> RunResult:

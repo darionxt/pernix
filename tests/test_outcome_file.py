@@ -297,27 +297,74 @@ async def test_a_file_that_cannot_be_written_is_logged_and_changes_nothing_else(
     assert _names(tmp_path) == ["taken"]
 
 
+async def test_a_path_that_names_no_file_is_logged_and_changes_nothing_else(
+    pages: LoopbackServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with asyncio.timeout(10):
+        result = await _crawler(_pages(pages), {"outcome_file": tmp_path.anchor}).crawl()
+
+    assert result.reason == "finished"
+    [record] = [record for record in caplog.records if record.name == "pernix.outcome_file"]
+    assert record.getMessage() == f"Writing the outcome file {tmp_path.anchor} failed"
+
+
 def test_the_path_is_checked_at_startup() -> None:
     with pytest.raises(SettingsError, match=r"outcome_file: unknown placeholders \['spider'\]"):
         load_settings(overrides={"outcome_file": "{spider}.json"})
 
 
-async def test_the_file_may_not_replace_another_output(pages: LoopbackServer, tmp_path: Path) -> None:
-    settings = {"outcome_file": str(tmp_path / "{name}.jsonl")}
+@pytest.mark.parametrize(
+    ("other", "problem"),
+    [
+        ("output", "output and outcome_file both write"),
+        ("feeds", r"feeds\[.*\] and outcome_file both write"),
+        ("items.failed_output", "items.failed_output and outcome_file both write"),
+    ],
+)
+async def test_the_file_never_replaces_another_output(
+    pages: LoopbackServer, tmp_path: Path, caplog: pytest.LogCaptureFixture, other: str, problem: str
+) -> None:
+    feed = tmp_path / "pages.jsonl"
+    feed.write_text("written by an earlier Run")
+    settings: dict[str, Any] = {"outcome_file": str(tmp_path / "{name}.jsonl")}
+    if other == "feeds":
+        settings["feeds"] = {str(feed): {}}
+    elif other == "items.failed_output":
+        settings["items.failed_output"] = f"{tmp_path}/./pages.jsonl"
 
-    with pytest.raises(SettingsError, match="output and outcome_file both write"):
-        await _crawler(_pages(pages), settings, output=tmp_path / "pages.jsonl").crawl()
+    with pytest.raises(SettingsError, match=problem):
+        await _crawler(_pages(pages), settings, output=feed if other == "output" else None).crawl()
+
+    assert feed.read_text() == "written by an earlier Run"
+    assert "The outcome file is not written: " in caplog.text
 
 
-def _written(path: Path, error: BaseException, *, stats: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _write(path: Path, error: BaseException, *, stats: Mapping[str, Any] | None = None) -> None:
+    """Write the outcome file of a failed Run of an idle Spider, with these stats."""
+
     class Idle(Spider):
         name = "idle"
 
     crawler = Crawler.from_spider(Idle)
     for key, value in (stats or {}).items():
         crawler.stats.set(key, value)
-    OutcomeFile(crawler, str(path)).write("failed", error=error, redactor=Redactor())
+    OutcomeFile(crawler, path).write("failed", error=error, redactor=Redactor())
+
+
+def _written(path: Path, error: BaseException, *, stats: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    _write(path, error, stats=stats)
     return _outcome(path)
+
+
+def test_a_stat_json_cannot_hold_is_logged_and_changes_nothing_else(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write(tmp_path / "outcome.json", RuntimeError("x"), stats={"text.broken": "\ud800"})
+
+    [record] = [record for record in caplog.records if record.name == "pernix.outcome_file"]
+    assert record.getMessage() == f"Writing the outcome file {tmp_path / 'outcome.json'} failed"
+    assert "surrogates not allowed" in (record.exc_text or "")
+    assert _names(tmp_path) == []
 
 
 def test_a_group_of_several_errors_lists_them(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import os
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
     from pernix.spider import Spider
     from pernix.stats import Gauge, Stats, StatsSink
 
-__all__ = ["DownloadAssembly", "RunAssembly"]
+__all__ = ["DownloadAssembly", "RunAssembly", "outcome_path"]
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +152,10 @@ class RunAssembly:
         are built with `crawler.build_component()`: Stats Sinks, Extensions, the
         proxies, their provider, and their binding policy, Fetchers, download
         Middleware, spider Middleware, Pipelines, failure Pipelines, Feeds, the
-        Fingerprint function, and the retry policy; the download and spider chains
-        and the Pipelines are checked. Steps that do not depend on each other all
-        run, so their problems are reported together. The core stats and the Stats
-        Sinks are subscribed.
+        Fingerprint function, and the retry policy; the download and spider chains,
+        the Pipelines, and the path of the outcome file are checked. Steps that do
+        not depend on each other all run, so their problems are reported together.
+        The core stats and the Stats Sinks are subscribed.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
@@ -171,7 +172,8 @@ class RunAssembly:
             pernix.errors.ComponentError: A component cannot be built, or does not fit
                 its role.
             pernix.errors.SettingsError: Two Fetchers claim the same URL scheme, a Feed
-                is invalid, or several problems were found; it lists them all.
+                or the path of the outcome file is invalid, or several problems were
+                found; it lists them all.
             pernix.errors.AddonError: An Addon's `setup()` failed.
         """
         settings, events = crawler.settings, crawler.events
@@ -186,6 +188,7 @@ class RunAssembly:
         pipelines = problems.attempt(_build_all, crawler, "pipelines")
         failed_pipelines = problems.attempt(_build_all, crawler, "failed_pipelines")
         feeds = problems.attempt(_build_feeds, crawler, output)
+        problems.attempt(outcome_path, crawler, output)
         fingerprint = problems.attempt(_fingerprint_function, crawler)
         retry_policy = problems.attempt(_retry_policy, crawler)
         handle = None
@@ -496,8 +499,8 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
     """The Feeds of the `feeds` setting and the one `output` names, each writing its own file.
 
     Raises:
-        pernix.errors.SettingsError: A Feed is invalid, or two of the Feeds,
-            `items.failed_output`, and `outcome_file` would write the same file.
+        pernix.errors.SettingsError: A Feed is invalid, or two Feeds, or a Feed and
+            `items.failed_output`, would write the same file.
     """
     feed_settings = crawler.settings.section(FeedSettings).feeds
     configured = [(f"feeds[{template!r}]", template, options) for template, options in feed_settings.items()]
@@ -508,11 +511,46 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
     failed_output = crawler.settings.section(ItemSettings).failed_output
     if failed_output is not None:
         destinations.append(("items.failed_output", _feed_path(crawler, failed_output)))
-    outcome_file = crawler.settings.section(CoreSettings).outcome_file
-    if outcome_file is not None:
-        destinations.append(("outcome_file", _feed_path(crawler, outcome_file)))
     _check_distinct(destinations)
     return feeds
+
+
+def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Path | None:
+    """The file of the `outcome_file` setting, which no other output of the Run may write.
+
+    The outcome file is written as the Run ends, also when the Run fails, as for an
+    invalid output, so the Crawler checks its path again before writing it: it then
+    never replaces the file of another output, such as one an earlier Run wrote.
+
+    Args:
+        crawler: The Crawler of the Run.
+        output: The Feed `output=` names, if any.
+
+    Returns:
+        The file, its placeholders filled in, or `None` without the setting.
+
+    Raises:
+        pernix.errors.SettingsError: The path template is invalid, or a Feed,
+            `output`, or `items.failed_output` writes the same file.
+    """
+    template = crawler.settings.section(CoreSettings).outcome_file
+    if template is None:
+        return None
+    path = _feed_path(crawler, template)
+    others = [(f"feeds[{feed!r}]", feed) for feed in crawler.settings.section(FeedSettings).feeds]
+    if output is not None:
+        others.append(("output", os.fspath(output)))
+    failed_output = crawler.settings.section(ItemSettings).failed_output
+    if failed_output is not None:
+        others.append(("items.failed_output", failed_output))
+    problems: list[str] = []
+    for label, other in others:
+        with contextlib.suppress(SettingsError):  # building the Feeds reports an invalid path
+            if _feed_path(crawler, other).resolve() == path.resolve():
+                problems.append(f"{label} and outcome_file both write {path}")
+    if problems:
+        raise SettingsError(problems)
+    return path
 
 
 def _feed(crawler: Crawler, template: str, options: FeedOptions) -> Feed:
