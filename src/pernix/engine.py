@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from pernix.retry_policy import RetryPolicy
     from pernix.sending import Sender
     from pernix.spider import Spider
+    from pernix.stats import Stats
 
 __all__ = ["Engine", "PutItem"]
 
@@ -80,6 +81,8 @@ class Engine:
         throttle: Throttle | None = None,
         worker_id: str | None = None,
         sender: Sender | None = None,
+        callback_timeout: float | None = None,
+        stats: Stats | None = None,
     ) -> None:
         """Wire the Engine to its collaborators.
 
@@ -109,10 +112,14 @@ class Engine:
             sender: Sends each Request, under a Session leased from the Session
                 Pool or as it is; `IndependentSending()` when `None`, for Requests
                 that are independent and go through no proxy.
+            callback_timeout: Seconds the spider chain may take to produce the
+                outputs of a Response, and an errback its own, before it fails with
+                `CallbackTimeout`; `None` for no limit.
+            stats: Where, with a limit, the timeouts are counted.
 
         Raises:
             ValueError: `concurrency` is less than 1, `browser_concurrency` is
-                negative, or `lease_ttl` is not positive.
+                negative, or `lease_ttl` or `callback_timeout` is not positive.
         """
         if concurrency < 1:
             raise ValueError(f"concurrency must be at least 1, got {concurrency}")
@@ -141,6 +148,8 @@ class Engine:
             retry_policy=retry_policy or DefaultRetryPolicy(RetrySettings()),
             throttle=self._throttle,
             sender=sender,
+            callback_timeout=callback_timeout,
+            stats=stats,
         )
 
     async def run(self) -> None:

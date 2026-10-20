@@ -31,6 +31,7 @@ from pernix.sessions.session_leasing import SessionLeasing
 from pernix.sessions.session_login import SessionLogin
 from pernix.settings import (
     BlockedSettings,
+    CallbackSettings,
     CoreSettings,
     DomainSettings,
     FeedOptions,
@@ -245,6 +246,8 @@ class RunAssembly:
             retry_policy=retry_policy,
             throttle=throttle,
             sender=sender,
+            callback_timeout=settings.section(CallbackSettings).timeout,
+            stats=crawler.stats,
         )
         inline_fetch = InlineFetch(
             download=download,

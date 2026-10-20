@@ -28,6 +28,7 @@ __all__ = [
     "FEED_FORMATS",
     "PATH_FIELDS",
     "BlockedSettings",
+    "CallbackSettings",
     "CoreSettings",
     "DomainSettings",
     "EventSettings",
@@ -510,6 +511,22 @@ class BlockedSettings(Section):
     render: bool = False
 
 
+class CallbackSettings(Section):
+    """Settings of running the Callbacks and errbacks.
+
+    Attributes:
+        timeout: Seconds a Callback, with the spider Middleware around it, may take
+            to produce its outputs, and an errback its own, before it is cancelled
+            and fails with `CallbackTimeout`; `None` for no limit. The time its
+            outputs take to be handed on, such as while the Item queue is full, does
+            not count. Only code that awaits can be cancelled.
+    """
+
+    __prefix__ = "callbacks"
+
+    timeout: Annotated[float, msgspec.Meta(gt=0)] | None = None
+
+
 class ItemSettings(Section):
     """Settings of how Items reach the Pipelines.
 
@@ -699,6 +716,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     DomainSettings,
     SessionSettings,
     ProxySettings,
+    CallbackSettings,
     ItemSettings,
     FeedSettings,
     LogSettings,
