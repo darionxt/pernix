@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import textwrap
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -13,9 +14,11 @@ import netguard
 from pernix.errors import ComponentError
 from pernix.fetchers import BrowserSettings
 from pernix.fetchers.launched_browser import launch_browser
+from pernix.logs.redaction import MASK
+from pernix.proxies.proxy_url import proxy_address, proxy_credentials
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Generator, Iterator, Mapping
     from pathlib import Path
 
     from pernix.testing import LoopbackServer
@@ -25,31 +28,51 @@ pytest_plugins = ["pytester"]
 _NETWORK_CHECK = "network_check"
 """The marker of the checks in tests/network_checks, which only a real network can make."""
 
-_CHECK_PROXY = pytest.StashKey[str | None]()
-"""`PERNIX_CHECK_PROXY`, read before each test clears the `PERNIX_*` variables, which settings would take."""
+
+@dataclass(frozen=True, slots=True)
+class CheckProxy:
+    """The proxy `--network-checks-proxy` names, which a check shows without its credentials.
+
+    Attributes:
+        url: The proxy's URL, credentials included, to go through.
+    """
+
+    url: str = field(repr=False)
+
+    def __str__(self) -> str:
+        return proxy_address(self.url)
+
+    def __repr__(self) -> str:
+        return f"CheckProxy({proxy_address(self.url)!r})"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    """Add `--network-checks`, which runs the checks only a real, clean network can make."""
+    """Add `--network-checks`, which runs the checks only a real, clean network can make, and the proxy they use."""
     parser.addoption(
         "--network-checks",
         action="store_true",
         help="run the checks of tests/network_checks, which reach real hosts; meant for a clean network",
     )
+    parser.addoption(
+        "--network-checks-proxy",
+        metavar="URL",
+        default=None,
+        help="the proxy the network checks check the egress through; that check is skipped without it",
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the marker of the network checks, and keep the proxy their egress check goes through."""
+    """Register the marker of the network checks."""
     config.addinivalue_line(
         "markers", f"{_NETWORK_CHECK}: a check that reaches real hosts, run only with --network-checks"
     )
-    config.stash[_CHECK_PROXY] = os.environ.get("PERNIX_CHECK_PROXY") or None
 
 
 @pytest.fixture
-def check_proxy(pytestconfig: pytest.Config) -> str | None:
-    """The proxy `PERNIX_CHECK_PROXY` names for the network checks, if any."""
-    return pytestconfig.stash[_CHECK_PROXY]
+def check_proxy(pytestconfig: pytest.Config) -> CheckProxy | None:
+    """The proxy `--network-checks-proxy` names for the network checks, if any."""
+    url = pytestconfig.getoption("--network-checks-proxy")
+    return CheckProxy(url) if url else None
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
@@ -59,6 +82,28 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.get_closest_marker(_NETWORK_CHECK) is not None:
             item.add_marker(pytest.mark.pernix_network if run else skip)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Show the proxy of the network checks without its credentials in what they report, their tracebacks included."""
+    report = yield
+    url = item.config.getoption("--network-checks-proxy")
+    if url and call.excinfo is not None and item.get_closest_marker(_NETWORK_CHECK) is not None:
+        if report.longrepr is not None and not isinstance(report.longrepr, tuple):
+            report.longrepr = _without_credentials(str(report.longrepr), url)
+        report.sections = [(title, _without_credentials(text, url)) for title, text in report.sections]
+    return report
+
+
+def _without_credentials(text: str, url: str) -> str:
+    """A text with a proxy's URL in it shown without its credentials, and its credentials masked wherever else."""
+    text = text.replace(url, proxy_address(url))
+    for credential in proxy_credentials(url):
+        text = text.replace(credential, MASK)
+    return text
 
 
 _LAUNCH_TIMEOUT = 60

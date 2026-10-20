@@ -5,9 +5,9 @@ clean network, without a proxy or a VPN that ends TCP connections or blocks UDP:
 
     uv run pytest --network-checks tests/network_checks
 
-The check of the egress through a proxy takes the proxy's URL from
-`PERNIX_CHECK_PROXY`, such as `http://user:password@proxy.example:8080`, and is
-skipped without it.
+The check of the egress through a proxy goes through the one
+`--network-checks-proxy=URL` names, such as `http://user:password@proxy.example:8080`,
+which it shows without its credentials, and is skipped without it.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from pernix.fetchers.pinned_pair import BUNDLED_BROWSER, client_headers
 from pernix.settings import DEFAULT_LOCALE
 
 if TYPE_CHECKING:
+    from conftest import CheckProxy
     from pernix import Response
 
 pytestmark = [pytest.mark.network_check, pytest.mark.usefixtures("browser_engine")]
@@ -97,14 +98,13 @@ async def test_the_browser_sends_ech_from_dns_where_the_http_fetcher_does_not() 
 
 
 async def test_requests_through_a_proxy_leave_from_its_address_and_webrtc_tells_no_other(
-    check_proxy: str | None,
+    check_proxy: CheckProxy | None,
 ) -> None:
-    proxy = check_proxy
-    if not proxy:
-        pytest.skip("PERNIX_CHECK_PROXY names no proxy to check the egress through")
+    if check_proxy is None:
+        pytest.skip("--network-checks-proxy names no proxy to check the egress through")
     async with HTTPFetcher() as direct:
         own = (await direct.fetch(Request(ADDRESS))).text.strip()
-    http, browser = await _fetch_both(ADDRESS, proxy=proxy, session=Session(proxy=proxy))
+    http, browser = await _fetch_both(ADDRESS, proxy=check_proxy.url, session=Session(proxy=check_proxy.url))
     gather = Evaluate(
         f"""() => new Promise(resolve => {{
   const connection = new RTCPeerConnection({{iceServers: [{{urls: "{STUN}"}}]}});
@@ -118,13 +118,18 @@ async def test_requests_through_a_proxy_leave_from_its_address_and_webrtc_tells_
 }})"""
     )
     async with BrowserFetcher(proxy_pool=True) as pooled:
-        called = await pooled.fetch(Request(ADDRESS, render=Render(actions=[gather])), session=Session(proxy=proxy))
+        called = await pooled.fetch(
+            Request(ADDRESS, render=Render(actions=[gather])), session=Session(proxy=check_proxy.url)
+        )
 
     egress = http.text.strip()
-    assert egress != own
-    assert browser.text.strip() == egress
+    assert egress != own, f"requests through {check_proxy} left from this machine's own address"
+    assert browser.text.strip() == egress, f"the browser's requests through {check_proxy} left from another address"
     assert called.browser is not None
-    assert not any(own in candidate for candidate in called.browser.evaluated[0])
+    candidates = called.browser.evaluated[0]
+    assert not any(own in candidate for candidate in candidates), (
+        f"WebRTC told this machine's address past {check_proxy}"
+    )
 
 
 async def test_a_fetch_cancelled_on_a_real_connection_ends_at_once_and_leaves_the_fetcher_working() -> None:

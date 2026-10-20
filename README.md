@@ -724,10 +724,10 @@ uv run ruff format --check
 uv run pyright
 ```
 
-The checks only a real network can make, of HTTP/3, ECH, the headers real servers see, the egress through a proxy, and cancellation, reach real hosts, so they run only when asked for, on a clean network, without a proxy or a VPN that ends connections or blocks UDP; the egress check takes its proxy from `PERNIX_CHECK_PROXY`:
+The checks only a real network can make, of HTTP/3, ECH, the headers real servers see, the egress through a proxy, and cancellation, reach real hosts, so they run only when asked for, on a clean network, without a proxy or a VPN that ends connections or blocks UDP; the egress check goes through the proxy `--network-checks-proxy` names, which it shows without its credentials:
 
 ```bash
-PERNIX_CHECK_PROXY=http://user:password@proxy.example:8080 uv run pytest --network-checks tests/network_checks
+uv run pytest --network-checks --network-checks-proxy=http://user:password@proxy.example:8080 tests/network_checks
 ```
 
 curl-cffi and patchright are pinned to exact versions, as their Profile and browser build form a Pinned Pair: upgrade either only with `uv run pytest tests/test_profile_contract.py` passing, which needs the browser engine. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
