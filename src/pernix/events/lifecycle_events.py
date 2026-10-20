@@ -25,6 +25,8 @@ __all__ = [
     "SpiderClosed",
     "SpiderIdle",
     "SpiderOpened",
+    "SpiderPaused",
+    "SpiderResumed",
     "StatsSnapshot",
 ]
 
@@ -42,13 +44,39 @@ class SpiderOpened(Event):
 
 @dataclass(frozen=True)
 class SpiderIdle(Event):
-    """The Frontier is empty and nothing is in flight.
+    """The Frontier is empty, nothing is in flight, and the Run is not paused.
 
     Attributes:
         spider: The Spider being run.
     """
 
     spider: Spider
+
+
+@dataclass(frozen=True)
+class SpiderPaused(Event):
+    """The Run was paused: it claims no new Request until it is resumed.
+
+    The Requests in flight still finish, and their Items are processed.
+
+    Attributes:
+        spider: The Spider being run.
+    """
+
+    spider: Spider
+
+
+@dataclass(frozen=True)
+class SpiderResumed(Event):
+    """The Run was resumed: it claims Requests again.
+
+    Attributes:
+        spider: The Spider being run.
+        paused_for: Seconds the Run was paused.
+    """
+
+    spider: Spider
+    paused_for: float
 
 
 @dataclass(frozen=True)

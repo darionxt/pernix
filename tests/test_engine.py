@@ -14,6 +14,7 @@ from pernix.engine import Engine
 from pernix.errors import BrowserLost, ConnectError, RetriesExhausted
 from pernix.frontiers import MemoryFrontier
 from pernix.items import ItemProcessor
+from pernix.pausing import Pausing
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import DomainSettings, RetrySettings
 from pernix.stats import Stats
@@ -1212,6 +1213,37 @@ async def test_a_drain_settles_the_requests_in_flight_once_their_items_are_proce
     assert (counts.leased, counts.done) == (1, 0)
     counts = await frontier.counts()
     assert (counts.done, counts.ready) == (1, 1)
+
+
+async def test_a_paused_run_flushes_the_items_and_holds_no_lease_once_they_are_processed() -> None:
+    pausing: Pausing | None = None
+
+    class PausesItself(Pages):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            if response.url.endswith("/a"):
+                assert pausing is not None
+                pausing.pause()  # as self.crawler.pause() would
+            async for output in super().parse(response):
+                yield output
+
+    spider, held, frontier = PausesItself(), HeldItems(), MemoryFrontier()
+    pausing = Pausing(spider, events.EventBus(timeout=5))
+    engine = _holding_engine(spider, _site({"/a": "<p>a</p>", "/b": "<p>b</p>"}), frontier, held, pausing=pausing)
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await held.stuck.wait()  # a Pause stops the claiming, so the Items are flushed
+        paused = await frontier.counts()
+        held.hold = False
+        held.release()
+        while (await frontier.counts()).leased:
+            await frontier.wait()
+        released = await frontier.counts()
+        pausing.resume()
+        await run
+
+    assert (paused.leased, paused.ready) == (1, 1)
+    assert (released.leased, released.done, released.ready) == (0, 1, 1)
+    assert (await frontier.counts()).done == 2
 
 
 async def test_items_in_a_batch_keep_their_requests_leased_until_the_batch_is_processed() -> None:
