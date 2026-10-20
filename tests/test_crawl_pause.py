@@ -184,6 +184,24 @@ async def test_pausing_once_stopping_or_after_the_run_does_nothing(pages: Loopba
     assert emitted == ["SpiderOpened", "SpiderClosed"]
 
 
+async def test_pausing_after_a_run_that_failed_before_it_started_does_nothing(pages: LoopbackServer) -> None:
+    class Broken:
+        async def open(self) -> None:
+            raise RuntimeError("cannot open")
+
+    crawler, _ = _crawler(_spider(pages, asyncio.Event(), _open()), {"extensions": {Broken: 100}})
+    crawler.pause()
+
+    with pytest.raises(RuntimeError, match="cannot open"):
+        async with asyncio.timeout(10):
+            await crawler.crawl()
+    crawler.resume()
+    crawler.pause()
+
+    assert not crawler.paused
+    assert pages.received == []
+
+
 async def test_a_run_never_paused_counts_no_pause(pages: LoopbackServer) -> None:
     crawler, emitted = _crawler(_spider(pages, asyncio.Event(), _open()))
     crawler.resume()

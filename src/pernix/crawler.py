@@ -409,6 +409,7 @@ class Crawler:
                     await run.frontier.close()
         finally:
             self._shutdown.end()
+            self._pausing.end()  # also when the Engine never ran
 
     def _forced_before_start(self) -> RunResult:
         self.stats.set("run.reason", "forced")  # as the reporter records it once a Run started

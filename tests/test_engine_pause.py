@@ -338,6 +338,40 @@ async def test_a_pause_as_the_run_goes_idle_holds_on_idle_until_resumed() -> Non
     assert (called, _paths(site)) == (["on_idle", "on_idle"], ["/a", "/more"])
 
 
+async def test_a_pause_right_after_a_resume_keeps_a_run_with_nothing_left_from_ending() -> None:
+    paused_by_on_idle: list[bool] = []
+
+    class PausesWhenIdle(OnePage):
+        async def on_idle(self) -> AsyncIterator[Request]:
+            if not paused_by_on_idle:
+                paused_by_on_idle.append(True)
+                pausing.pause()
+            return
+            yield
+
+    bus, repaused = events.EventBus(timeout=5), asyncio.Event()
+    engine, pausing, recorded, _ = _engine(PausesWhenIdle(), _site("/a"), bus=bus)
+
+    def pause_again(_event: events.SpiderResumed) -> None:
+        if len(recorded) == 3:  # SpiderIdle, SpiderPaused, SpiderResumed
+            asyncio.get_running_loop().call_soon(pausing.pause)  # before the waits released see it
+
+    bus.on(events.SpiderResumed, pause_again)
+    bus.on(events.SpiderPaused, lambda _event: repaused.set() if len(recorded) == 4 else None)
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await pausing.waiting_for(1)  # the feeding, as on_idle() added nothing
+        pausing.resume()
+        await repaused.wait()
+
+        assert (pausing.waiting, run.done()) == (1, False)
+
+        pausing.resume()
+        await run
+
+    assert _kinds(recorded) == ["SpiderIdle", "SpiderPaused", "SpiderResumed", "SpiderPaused", "SpiderResumed"]
+
+
 async def test_a_pause_while_the_frontier_counts_keeps_the_run_from_going_idle() -> None:
     pausing: HeldPausing | None = None
 

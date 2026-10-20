@@ -118,7 +118,8 @@ class Pausing:
 
     async def released(self) -> None:
         """Wait until the Run is not held: resumed and announced so, or ended."""
-        await self._released.wait()
+        while self.held:  # a pause right after the release holds it again before the wait returns
+            await self._released.wait()
 
     async def announce(self) -> None:
         """Emit the changes as `SpiderPaused` and `SpiderResumed`, in order, until `end()`; release a resumed Run."""
