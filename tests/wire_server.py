@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import http
 import itertools
 import socket
 import ssl
@@ -55,6 +56,24 @@ _CLOSE_TIMEOUT = 5.0
 
 _LINGER = 2.0
 """Seconds the server waits, after sending GOAWAY, for the client to close the connection first."""
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What the server answers a path with.
+
+    Attributes:
+        content_type: The `Content-Type`.
+        body: The body.
+        headers: Other headers, after `Content-Type` and `Cache-Control`, such as
+            `Accept-CH` or `Location`.
+        status: The status.
+    """
+
+    content_type: str = "text/html"
+    body: bytes = PAGE
+    headers: tuple[tuple[str, str], ...] = ()
+    status: int = 200
 
 
 @dataclass(frozen=True)
@@ -121,7 +140,7 @@ class WireServer:
     Attributes:
         closing: The paths after which the server closes the connection.
         routes: What a path is answered with, as its content type and body, such as
-            a page that makes a request of its own.
+            a page that makes a request of its own, or as an `Answer`.
     """
 
     def __init__(
@@ -140,7 +159,7 @@ class WireServer:
                 4096, the size the protocol starts with.
         """
         self.closing: set[str] = set()
-        self.routes: dict[str, tuple[str, bytes]] = {}
+        self.routes: dict[str, tuple[str, bytes] | Answer] = {}
         self._announces_header_table_size = announces_header_table_size
         self._socket = socket.create_server(("127.0.0.1", 0))
         leaf = ca.issue_cert(HOST, "127.0.0.1", "::1")
@@ -270,10 +289,13 @@ class WireServer:
             path = urlsplit(request_line.split(" ")[1]).path
             captured.requests.append(CapturedRequest(self._next(), path, headers, request_line=request_line))
             closes = path in self.closing
-            kind, body = self.routes.get(path, ("text/html", PAGE))
-            fields = f"Content-Type: {kind}\r\nCache-Control: no-store\r\n"
-            fields += f"Content-Length: {len(body)}\r\n{'Connection: close' if closes else 'Keep-Alive: timeout=5'}\r\n"
-            connection.sendall(f"HTTP/1.1 200 OK\r\n{fields}\r\n".encode() + body)
+            answer = self._answer_for(path)
+            fields = f"Content-Type: {answer.content_type}\r\nCache-Control: no-store\r\n"
+            fields += "".join(f"{name}: {value}\r\n" for name, value in answer.headers)
+            fields += f"Content-Length: {len(answer.body)}\r\n"
+            fields += f"{'Connection: close' if closes else 'Keep-Alive: timeout=5'}\r\n"
+            status = f"{answer.status} {http.HTTPStatus(answer.status).phrase}"
+            connection.sendall(f"HTTP/1.1 {status}\r\n{fields}\r\n".encode() + answer.body)
             if closes:
                 return
 
@@ -296,7 +318,7 @@ class WireServer:
                     path = urlsplit(dict(headers).get(":path", "")).path
                     block = reader.blocks.get(event.stream_id)
                     captured.requests.append(CapturedRequest(self._next(), path, headers, block=block))
-                    _answer_stream(h2_connection, event.stream_id, *self.routes.get(path, ("text/html", PAGE)))
+                    _answer_stream(h2_connection, event.stream_id, self._answer_for(path))
                     closing = closing or path in self.closing
                 elif isinstance(event, h2.events.ConnectionTerminated):
                     return
@@ -306,6 +328,14 @@ class WireServer:
             if closing:
                 _linger(connection, reader)
                 return
+
+    def _answer_for(self, path: str) -> Answer:
+        route = self.routes.get(path)
+        if route is None:
+            return Answer()
+        if isinstance(route, Answer):
+            return route
+        return Answer(*route)
 
     def _settings_frame(self, connection: h2.connection.H2Connection) -> bytes:
         """The server's first SETTINGS frame: the settings h2 keeps that differ from the protocol's defaults.
@@ -319,17 +349,18 @@ class WireServer:
         return len(payload).to_bytes(3) + bytes([4, 0]) + bytes(4) + payload
 
 
-def _answer_stream(connection: h2.connection.H2Connection, stream_id: int, kind: str, body: bytes) -> None:
+def _answer_stream(connection: h2.connection.H2Connection, stream_id: int, answer: Answer) -> None:
     connection.send_headers(
         stream_id,
         [
-            (":status", "200"),
-            ("content-type", kind),
+            (":status", str(answer.status)),
+            ("content-type", answer.content_type),
             ("cache-control", "no-store"),
-            ("content-length", str(len(body))),
+            *((name.lower(), value) for name, value in answer.headers),
+            ("content-length", str(len(answer.body))),
         ],
     )
-    connection.send_data(stream_id, body, end_stream=True)
+    connection.send_data(stream_id, answer.body, end_stream=True)
 
 
 def _linger(connection: ssl.SSLSocket, reader: Http2Reader) -> None:

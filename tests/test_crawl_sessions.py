@@ -64,6 +64,21 @@ async def test_requests_lease_sessions_by_default_and_keep_their_cookies(server:
     assert report.stats["sessions.created"] == 1
 
 
+def _echo_arch(request: ReceivedRequest) -> Reply:
+    return Reply(body=request.header("sec-ch-ua-arch") or "", headers=[("Accept-CH", "Sec-CH-UA-Arch")])
+
+
+async def test_a_session_keeps_the_client_hints_an_origin_asked_for_between_its_leases(server: LoopbackServer) -> None:
+    server.route("/echo", handler=_echo_arch)
+
+    class Leasing(Fetch):
+        settings: ClassVar[Mapping[str, Any]] = {**POOL, "sessions.size": 1}
+
+    report = await crawl(Leasing, url=server.url("/echo"), then=("/echo?again",))
+
+    assert [item["text"] for item in report.items] == ["", '"x86"']
+
+
 async def test_a_request_from_a_callback_leases_its_own_session(server: LoopbackServer) -> None:
     server.route("/sign-in", handler=_sign_in)
     server.route("/echo", handler=_echo_cookie)

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from pernix.fetchers.browser_cookies import apply_page_changes, browser_cookie, browser_key, changes, keyed
+from pernix.fetchers.browser_hints import teach_hints
+from pernix.fetchers.client_hints import keep_accepted
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Sequence
 
     from patchright._impl._api_structures import Cookie as BrowserCookie
     from patchright._impl._api_structures import SetCookieParam
@@ -24,16 +27,20 @@ __all__ = ["NewContext", "SessionContext", "SessionContexts"]
 type NewContext = Callable[[LaunchedBrowser, Session, str | None, bool], Awaitable[BrowserContext]]
 """Creates a Session's context: with a proxy, its localStorage, and service workers blocked or not."""
 
+logger = logging.getLogger(__name__)
+
 _LOCAL_STORAGE = "() => [location.origin, Object.entries(localStorage)]"
 
 
 class SessionContext:
-    """A browser context kept for a Session, which holds its cookies and the localStorage of its origins.
+    """A browser context kept for a Session, which holds its cookies, the localStorage of its origins, and their client hints.
 
     Before each fetch, its cookies are made those of the Session, with the
-    Request's own; after it, the changes the page made are merged back into the
-    Session. Its proxy, and whether it blocks service workers, are fixed when it is
-    created.
+    Request's own, and it is taught the client hints of the Session's origins that
+    it does not keep (`pernix.fetchers.browser_hints`); after it, the changes the
+    page made are merged back into the Session, with the client hints its
+    navigations asked for. Its proxy, and whether it blocks service workers, are
+    fixed when it is created.
 
     Attributes:
         session: The id of the Session.
@@ -43,6 +50,8 @@ class SessionContext:
         context: The browser context.
         launched: The browser it belongs to.
         local_storage: The localStorage the context holds, by origin, as last seen.
+        client_hints: The client hints the context keeps, by origin, as it was
+            taught them or its navigations asked for them.
         broken: Whether it is not to be used again: it failed, or its browser is
             being replaced or was lost.
         handed_over: Whether its fetch handed it on with its page, kept open for a
@@ -74,6 +83,7 @@ class SessionContext:
         self.blocks_service_workers = blocks_service_workers
         self.launched = launched
         self.local_storage = {origin: dict(items) for origin, items in session.local_storage.items()}
+        self.client_hints: dict[str, tuple[str, ...]] = {}
         self.broken = False
         self.handed_over = False
         self._cookies: dict[BrowserKey, BrowserCookie] | None = None
@@ -108,6 +118,10 @@ class SessionContext:
     async def sync(self, session: Session, request_cookies: Iterable[SetCookieParam], *, now: float) -> None:
         """Make the context hold the cookies of a Session that have not expired, with the Request's own, and no other.
 
+        It is also taught the client hints of each origin whose hints it keeps
+        otherwise than the Session; an origin that could not be taught is tried
+        again before the next fetch.
+
         Args:
             session: The Session.
             request_cookies: The Request's own cookies, from
@@ -125,9 +139,18 @@ class SessionContext:
         if missing:
             await self.context.add_cookies(missing)
             held = keyed(await self.context.cookies())
+        await self._teach_hints(session)
         self._cookies = held
 
-    async def merge(self, page: Page, session: Session, *, now: float, close_pages: bool = True) -> None:
+    async def merge(
+        self,
+        page: Page,
+        session: Session,
+        *,
+        now: float,
+        close_pages: bool = True,
+        accepted: Sequence[tuple[str, str]] = (),
+    ) -> None:
         """End a fetch: close its pages, and keep in its Session the cookies it changed and the localStorage of its page.
 
         What the fetch changed is read, and the pages of the context closed, the
@@ -142,6 +165,9 @@ class SessionContext:
             now: The time of the changes, in seconds since the epoch.
             close_pages: Close the pages; `False` leaves them open, for a page kept
                 for its Callback.
+            accepted: The `Accept-CH` of each response to the navigations of the
+                page's main frame, with its URL, in order, whose client hints the
+                context now keeps, and the Session too.
         """
         before, self._cookies = self._cookies, None
         if before is None:
@@ -154,6 +180,29 @@ class SessionContext:
         apply_page_changes(session.cookies, before, after, now=now, overrides=self._overrides)
         if storage is not None:
             self._keep_local_storage(session, *storage)
+        for url, accept_ch in accepted:
+            keep_accepted(self.client_hints, url, accept_ch)
+            keep_accepted(session.client_hints, url, accept_ch)
+
+    async def _teach_hints(self, session: Session) -> None:
+        """Teach the context the client hints of each origin whose hints it keeps otherwise than the Session."""
+        for origin in dict.fromkeys([*session.client_hints, *self.client_hints]):
+            hints = session.client_hints.get(origin, ())
+            if self.client_hints.get(origin, ()) == hints:
+                continue
+            try:
+                await teach_hints(self.context, origin, hints)
+            except Exception:
+                logger.warning(
+                    "Teaching a browser context the client hints of %s failed; its requests there send others",
+                    origin,
+                    exc_info=True,
+                )
+                continue
+            if hints:
+                self.client_hints[origin] = hints
+            else:
+                self.client_hints.pop(origin, None)
 
     async def _close_pages(self) -> None:
         """Close every page of the context: one fetch uses it at a time, so they are all its fetch's."""

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from pernix import Cookie, Session
+from pernix.fetchers import session_contexts
 from pernix.fetchers.browser_cookies import request_cookie
 from pernix.fetchers.session_contexts import SessionContexts
 
@@ -314,3 +315,39 @@ async def test_a_fetch_cancelled_while_its_changes_are_read_keeps_none_of_them()
 
     assert [cookie.value for cookie in session.cookies] == ["1"]
     assert len(browser.closed) == 1
+
+
+async def test_a_context_is_taught_the_hints_it_does_not_keep_and_the_session_keeps_those_its_page_asked_for(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    taught: list[tuple[str, tuple[str, ...]]] = []
+    failing = {"https://down.example"}
+
+    async def teach(_context: object, origin: str, hints: tuple[str, ...]) -> None:
+        if origin in failing:
+            raise RuntimeError("the page did not open")
+        taught.append((origin, tuple(hints)))
+
+    monkeypatch.setattr(session_contexts, "teach_hints", teach)
+    browser = Browser()
+    contexts = _contexts(browser)
+    session = Session("alice", client_hints={ORIGIN: ("sec-ch-ua-arch",), "https://down.example": ("dpr",)})
+
+    async with contexts.using(LAUNCHED, session, proxy=None) as held:
+        await held.sync(session, [], now=NOW)
+        accepted = [(f"{ORIGIN}/a", "Sec-CH-UA-Model"), ("http://insecure.example/", "dpr")]
+        await held.merge(cast("Page", FakePage(ORIGIN, {})), session, now=NOW, accepted=accepted)
+    failing.clear()
+    async with contexts.using(LAUNCHED, session, proxy=None) as held:
+        await held.sync(session, [], now=NOW)
+
+    assert taught == [(ORIGIN, ("sec-ch-ua-arch",)), ("https://down.example", ("dpr",))]
+    assert (
+        session.client_hints
+        == held.client_hints
+        == {
+            ORIGIN: ("sec-ch-ua-model",),
+            "https://down.example": ("dpr",),
+        }
+    )
+    assert "Teaching a browser context the client hints of https://down.example failed" in caplog.text

@@ -87,6 +87,8 @@ yield Request(image, headers={"Sec-Fetch-Dest": "image", "Referer": response.url
 
 The `Referer` sent is the page's, by Chrome's default policy: whole to its own origin, its origin alone to another, and none from HTTPS to plain HTTP; `Sec-Fetch-Site` tells how the page and the URL relate, `none` for a navigation without a page. An empty `Referer` names no page. With `http.inherit_referer`, a Request a Callback constructs without a `Referer` takes the page its Response belongs to: that Response's URL when it is a page, or the page its own Request came from, so API calls keep the page that started them. A header a Request sets replaces the kind's of its name in place; another goes after them in a navigation, and first among those the page adds in the other kinds. A `fetch()` to another origin than its page's sends no Session cookies, as `fetch()` does by default. To a plain `http://` host other than a loopback one, Chrome's reduced set goes: no client hints, no `Sec-Fetch-*`, and `Accept-Encoding: gzip, deflate`. Other Profiles send a Request's headers as they are.
 
+The client hints a site asks for with `Accept-CH`, in the response to a navigation or a form submission, go with the requests to its origin from then on, as Chrome sends them: its architecture, platform version, full version, viewport, device memory, and the others, with the values the browser's pages present. A navigation whose `Critical-CH` needs hints it did not send is sent again from the Request's URL, as Chrome does. Under a Session, the hints are kept in it, with its cookies; without one, they last the fetch's redirect chain only.
+
 The browser renders top-level navigations only, as typed in: a rendered Request's `Referer` is not sent. The contract tests compare each kind with what a page makes Chrome send, and `docs/design.md` §5.4 lists what still differs, such as the order of headers a page sets itself.
 
 ## Rendering in the browser
@@ -168,7 +170,7 @@ class Account(Spider):
         yield Request("/orders", session=response.session)  # the login's cookies come along
 ```
 
-Requests are independent by default: each sends only the cookies it carries. With `sessions.enabled`, every Request leases a Session from the Run's Session Pool instead, and sends the Session's cookies, which keep those set during its fetches. Sessions are created as Requests need them, up to `sessions.size`, and each takes `sessions.max_concurrency` fetches at once. `Request(session="me")` leases the Session of that id, created on first use, and `session=response.session` continues the Session of a page; a Request a Callback yields without one leases whichever Session is free. Inline Fetches continue the Session of the Request being handled. A 429 cools only its Session down, so the others keep fetching from the domain. Rendered Requests lease Sessions too: each Session has browser contexts of its own, which hold its cookies and localStorage, so a login in the browser carries over to HTTP, and the other way round. See [`docs/design.md`](docs/design.md) §5.3.
+Requests are independent by default: each sends only the cookies it carries. With `sessions.enabled`, every Request leases a Session from the Run's Session Pool instead, and sends the Session's cookies, which keep those set during its fetches. Sessions are created as Requests need them, up to `sessions.size`, and each takes `sessions.max_concurrency` fetches at once. `Request(session="me")` leases the Session of that id, created on first use, and `session=response.session` continues the Session of a page; a Request a Callback yields without one leases whichever Session is free. Inline Fetches continue the Session of the Request being handled. A 429 cools only its Session down, so the others keep fetching from the domain. Rendered Requests lease Sessions too: each Session has browser contexts of its own, which hold its cookies, localStorage, and client hints, so a login in the browser carries over to HTTP, and the other way round. A context learns the client hints a Session keeps through a navigation answered in the browser itself, for which Chrome connects to the site ahead of time, as it does for any navigation, but sends it nothing. See [`docs/design.md`](docs/design.md) §5.3.
 
 ### Logging in with Accounts
 
@@ -635,9 +637,11 @@ src/pernix/
 │   ├── http_fetcher.py  curl-cffi HTTP Fetcher, following redirects one hop at a time
 │   ├── redirects.py     which responses redirect, where to, and how the request changes, as in browsers
 │   ├── chain_cookies.py the cookies of a fetch, sent to each redirect hop in Chrome's order
+│   ├── chain_hints.py   the client hints origins asked a fetch for, from its Session and its responses
 │   ├── http_settings.py the http.* settings and the pinned Profile
 │   ├── pinned_pair.py   the Pinned Pair: the bundled build's User-Agent, client hints, and Accept-Language
 │   ├── chrome_headers.py the headers Chrome sends for each kind of request, and from which page
+│   ├── client_hints.py  the client hints Chrome sends after Accept-CH, how it reads it, and their values
 │   ├── browser_fetcher.py patchright browser Fetcher: loads pages, builds their Responses
 │   ├── page_slots.py    the pages open at once, browser.max_pages, each taken by one fetch
 │   ├── browser_generations.py the browsers one Generation after another: replaced, lost, probed, closed
@@ -645,6 +649,7 @@ src/pernix/
 │   ├── tripwire.py      cancels the work in its scopes once tripped, raising an error in its place
 │   ├── session_contexts.py the browser contexts kept for Sessions, synced before and merged after each fetch
 │   ├── browser_cookies.py cookies between a cookie jar and the browser, and what a page changed
+│   ├── browser_hints.py teaches a browser context a Session's client hints; reads those its pages asked for
 │   ├── browser_settings.py the browser.* settings
 │   ├── page_actions.py  runs a Render's page methods, wait, actions, and screenshot on its page
 │   ├── kept_pages.py    the pages kept open for Callbacks, and the scope that closes them

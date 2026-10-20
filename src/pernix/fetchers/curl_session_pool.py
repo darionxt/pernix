@@ -80,11 +80,17 @@ class _Start:
     header_order: str | None = None
     stream_weight: int | None = None
     proxy_headers: Sequence[str] = ()
+    on_client_hints: ClientHintsCallback | None = None
     transfer: Transfer | None = None
 
 
 type HeadersCallback = Callable[[str, list[str]], object]
 """Called with the URL a transfer requested and the `Set-Cookie` values of its response."""
+
+type ClientHintsCallback = Callable[[str, str | None, str | None], object]
+"""Called with the URL a transfer requested and the `Accept-CH` and `Critical-CH` of its response, if any."""
+
+_CLIENT_HINT_HEADERS = ("accept-ch", "critical-ch")
 
 _starting: ContextVar[_Start | None] = ContextVar("pernix_curl_start", default=None)
 """The request the current task is starting with `CurlSession.start()`, if any."""
@@ -127,6 +133,7 @@ class CurlSession(AsyncSession):
         header_order: str | None = None,
         stream_weight: int | None = None,
         proxy_headers: Sequence[str] = (),
+        on_client_hints: ClientHintsCallback | None = None,
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
@@ -154,6 +161,11 @@ class CurlSession(AsyncSession):
                 an HTTP proxy, such as `User-Agent: ...`, in order, after the `Host`
                 and `Proxy-Authorization` curl makes (`CURLOPT_PROXYHEADER`); none
                 for curl's own `Proxy-Connection`.
+            on_client_hints: Called at the end of the headers of the response,
+                unless it is informational, with the URL it answered and its
+                `Accept-CH` and `Critical-CH`, each with its fields joined with
+                commas, `None` without one, when it has either; an error it raises
+                is logged.
             **options: The options of `AsyncSession.request()`, but `stream` and
                 `cookies`.
 
@@ -165,7 +177,9 @@ class CurlSession(AsyncSession):
             pernix.errors.ResponseTooLarge: The limit stopped the transfer before the
                 headers came back.
         """
-        start = _Start(url, body_limit, cookie, on_headers, resolve, header_order, stream_weight, proxy_headers)
+        start = _Start(
+            url, body_limit, cookie, on_headers, resolve, header_order, stream_weight, proxy_headers, on_client_hints
+        )
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -235,7 +249,8 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
                 setopt(CurlOpt.STREAM_WEIGHT, start.stream_weight)
             if start.proxy_headers:
                 setopt(CurlOpt.PROXYHEADER, [header.encode() for header in start.proxy_headers])
-            option, value = CurlOpt.HEADERFUNCTION, _HeaderWatch(value, start.on_headers, transfer)
+            watch = _HeaderWatch(value, start.on_headers, transfer, on_client_hints=start.on_client_hints)
+            option, value = CurlOpt.HEADERFUNCTION, watch
         elif option == CurlOpt.COOKIELIST and value == "ALL" and start.cookie:
             result = setopt(option, value)
             setopt(CurlOpt.COOKIE, start.cookie)
@@ -250,32 +265,43 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
 
 
 class _HeaderWatch:
-    """Writes the response headers of one transfer to curl-cffi's buffer, reporting their cookies.
+    """Writes the response headers of one transfer to curl-cffi's buffer, reporting their cookies and client hints.
 
     At the end of the headers of the response, it reports the URL curl requested for
     it and its `Set-Cookie` values, decoded as UTF-8 unless their bytes are not UTF-8,
-    then as Latin-1. curl unfolds folded lines itself; one that gets
+    then as Latin-1, and its `Accept-CH` and `Critical-CH`. curl unfolds folded lines itself; one that gets
     through still continues the header before it. Informational responses and 407s,
     which answer for a proxy, are not reported, nor are headers after the body,
     trailers. The headers of a redirect, a redirect status with a `Location`, lift
-    the limit of the transfer before curl delivers its body.
+    the limit of the transfer before curl delivers its body, as do those of a
+    response with a `Critical-CH`, which may be dropped to send the navigation again
+    with the client hints it names; the limit is then the caller's to set back.
     """
 
-    def __init__(self, buffer: Any, on_headers: HeadersCallback | None, transfer: Transfer) -> None:
+    def __init__(
+        self,
+        buffer: Any,
+        on_headers: HeadersCallback | None,
+        transfer: Transfer,
+        *,
+        on_client_hints: ClientHintsCallback | None = None,
+    ) -> None:
         self._buffer = buffer
         self._on_headers = on_headers
+        self._on_client_hints = on_client_hints
         self._transfer = transfer
         self._status = 0
         self._set_cookies: list[str] = []
         self._in_set_cookie = False
         self._located = False
+        self._client_hints: dict[str, list[str]] = {}
 
     def __call__(self, line: bytes) -> int:
         text = line.decode("latin-1").strip()
         if text.startswith("HTTP/"):
             code = text.split(maxsplit=2)[1:2]
             self._status = int(code[0]) if code and code[0].isdigit() else 0
-            self._set_cookies, self._in_set_cookie, self._located = [], False, False
+            self._set_cookies, self._in_set_cookie, self._located, self._client_hints = [], False, False, {}
         elif not text:
             self._end()
         elif self._status < 200:  # an informational response, or trailers
@@ -291,6 +317,8 @@ class _HeaderWatch:
                 self._set_cookies.append(value)
             elif name == "location" and value:
                 self._located = True
+            elif name in _CLIENT_HINT_HEADERS:
+                self._client_hints.setdefault(name, []).append(value)
         self._buffer.write(line)
         return len(line)
 
@@ -300,15 +328,24 @@ class _HeaderWatch:
         return effective.decode("utf-8", "replace")  # a host left unreadable takes no cookies
 
     def _end(self) -> None:
-        """End the headers of a response, reporting its cookies, and lifting the limit for the body of a redirect."""
-        if self._status in REDIRECT_STATUSES and self._located:
+        """End the headers of a response, reporting what it asks for, and lifting the limit of a body it may drop."""
+        critical = ", ".join(self._client_hints.get("critical-ch", [])) or None
+        if (self._status in REDIRECT_STATUSES and self._located) or critical:
             self._transfer.limit = None
-        if self._status >= 200 and self._status != 407 and self._on_headers is not None and self._set_cookies:
+        answers = self._status >= 200 and self._status != 407
+        if answers and self._on_headers is not None and self._set_cookies:
             url = self._url()
             try:
                 self._on_headers(url, [_text(value) for value in self._set_cookies])
             except Exception:
                 logger.exception("Handling the Set-Cookie headers of %s failed", url)
+        if answers and self._on_client_hints is not None and self._client_hints:
+            url = self._url()
+            accept = self._client_hints.get("accept-ch")
+            try:
+                self._on_client_hints(url, None if accept is None else ", ".join(accept), critical)
+            except Exception:
+                logger.exception("Handling the client hints %s asks for failed", url)
         if self._status >= 200:
             self._status = 0  # what follows the body is no response
 
