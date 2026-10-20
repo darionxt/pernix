@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import enum
 import sys
 from typing import TYPE_CHECKING, Any
 
 from pernix.crawler import Crawler
 from pernix.errors import CONFIGURATION_ERRORS
+from pernix.exit_code import ExitCode
 from pernix.stop_signals import StopSignals
 
 if TYPE_CHECKING:
@@ -17,19 +17,6 @@ if TYPE_CHECKING:
     from pernix.spider import Spider
 
 __all__ = ["ExitCode", "run_program", "run_spider"]
-
-
-class ExitCode(enum.IntEnum):
-    """The exit status of a program that runs a Spider."""
-
-    COMPLETED = 0
-    """The Run finished, or code stopped it."""
-    FAILED = 1
-    """An error ended the Run."""
-    CONFIGURATION_ERROR = 2
-    """The settings, the Spider arguments, or a component are invalid."""
-    INTERRUPTED = 130
-    """A signal stopped the Run."""
 
 
 def run_spider(
@@ -94,11 +81,9 @@ def run_program(
         return ExitCode.CONFIGURATION_ERROR, None
     try:
         result, interrupted = asyncio.run(_crawl(crawler))
-    except CONFIGURATION_ERRORS:  # the Run logged it
-        return ExitCode.CONFIGURATION_ERROR, None
-    except Exception:  # the Run logged it
-        return ExitCode.FAILED, None
-    return (ExitCode.INTERRUPTED if interrupted else ExitCode.COMPLETED), result
+    except Exception as exc:  # the Run logged it
+        return ExitCode.of(exc), None
+    return ExitCode.of(None, interrupted=interrupted), result
 
 
 async def _crawl(crawler: Crawler) -> tuple[RunResult, bool]:

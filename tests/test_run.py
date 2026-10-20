@@ -221,6 +221,22 @@ def test_one_signal_drains_the_run_and_exits_with_130(
 
 
 @posix_signals
+def test_the_outcome_file_of_a_run_a_signal_stopped_records_130(
+    pages: LoopbackServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PERNIX_OUTCOME_FILE", str(tmp_path / "outcome.json"))
+    program = Program(pages, tmp_path, wait=0.5)
+    program.wait_until_fetching()
+
+    program.process.send_signal(signal.SIGTERM)
+    code, _, stderr = program.finish()
+
+    outcome = orjson.loads((tmp_path / "outcome.json").read_bytes())
+    assert code == outcome["exit_code"] == ExitCode.INTERRUPTED, stderr
+    assert outcome["reason"] == "drained"
+
+
+@posix_signals
 def test_a_second_signal_force_stops_the_run_and_exits_with_130(pages: LoopbackServer, tmp_path: Path) -> None:
     program = Program(pages, tmp_path, wait=60)
     program.wait_until_fetching()

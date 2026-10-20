@@ -10,13 +10,14 @@ from pernix.account import collect_accounts
 from pernix.addons import addon_settings, load_addons
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
-from pernix.errors import CONFIGURATION_ERRORS
+from pernix.errors import CONFIGURATION_ERRORS, SettingsError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.items import ItemStream
 from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
+from pernix.outcome_file import OutcomeFile
 from pernix.pausing import Pausing
 from pernix.request import Request
-from pernix.run_assembly import RunAssembly
+from pernix.run_assembly import RunAssembly, outcome_path
 from pernix.run_result import RunResult
 from pernix.settings import (
     CoreSettings,
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     import os
     from collections.abc import Callable, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
+    from signal import Signals
 
     from pernix.account import Account
     from pernix.engine import Engine
@@ -111,6 +113,7 @@ class Crawler:
         self._pausing = Pausing(spider, self.events)
         self._outlet: Outlet | None = None
         self._inline_fetch: InlineFetch | None = None
+        self._interrupted = False
 
     @classmethod
     def from_spider(
@@ -182,7 +185,7 @@ class Crawler:
         """
         return build_component(spec, crawler=self, provide=self._provide, known_types=self._service_types())
 
-    def stop(self, mode: StopMode = "drain") -> None:
+    def stop(self, mode: StopMode = "drain", *, signal: Signals | None = None) -> None:
         """Ask the Run to stop; it returns at once.
 
         A Drain (`"drain"`) stops claiming new Requests and scheduling those of
@@ -204,11 +207,16 @@ class Crawler:
 
         Args:
             mode: `"drain"` or `"force"`.
+            signal: The signal that asked for the stop, which `run()` and
+                `pernix run` pass on SIGINT and SIGTERM; the Run's outcome file then
+                records the exit code 130 they exit with, unless the Run failed.
 
         Raises:
             ValueError: `mode` is neither.
         """
         self._shutdown.request(mode)
+        if signal is not None:
+            self._interrupted = True
 
     @property
     def paused(self) -> bool:
@@ -358,7 +366,9 @@ class Crawler:
         until `resume()`.
 
         An error that ends the Run is logged, with its traceback unless it is a
-        configuration error, and raised.
+        configuration error, and raised. Last, however the Run ends, the file of the
+        `outcome_file` setting, if set, is written, as
+        `pernix.outcome_file.OutcomeFile` describes.
 
         Returns:
             How the Run ended.
@@ -379,13 +389,14 @@ class Crawler:
         with run_context(self._run_context):
             async with RunLog(self.settings.section(LogSettings), self._run_context, secrets=secrets) as run_log:
                 try:
-                    return await self._crawl(run_log)
-                except CONFIGURATION_ERRORS as exc:
-                    logger.error("%s", exc)
+                    result = await self._crawl(run_log)
+                except BaseException as exc:
+                    _log_failure(exc)
+                    reason = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    self._write_outcome(run_log, reason, exc)
                     raise
-                except Exception as exc:
-                    logger.error("The Run failed", exc_info=exc)
-                    raise
+                self._write_outcome(run_log, result.reason)
+                return result
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
         try:
@@ -416,6 +427,17 @@ class Crawler:
         finally:
             self._shutdown.end()
             self._pausing.end()  # also when the Engine never ran
+
+    def _write_outcome(self, run_log: RunLog, reason: str, error: BaseException | None = None) -> None:
+        """Write the outcome file, if the `outcome_file` setting names one that no other output writes."""
+        try:
+            path = outcome_path(self, self._output)
+        except SettingsError as exc:
+            logger.error("The outcome file is not written: %s", "; ".join(exc.problems))
+            return
+        if path is not None:
+            outcome = OutcomeFile(self, path)
+            outcome.write(reason, error=error, interrupted=self._interrupted, redactor=run_log.redactor)
 
     def _forced_before_start(self) -> RunResult:
         self.stats.set("run.reason", "forced")  # as the reporter records it once a Run started
@@ -499,6 +521,14 @@ class Crawler:
             except KeyError:
                 return None
         return None
+
+
+def _log_failure(error: BaseException) -> None:
+    """Log an error that ended the Run, with its traceback unless it is a configuration error."""
+    if isinstance(error, CONFIGURATION_ERRORS):
+        logger.error("%s", error)
+    elif isinstance(error, Exception):
+        logger.error("The Run failed", exc_info=error)
 
 
 def _as_request(request: Request | str) -> Request:
