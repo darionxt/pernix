@@ -37,6 +37,7 @@ __all__ = [
     "FrontierSettings",
     "ItemSettings",
     "LogSettings",
+    "LoopSettings",
     "NetworkSettings",
     "ProxySettings",
     "ResponseSettings",
@@ -654,6 +655,20 @@ class StatsSettings(Section):
     sinks: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
 
 
+class LoopSettings(Section):
+    """Settings of watching the event loop, which the Callbacks and the components of a Run share.
+
+    Attributes:
+        block_threshold: Seconds the event loop may stay blocked, by code that does
+            not await, such as `time.sleep()` or a long parse, before a warning logs
+            the stack of the code that blocks it; 0 turns the watchdog off.
+    """
+
+    __prefix__ = "loop"
+
+    block_threshold: Annotated[float, msgspec.Meta(ge=0)] = 30.0
+
+
 class ShutdownSettings(Section):
     """Settings of stopping a Run.
 
@@ -688,6 +703,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FeedSettings,
     LogSettings,
     StatsSettings,
+    LoopSettings,
     ShutdownSettings,
 )
 """The Sections every Crawler registers."""

@@ -30,12 +30,13 @@ class StatsReporter:
     """Takes the snapshots of a Run's stats: one every `interval`, and a final one.
 
     `start()` records `run.id`, `run.spider`, and `run.started_at`, and starts sampling
-    the event loop lag. Before each snapshot, `run.elapsed` and the gauges are read
+    the event loop lag, with its watchdog, if any. Before each snapshot, `run.elapsed` and the gauges are read
     into the stats: each field of the dataclass a gauge returns is stored as
     `<prefix>.<field>`, as are `loop.lag_avg` and `loop.lag_max`. Each snapshot is
     emitted as `StatsSnapshot` and logged at INFO with the stats in the `stats`
-    extra field. `finish()` stops the periodic snapshots, records `run.finished_at`
-    and `run.reason`, and takes the final snapshot, logged as the Run's summary.
+    extra field. `finish()` stops the periodic snapshots and the sampling, records
+    `run.finished_at` and `run.reason`, and takes the final snapshot, logged as the
+    Run's summary.
     """
 
     def __init__(
@@ -74,12 +75,12 @@ class StatsReporter:
         self._stats.set("run.id", self._run.run_id)
         self._stats.set("run.spider", self._run.spider)
         self._stats.set("run.started_at", _now())
-        self._tasks.append(asyncio.create_task(self._lag.run()))
+        self._lag.start()
         if self._interval:
             self._tasks.append(asyncio.create_task(self._periodically()))
 
     async def finish(self, reason: str) -> dict[str, int | float | str]:
-        """Stop the periodic snapshots and take the final one.
+        """Stop the periodic snapshots and the sampling, and take the final snapshot.
 
         Args:
             reason: How the Run ended, as in `SpiderClosed`.
@@ -89,6 +90,7 @@ class StatsReporter:
         """
         for task in self._tasks:
             task.cancel()
+        await self._lag.stop()
         if self._tasks:
             await asyncio.wait(self._tasks)
         self._stats.set("run.finished_at", _now())
