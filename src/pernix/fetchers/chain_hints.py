@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pernix.fetchers.client_hints import keep_accepted, parse_hints
+from pernix.fetchers.client_hints import DEFAULT_HINTS, keep_accepted, parse_hints
 from pernix.urls import is_potentially_trustworthy, url_origin
 
 if TYPE_CHECKING:
     from pernix.session import Session
 
 __all__ = ["ChainHints"]
+
+_NEVER_MISSING = frozenset({*DEFAULT_HINTS, "save-data"})
+"""The hints Chrome takes as sent by default, which `Critical-CH` never finds missing: `Save-Data` too."""
 
 
 class ChainHints:
@@ -55,8 +58,8 @@ class ChainHints:
 
         Returns:
             The hints its `Critical-CH` names that its `Accept-CH` asks for and its
-            origin had not asked for before, which Chrome sends the navigation again
-            for; none without both headers.
+            origin had not asked for before, but those Chrome sends by default,
+            which Chrome sends the navigation again for; none without both headers.
         """
         if not is_potentially_trustworthy(url):
             return ()
@@ -66,7 +69,7 @@ class ChainHints:
         missing = (
             ()
             if accepted is None or critical is None
-            else tuple(hint for hint in critical if hint in accepted and hint not in before)
+            else tuple(hint for hint in critical if hint in accepted and hint not in {*before, *_NEVER_MISSING})
         )
         keep_accepted(self._asked, url, accept_ch)
         if self._session is not None:  # whatever the chain held, as another fetch of the Session may have changed it

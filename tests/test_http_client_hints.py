@@ -129,6 +129,15 @@ async def test_critical_ch_needing_no_hint_more_sends_nothing_again(server: Loop
     assert [received.path for received in server.received] == ["/critical", "/known"]
 
 
+async def test_critical_ch_naming_a_hint_sent_by_default_sends_nothing_again(server: LoopbackServer) -> None:
+    server.route("/critical", "", headers=[("Accept-CH", "Sec-CH-UA, Sec-CH-UA-Arch"), ("Critical-CH", "Sec-CH-UA")])
+
+    async with HTTPFetcher() as fetcher:
+        await fetcher.fetch(Request(server.url("/critical")))
+
+    assert [received.path for received in server.received] == ["/critical"]
+
+
 async def test_a_form_submission_keeps_the_hints_it_is_asked_for_but_is_not_sent_again(
     server: LoopbackServer,
 ) -> None:

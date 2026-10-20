@@ -80,6 +80,12 @@ def test_a_chain_keeps_what_its_responses_ask_for_in_its_session_too() -> None:
     assert chain.asked(f"{SHOP}/x") == session.client_hints[SHOP] == ("sec-ch-ua-arch", "sec-ch-ua-model")
 
 
+def test_critical_ch_never_finds_the_hints_sent_by_default_missing() -> None:
+    chain = ChainHints(None)
+
+    assert chain.receive(f"{SHOP}/", "sec-ch-ua, save-data, sec-ch-ua-arch", "sec-ch-ua, save-data") == ()
+
+
 def test_a_chain_without_a_session_keeps_its_hints_to_itself() -> None:
     chain = ChainHints(None)
 
