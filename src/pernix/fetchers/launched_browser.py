@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import logging
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from pernix.errors import ComponentError
 from pernix.fetchers.address_guard_proxy import AddressGuardProxy
 from pernix.fetchers.browser_processes import BrowserProcesses
 from pernix.fetchers.network_guard import current_guard
+from pernix.fetchers.page_intl import present_intl
 from pernix.fetchers.pinned_pair import BUNDLED_BROWSER
 from pernix.fetchers.refusing_proxy import RefusingProxy
 from pernix.settings import DEFAULT_LOCALE
@@ -21,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from patchright._impl._api_structures import StorageState
-    from patchright.async_api import Browser, BrowserContext, CDPSession, Playwright, ProxySettings
+    from patchright.async_api import Browser, BrowserContext, CDPSession, Page, Playwright, ProxySettings
     from patchright.async_api._context_manager import PlaywrightContextManager
 
     from pernix.fetchers.address_guard import AddressGuard
@@ -73,6 +75,10 @@ class LaunchedBrowser:
             `HeadlessChrome`, in headless mode; `None` for its own.
         guard_proxy: Where a browser launched while `network.public_only` is on
             sends all its traffic, the proxy that checks every host it reaches.
+        timezone: The time zone its contexts present, an IANA name; `None` for the
+            machine's.
+        intl_locale: The locale of `Intl` its pages present, with their frames and
+            web workers; `None` for the machine's.
     """
 
     playwright: Playwright
@@ -83,6 +89,8 @@ class LaunchedBrowser:
     processes: BrowserProcesses | None = None
     user_agent: str | None = None
     guard_proxy: AddressGuardProxy | None = None
+    timezone: str | None = None
+    intl_locale: str | None = None
 
     async def new_context(
         self,
@@ -104,11 +112,15 @@ class LaunchedBrowser:
                 then never completes.
 
         Returns:
-            The context, without pages, presenting `user_agent`, if set.
+            The context, without pages, presenting `user_agent` and `timezone`, if
+            set: patchright's `timezone_id` sets the time zone of every page, frame,
+            and web worker, without moving a header.
         """
         options: dict[str, Any] = {}
         if self.user_agent is not None:
             options["user_agent"] = self.user_agent
+        if self.timezone is not None:
+            options["timezone_id"] = self.timezone
         if proxy:
             options["proxy"] = _proxy_settings(proxy)
         if local_storage:
@@ -116,6 +128,27 @@ class LaunchedBrowser:
         if blocks_service_workers:
             options["service_workers"] = "block"
         return await self.browser.new_context(**options)
+
+    async def new_page(self, context: BrowserContext) -> Page:
+        """Open a page in a context, presenting `intl_locale` and `timezone`, if set, before it loads anything.
+
+        Args:
+            context: A context of the browser, from `new_context()`.
+
+        Returns:
+            The page, whose frames and web workers present them too
+            (`pernix.fetchers.page_intl`).
+        """
+        page = await context.new_page()
+        if self.intl_locale is None and self.timezone is None:
+            return page
+        try:
+            await present_intl(context, page, locale=self.intl_locale, timezone=self.timezone)
+        except BaseException:
+            with contextlib.suppress(Exception):  # a page that went away
+                await page.close()
+            raise
+        return page
 
     async def probe(self) -> None:
         """Ask the browser for its version, through the driver, which fails, or never ends, once either went away.
@@ -141,15 +174,20 @@ class LaunchedBrowser:
 
 
 async def launch_browser(
-    settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE, address_guard: AddressGuard | None = None
+    settings: BrowserSettings,
+    *,
+    locale: Sequence[str] = DEFAULT_LOCALE,
+    timezone: str | None = None,
+    address_guard: AddressGuard | None = None,
 ) -> LaunchedBrowser:
     """Start patchright and launch a browser.
 
     The browser is Chrome for Testing, in the new headless mode unless
     `browser.headless` is off, with `browser.launch_options` over those defaults.
     It presents the languages of `locale`, through Chrome's `--accept-lang`, unless
-    the `args` of `launch_options` set it; its contexts present its User-Agent
-    without `HeadlessChrome`, as it is with a window. With an address guard, as
+    the `args` of `launch_options` set it, and the first of them as the locale of
+    `Intl`; its contexts present its User-Agent without `HeadlessChrome`, as it is
+    with a window, and `timezone`, if given. With an address guard, as
     `network.public_only` asks, all its traffic goes through a proxy that checks
     every host (`pernix.fetchers.address_guard_proxy`). Under the network guard,
     every connection to a host other than a loopback one goes to a proxy that
@@ -159,6 +197,7 @@ async def launch_browser(
     Args:
         settings: The browser settings.
         locale: The languages to present, in order.
+        timezone: The time zone to present, an IANA name; `None` for the machine's.
         address_guard: The address guard that checks the hosts the browser reaches,
             if any.
 
@@ -212,7 +251,18 @@ async def launch_browser(
         await _close_proxies(refusing_proxy, guard_proxy)
         raise
     guarded = network_guard is not None
-    return LaunchedBrowser(playwright, browser, guarded, refusing_proxy, devtools, processes, user_agent, guard_proxy)
+    return LaunchedBrowser(
+        playwright,
+        browser,
+        guarded,
+        refusing_proxy,
+        devtools,
+        processes,
+        user_agent,
+        guard_proxy,
+        timezone=timezone,
+        intl_locale=locale[0],
+    )
 
 
 async def probe_browser(settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE) -> str:

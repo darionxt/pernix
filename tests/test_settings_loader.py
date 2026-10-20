@@ -244,6 +244,25 @@ def test_a_locale_names_language_tags(tmp_path: Path, locale: str | list[str], p
     assert found.startswith(f"locale: {problem} (from ")
 
 
+def test_a_time_zone_is_read_from_any_layer(tmp_path: Path) -> None:
+    assert (
+        _load(tmp_path, spider_settings={"timezone": "Europe/Berlin"}).section(CoreSettings).timezone == "Europe/Berlin"
+    )
+    assert _load(tmp_path, environ={"PERNIX_TIMEZONE": "Asia/Tokyo"}).section(CoreSettings).timezone == "Asia/Tokyo"
+
+
+@pytest.mark.parametrize("timezone", ["+08:00", "Mars/Olympus", "posix/Europe/Berlin"])
+def test_a_time_zone_is_an_iana_name_the_system_knows(tmp_path: Path, timezone: str) -> None:
+    with pytest.raises(SettingsError) as excinfo:
+        _load(tmp_path, spider_settings={"timezone": timezone})
+
+    [found] = excinfo.value.problems
+    assert found.startswith(
+        f"timezone: no time zone is named {timezone!r} here; give an IANA name, such as Europe/Berlin, or install the "
+        "tzdata package where the system has no time zone data, as on Windows (from "
+    )
+
+
 def test_invalid_environment_values_name_the_variable(tmp_path: Path) -> None:
     with pytest.raises(SettingsError) as excinfo:
         _load(tmp_path, environ={"PERNIX_DOMAIN__DELAY": "soon"})
@@ -628,6 +647,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "failed_pipelines": {FailedItemsFile: 100},
         "run_id": None,
         "locale": ("en-US", "en"),
+        "timezone": None,
         "domain.delay": 0.0,
         "domain.verify": True,
         "domain.codes": [],
