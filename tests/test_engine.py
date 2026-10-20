@@ -1160,6 +1160,36 @@ async def test_a_cancelled_run_returns_the_requests_waiting_for_their_items_with
     assert lease.attempt == 1
 
 
+async def test_a_failure_before_a_handed_over_request_is_taken_up_returns_it() -> None:
+    failing = False
+
+    class FailingCounts(MemoryFrontier):
+        async def counts(self) -> FrontierCounts:
+            nonlocal failing
+            if failing:
+                failing = False
+                raise RuntimeError("the backend went away")
+            return await super().counts()
+
+    class Failing(HeldItems):
+        async def put(self, item: Any, ctx: ItemContext, pending: PendingItems) -> None:
+            nonlocal failing
+            await super().put(item, ctx, pending)
+            failing = True  # once the attempt ends, the worker fails before the Request is taken up
+
+    held, frontier = Failing(), FailingCounts()
+    engine = _holding_engine(Links(), _site({"/a": "<p>a</p>"}), frontier, held, lease_ttl=0.06)
+    with pytest.raises(ExceptionGroup) as raised:
+        async with asyncio.timeout(5):
+            await engine.run()
+
+    assert raised.group_contains(RuntimeError, match="the backend went away")
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased) == (1, 0)
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    assert lease.attempt == 1
+
+
 async def test_a_drain_settles_the_requests_in_flight_once_their_items_are_processed() -> None:
     engine: Engine | None = None
 

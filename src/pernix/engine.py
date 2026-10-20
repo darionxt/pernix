@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 from contextlib import aclosing
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pernix.callbacks import iterate_and_close
@@ -32,6 +33,23 @@ if TYPE_CHECKING:
 __all__ = ["Engine", "PutItem"]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(eq=False, slots=True)
+class _Attempted:
+    """A Request whose attempt ended, to settle once the Items of the attempt are processed.
+
+    Attributes:
+        lease: The Lease on the Request.
+        settlement: How to settle it.
+        items: The Items of the attempt.
+        renewal: Renews the Lease until it is settled.
+    """
+
+    lease: Lease
+    settlement: Settlement
+    items: PendingItems
+    renewal: asyncio.Task[None]
 
 
 class Engine:
@@ -158,7 +176,7 @@ class Engine:
         self._attempts = 0
         """The attempts in progress."""
         self._waiting = 0
-        """The Requests whose attempts ended, waiting for their Items."""
+        """The Requests whose attempts ended, until they are settled."""
         self._processor = RequestProcessor(
             spider,
             download=download,
@@ -238,14 +256,27 @@ class Engine:
         for them in a task of the worker's, which goes on to the next; on a Drain, the
         worker returns once they are settled.
         """
-        async with asyncio.TaskGroup() as waiting:
-            while not self._draining.is_set():
-                lease = await self._claim(rendered) or await self._wait_for_work(rendered)
-                if lease is not None:
+        handed_over: set[_Attempted] = set()  # to tasks of `waiting` that have not started yet
+        try:
+            async with asyncio.TaskGroup() as waiting:
+                while not self._draining.is_set():
+                    lease = await self._claim(rendered) or await self._wait_for_work(rendered)
+                    if lease is None:
+                        continue
                     with request_context(lease.id):  # records logged for the Request, its Callback's included
-                        await self._process(lease, waiting)
+                        attempted = await self._process(lease)
+                        if attempted.items.count:
+                            handed_over.add(attempted)
+                            waiting.create_task(self._settle_once_processed(attempted, handed_over))
+                        else:
+                            await self._settle_once_processed(attempted, handed_over)
                     await self._flush_if_stuck()
-            await self._flush_if_stuck()
+                await self._flush_if_stuck()
+        finally:
+            while handed_over:  # a failure or a cancellation stopped their tasks before they started
+                attempted = handed_over.pop()
+                await self._stop_waiting(attempted)
+                await self._return(attempted.lease)
 
     async def _claim(self, rendered: bool | None) -> Lease | None:
         leases = await self._frontier.claim(
@@ -280,8 +311,8 @@ class Engine:
                 raise
         return lease
 
-    async def _process(self, lease: Lease, waiting: asyncio.TaskGroup) -> None:
-        """Make an attempt at a Request, and settle it here, or in `waiting` while its Items are processed."""
+    async def _process(self, lease: Lease) -> _Attempted:
+        """Make an attempt at a Request, renewing its Lease, which goes on until it is settled."""
         items = PendingItems()
         renewal = asyncio.create_task(self._keep_leased(lease))
         self._attempts += 1
@@ -295,37 +326,31 @@ class Engine:
             raise
         finally:
             self._attempts -= 1
-        if not items.count:
-            await self._settle_once_processed(lease, settlement, items, renewal)
-            return
         self._waiting += 1
-        waiting.create_task(self._settle_once_processed(lease, settlement, items, renewal, waited=True))
+        return _Attempted(lease, settlement, items, renewal)
 
-    async def _settle_once_processed(
-        self,
-        lease: Lease,
-        settlement: Settlement,
-        items: PendingItems,
-        renewal: asyncio.Task[None],
-        *,
-        waited: bool = False,
-    ) -> None:
-        """Settle a Lease once the Items of its attempt are processed, while `renewal` renews it."""
+    async def _settle_once_processed(self, attempted: _Attempted, handed_over: set[_Attempted]) -> None:
+        """Settle a Lease once the Items of its attempt are processed, taking it from those handed over."""
+        handed_over.discard(attempted)
+        lease = attempted.lease
         try:
-            await items.wait()
-            renewal.cancel()  # before settling, so a renewal never races the settlement
-            settled = await self._settle(lease, settlement)
+            await attempted.items.wait()
+            attempted.renewal.cancel()  # before settling, so a renewal never races the settlement
+            settled = await self._settle(lease, attempted.settlement)
         except asyncio.CancelledError:
             # Until settled, the Request goes back; once settled, this write is stale and changes nothing.
             await self._return(lease)
             raise
         finally:
-            renewal.cancel()
-            await asyncio.wait([renewal])
-            if waited:
-                self._waiting -= 1
+            await self._stop_waiting(attempted)
         if not settled:
             logger.warning("The Lease on %r expired before it was settled; it may be processed again", lease.request)
+
+    async def _stop_waiting(self, attempted: _Attempted) -> None:
+        """Stop renewing the Lease of a Request that waits no more, settled or given back."""
+        attempted.renewal.cancel()
+        await asyncio.wait([attempted.renewal])
+        self._waiting -= 1
 
     async def _flush_if_stuck(self) -> None:
         """Flush the Items when nothing else can happen before the Requests waiting for them are settled.
