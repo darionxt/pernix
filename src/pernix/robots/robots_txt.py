@@ -113,8 +113,9 @@ class RobotsTxt(Middleware):
 
     A Request the rules disallow raises `IgnoreRequest` with the reason
     `"robots.txt"`. The `Crawl-delay` of the rules spaces the starts of the
-    domain's fetches when it is longer than the jittered `domain.delay`, at most
-    `robots.crawl_delay_max`; the domain takes the longest of its origins'.
+    fetches of the slot of each Request they are found for, when it is longer than
+    the jittered `domain.delay`, at most `robots.crawl_delay_max`; a slot takes the
+    longest of the origins it fetches.
 
     Stats: `robots.fetched`, the fetches of robots.txt; `robots.by_status.<code>`,
     their statuses; `robots.errors_by_type.<ErrorType>`, those that raised;
@@ -181,10 +182,11 @@ class RobotsTxt(Middleware):
         if found is None:  # made as part of fetching the origin's robots.txt
             return await call_next(request)
         rules, waited = found
+        slot = self._slot_of(request)
+        self._space(origin, slot, rules.crawl_delay)
         if not rules.allows(request.url):
             self._stats.inc("robots.disallowed")
             raise IgnoreRequest(REASON)
-        slot = self._slot_of(request)
         if waited and not await self._throttle.pace(slot):
             raise NotYet(self._throttle.cooldown_left(slot), "domain cooling down")
         return await call_next(request)
@@ -265,7 +267,6 @@ class RobotsTxt(Middleware):
         else:
             rules = RobotsRules.allowing_all()
         state.rules, state.refresh_at, state.unreachable = rules, self._clock() + CACHE_TTL, 0
-        self._space(origin, self._slot_of(request), rules.crawl_delay)
         logger.debug("Fetched the robots.txt of %s: %s", origin, answer.value)
         return rules
 
@@ -306,7 +307,6 @@ class RobotsTxt(Middleware):
         state.unreachable += 1
         if state.unreachable >= UNREACHABLE_LIMIT:
             state.rules, state.refresh_at, state.unreachable = RobotsRules.disallowing_all(), now + CACHE_TTL, 0
-            self._space(origin, self._slot_of(request), None)
             logger.warning(
                 "The robots.txt of %s was unreachable %d times in a row (%s); its Requests are ignored until it is "
                 "fetched again, in %d hours",
@@ -330,11 +330,20 @@ class RobotsTxt(Middleware):
         return NotYet(delay, "robots.txt unreachable")
 
     def _space(self, origin: str, slot: str, crawl_delay: float | None) -> None:
-        """Space the fetches of a domain by the longest `Crawl-delay` of its origins, at most `robots.crawl_delay_max`."""
+        """Space the fetches of a slot by the longest `Crawl-delay` of the origins it fetches, at most `robots.crawl_delay_max`.
+
+        Each slot takes the `Crawl-delay` of the rules in force once a fetch of it
+        finds them, so a slot that fetches several origins, or an origin fetched
+        in several slots, and rules fetched again, keep it up to date.
+        """
+        limit = self._crawl_delay_max
+        delay = (crawl_delay if limit is None else min(crawl_delay, limit)) if crawl_delay else 0.0
+        delays = self._delays.get(slot)
+        if (0.0 if delays is None else delays.get(origin, 0.0)) == delay:
+            return
         delays = self._delays.setdefault(slot, {})
-        if crawl_delay:
-            limit = self._crawl_delay_max
-            delays[origin] = crawl_delay if limit is None else min(crawl_delay, limit)
+        if delay:
+            delays[origin] = delay
         else:
             delays.pop(origin, None)
         self._throttle.space(slot, max(delays.values(), default=0.0))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, ClassVar
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -350,6 +351,27 @@ async def test_the_slot_of_a_request_is_the_one_the_run_computes() -> None:
     assert obeying.throttle.blocked() == {"everything"}
     assert obeying.throttle.cooldown_left("everything") == UNREACHABLE_WAIT
     assert obeying.throttle.cooldown_left(HOST) == 0
+
+
+async def test_every_slot_an_origin_is_fetched_in_takes_its_crawl_delay_as_it_is_now() -> None:
+    site = Site(b"User-agent: *\nCrawl-delay: 4\n", b"User-agent: *\nCrawl-delay: 1\n")
+    obeying = Obeying(slot_of=lambda request: urlsplit(request.url).path.split("/")[1])
+
+    await obeying.fetch(f"{SITE}/a/1", site)
+    assert await obeying.throttle.pace("b")  # as a Run paces a fetch before its download chain
+    await obeying.fetch(f"{SITE}/b/1", site)  # with the rules kept
+    obeying.clock.advance(3.99)
+    assert obeying.throttle.blocked() == {"a", "b"}
+    obeying.clock.advance(CACHE_TTL)
+    await obeying.fetch(f"{SITE}/a/2", site)  # with the rules fetched again
+    await obeying.fetch(f"{SITE}/b/2", site)
+    assert await obeying.throttle.pace("b")
+
+    obeying.clock.advance(0.99)
+    assert obeying.throttle.blocked() == {"a", "b"}
+    obeying.clock.advance(0.01)
+    assert obeying.throttle.blocked() == frozenset()
+    assert len(site.robots) == 2
 
 
 async def test_a_crawl_delay_no_longer_than_the_delay_changes_nothing() -> None:
