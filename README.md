@@ -62,6 +62,8 @@ class Account(Spider):
 
 `await self.fetch()` is an Inline Fetch: the Request goes through the download Middleware and the per-domain limits, and is retried in place, but it skips the Frontier, so it is neither deduplicated nor stored, and no Callback runs for it. Once its retries run out it raises `RetriesExhausted`. It sends only the cookies you pass, unless the Request being handled has a Session. `self.stream()` reads a body as it arrives: a slow reader keeps about 1 MiB of it in memory, and the transfer holds its domain's slot until the block ends. A Force Stop cancels Inline Fetches with the Request they belong to. See [`docs/design.md`](docs/design.md) §4.6.
 
+`callbacks.timeout` limits how long a Callback, with the spider Middleware, may take to produce its outputs, Inline Fetches included, but not the time its outputs wait to be handed on, such as while the Item queue is full; an errback gets as long for its own. Once the time runs out, the Callback is cancelled at the `await` it is in and fails with `CallbackTimeout`, which its errback gets, and the Request is not retried; a page it kept is closed. The limit is off by default, as some Callbacks take long for good reasons. Code that never awaits cannot be cut short, as Logs and stats below explains. See [`docs/design.md`](docs/design.md) §4.5.
+
 ## Requests as the browser makes them
 
 With the pinned Profile, an HTTP Request carries the headers Chrome sends for the kind of request it is, in Chrome's order, with its `Priority` and HTTP/2 stream weight. Its method and body tell the kind, or a `Sec-Fetch-Dest` header names it; its `Referer` header names the page it comes from.
@@ -424,6 +426,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `stats.interval` | `60.0` | Seconds between stats snapshots; `0` keeps only the final one |
 | `stats.sinks` | `{}` | Stats Sinks, as `{sink: order}`, that receive every snapshot |
 | `loop.block_threshold` | `30.0` | Seconds the event loop may stay blocked before a warning logs the code blocking it; `0` turns the watchdog off |
+| `callbacks.timeout` | `None` | Seconds a Callback, with the spider Middleware, or an errback may take to produce its outputs before it fails with `CallbackTimeout`; `None` for no limit |
 | `items.queue_size` | `1000` | Items waiting for the Pipelines at most; a Callback producing more waits |
 | `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |

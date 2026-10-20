@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
@@ -7,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from pernix.callbacks import iterate_and_close, run_errback
-from pernix.errors import IgnoreRequest, RetriesExhausted, Retry, SessionError
+from pernix.errors import CallbackTimeout, IgnoreRequest, RetriesExhausted, Retry, SessionError
 from pernix.events import RequestFailed, RequestIgnored, RequestRetried, ResponseReceived
 from pernix.fetchers.kept_pages import keeping_pages
 from pernix.inline_fetch import handling
@@ -19,6 +20,8 @@ from pernix.sending import IndependentSending, NotYet
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from pernix.events import EventBus
     from pernix.fetchers.kept_pages import PageKeeping
     from pernix.frontiers import Lease
@@ -27,6 +30,7 @@ if TYPE_CHECKING:
     from pernix.retry_policy import Decision, RetryPolicy
     from pernix.sending import Sender
     from pernix.spider import Spider
+    from pernix.stats import Stats
     from pernix.throttle import Throttle
 
 __all__ = ["Again", "Dead", "Done", "PutItem", "RequestProcessor", "Settlement"]
@@ -105,6 +109,14 @@ class RequestProcessor:
     as `RequestIgnored` and counts as done. Each Response handed to the spider chain
     is emitted as `ResponseReceived`.
 
+    With `callback_timeout`, the spider chain has that many seconds in all to
+    produce the outputs of a Response, and each errback as many for its own; the
+    time spent dispatching the outputs does not count. Once the time runs out, it is
+    cancelled at the `await` it is in, or, running without waiting, it is stopped as
+    soon as it gives an output, which is not taken, or ends; it raises
+    `CallbackTimeout`, which a Callback fails with as with any error of its own, and
+    an errback is logged as failing.
+
     The pages a rendered fetch keeps for the Callback (`Render(keep_page=True)`) are
     closed once the attempt ends, however it ends. A Callback that fails while the
     page it keeps crashed, or the browser of that page was lost, fails with
@@ -125,6 +137,8 @@ class RequestProcessor:
         retry_policy: RetryPolicy,
         throttle: Throttle,
         sender: Sender | None = None,
+        callback_timeout: float | None = None,
+        stats: Stats | None = None,
     ) -> None:
         """Wire the processor to its collaborators.
 
@@ -139,7 +153,17 @@ class RequestProcessor:
             throttle: Paces fetches per slot.
             sender: Sends each Request, under a Session leased from the Session
                 Pool or as it is; `IndependentSending()` when `None`.
+            callback_timeout: Seconds the spider chain may take to produce the
+                outputs of a Response, and an errback its own; `None` for no limit.
+            stats: Where, with a limit, the Callbacks and errbacks that ran out of
+                time are counted, as `callbacks.timeouts` and
+                `callbacks.errback_timeouts`, from 0.
+
+        Raises:
+            ValueError: `callback_timeout` is not positive.
         """
+        if callback_timeout is not None and callback_timeout <= 0:
+            raise ValueError(f"callback_timeout must be positive, got {callback_timeout}")
         self._spider = spider
         self._download = download
         self._handle = handle
@@ -149,6 +173,11 @@ class RequestProcessor:
         self._retry_policy = retry_policy
         self._throttle = throttle
         self._sender = sender or IndependentSending()
+        self._callback_timeout = callback_timeout
+        self._stats = stats
+        if callback_timeout is not None and stats is not None:
+            stats.set("callbacks.timeouts", 0)
+            stats.set("callbacks.errback_timeouts", 0)
 
     async def attempt(self, lease: Lease) -> Settlement:
         """Fetch a Request and run its Callback once, then close the pages it kept.
@@ -296,34 +325,44 @@ class RequestProcessor:
     async def _handle_response(self, request: Request, response: Response) -> Exception | None:
         """Run the spider chain for a Response and dispatch its outputs; return what it raised, if anything."""
         callback = request.callback or self._spider.parse
+        limit = _TimeLimit(_name(callback), self._callback_timeout)
         with handling(response.request):
             async with aclosing(iterate_and_close(self._handle(response))) as outputs:
                 while True:
                     # Only advancing the Callback is isolated: a failure to store its
                     # output is not the Callback's fault and must not be swallowed.
                     try:
-                        output = await anext(outputs)
+                        output = await limit.next(outputs)
                     except StopAsyncIteration:
                         return None
                     except Retry as exc:
                         return exc
                     except Exception as exc:
+                        if limit.ran_out:
+                            self._count("callbacks.timeouts")
                         logger.exception("Callback %s failed for %r", _name(callback), response)
                         return exc
                     await self._handle_output(output, request, response)
 
     async def _run_errback(self, request: Request, error: Exception) -> None:
+        limit = _TimeLimit(_name(request.errback), self._callback_timeout)
         with handling(request):
             async with aclosing(run_errback(request, error)) as outputs:
                 while True:
                     try:
-                        output = await anext(outputs)
+                        output = await limit.next(outputs)
                     except StopAsyncIteration:
                         return
                     except Exception:
+                        if limit.ran_out:
+                            self._count("callbacks.errback_timeouts")
                         logger.exception("Errback %s failed for %r", _name(request.errback), request)
                         return
                     await self._handle_output(output, request, None)
+
+    def _count(self, key: str) -> None:
+        if self._stats is not None:
+            self._stats.inc(key)
 
     async def _handle_output(self, output: object, request: Request, response: Response | None) -> None:
         match output:
@@ -335,6 +374,77 @@ class RequestProcessor:
                 await self._put_item(output, ItemContext(request, response))
             case _:
                 logger.warning("Ignoring unsupported output %r produced for %r", output, request)
+
+
+class _TimeLimit:
+    """The time a Callback, or an errback, has left to produce its outputs, as `callbacks.timeout` limits it.
+
+    Attributes:
+        ran_out: Whether it ran out of time.
+    """
+
+    def __init__(self, handler: str, seconds: float | None) -> None:
+        """Give a Callback or an errback its time.
+
+        Args:
+            handler: The name of the Callback or the errback.
+            seconds: The time it may take in all; `None` for no limit.
+        """
+        self._handler = handler
+        self._seconds = seconds
+        self._left = seconds or 0.0
+        self.ran_out = False
+
+    async def next(self, outputs: AsyncGenerator[object]) -> object:
+        """Wait for the next output, within the time left, which only this wait takes from.
+
+        Args:
+            outputs: The outputs.
+
+        Returns:
+            The next output.
+
+        Raises:
+            StopAsyncIteration: There are no more outputs.
+            pernix.errors.CallbackTimeout: The time ran out: while the producer waited,
+                which cancelled it at the `await` it was in, or while it ran without
+                waiting, and it then gave an output, which is not taken, or ended. A
+                producer left suspended is closed first, its cleanup failing with it.
+        """
+        seconds = self._seconds
+        if seconds is None:
+            return await anext(outputs)
+        started = asyncio.get_running_loop().time()
+        scope = asyncio.timeout(self._left)
+        try:
+            async with scope:
+                output = await anext(outputs)
+        except StopAsyncIteration:
+            if self._spent(started, scope):  # it ended once its time ran out, without waiting or once cancelled
+                raise self._ran_out(seconds) from None
+            raise
+        except Exception as exc:
+            if scope.expired():  # once cancelled, it raised something else
+                raise self._ran_out(seconds) from exc
+            raise
+        if self._spent(started, scope):
+            # It swallowed its cancellation and went on, or ran past its time without waiting.
+            timeout = self._ran_out(seconds)
+            try:
+                await outputs.aclose()  # its cleanup is the Callback's, so it fails with it
+            except Exception as exc:
+                raise timeout from exc
+            raise timeout
+        return output
+
+    def _spent(self, started: float, scope: asyncio.Timeout) -> bool:
+        """Take the time a wait since `started` took from the time left; return whether the time ran out."""
+        self._left -= asyncio.get_running_loop().time() - started
+        return scope.expired() or self._left <= 0
+
+    def _ran_out(self, seconds: float) -> CallbackTimeout:
+        self.ran_out = True
+        return CallbackTimeout(f"{self._handler} ran longer than callbacks.timeout ({seconds:g} s)", timeout=seconds)
 
 
 @dataclass(slots=True)

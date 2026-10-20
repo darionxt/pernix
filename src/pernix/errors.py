@@ -12,6 +12,7 @@ __all__ = [
     "AddonError",
     "Blocked",
     "BrowserLost",
+    "CallbackTimeout",
     "ComponentError",
     "ConnectError",
     "DecodeError",
@@ -213,6 +214,28 @@ class RetriesExhausted(PernixError):
         super().__init__(reason)
         self.reason = reason
         self.response = response
+
+
+class CallbackTimeout(PernixError, TimeoutError):
+    """A Callback, with the spider Middleware around it, or an errback ran longer than `callbacks.timeout`.
+
+    It was cancelled at the `await` it was in. A Callback's timeout fails its Request
+    as any error the Callback raises does: it is not retried (ADR 0006), and the
+    errback gets it. An errback's timeout is logged as an errback raising is.
+
+    Attributes:
+        timeout: The limit, in seconds.
+    """
+
+    def __init__(self, message: str, *, timeout: float) -> None:
+        """Create the error.
+
+        Args:
+            message: What ran longer, and the limit.
+            timeout: The limit, in seconds.
+        """
+        super().__init__(message)
+        self.timeout = timeout
 
 
 class _ControlFlow(Exception):

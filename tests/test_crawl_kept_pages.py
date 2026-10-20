@@ -99,6 +99,35 @@ async def test_the_page_is_closed_when_a_force_stop_cancels_its_callback(site: s
     assert (stats["browser.pages_open"], stats["browser.contexts_open"]) == (0, 0)
 
 
+async def test_a_callback_whose_time_runs_out_closes_its_page_and_gives_its_slot_back(site: str) -> None:
+    pages: list[Page] = []
+
+    class Stuck(Kept):
+        settings: ClassVar[Mapping[str, Any]] = {"browser.max_pages": 1, "callbacks.timeout": 0.5}
+
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(f"{self.base}/", render=Render(keep_page=True))
+            yield Request(f"{self.base}/next", render=True, callback=self.parse_next)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            assert response.page is not None
+            pages.append(response.page)
+            yield {"kept": True}
+            await asyncio.Event().wait()  # holds the only page slot until its time runs out
+
+        async def parse_next(self, response: Response) -> AsyncIterator[Any]:
+            yield {"next": response.css("h1::text").get()}
+
+    report = await crawl(Stuck, base=site)
+
+    assert sorted(report.items, key=str) == [{"kept": True}, {"next": "page two"}]
+    assert report.stats["callbacks.timeouts"] == 1
+    assert report.stats["requests.failed_by_error.CallbackTimeout"] == 1
+    [page] = pages
+    assert page.is_closed()
+    assert (report.stats["browser.pages_open"], report.stats["browser.contexts_open"]) == (0, 0)
+
+
 async def test_a_callback_holding_the_only_page_can_still_render(site: str) -> None:
     class Nested(Kept):
         settings: ClassVar[Mapping[str, Any]] = {"browser.max_pages": 1}
