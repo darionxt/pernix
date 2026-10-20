@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, cast
 from pernix.addons import setup_addon
 from pernix.blocked_responses import BlockedResponses
 from pernix.callbacks import run_callbacks
+from pernix.control import ControlFile, RunControl
 from pernix.engine import Engine
 from pernix.errors import CONFIGURATION_ERRORS, ComponentError, SettingsError
 from pernix.events import StatsSnapshot
@@ -34,6 +35,7 @@ from pernix.sessions.session_login import SessionLogin
 from pernix.settings import (
     BlockedSettings,
     CallbackSettings,
+    ControlSettings,
     CoreSettings,
     DomainSettings,
     FeedOptions,
@@ -56,6 +58,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pernix.account import Account
+    from pernix.control import ControlSource
     from pernix.crawler import Crawler
     from pernix.frontiers import Frontier
     from pernix.logs import RunLog
@@ -118,8 +121,9 @@ class RunAssembly:
 
     Attributes:
         components: The components to subscribe and open, in order: Stats Sinks,
-            Extensions, the sources of proxies and the proxies, Fetchers, download
-            Middleware, spider Middleware, Pipelines, and failure Pipelines.
+            the control sources and their reading, Extensions, the sources of
+            proxies and the proxies, Fetchers, download Middleware, spider
+            Middleware, Pipelines, and failure Pipelines.
         feeds: The Feeds, opened after the components.
         items: Takes the Items through the Pipelines into the Feeds.
         frontier: Holds the Requests of the Run.
@@ -151,13 +155,14 @@ class RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
         The Crawler's Addons register their subscribers first. Then the components
-        are built with `crawler.build_component()`: Stats Sinks, Extensions, the
-        proxies, their provider, and their binding policy, Fetchers, download
-        Middleware, spider Middleware, Pipelines, failure Pipelines, Feeds, the
-        Fingerprint function, and the retry policy; the download and spider chains,
-        the Pipelines, and the path of the outcome file are checked. Steps that do
-        not depend on each other all run, so their problems are reported together.
-        The core stats and the Stats Sinks are subscribed.
+        are built with `crawler.build_component()`: Stats Sinks, control sources,
+        Extensions, the proxies, their provider, and their binding policy,
+        Fetchers, download Middleware, spider Middleware, Pipelines, failure
+        Pipelines, Feeds, the Fingerprint function, and the retry policy; the
+        download and spider chains, the Pipelines, and the path of the outcome file
+        are checked. Steps that do not depend on each other all run, so their
+        problems are reported together. The core stats and the Stats Sinks are
+        subscribed.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
@@ -185,6 +190,7 @@ class RunAssembly:
         for addon in crawler.addons:
             problems.attempt(setup_addon, addon, events=events, settings=settings)
         sinks = problems.attempt(_build_sinks, crawler)
+        controlling = problems.attempt(_controlling, crawler)
         extensions = problems.attempt(_build_all, crawler, "extensions")
         proxying = problems.attempt(_proxying, crawler, run_log)
         downloading = problems.attempt(DownloadAssembly.build, crawler)
@@ -210,6 +216,7 @@ class RunAssembly:
         if (
             problems.found
             or sinks is None
+            or controlling is None
             or extensions is None
             or proxying is None
             or downloading is None
@@ -271,6 +278,7 @@ class RunAssembly:
             events.on(StatsSnapshot, sink.push)
         components = (
             *sinks,
+            *controlling,
             *extensions,
             *proxying.components,
             *downloading.components,
@@ -499,6 +507,37 @@ def _build_sinks(crawler: Crawler) -> list[StatsSink]:
         if not callable(getattr(sink, "push", None)):
             raise ComponentError(f"stats.sinks: {sink!r} must have push(snapshot)")
     return cast("list[StatsSink]", sinks)
+
+
+def _controlling(crawler: Crawler) -> tuple[object, ...]:
+    """The control sources of `control.file` and `control.sources`, then the `RunControl` reading them; none without one.
+
+    The Platform's control applies to the Run as `crawler.pause()`, `resume()`, and
+    `stop()`.
+
+    Raises:
+        pernix.errors.ComponentError: A control source cannot be built, or has no
+            `state()`.
+    """
+    options = crawler.settings.section(ControlSettings)
+    sources: list[tuple[str, ControlSource]] = []
+    if options.file is not None:
+        sources.append((ControlSettings.key("file"), ControlFile(options.file)))
+    for source in _build_all(crawler, ControlSettings.key("sources")):
+        if not callable(getattr(source, "state", None)):
+            raise ComponentError(f"{ControlSettings.key('sources')}: {source!r} must have state()")
+        sources.append((type(source).__qualname__, cast("ControlSource", source)))
+    if not sources:
+        return ()
+    control = RunControl(
+        sources,
+        interval=options.interval,
+        pause=crawler.pause,
+        resume=crawler.resume,
+        stop=crawler.stop,
+        stats=crawler.stats,
+    )
+    return (*(source for _, source in sources), control)
 
 
 def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> list[Feed]:
