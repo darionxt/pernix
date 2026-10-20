@@ -22,17 +22,47 @@ if TYPE_CHECKING:
 
 pytest_plugins = ["pytester"]
 
+_NETWORK_CHECK = "network_check"
+"""The marker of the checks in tests/network_checks, which only a real network can make."""
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add `--network-checks`, which runs the checks only a real, clean network can make."""
+    parser.addoption(
+        "--network-checks",
+        action="store_true",
+        help="run the checks of tests/network_checks, which reach real hosts; meant for a clean network",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the marker of the network checks."""
+    config.addinivalue_line(
+        "markers", f"{_NETWORK_CHECK}: a check that reaches real hosts, run only with --network-checks"
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip the network checks unless asked for; those asked for may reach any host."""
+    run = bool(config.getoption("--network-checks"))
+    skip = pytest.mark.skip(reason="a network check, which reaches real hosts; run it with --network-checks")
+    for item in items:
+        if item.get_closest_marker(_NETWORK_CHECK) is not None:
+            item.add_marker(pytest.mark.pernix_network if run else skip)
+
+
 _LAUNCH_TIMEOUT = 60
 """Seconds the browser may take to start for the tests, before they fail with its log."""
 
 
 @pytest.fixture(autouse=True)
-def _block_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests must never reach the external network.
+def _block_external_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must never reach the external network, but the network checks, run only when asked for.
 
     This covers Python sockets only; native transports are guarded at the Fetcher level.
     """
-    netguard.install(monkeypatch)
+    if request.node.get_closest_marker(_NETWORK_CHECK) is None:
+        netguard.install(monkeypatch)
 
 
 @pytest.fixture(autouse=True)

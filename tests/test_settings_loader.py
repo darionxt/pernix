@@ -663,7 +663,8 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "http.pool_idle": 300.0,
         "http.inherit_referer": False,
         # and by the default browser Fetcher
-        "browser.headless": True,
+        "browser.preset": "bundled",
+        "browser.headless": None,
         "browser.timeout": 30.0,
         "browser.deadline": 180.0,
         "browser.launch_options": {},

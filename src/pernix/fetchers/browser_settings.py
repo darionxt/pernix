@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import msgspec
 from msgspec import structs
@@ -8,14 +8,25 @@ from msgspec import structs
 from pernix.browser.resource_types import check_resource_types
 from pernix.settings import Section
 
-__all__ = ["BrowserSettings"]
+__all__ = ["BrowserSettings", "Preset"]
+
+type Preset = Literal["bundled", "stealth"]
+"""How the browser Fetcher launches its browser: the bundled build, or the system's own Chrome with a window."""
 
 
 class BrowserSettings(Section):
     """Settings of the browser Fetcher.
 
     Attributes:
-        headless: Run the browser without a window, in Chrome's new headless mode.
+        preset: The browser launched: `bundled`, Chrome for Testing, the build
+            the HTTP Fetcher presents with the pinned Profile, without a window;
+            or `stealth`, for sites that look harder at the client: the system's
+            own Chrome, `channel="chrome"`, with a window, and its pages without a
+            viewport of their own, so that they get the window's. A `channel` or
+            an `executable_path` in `launch_options` still names another browser.
+        headless: Run the browser without a window, in Chrome's new headless
+            mode; `None`, the default, as the preset does: without one for
+            `bundled`, with one for `stealth`.
         timeout: Seconds a page may take to load, until its `load` event;
             `Request(timeout=...)` overrides it.
         deadline: Seconds a whole fetch may take, starting the browser included,
@@ -50,7 +61,8 @@ class BrowserSettings(Section):
 
     __prefix__ = "browser"
 
-    headless: bool = True
+    preset: Preset = "bundled"
+    headless: bool | None = None
     timeout: Annotated[float, msgspec.Meta(gt=0)] = 30.0
     deadline: Annotated[float, msgspec.Meta(gt=0)] = 180.0
     launch_options: dict[str, Any] = msgspec.field(default_factory=dict[str, Any])
@@ -62,6 +74,11 @@ class BrowserSettings(Section):
     context_idle: Annotated[float, msgspec.Meta(gt=0)] = 300.0
     block: tuple[str, ...] = ()
     action_timeout: Annotated[float, msgspec.Meta(gt=0)] = 10.0
+
+    @property
+    def runs_headless(self) -> bool:
+        """Whether the browser runs without a window: as `headless` says, else as `preset` does."""
+        return self.preset == "bundled" if self.headless is None else self.headless
 
     def __post_init__(self) -> None:
         if "headless" in self.launch_options:

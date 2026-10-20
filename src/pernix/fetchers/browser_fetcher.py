@@ -47,6 +47,7 @@ from pernix.settings import (
     DEFAULT_LOCALE,
     CoreSettings,
     NetworkSettings,
+    ProxySettings,
     ResponseSettings,
     Section,
     locale_languages,
@@ -255,6 +256,7 @@ class BrowserFetcher:
         locale: str | Sequence[str] = DEFAULT_LOCALE,
         timezone: str | None = None,
         network: NetworkSettings | None = None,
+        proxy_pool: bool = False,
     ) -> None:
         """Configure the fetcher.
 
@@ -268,6 +270,9 @@ class BrowserFetcher:
             timezone: The time zone its pages present, an IANA name; `None` for
                 the machine's.
             network: Which hosts may be reached; any when `None`.
+            proxy_pool: Whether the Run goes through a Proxy Pool, around whose
+                proxies WebRTC is kept, as it would tell pages the machine's own
+                address.
 
         Raises:
             ValueError: `locale` names no language, or something else, or
@@ -280,6 +285,7 @@ class BrowserFetcher:
         self._locale = locale_languages(locale)
         self._timezone = None if timezone is None else time_zone_name(timezone)
         self._reported = False
+        self._proxy_pool = proxy_pool
         self._address_guard: AddressGuard | None = None
         if network is not None and network.public_only:
             check_launch_options(self._settings)
@@ -310,12 +316,15 @@ class BrowserFetcher:
             A fetcher with the `browser.*` settings, whose Responses use
             `response.default_encoding`, counting in the Run's stats,
             presenting the languages of `locale` and the time zone of `timezone`,
-            and reaching the hosts the `network.*` settings allow. Launch options
-            naming another browser than the bundled build are warned about.
+            and reaching the hosts the `network.*` settings allow, with WebRTC
+            kept off UDP while `proxies.*` configure a Proxy Pool. Launch options
+            naming another browser than the bundled build are warned about, but
+            under the `stealth` preset, which names one on purpose.
         """
         settings = crawler.settings.section(BrowserSettings)
         options = settings.launch_options
-        if "executable_path" in options or options.get("channel", "chromium") != "chromium":
+        named = "executable_path" in options or options.get("channel", "chromium") != "chromium"
+        if named and settings.preset != "stealth":
             logger.warning(
                 "%s names another browser than the bundled build, which the HTTP Fetcher presents with the pinned "
                 "Profile, so the two present different clients",
@@ -329,6 +338,7 @@ class BrowserFetcher:
             locale=core.locale,
             timezone=core.timezone,
             network=crawler.settings.section(NetworkSettings),
+            proxy_pool=crawler.settings.section(ProxySettings).enabled,
         )
 
     async def __aenter__(self) -> Self:
@@ -750,7 +760,11 @@ class BrowserFetcher:
         With `network.public_only`, it goes through the proxy that checks every host it reaches.
         """
         launched = await launch_browser(
-            settings, locale=self._locale, timezone=self._timezone, address_guard=self._address_guard
+            settings,
+            locale=self._locale,
+            timezone=self._timezone,
+            address_guard=self._address_guard,
+            proxy_pool=self._proxy_pool,
         )
         if not self._reported:
             self._reported = True

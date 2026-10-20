@@ -43,6 +43,7 @@ HTTP_KEYS = (
     "inherit_referer",
 )
 BROWSER_KEYS = (
+    "preset",
     "headless",
     "timeout",
     "deadline",

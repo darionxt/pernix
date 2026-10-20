@@ -29,6 +29,10 @@ Randomly generated headers or page properties only change the surface; they cann
 - The Profile contract tests (`tests/test_profile_contract.py`) show that, under one Session, the two Fetchers put one client on the wire: a loopback server records what each sends for the same pages, and any difference fails, named. They compare the TLS ClientHello, a resumed one included, the HTTP/2 preface, the HPACK representation of each header field, and the header fields in order with their values, for the default `locale` and others. What clients randomize, such as GREASE values and the order of TLS extensions, and what comes from the server, such as session tickets, is left out; `docs/design.md` §5.4 lists each with its reason.
 - A Run warns, once each, about a pair other than the pinned one: an `http.impersonate` other than the pinned Profile, `browser.launch_options` naming another browser with `executable_path` or `channel`, a launched browser of another version than the record, and a browser presenting other languages than `locale`. `pernix check` marks the Profile and the browser as pinned or not. None of them is an error, so that another browser can be chosen on purpose.
 
+**The stealth preset**
+
+- `browser.preset = "stealth"` launches the system's own Google Chrome with a window instead of the bundled build, for sites that look harder at the client. The HTTP Fetcher keeps the pinned pair: curl-cffi has no Profile of the system's Chrome, and naming it over the pinned Profile's TLS would contradict itself. The two Fetchers then present two clients, each consistent, which a Run tells once, at INFO, as a choice rather than a mistake; a browser named in `launch_options` without the preset is still warned about.
+
 **Upgrading either side**
 
 - An upgrade of patchright or curl-cffi, or a change of the default Profile, lands only with the contract tests passing on macOS and Linux, as CI runs them. A browser build that changes what it sends moves the default Profile to the curl-cffi target that matches it, in the same change, and an upgrade of patchright updates the recorded version and brands.

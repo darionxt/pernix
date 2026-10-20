@@ -66,7 +66,8 @@ def test_the_core_imports_without_patchright() -> None:
 def test_the_browser_settings_and_their_defaults(tmp_path: Path) -> None:
     settings = load_settings(sections=CORE_SECTIONS, project_dir=tmp_path, environ={}).section(BrowserSettings)
 
-    assert settings == BrowserSettings(headless=True, timeout=30.0, deadline=180.0, launch_options={})
+    assert settings == BrowserSettings(preset="bundled", headless=None, timeout=30.0, deadline=180.0, launch_options={})
+    assert settings.runs_headless
 
 
 @pytest.mark.parametrize(
