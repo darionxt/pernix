@@ -79,6 +79,7 @@ class _Start:
     resolve: Sequence[str] = ()
     header_order: str | None = None
     stream_weight: int | None = None
+    proxy_headers: Sequence[str] = ()
     transfer: Transfer | None = None
 
 
@@ -125,6 +126,7 @@ class CurlSession(AsyncSession):
         resolve: Sequence[str] = (),
         header_order: str | None = None,
         stream_weight: int | None = None,
+        proxy_headers: Sequence[str] = (),
         **options: Any,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Start a streamed transfer and wait for its headers.
@@ -148,6 +150,10 @@ class CurlSession(AsyncSession):
                 `None` for the Profile's.
             stream_weight: The weight of the request's HTTP/2 stream; `None` for the
                 Profile's.
+            proxy_headers: The headers of the `CONNECT` that opens a tunnel through
+                an HTTP proxy, such as `User-Agent: ...`, in order, after the `Host`
+                and `Proxy-Authorization` curl makes (`CURLOPT_PROXYHEADER`); none
+                for curl's own `Proxy-Connection`.
             **options: The options of `AsyncSession.request()`, but `stream` and
                 `cookies`.
 
@@ -159,7 +165,7 @@ class CurlSession(AsyncSession):
             pernix.errors.ResponseTooLarge: The limit stopped the transfer before the
                 headers came back.
         """
-        start = _Start(url, body_limit, cookie, on_headers, resolve, header_order, stream_weight)
+        start = _Start(url, body_limit, cookie, on_headers, resolve, header_order, stream_weight, proxy_headers)
         token = _starting.set(start)  # this request's own, not one a parent task started
         try:
             response = await self.request(method, url, stream=True, **options)
@@ -202,8 +208,8 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
 
     It also sets the `Cookie` header of the request once curl-cffi has cleared the
     cookies the handle held, the addresses its hosts resolve to with its URL, and
-    the order of its headers and the weight of its HTTP/2 stream once curl-cffi has
-    set the Profile's.
+    the order of its headers, the weight of its HTTP/2 stream, and the headers of
+    its `CONNECT` once curl-cffi has set the Profile's.
     """
 
     def watched_setopt(option: CurlOpt, value: Any) -> int:
@@ -227,6 +233,8 @@ def _watched(setopt: Callable[[CurlOpt, Any], int], transfer: Transfer, start: _
                 setopt(CurlOpt.HTTPHEADER_ORDER, start.header_order.encode())
             if start.stream_weight is not None:
                 setopt(CurlOpt.STREAM_WEIGHT, start.stream_weight)
+            if start.proxy_headers:
+                setopt(CurlOpt.PROXYHEADER, [header.encode() for header in start.proxy_headers])
             option, value = CurlOpt.HEADERFUNCTION, _HeaderWatch(value, start.on_headers, transfer)
         elif option == CurlOpt.COOKIELIST and value == "ALL" and start.cookie:
             result = setopt(option, value)
