@@ -50,14 +50,14 @@ async def test_a_blocked_output_never_stalls_the_event_loop(monkeypatch: pytest.
     lag = LoopLag(interval=0.005)
     try:
         async with asyncio.timeout(5), run_log:
-            sampling = asyncio.create_task(lag.run())
+            lag.start()
             with run_context(RUN):
                 for n in range(2000):
                     log.warning("record %d", n)
                     if n % 100 == 0:
                         await asyncio.sleep(0)
             await asyncio.sleep(0.02)
-            sampling.cancel()
+            await lag.stop()
         # closing returned after its drain timeout, although the output still blocks
     finally:
         stream.unblock.set()

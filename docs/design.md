@@ -183,6 +183,7 @@ Request(
   - To retry, the user explicitly writes `raise Retry(reason, delay=None)`; the retry policy still decides whether a retry is left (§6.4). Deciding whether a page is Blocked is covered in §5.4 and handled automatically by the framework.
 - **Errbacks**: `errback(request, error)` runs once a Request fails for good, whether its fetch failed, its retries ran out (`error` is then `RetriesExhausted`, carrying the last `response` or the last exception as its cause), or its Callback raised. Like a Callback, it may yield Requests and Items; relative URLs resolve against the failed Request's URL. An errback that raises is logged.
 - Every Request must go through the Frontier; a Callback cannot bypass scheduling and hand a Request directly to a Fetcher. For cases that need the Response "right away", use the Inline Fetch in §4.6.
+- **Blocking code**: Callbacks, errbacks, Middleware, Pipelines, and components share the Run's one event loop. Code that never awaits, such as `time.sleep()`, a synchronous HTTP call, or a long parse, blocks it, and with it the whole Run: fetches, Lease renewals, stats reports, and the stops the first two signals ask for (§6.6) wait until it returns, and no timeout can cut it short. Blocking calls belong in `asyncio.to_thread()`, which keeps the loop running, and long CPU-bound work in a process pool, which also runs it in parallel. The loop watchdog (§8) logs the code that blocks the loop.
 
 ### 4.6 Inline Fetch (`await self.fetch`)
 
@@ -948,7 +949,7 @@ Rules:
 | Session Pool | Opt-in; Requests are independent by default (ADR 0011) | ✓ |
 | Proxies | Enabled when configured | ✓ |
 | Blocked-response detection | Enabled (status-code rules) | ✓ |
-| Stats / event loop lag sampling | Enabled | ✓ |
+| Stats / event loop lag sampling and watchdog | Enabled | ✓ |
 | Feeds (jsonl/csv/json) | Enabled with `-o` or settings | ✓ |
 | Development response cache | Disabled | ✓ |
 | Link extractor, Sitemap | Utility functions | — |
@@ -988,11 +989,15 @@ Rules:
 | `items.scraped`, `items.dropped`, `items.errors`, `items.retried`, `items.failures_lost`, `items.discarded` | Items stored, dropped, or failed; Pipeline calls retried; failed Items a failure Pipeline lost; Items a stopped Run never processed |
 | `frontier.ready`, `frontier.delayed`, `frontier.leased`, `frontier.done`, `frontier.dead` | The Frontier at the snapshot |
 | `throttle.waits`, `throttle.wait_seconds`, `throttle.cooldowns`, `throttle.refused` | Waiting for per-domain slots, and cooldowns |
-| `loop.lag_avg`, `loop.lag_max` | Event loop lag in seconds, sampled every second |
+| `loop.lag_avg`, `loop.lag_max` | Event loop lag in seconds, sampled every second, or every quarter of `loop.block_threshold` when that is shorter |
+| `loop.blocks`, `loop.block_seconds` | Times the event loop was blocked past `loop.block_threshold`, and the seconds those blocks lasted, to within a sample; absent with the watchdog off |
 | `log.warning`, `log.error`, `log.critical`, `log.dropped` | Records logged per level, and records dropped from the full queue |
 | `sessions.*`, `proxies.*`, `browser.*` | Sessions and proxies (§5.3), and the browser's pages and contexts (§5.2) |
 
 - Every `stats.interval` (60 s; 0 turns it off), a `StatsSnapshot` Event is emitted and an INFO line logged, such as "Fetched 120 responses (60/min), scraped 340 items (170/min)", with the stats in its `stats` field. After `SpiderClosed` and before the components are closed, the final snapshot (`final=True`) is emitted and logged as the Run's summary; text output lists every stat.
+- **Loop watchdog** (`loop.block_threshold`, 30 s; 0 turns it off): each lag sample is a beat, due one sampling interval after the one before. A daemon thread of the Run sleeps until the event loop is `loop.block_threshold` seconds late for its next beat; if it has not beaten by then, the loop is blocked, and the thread logs a WARNING whose `stack_info` is the stack of the loop's thread, naming the code that blocks it, once per block. The next beat logs at INFO how long the block lasted and counts it in `loop.blocks` and `loop.block_seconds`; a Run that ends first counts it as it stops the thread. The thread lives as long as the lag sampling, from before `SpiderOpened` is emitted to the final snapshot, and runs in the Run's context, so each Run has its own, and its records carry the Run's `run_id`. Limits:
+  - A C call that holds the GIL keeps the thread waiting until it returns, so the warning comes late, with the stack as it is then. `faulthandler.dump_traceback_later()` could report that case, but it is process-wide and would replace a timer the application or pytest set (`faulthandler_timeout`), so it is not used.
+  - A debugger paused on a breakpoint blocks the loop, and is warned about; a machine asleep does not, as the monotonic clock stops meanwhile on macOS and Linux.
 - **Stats Sinks** (`stats.sinks`, as `{sink: order}`) report snapshots elsewhere, such as to the Platform. A sink has `push(snapshot)`, sync or async, which is subscribed to `StatsSnapshot`, so a sink that fails or times out does not affect the Run. Sinks are built and opened like Extensions, before them, and receive the final snapshot before they are closed.
 
 **Control**

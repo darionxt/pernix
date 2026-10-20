@@ -423,6 +423,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `log.redact` | `()` | Names whose values are masked in logs, besides the built-in ones |
 | `stats.interval` | `60.0` | Seconds between stats snapshots; `0` keeps only the final one |
 | `stats.sinks` | `{}` | Stats Sinks, as `{sink: order}`, that receive every snapshot |
+| `loop.block_threshold` | `30.0` | Seconds the event loop may stay blocked before a warning logs the code blocking it; `0` turns the watchdog off |
 | `items.queue_size` | `1000` | Items waiting for the Pipelines at most; a Callback producing more waits |
 | `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
@@ -483,6 +484,8 @@ Pipelines run in order on each Item, apart from the Callbacks: when they fall be
 Pernix logs on the `pernix.*` loggers; `self.logger` in a Spider is `pernix.spiders.<name>`. During a Run, records are queued and written by a background thread, so a slow log output never stalls the crawl. If your application configured logging, the records go to its handlers; otherwise Pernix writes them to stderr, as text on a terminal and as JSON lines otherwise. Every record carries the `run_id`, the `spider`, and the `request_id` of the Request being processed, and credentials, cookies, tokens, and `Secret` settings are masked.
 
 The stats of a Run, such as `downloads.by_status.200` or `items.scraped`, are in `crawler.stats` (`self.stats` in a Spider, where you can add your own). They are logged every minute and summarized at the end, and Stats Sinks registered with `stats.sinks` receive every snapshot. See [`docs/design.md`](docs/design.md) §8 for the keys.
+
+Callbacks, Middleware, Pipelines, and Extensions share one event loop, so code that never awaits, such as `time.sleep()`, a synchronous HTTP client, or a long parse, stops the whole Run while it runs: no fetch, Lease renewal, or stats report goes on meanwhile. Await instead; run blocking calls with `await asyncio.to_thread(...)`, which keeps the loop running, and long CPU-bound work in a process pool, with `loop.run_in_executor()`, which also runs it in parallel. Once the event loop has been blocked for `loop.block_threshold` (30 s), a warning logs the stack of the code that blocks it, and once the loop runs again, an INFO line tells how long it was blocked; `loop.blocks` and `loop.block_seconds` count the blocks and their seconds. See [`docs/design.md`](docs/design.md) §8.
 
 ## Testing
 
@@ -676,6 +679,7 @@ src/pernix/
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items
 │   ├── stats_reporter.py periodic and final snapshots, the summary
 │   ├── loop_lag.py      samples the event loop lag
+│   ├── loop_watchdog.py warns while the event loop is blocked, with the stack that blocks it
 │   └── stats_sink.py    StatsSink protocol
 ├── settings/
 │   ├── loader.py        merges and validates the settings layers
