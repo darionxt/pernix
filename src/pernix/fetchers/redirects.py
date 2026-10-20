@@ -6,11 +6,17 @@ is resolved against the URL that answered as WHATWG URLs resolve it. 301 and 302
 POST into a GET, and 303 turns anything but GET and HEAD into one, without the body and
 the headers that describe it; 307 and 308 keep the method and the body. Credentials in
 headers never follow a redirect to another origin.
+
+A fetch follows as many redirects as `http.max_redirects` allows, or fewer inside
+`following_at_most()`, as a robots.txt fetch does.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from ada_url import URL
@@ -20,7 +26,10 @@ from pernix.errors import FetchError
 from pernix.headers import Headers
 from pernix.urls import url_host
 
-__all__ = ["REDIRECT_STATUSES", "Hop", "redirect_target", "redirected"]
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+__all__ = ["REDIRECT_STATUSES", "Hop", "following_at_most", "redirect_limit", "redirect_target", "redirected"]
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 """The statuses browsers follow: other 3xx responses, such as 300 or 304, are final."""
@@ -34,6 +43,41 @@ _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 """The headers dropped on a redirect to another origin."""
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+_limit: ContextVar[int | None] = ContextVar("pernix_redirect_limit", default=None)
+"""The redirects the fetches the current task makes may follow at most, below the Fetcher's own limit, if any."""
+
+
+@contextmanager
+def following_at_most(redirects: int) -> Generator[None]:
+    """Make the fetches inside the block follow at most so many redirects, if the Fetcher's own limit is higher.
+
+    The HTTP Fetcher reads it: RFC 9309 has a robots.txt fetch follow five.
+
+    Args:
+        redirects: The redirects to follow at most.
+
+    Yields:
+        Nothing; the block runs with the limit in effect.
+    """
+    token = _limit.set(redirects)
+    try:
+        yield
+    finally:
+        _limit.reset(token)
+
+
+def redirect_limit(configured: int) -> int | None:
+    """Return the limit `following_at_most()` sets for the current fetch, if it is below the Fetcher's own.
+
+    Args:
+        configured: The Fetcher's own limit, such as `http.max_redirects`.
+
+    Returns:
+        The lower limit; `None` when the Fetcher's own applies.
+    """
+    limit = _limit.get()
+    return limit if limit is not None and limit < configured else None
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,6 +15,7 @@ from pernix import Request
 from pernix.errors import FetchError, TooManyRedirects
 from pernix.fetchers import HTTPFetcher, HTTPSettings
 from pernix.fetchers.network_guard import blocking_network
+from pernix.fetchers.redirects import following_at_most
 from pernix.testing import LoopbackServer
 
 if TYPE_CHECKING:
@@ -202,6 +203,24 @@ async def test_more_redirects_than_allowed_fail_before_the_next_is_sent(
             await fetcher.fetch(Request(server.url("/r0")))
 
     assert [hop.path for hop in server.received] == [f"/r{n}" for n in range(max_redirects + 1)]
+
+
+@pytest.mark.parametrize(("lower", "followed"), [(2, 2), (5, 3)])
+async def test_a_fetch_follows_fewer_redirects_when_asked_to_but_never_more(
+    server: LoopbackServer, lower: int, followed: int
+) -> None:
+    for n in range(5):
+        server.route(f"/r{n}", status=302, headers=[("Location", f"/r{n + 1}")])
+
+    async with HTTPFetcher(HTTPSettings(max_redirects=3)) as fetcher:
+        with following_at_most(lower), pytest.raises(TooManyRedirects) as raised:
+            await fetcher.fetch(Request(server.url("/r0")))
+        response = await fetcher.fetch(Request(server.url("/r2")))  # outside the block, three are followed
+
+    limit = f"{followed}" if lower < 3 else r"http\.max_redirects \(3\)"
+    assert raised.match(rf"redirected more than {limit} times")
+    assert [hop.path for hop in server.received][: followed + 1] == [f"/r{n}" for n in range(followed + 1)]
+    assert response.url == server.url("/r5")
 
 
 @pytest.mark.parametrize(

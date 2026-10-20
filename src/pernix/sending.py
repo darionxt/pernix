@@ -24,6 +24,10 @@ __all__ = ["IndependentSending", "NotYet", "Sender", "Sending"]
 class NotYet(Exception):
     """A Request cannot be sent yet, as no Session or no proxy is free for it; it is to wait elsewhere.
 
+    The download chain raises it too for a Request that is to wait, as while the
+    robots.txt of its origin is unreachable: one from the Frontier goes back there
+    without counting an attempt, and an Inline Fetch waits in place.
+
     Attributes:
         delay: Seconds until one may be, at the soonest; 0 if one is only busy.
         reason: What the Request waits for.
@@ -36,7 +40,7 @@ class NotYet(Exception):
             delay: Seconds to wait.
             reason: What the Request waits for, such as `no Session available`.
         """
-        super().__init__(f"{reason}; one may be in {delay:.2f} s")
+        super().__init__(f"{reason}; it may be sent in {delay:.2f} s")
         self.delay = delay
         self.reason = reason
 

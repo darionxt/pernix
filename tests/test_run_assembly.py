@@ -116,6 +116,20 @@ def test_a_binding_policy_without_a_source_or_a_session_pool_fails_the_build() -
     assert "enable one with sessions.enabled" in str(refused.value)
 
 
+def test_obeying_robots_txt_without_an_http_fetcher_fails_the_build() -> None:
+    with pytest.raises(
+        SettingsError, match=r"robots\.obey: robots\.txt is fetched with the Fetcher registered as 'http'"
+    ):
+        _build({"robots.obey": True, "fetchers": {"http": None}})
+
+
+def test_a_product_token_is_letters_underscores_and_hyphens_or_a_star() -> None:
+    _build({"robots.user_agent": "Example_Bot-News"})
+    _build({"robots.user_agent": "*"})
+    with pytest.raises(SettingsError, match=r"robots\.user_agent: 'ExampleBot/1\.0' is not a product token"):
+        _build({"robots.user_agent": "ExampleBot/1.0"})
+
+
 def test_never_rebinding_while_refreshes_replace_the_proxies_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
     _build({"proxies.urls": ["a.example:1"], "proxies.rebind": "never", "proxies.refresh": 60})
 

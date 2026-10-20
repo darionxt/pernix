@@ -45,6 +45,7 @@ __all__ = [
     "ProxySettings",
     "ResponseSettings",
     "RetrySettings",
+    "RobotsSettings",
     "SessionSettings",
     "ShutdownSettings",
     "StatsSettings",
@@ -56,6 +57,9 @@ DEFAULT_LOCALE = ("en-US", "en")
 """The languages presented by default, as Chrome presents them for American English."""
 
 _LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
+
+_PRODUCT_TOKEN = re.compile(r"[A-Za-z_-]+|\*")
+"""A product token as RFC 9309 writes it, letters, `_`, and `-`, or `*` for the `*` group alone."""
 
 
 class CoreSettings(Section):
@@ -208,6 +212,39 @@ class DomainSettings(Section):
     rate: Annotated[float, msgspec.Meta(gt=0)] | None = None
     burst: Annotated[int, msgspec.Meta(ge=1)] = 1
     cooldown_max: Annotated[float, msgspec.Meta(ge=0)] = 300.0
+
+
+class RobotsSettings(Section):
+    """Settings of obeying the robots.txt of each origin Requests go to, as RFC 9309 has it.
+
+    Off by default. With `obey`, the first Request to an origin fetches its
+    robots.txt, which the Requests to it then wait for, and which is kept for 24
+    hours; the Requests it disallows are ignored. Its `Crawl-delay` spaces the
+    fetches of the domain when it is longer than `domain.delay`.
+
+    Attributes:
+        obey: Obey robots.txt; a Request with `ext={"robots": {"obey": False}}` is
+            fetched whatever it says.
+        user_agent: The product token matched against the `User-agent` lines: the
+            groups naming it apply, or else the `*` group. Letters, `_`, and `-`,
+            or `*` for the `*` group alone. A crawler that sends a User-Agent of its
+            own names its token here.
+        crawl_delay_max: The longest a `Crawl-delay` spaces the fetches of a
+            domain; `None` for no limit.
+    """
+
+    __prefix__ = "robots"
+
+    obey: bool = False
+    user_agent: str = "pernix"
+    crawl_delay_max: Annotated[float, msgspec.Meta(ge=0)] | None = None
+
+    def __post_init__(self) -> None:
+        if _PRODUCT_TOKEN.fullmatch(self.user_agent) is None:
+            raise ValueError(
+                f"{self.key('user_agent')}: {self.user_agent!r} is not a product token; write letters, '_', and '-' "
+                "alone, such as 'ExampleBot', or '*'"
+            )
 
 
 class SessionSettings(Section):
@@ -756,6 +793,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     RetrySettings,
     BlockedSettings,
     DomainSettings,
+    RobotsSettings,
     SessionSettings,
     ProxySettings,
     CallbackSettings,
