@@ -10,6 +10,8 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from patchright.async_api import BrowserContext, CDPSession, Page
 
 __all__ = ["present_intl"]
@@ -50,10 +52,14 @@ async def present_intl(context: BrowserContext, page: Page, *, locale: str | Non
     its frames, is patchright's `timezone_id`; a service worker that started for an
     earlier page of the context needs its own.
 
-    The overrides last as long as the session, which closes with the page. A page
-    the page opens in another process, as with `noopener`, presents the machine's
-    locale; a service worker already running when the page loads takes the locale
-    and the time zone once attached, as the page navigates.
+    An override belongs to the target whose session set it first in a process: the
+    others sharing the process are refused it, and it ends with that target, so
+    once a frame or a service worker goes, both are set again in those left, which
+    present the machine's meanwhile. The page's own last as long as the session,
+    which closes with the page. A page the page opens in another process, as with
+    `noopener`, presents the machine's locale; a service worker already running
+    when the page loads takes the locale and the time zone once attached, as the
+    page navigates.
 
     Args:
         context: The page's context.
@@ -66,6 +72,7 @@ async def present_intl(context: BrowserContext, page: Page, *, locale: str | Non
     devtools = await context.new_cdp_session(page)
     related = _RelatedTargets(devtools, locale=locale, timezone=timezone)
     devtools.on("Target.attachedToTarget", related.attached)
+    devtools.on("Target.detachedFromTarget", related.detached)
     devtools.on("Target.receivedMessageFromTarget", related.received)
     if locale is not None:
         try:
@@ -77,7 +84,11 @@ async def present_intl(context: BrowserContext, page: Page, *, locale: str | Non
 
 
 class _RelatedTargets:
-    """Sets the locale and the time zone of each target attached through a page's DevTools session, then lets it run."""
+    """Sets the locale and the time zone of each target attached through a page's DevTools session, then lets it run.
+
+    Once one is detached, they are set again in the others, as it may have held
+    them for a process it shared with some.
+    """
 
     def __init__(self, devtools: CDPSession, *, locale: str | None, timezone: str | None) -> None:
         """Serve the targets attached through a session.
@@ -93,6 +104,8 @@ class _RelatedTargets:
             *([] if timezone is None else [("Emulation.setTimezoneOverride", {"timezoneId": timezone})]),
         ]
         self._ids = itertools.count(1)
+        self._targets: dict[Route, None] = {}
+        """The targets attached, by the sessions leading to them, in the order they were."""
         self._setting: set[asyncio.Task[None]] = set()
 
     def attached(self, event: dict[str, Any], parent: Route = ()) -> None:
@@ -104,10 +117,23 @@ class _RelatedTargets:
                 none for the page.
         """
         route = (*parent, str(event["sessionId"]))
-        frame = event["targetInfo"]["type"] == "iframe"
-        setting = asyncio.get_running_loop().create_task(self._set(route, frame=frame))
-        self._setting.add(setting)
-        setting.add_done_callback(self._setting.discard)
+        self._targets[route] = None
+        self._start(self._set(route, frame=event["targetInfo"]["type"] == "iframe"))
+
+    def detached(self, event: dict[str, Any], parent: Route = ()) -> None:
+        """Forget a target detached, and those attached through it, and set the overrides again in the others.
+
+        Args:
+            event: The `Target.detachedFromTarget` event.
+            parent: The sessions leading to the target it was attached through;
+                none for the page.
+        """
+        route = (*parent, str(event["sessionId"]))
+        gone = [target for target in self._targets if target[: len(route)] == route]
+        for target in gone:
+            del self._targets[target]
+        if gone and self._targets and self._overrides:
+            self._start(self._set_again(list(self._targets)))
 
     def received(self, event: dict[str, Any], parent: Route = ()) -> None:
         """Follow a message from a target attached through the session, which may tell of a target attached to it.
@@ -122,6 +148,8 @@ class _RelatedTargets:
         method = message.get("method")
         if method == "Target.attachedToTarget":
             self.attached(message["params"], route)
+        elif method == "Target.detachedFromTarget":
+            self.detached(message["params"], route)
         elif method == "Target.receivedMessageFromTarget":
             self.received(message["params"], route)
 
@@ -142,6 +170,23 @@ class _RelatedTargets:
         finally:
             with contextlib.suppress(Exception):
                 await self._send(route, "Runtime.runIfWaitingForDebugger", {})
+
+    async def _set_again(self, routes: list[Route]) -> None:
+        """Set the overrides of targets running already: those whose process lost them take them; the others refuse."""
+        for route in routes:
+            for method, params in self._overrides:
+                try:
+                    await self._send(route, method, params)
+                except Exception:  # the target, or the page, went away
+                    logger.debug(
+                        "Setting the locale and the time zone of a target of a page again failed", exc_info=True
+                    )
+
+    def _start(self, setting: Coroutine[Any, Any, None]) -> None:
+        """Run a coroutine sending overrides in a task of its own, kept until it ends."""
+        task = asyncio.get_running_loop().create_task(setting)
+        self._setting.add(task)
+        task.add_done_callback(self._setting.discard)
 
     async def _send(self, route: Route, method: str, params: dict[str, Any]) -> None:
         """Send a command to a target, through the session of each target that leads to it."""

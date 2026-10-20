@@ -33,7 +33,7 @@ class DevTools:
     ) -> None:
         self.sent: list[tuple[str, dict[str, Any]]] = []
         self.handlers: dict[str, Callable[[dict[str, Any]], None]] = {}
-        self.ran: asyncio.Queue[tuple[str, ...]] = asyncio.Queue()
+        self.arriving: asyncio.Queue[tuple[tuple[str, ...], str]] = asyncio.Queue()
         self._failing = failing
 
     def on(self, event: str, handler: Callable[[dict[str, Any]], None]) -> None:
@@ -42,16 +42,21 @@ class DevTools:
     async def send(self, method: str, params: dict[str, Any]) -> None:
         self.sent.append((method, params))
         route, command = _unwrapped(method, params)
-        if command["method"] == "Runtime.runIfWaitingForDebugger":
-            self.ran.put_nowait(route)
+        self.arriving.put_nowait((route, command["method"]))
         failure = self._failing(method, params)
         if failure is not None:
             raise failure
 
     def attach(self, session: str, kind: str, *, through: tuple[str, ...] = ()) -> None:
         """Tell of a target attached, through the targets of `through`, outermost first."""
-        event: dict[str, Any] = {"sessionId": session, "targetInfo": {"type": kind}, "waitingForDebugger": True}
-        method = "Target.attachedToTarget"
+        event = {"sessionId": session, "targetInfo": {"type": kind}, "waitingForDebugger": True}
+        self._tell("Target.attachedToTarget", event, through)
+
+    def detach(self, session: str, *, through: tuple[str, ...] = ()) -> None:
+        """Tell of a target detached, through the targets of `through`, outermost first."""
+        self._tell("Target.detachedFromTarget", {"sessionId": session}, through)
+
+    def _tell(self, method: str, event: dict[str, Any], through: tuple[str, ...]) -> None:
         for parent in reversed(through):
             message = json.dumps({"method": method, "params": event})
             event, method = {"sessionId": parent, "message": message}, "Target.receivedMessageFromTarget"
@@ -85,9 +90,19 @@ async def _present(devtools: DevTools, *, timezone: str | None = "Europe/Berlin"
     await present_intl(context, cast("Page", object()), locale="de-DE", timezone=timezone)
 
 
-async def _ran(devtools: DevTools, count: int) -> list[tuple[str, ...]]:
+async def _arrived(devtools: DevTools, method: str, count: int) -> list[tuple[str, ...]]:
+    """The targets the next `count` commands of a method went to, once they were sent."""
+    routes: list[tuple[str, ...]] = []
     async with asyncio.timeout(5):  # a target never let run would hang
-        return [await devtools.ran.get() for _ in range(count)]
+        while len(routes) < count:
+            route, sent = await devtools.arriving.get()
+            if sent == method:
+                routes.append(route)
+    return routes
+
+
+async def _ran(devtools: DevTools, count: int) -> list[tuple[str, ...]]:
+    return await _arrived(devtools, "Runtime.runIfWaitingForDebugger", count)
 
 
 async def test_the_page_takes_the_locale_and_its_cross_site_frames_and_service_workers_are_attached() -> None:
@@ -162,3 +177,37 @@ async def test_a_target_runs_even_when_its_overrides_cannot_be_sent() -> None:
         "Emulation.setLocaleOverride",
         "Runtime.runIfWaitingForDebugger",
     ]
+
+
+async def test_once_a_target_is_detached_the_others_take_both_again() -> None:
+    devtools = DevTools()
+    await _present(devtools)
+    for session in ("gone", "left", "other"):
+        devtools.attach(session, "iframe")
+    devtools.attach("within", "iframe", through=("gone",))
+    await _ran(devtools, 4)
+    sent = len(devtools.sent)
+
+    devtools.detach("gone")
+
+    assert await _arrived(devtools, TIMEZONE[0], 2) == [("left",), ("other",)]
+    assert devtools.commands()[sent:] == [
+        (("left",), *LOCALE),
+        (("left",), *TIMEZONE),
+        (("other",), *LOCALE),
+        (("other",), *TIMEZONE),
+    ]
+
+
+async def test_a_target_detached_within_another_is_followed() -> None:
+    devtools = DevTools()
+    await _present(devtools, timezone=None)
+    devtools.attach("frame", "iframe")
+    devtools.attach("within", "iframe", through=("frame",))
+    await _ran(devtools, 2)
+    sent = len(devtools.sent)
+
+    devtools.detach("within", through=("frame",))
+
+    assert await _arrived(devtools, LOCALE[0], 1) == [("frame",)]
+    assert devtools.commands()[sent:] == [(("frame",), *LOCALE)]

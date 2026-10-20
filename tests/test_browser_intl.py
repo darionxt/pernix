@@ -78,6 +78,27 @@ window.reports = new Promise(resolve => {{
 }});
 </script><iframe src="FRAME"></iframe></body>"""
 
+TWIN = f"""<!doctype html><script>{INTL}
+addEventListener("message", event => event.source.postMessage(intl("frame"), "*"));
+</script>"""
+
+TWINS = """<!doctype html><body><iframe src="TWIN"></iframe><iframe src="TWIN"></iframe></body>"""
+
+LEFT_ALONE = """async () => {
+  const [gone, left] = document.querySelectorAll("iframe");
+  gone.remove();
+  const ask = () => new Promise(resolve => {
+    addEventListener("message", event => resolve(event.data), {once: true});
+    left.contentWindow.postMessage(null, "*");
+  });
+  const reports = [await ask()];
+  for (let tries = 0; reports.at(-1)[1] !== "de-DE" && tries < 200; tries++) {  // what it presents a moment later
+    await new Promise(resolve => setTimeout(resolve, 50));
+    reports.push(await ask());
+  }
+  return reports.at(-1);
+}"""
+
 REPORTS = Render(actions=[Evaluate("() => window.reports")])
 
 WORKERS_REPORTING = ("dedicated worker", "page", "service worker", "shared worker", "worker of a worker")
@@ -94,6 +115,8 @@ def _serve(server: LoopbackServer) -> None:
         "/framed", FRAMED.replace("FRAME", f"http://localhost:{port}/frame?next={quote(inner, safe='')}"), headers=html
     )
     server.route("/frame", FRAME, headers=html)
+    server.route("/twins", TWINS.replace("TWIN", f"http://localhost:{port}/twin"), headers=html)
+    server.route("/twin", TWIN, headers=html)
     server.route("/away", status=302, headers=[("Location", f"http://localhost:{port}/")])
 
 
@@ -125,6 +148,19 @@ async def test_cross_site_frames_at_any_depth_and_their_workers_present_them_too
 
     where = ["frame of a.localhost", "frame of localhost", "page", "worker of a.localhost", "worker of localhost"]
     assert _reports(response) == [[place, "de-DE", TIMEZONE] for place in where]
+
+
+async def test_a_cross_site_frame_presents_them_once_a_frame_it_shares_its_process_with_is_removed(
+    server: LoopbackServer,
+) -> None:
+    _serve(server)
+    render = Render(actions=[Evaluate(LEFT_ALONE, timeout=30)])
+
+    async with BrowserFetcher(locale=LOCALE, timezone=TIMEZONE) as fetcher:
+        response = await fetcher.fetch(Request(server.url("/twins"), render=render))
+
+    assert response.browser is not None
+    assert response.browser.evaluated == (["frame", "de-DE", TIMEZONE],)
 
 
 async def test_a_page_redirected_to_another_site_presents_them(server: LoopbackServer) -> None:
