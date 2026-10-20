@@ -15,6 +15,8 @@ def test_other_lifecycle_events_are_observed_in_order() -> None:
     observed = [
         events.SpiderOpened,
         events.SpiderIdle,
+        events.SpiderPaused,
+        events.SpiderResumed,
         events.RequestDropped,
         events.RequestFailed,
         events.ResponseReceived,
