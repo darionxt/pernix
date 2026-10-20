@@ -86,6 +86,10 @@ class CoreSettings(Section):
             `FailedItemsFile`, enabled by default, writes them to `items.failed_output`.
         run_id: Identifies the Run in logs, Events, and stats; `None` generates one.
             A Platform passes its own, for example as `PERNIX_RUN_ID`.
+        outcome_file: A JSON file, a path template as for Feeds, that the Run
+            writes as it ends, however it ends, telling a Platform how: the reason,
+            the exit code, the stats, and the error it failed with; `None` writes
+            none. See `pernix.outcome_file.OutcomeFile`.
         locale: The languages the client presents, in order of preference, as a
             list or a comma-separated string, such as `"de-DE,de,en-US,en"`: the
             browser's `navigator.languages`, from which Chrome makes its
@@ -110,10 +114,13 @@ class CoreSettings(Section):
     pipelines: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
     failed_pipelines: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.items.FailedItemsFile": 100})
     run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None
+    outcome_file: str | None = None
     locale: str | tuple[str, ...] = DEFAULT_LOCALE
     timezone: str | None = None
 
     def __post_init__(self) -> None:
+        if self.outcome_file is not None:
+            _check_path_template(self.key("outcome_file"), self.outcome_file)
         try:
             structs.force_setattr(self, "locale", locale_languages(self.locale))
         except ValueError as exc:
