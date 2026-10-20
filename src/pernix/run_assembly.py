@@ -38,13 +38,14 @@ from pernix.settings import (
     FingerprintSettings,
     FrontierSettings,
     ItemSettings,
+    LoopSettings,
     ProxySettings,
     RetrySettings,
     SessionSettings,
     StatsSettings,
 )
 from pernix.spider_hooks import overrides
-from pernix.stats import CoreStats, StatsReporter
+from pernix.stats import CoreStats, LoopLag, LoopWatchdog, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
@@ -589,7 +590,11 @@ def _retry_policy(crawler: Crawler) -> RetryPolicy:
 def _reporter(
     crawler: Crawler, frontier: Frontier, throttle: Throttle, run_log: RunLog, proxies: MemoryProxyPool | None
 ) -> StatsReporter:
-    """The reporter of the Run's stats, reading the Frontier, the Throttle, the proxies, and the log counts."""
+    """The reporter of the Run's stats, reading the Frontier, the Throttle, the proxies, and the log counts.
+
+    It samples the event loop lag, which beats for a watchdog of the loop, unless
+    `loop.block_threshold` is 0.
+    """
     gauges: dict[str, Gauge] = {
         "frontier": frontier.counts,
         "throttle": lambda: throttle.stats,
@@ -599,4 +604,6 @@ def _reporter(
         gauges["proxies"] = proxies.counts
     interval = crawler.settings.section(StatsSettings).interval
     run = RunContext(crawler.run_id, crawler.spider.name)
-    return StatsReporter(crawler.stats, crawler.events, run, interval=interval, gauges=gauges)
+    threshold = crawler.settings.section(LoopSettings).block_threshold
+    lag = LoopLag(watchdog=LoopWatchdog(threshold, stats=crawler.stats) if threshold else None)
+    return StatsReporter(crawler.stats, crawler.events, run, interval=interval, gauges=gauges, lag=lag)

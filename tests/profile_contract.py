@@ -140,6 +140,7 @@ async def run_both(
     *,
     impersonate: str | None = None,
     locale: Sequence[str] = DEFAULT_LOCALE,
+    timezone: str | None = None,
     launch_options: Mapping[str, Any] | None = None,
     new_session: Callable[[], Session] | None = None,
 ) -> tuple[Capture, Capture]:
@@ -150,6 +151,7 @@ async def run_both(
         steps: The requests, in order.
         impersonate: The Profile the HTTP Fetcher uses instead of the default one.
         locale: The languages both present.
+        timezone: The time zone the browser presents; the machine's when `None`.
         launch_options: Options the browser is launched with, over those that make
             it trust the server.
         new_session: Makes a Session for each Fetcher instead, so that what the
@@ -163,7 +165,10 @@ async def run_both(
     http = await capture_http(server, steps, session, impersonate=impersonate, locale=locale)
     if new_session is not None:
         session = new_session()
-    return http, await capture_browser(server, steps, session, locale=locale, launch_options=launch_options)
+    browser = await capture_browser(
+        server, steps, session, locale=locale, timezone=timezone, launch_options=launch_options
+    )
+    return http, browser
 
 
 async def capture_http(
@@ -200,6 +205,7 @@ async def capture_browser(
     session: Session,
     *,
     locale: Sequence[str] = DEFAULT_LOCALE,
+    timezone: str | None = None,
     launch_options: Mapping[str, Any] | None = None,
 ) -> Capture:
     """Make the requests of a case with a browser Fetcher of its own, which trusts the server's certificate.
@@ -210,6 +216,7 @@ async def capture_browser(
             loaded.
         session: The Session to load them under.
         locale: The languages to present.
+        timezone: The time zone to present; the machine's when `None`.
         launch_options: Options the browser is launched with, over those that make
             it trust the server.
 
@@ -219,7 +226,7 @@ async def capture_browser(
     since = _closing(server, steps)
     options = dict(launch_options or {})
     options["args"] = [f"--ignore-certificate-errors-spki-list={server.spki}", *options.get("args", ())]
-    async with BrowserFetcher(BrowserSettings(launch_options=options), locale=locale) as fetcher:
+    async with BrowserFetcher(BrowserSettings(launch_options=options), locale=locale, timezone=timezone) as fetcher:
         for step in steps:
             if step.by_page:
                 continue

@@ -145,7 +145,14 @@ class Shop(Spider):
 
 Page methods run any patchright code on the page: `setup` before it loads, and `action` once `wait_for` and the actions are done, before the screenshot; `PageMethod(method, optional=True, timeout=5)` lets one fail, logged, or limits its time. Like Callbacks, they are Spider methods, persisted by name, and they run in rendered Inline Fetches too. With `keep_page=True`, the Callback gets the page as `response.page`; the Run closes it, with its context, once the Callback ends, however it ends. It counts toward `browser.max_pages` meanwhile, and the rendered fetches the Callback makes share its slot. Only the Callback of a Request the Run fetches can keep a page: an Inline Fetch raises `ValueError`. A Callback that fails as its kept page crashed, or its browser was lost, is retried as the fetch would be.
 
-HTTP and the browser present one client: with the pinned Profile, HTTP requests carry the `User-Agent` and client hints of the bundled Chrome for Testing build on the platform the Run is on, and the browser, in headless mode, drops `HeadlessChrome` from its own User-Agent, as it is with a window. Both present the languages of `locale`. A Run warns about a Profile or a browser other than the Pinned Pair, and `pernix check` tells whether they are. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
+HTTP and the browser present one client: with the pinned Profile, HTTP requests carry the `User-Agent` and client hints of the bundled Chrome for Testing build on the platform the Run is on, and the browser, in headless mode, drops `HeadlessChrome` from its own User-Agent, as it is with a window. Both present the languages of `locale`. The browser's pages, their frames, and their web workers also present the first of them as the locale of `Intl`, and the time zone of `timezone`, an IANA name, or the machine's when it is not set. Both are ordinary settings, set in `Spider.settings` or any other layer:
+
+```python
+class Shop(Spider):
+    settings = {"locale": "de-DE,de,en-US,en", "timezone": "Europe/Berlin"}
+```
+
+A Run warns about a Profile or a browser other than the Pinned Pair, and `pernix check` tells whether they are. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
 
 ## Sessions
 
@@ -366,7 +373,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `failed_pipelines` | `{FailedItemsFile: 100}` | Pipelines that receive the Items a Pipeline failed on, as `FailedItem`s |
 | `feeds` | `{}` | Files Items are written to, as `{path_template: options}` |
 | `run_id` | `None` | Identifies the Run in logs and stats; `None` generates one |
-| `locale` | `["en-US", "en"]` | The languages the browser presents, as a list or `"en-US,en"`; the HTTP Fetcher sends the `Accept-Language` Chrome makes of them |
+| `locale` | `["en-US", "en"]` | The languages the browser presents, as a list or `"en-US,en"`; the HTTP Fetcher sends the `Accept-Language` Chrome makes of them, and the first is the locale of `Intl` in the browser |
+| `timezone` | `None` | The time zone of the browser's pages, their frames, and their web workers, an IANA name such as `"Europe/Berlin"`; `None` keeps the machine's |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
 | `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |
@@ -417,6 +425,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `log.redact` | `()` | Names whose values are masked in logs, besides the built-in ones |
 | `stats.interval` | `60.0` | Seconds between stats snapshots; `0` keeps only the final one |
 | `stats.sinks` | `{}` | Stats Sinks, as `{sink: order}`, that receive every snapshot |
+| `loop.block_threshold` | `30.0` | Seconds the event loop may stay blocked before a warning logs the code blocking it; `0` turns the watchdog off |
 | `items.queue_size` | `1000` | Items waiting for the Pipelines at most; a Callback producing more waits |
 | `items.concurrency` | `1` | Items processed at once; with 1, Feeds keep the order Items were produced in |
 | `items.timeout` | `60.0` | Seconds one Pipeline call may take before it fails with `TimeoutError`; `0` for no limit |
@@ -477,6 +486,8 @@ Pipelines run in order on each Item, apart from the Callbacks: when they fall be
 Pernix logs on the `pernix.*` loggers; `self.logger` in a Spider is `pernix.spiders.<name>`. During a Run, records are queued and written by a background thread, so a slow log output never stalls the crawl. If your application configured logging, the records go to its handlers; otherwise Pernix writes them to stderr, as text on a terminal and as JSON lines otherwise. Every record carries the `run_id`, the `spider`, and the `request_id` of the Request being processed, and credentials, cookies, tokens, and `Secret` settings are masked.
 
 The stats of a Run, such as `downloads.by_status.200` or `items.scraped`, are in `crawler.stats` (`self.stats` in a Spider, where you can add your own). They are logged every minute and summarized at the end, and Stats Sinks registered with `stats.sinks` receive every snapshot. See [`docs/design.md`](docs/design.md) §8 for the keys.
+
+Callbacks, Middleware, Pipelines, and Extensions share one event loop, so code that never awaits, such as `time.sleep()`, a synchronous HTTP client, or a long parse, stops the whole Run while it runs: no fetch, Lease renewal, or stats report goes on meanwhile. Await instead; run blocking calls with `await asyncio.to_thread(...)`, which keeps the loop running, and long CPU-bound work in a process pool, with `loop.run_in_executor()`, which also runs it in parallel. Once the event loop has been blocked for `loop.block_threshold` (30 s), a warning logs the stack of the code that blocks it, and once the loop runs again, an INFO line tells how long it was blocked; `loop.blocks` and `loop.block_seconds` count the blocks and their seconds. See [`docs/design.md`](docs/design.md) §8.
 
 ## Testing
 
@@ -673,6 +684,7 @@ src/pernix/
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items
 │   ├── stats_reporter.py periodic and final snapshots, the summary
 │   ├── loop_lag.py      samples the event loop lag
+│   ├── loop_watchdog.py warns while the event loop is blocked, with the stack that blocks it
 │   └── stats_sink.py    StatsSink protocol
 ├── settings/
 │   ├── loader.py        merges and validates the settings layers

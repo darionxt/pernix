@@ -43,7 +43,15 @@ from pernix.fetchers.session_contexts import SessionContexts
 from pernix.fetchers.tripwire import GRACE, Tripwire, first_tripped
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
-from pernix.settings import DEFAULT_LOCALE, CoreSettings, NetworkSettings, ResponseSettings, Section, locale_languages
+from pernix.settings import (
+    DEFAULT_LOCALE,
+    CoreSettings,
+    NetworkSettings,
+    ResponseSettings,
+    Section,
+    locale_languages,
+    time_zone_name,
+)
 from pernix.urls import url_host
 
 if TYPE_CHECKING:
@@ -186,7 +194,11 @@ class BrowserFetcher:
     User-Agent without `HeadlessChrome`, so that it names itself as it does with a
     window, and as the HTTP Fetcher names it with the pinned Profile (ADR 0010).
     The first browser of a Run that is not the bundled build, or that presents
-    other languages, as Chrome does for some lists, is warned about.
+    other languages, as Chrome does for some lists, is warned about. Its pages,
+    their frames, and their web workers present the first language of `locale` as
+    the locale of `Intl`, and the time zone of `timezone`, if set, where they would
+    otherwise present the machine's; a page that a page opens in another process,
+    as with `noopener`, presents the machine's locale.
 
     With `network.public_only`, the browser sends all its traffic, its own
     background requests included, through a proxy that resolves each host, checks
@@ -241,6 +253,7 @@ class BrowserFetcher:
         default_encoding: str = "utf-8",
         stats: Stats | None = None,
         locale: str | Sequence[str] = DEFAULT_LOCALE,
+        timezone: str | None = None,
         network: NetworkSettings | None = None,
     ) -> None:
         """Configure the fetcher.
@@ -251,17 +264,21 @@ class BrowserFetcher:
                 not a rendered DOM.
             stats: Where the pages and the contexts are counted.
             locale: The languages the browser presents, as the `locale` setting
-                names them.
+                names them; the first is the locale of `Intl` in its pages.
+            timezone: The time zone its pages present, an IANA name; `None` for
+                the machine's.
             network: Which hosts may be reached; any when `None`.
 
         Raises:
-            ValueError: `locale` names no language, or something else.
+            ValueError: `locale` names no language, or something else, or
+                `timezone` names no time zone.
             pernix.errors.SettingsError: `network.public_only` is on, and
                 `browser.launch_options` would take the browser around the proxy
                 that checks hosts.
         """
         self._settings = settings or BrowserSettings()
         self._locale = locale_languages(locale)
+        self._timezone = None if timezone is None else time_zone_name(timezone)
         self._reported = False
         self._address_guard: AddressGuard | None = None
         if network is not None and network.public_only:
@@ -292,9 +309,9 @@ class BrowserFetcher:
         Returns:
             A fetcher with the `browser.*` settings, whose Responses use
             `response.default_encoding`, counting in the Run's stats,
-            presenting the languages of `locale`, and reaching the hosts the
-            `network.*` settings allow. Launch options naming another browser
-            than the bundled build are warned about.
+            presenting the languages of `locale` and the time zone of `timezone`,
+            and reaching the hosts the `network.*` settings allow. Launch options
+            naming another browser than the bundled build are warned about.
         """
         settings = crawler.settings.section(BrowserSettings)
         options = settings.launch_options
@@ -304,11 +321,13 @@ class BrowserFetcher:
                 "Profile, so the two present different clients",
                 settings.key("launch_options"),
             )
+        core = crawler.settings.section(CoreSettings)
         return cls(
             settings,
             default_encoding=crawler.settings.section(ResponseSettings).default_encoding,
             stats=crawler.stats,
-            locale=crawler.settings.section(CoreSettings).locale,
+            locale=core.locale,
+            timezone=core.timezone,
             network=crawler.settings.section(NetworkSettings),
         )
 
@@ -438,7 +457,7 @@ class BrowserFetcher:
                 await launched.new_context(proxy=proxy, blocks_service_workers=workers)
             )
             try:
-                response, opened = await self._load(context, load)
+                response, opened = await self._load(launched, context, load)
             except BaseException:
                 await self._close_soon(context)
                 raise
@@ -449,7 +468,7 @@ class BrowserFetcher:
             return response
         async with self._contexts.using(launched, session, proxy=proxy, blocks_service_workers=workers) as kept:
             page.context = kept.context
-            response, opened = await self._load(kept.context, load, kept=kept, session=session)
+            response, opened = await self._load(launched, kept.context, load, kept=kept, session=session)
             if opened is not None:
                 kept.handed_over = True  # the page's Callback closes it, never to be used again
                 self._keep(page, opened, generation, kept.context, request.url)
@@ -457,6 +476,7 @@ class BrowserFetcher:
 
     async def _load(
         self,
+        launched: LaunchedBrowser,
         context: BrowserContext,
         load: _Load,
         *,
@@ -469,7 +489,7 @@ class BrowserFetcher:
         if it is kept for a Session, once what the fetch changed is kept. A page the
         Render keeps is left open, and given back with what watches it.
         """
-        page = await context.new_page()
+        page = await launched.new_page(context)
         if self._stats is not None:
             self._stats.inc("browser.pages")
         crash = Tripwire()
@@ -729,7 +749,9 @@ class BrowserFetcher:
 
         With `network.public_only`, it goes through the proxy that checks every host it reaches.
         """
-        launched = await launch_browser(settings, locale=self._locale, address_guard=self._address_guard)
+        launched = await launch_browser(
+            settings, locale=self._locale, timezone=self._timezone, address_guard=self._address_guard
+        )
         if not self._reported:
             self._reported = True
             try:

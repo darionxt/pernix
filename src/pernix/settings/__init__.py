@@ -12,6 +12,7 @@ from pernix.settings.core_settings import (
     FrontierSettings,
     ItemSettings,
     LogSettings,
+    LoopSettings,
     NetworkSettings,
     ProxySettings,
     ResponseSettings,
@@ -20,6 +21,7 @@ from pernix.settings.core_settings import (
     ShutdownSettings,
     StatsSettings,
     locale_languages,
+    time_zone_name,
 )
 from pernix.settings.loader import load_settings
 from pernix.settings.section import ComponentMap, NamedComponents, Section
@@ -39,6 +41,7 @@ __all__ = [
     "FrontierSettings",
     "ItemSettings",
     "LogSettings",
+    "LoopSettings",
     "NamedComponents",
     "NetworkSettings",
     "ProxySettings",
@@ -52,4 +55,5 @@ __all__ = [
     "StatsSettings",
     "load_settings",
     "locale_languages",
+    "time_zone_name",
 ]

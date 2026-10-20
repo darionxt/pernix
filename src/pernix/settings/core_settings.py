@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import codecs
+import functools
 import logging
 import re
 import string
+import zoneinfo
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -37,6 +39,7 @@ __all__ = [
     "FrontierSettings",
     "ItemSettings",
     "LogSettings",
+    "LoopSettings",
     "NetworkSettings",
     "ProxySettings",
     "ResponseSettings",
@@ -45,6 +48,7 @@ __all__ = [
     "ShutdownSettings",
     "StatsSettings",
     "locale_languages",
+    "time_zone_name",
 ]
 
 DEFAULT_LOCALE = ("en-US", "en")
@@ -83,6 +87,11 @@ class CoreSettings(Section):
             `Accept-Language`, which the HTTP Fetcher sends too with the pinned
             Profile. Chrome adds languages to some lists, such as English to
             `"de-DE,de"`; the browser Fetcher then warns, naming the list to set.
+            The first language is also the locale of `Intl` in the browser's
+            pages, their frames, and their web workers.
+        timezone: The time zone of the browser's pages, their frames, and their
+            web workers, an IANA name such as `"Europe/Berlin"`; `None` keeps the
+            machine's. Only the browser presents one.
     """
 
     concurrency: Annotated[int, msgspec.Meta(ge=1)] = 16
@@ -97,12 +106,18 @@ class CoreSettings(Section):
     failed_pipelines: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.items.FailedItemsFile": 100})
     run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None
     locale: str | tuple[str, ...] = DEFAULT_LOCALE
+    timezone: str | None = None
 
     def __post_init__(self) -> None:
         try:
             structs.force_setattr(self, "locale", locale_languages(self.locale))
         except ValueError as exc:
             raise ValueError(f"{self.key('locale')}: {exc}") from None
+        if self.timezone is not None:
+            try:
+                time_zone_name(self.timezone)
+            except ValueError as exc:
+                raise ValueError(f"{self.key('timezone')}: {exc}") from None
 
 
 def locale_languages(locale: str | Sequence[str]) -> tuple[str, ...]:
@@ -126,6 +141,34 @@ def locale_languages(locale: str | Sequence[str]) -> tuple[str, ...]:
         if _LANGUAGE_TAG.fullmatch(tag) is None:
             raise ValueError(f"{tag!r} is not a language tag, such as 'en-US' or 'de'")
     return languages
+
+
+def time_zone_name(name: str) -> str:
+    """Check that an IANA name, such as `Europe/Berlin`, names a time zone here.
+
+    Args:
+        name: The name.
+
+    Returns:
+        The name, as given.
+
+    Raises:
+        ValueError: No time zone is named so here, as for a fixed offset such as
+            `+08:00`, or where the system has no time zone data, such as on Windows
+            without the `tzdata` package.
+    """
+    if name not in _time_zones():
+        raise ValueError(
+            f"no time zone is named {name!r} here; give an IANA name, such as Europe/Berlin, or install the tzdata "
+            "package where the system has no time zone data, as on Windows"
+        )
+    return name
+
+
+@functools.cache
+def _time_zones() -> frozenset[str]:
+    """The IANA names of the time zones the system's data, or the `tzdata` package, holds."""
+    return frozenset(zoneinfo.available_timezones())
 
 
 class EventSettings(Section):
@@ -654,6 +697,20 @@ class StatsSettings(Section):
     sinks: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
 
 
+class LoopSettings(Section):
+    """Settings of watching the event loop, which the Callbacks and the components of a Run share.
+
+    Attributes:
+        block_threshold: Seconds the event loop may stay blocked, by code that does
+            not await, such as `time.sleep()` or a long parse, before a warning logs
+            the stack of the code that blocks it; 0 turns the watchdog off.
+    """
+
+    __prefix__ = "loop"
+
+    block_threshold: Annotated[float, msgspec.Meta(ge=0)] = 30.0
+
+
 class ShutdownSettings(Section):
     """Settings of stopping a Run.
 
@@ -688,6 +745,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     FeedSettings,
     LogSettings,
     StatsSettings,
+    LoopSettings,
     ShutdownSettings,
 )
 """The Sections every Crawler registers."""

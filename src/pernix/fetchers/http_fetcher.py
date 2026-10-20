@@ -26,7 +26,7 @@ from pernix.errors import (
 from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.chain_cookies import ChainCookies
 from pernix.fetchers.chain_hints import ChainHints
-from pernix.fetchers.chrome_headers import ChromeRequest, HopHints, chrome_request
+from pernix.fetchers.chrome_headers import ChromeRequest, HopHints, chrome_request, through_proxy, tunnel_headers
 from pernix.fetchers.client_hints import DEFAULT_HINTS, HintValues, sent_hints
 from pernix.fetchers.curl_session_pool import ClientHintsCallback, CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.fetcher import request_proxy
@@ -516,17 +516,25 @@ class HTTPFetcher:
         Waiting for the headers is limited precisely with asyncio; once they arrived,
         curl limits each pause in the body to whole seconds. A pinned host is
         reached at the addresses it was checked at. With the pinned Profile, `sent`
-        holds the headers Chrome sends, which replace curl's own. `on_client_hints`
-        is told of the client hints the response asks for as its headers arrive, as
-        the cookies it sets are kept then, even if its body fails.
+        holds the headers Chrome sends, which replace curl's own, as Chrome sends
+        them through an HTTP proxy, if any, with the `CONNECT` it sends for a tunnel.
+        `on_client_hints` is told of the client hints the response asks for as its
+        headers arrive, as the cookies it sets are kept then, even if its body fails.
         """
         credentials = sent is None or sent.credentials
         shaped: dict[str, Any] = {}
         if sent is not None:
+            tunnel: list[tuple[str, str]] = []
+            if _http_proxy(proxy):
+                if hop.url[:7].lower() == "http://":
+                    sent = through_proxy(sent)
+                else:
+                    tunnel = tunnel_headers(sent)
             shaped = {
                 "default_headers": False,
                 "header_order": sent.order,
                 "stream_weight": sent.weight,
+                "proxy_headers": [f"{name}: {value}" for name, value in tunnel],
             }
         scope = asyncio.timeout(curl_timeout)
         try:
@@ -759,6 +767,14 @@ def _without_cookies(headers: Headers) -> Headers:
 
 def _owner(session: Session | None) -> str | None:
     return None if session is None else session.id
+
+
+def _http_proxy(proxy: str | None) -> bool:
+    """Whether a proxy is an HTTP one, `http` or `https`, which a request reaches its server through with `CONNECT`, or as a whole."""
+    if not proxy:
+        return False
+    scheme, separator, _rest = proxy.partition("://")
+    return not separator or scheme.lower() in ("http", "https")
 
 
 def _http_version(url: str) -> CurlHttpVersion | None:
