@@ -72,6 +72,7 @@ def test_settings_are_a_read_only_mapping(settings: Settings) -> None:
         "pipelines",
         "failed_pipelines",
         "run_id",
+        "outcome_file",
         "locale",
         "timezone",
         "test.plugins",

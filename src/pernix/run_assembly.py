@@ -496,8 +496,8 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
     """The Feeds of the `feeds` setting and the one `output` names, each writing its own file.
 
     Raises:
-        pernix.errors.SettingsError: A Feed is invalid, or two Feeds, or a Feed and
-            `items.failed_output`, would write the same file.
+        pernix.errors.SettingsError: A Feed is invalid, or two of the Feeds,
+            `items.failed_output`, and `outcome_file` would write the same file.
     """
     feed_settings = crawler.settings.section(FeedSettings).feeds
     configured = [(f"feeds[{template!r}]", template, options) for template, options in feed_settings.items()]
@@ -508,6 +508,9 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
     failed_output = crawler.settings.section(ItemSettings).failed_output
     if failed_output is not None:
         destinations.append(("items.failed_output", _feed_path(crawler, failed_output)))
+    outcome_file = crawler.settings.section(CoreSettings).outcome_file
+    if outcome_file is not None:
+        destinations.append(("outcome_file", _feed_path(crawler, outcome_file)))
     _check_distinct(destinations)
     return feeds
 

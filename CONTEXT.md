@@ -189,3 +189,7 @@ _Avoid_: metrics
 **Stats Sink**:
 A component that receives every stats snapshot of a Run to report it elsewhere, such as to the Platform.
 _Avoid_: stats exporter
+
+**Outcome File**:
+A JSON document a Run writes as its last step, however it ends, telling a Platform how it ended: its reason, its exit code, its stats, and the error it failed with.
+_Avoid_: result file, status file
