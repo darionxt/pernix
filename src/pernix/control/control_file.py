@@ -65,8 +65,8 @@ def read_control_file(path: str | os.PathLike[str]) -> ControlState:
         The state.
 
     Raises:
-        ValueError: The file is empty, as while it is written in place, or holds
-            something other than a state.
+        ValueError: The file is empty, as while it is written in place, holds
+            something other than a state, or is longer than 1 KiB.
         OSError: The file exists but cannot be read.
     """
     try:
@@ -74,11 +74,13 @@ def read_control_file(path: str | os.PathLike[str]) -> ControlState:
             data = file.read(_MAX_BYTES + 1)
     except FileNotFoundError:
         return "running"
+    expected = ", ".join(CONTROL_STATES[:-1]) + f", or {CONTROL_STATES[-1]}"
+    if len(data) > _MAX_BYTES:  # its start alone may look like a state
+        raise ValueError(f"{path} holds more than {_MAX_BYTES} bytes; it should hold {expected}")
     text = data.decode("utf-8", errors="replace").strip().lower()
     for state in CONTROL_STATES:
         if text == state:
             return state
-    expected = ", ".join(CONTROL_STATES[:-1]) + f", or {CONTROL_STATES[-1]}"
     if not text:
         raise ValueError(f"{path} is empty; it should hold {expected}")
     shown = text if len(text) <= 40 else f"{text[:40]}..."

@@ -109,6 +109,19 @@ async def test_the_most_restrictive_state_told_wins() -> None:
     assert stats.get("control.state") == "drain"
 
 
+async def test_sources_of_the_same_label_are_told_apart(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="pernix")
+    control, applied, _ = _control(
+        [("Store", Told("force")), ("Store", Told("running")), ("Store", Told(OSError("down")))]
+    )
+
+    await control.poll()
+
+    assert applied.calls == ["stop force"]
+    assert "Control: force, as Store #1 tells" in caplog.text
+    assert "Reading the control source Store #3 failed" in caplog.text
+
+
 async def test_a_stop_cannot_be_undone_but_a_drain_escalates_to_a_force_stop() -> None:
     control, applied, _ = _control([("file", Told("drain", "running", "paused", "drain", "force", "running"))])
 

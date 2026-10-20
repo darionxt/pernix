@@ -43,9 +43,20 @@ def test_anything_else_is_an_error_naming_what_the_file_holds(tmp_path: Path) ->
 
 def test_long_contents_are_cut_in_the_error(tmp_path: Path) -> None:
     path = tmp_path / "state"
-    path.write_text("x" * 5000)
+    path.write_text("x" * 100)
 
     with pytest.raises(ValueError, match=r"holds 'x{40}\.\.\.', not"):
+        read_control_file(path)
+
+
+def test_a_file_longer_than_a_kibibyte_is_an_error_whatever_it_starts_with(tmp_path: Path) -> None:
+    path = tmp_path / "state"
+    path.write_text("force" + " " * 1019)
+    assert read_control_file(path) == "force"  # 1024 bytes
+
+    path.write_text("force" + " " * 1024 + "pausd")
+
+    with pytest.raises(ValueError, match=r"state holds more than 1024 bytes; it should hold running, paused"):
         read_control_file(path)
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections import Counter
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -57,7 +58,8 @@ class RunControl:
         """Configure the reading.
 
         Args:
-            sources: The sources, each with a label naming it in the log, in order.
+            sources: The sources, each with a label naming it in the log, in order;
+                sources of the same label are numbered, such as `Store #2`.
             interval: Seconds between two reads, and the time each read may take.
             pause: Pauses the Run.
             resume: Resumes the Run.
@@ -69,15 +71,16 @@ class RunControl:
         """
         if interval <= 0:
             raise ValueError(f"interval must be positive, got {interval}")
-        self._sources = tuple(sources)
+        self._sources = _labelled(sources)
         self._interval = interval
         self._pause = pause
         self._resume = resume
         self._stop = stop
         self._stats = stats
-        self._told: dict[str, ControlState] = dict.fromkeys((label for label, _ in self._sources), "running")
-        self._failing: dict[str, str] = {}
-        """The failure each failing source was last logged with, by its label."""
+        self._told: list[ControlState] = ["running"] * len(self._sources)
+        """The state each source told last, in order."""
+        self._failing: dict[int, str] = {}
+        """The failure each failing source was last logged with, by its place."""
         self._applied: ControlState = "running"
         self._polling: asyncio.Task[None] | None = None
         stats.set("control.failures", 0)
@@ -97,13 +100,13 @@ class RunControl:
 
     async def poll(self) -> None:
         """Read every source at once, and apply the combined state if it changed."""
-        await asyncio.gather(*(self._read(label, source) for label, source in self._sources))
-        state = max(self._told.values(), key=_RANKS.__getitem__)
+        await asyncio.gather(*(self._read(place) for place in range(len(self._sources))))
+        state = max(self._told, key=_RANKS.__getitem__)
         self._stats.set("control.state", state)
         if state == self._applied or (self._applied in _STOPS and _RANKS[state] <= _RANKS[self._applied]):
             return  # unchanged, or a stop that cannot be undone
         self._applied = state
-        by = ", ".join(label for label, told in self._told.items() if told == state)
+        by = ", ".join(label for (label, _), told in zip(self._sources, self._told, strict=True) if told == state)
         logger.info("Control: %s, as %s tells", state, by)
         match state:
             case "running":
@@ -121,34 +124,46 @@ class RunControl:
             except Exception:
                 logger.exception("Applying the control state failed")
 
-    async def _read(self, label: str, source: ControlSource) -> None:
+    async def _read(self, place: int) -> None:
         """Read one source, keeping the state it told before if that fails."""
+        source = self._sources[place][1]
         try:
             async with asyncio.timeout(self._interval):
                 told = source.state()
                 if inspect.isawaitable(told):
                     told = await told
         except TimeoutError:
-            self._failed(label, f"it took longer than control.interval ({self._interval} s)")
+            self._failed(place, f"it took longer than control.interval ({self._interval} s)")
             return
         except Exception as exc:
-            self._failed(label, f"{type(exc).__name__}: {exc}")
+            self._failed(place, f"{type(exc).__name__}: {exc}")
             return
         if told not in CONTROL_STATES:
-            self._failed(label, f"it told {told!r}, not a state")
+            self._failed(place, f"it told {told!r}, not a state")
             return
-        if self._failing.pop(label, None) is not None:
-            logger.info("The control source %s reads again: %s", label, told)
-        self._told[label] = told
+        if self._failing.pop(place, None) is not None:
+            logger.info("The control source %s reads again: %s", self._sources[place][0], told)
+        self._told[place] = told
 
-    def _failed(self, label: str, failure: str) -> None:
+    def _failed(self, place: int, failure: str) -> None:
         self._stats.inc("control.failures")
-        if self._failing.get(label) == failure:
+        if self._failing.get(place) == failure:
             return
-        self._failing[label] = failure
+        self._failing[place] = failure
         logger.warning(
             "Reading the control source %s failed; keeping the state it told before, %s: %s",
-            label,
-            self._told[label],
+            self._sources[place][0],
+            self._told[place],
             failure,
         )
+
+
+def _labelled(sources: Sequence[tuple[str, ControlSource]]) -> tuple[tuple[str, ControlSource], ...]:
+    """The sources, those whose label is given more than once numbered in order, so that the log tells them apart."""
+    given = Counter(label for label, _ in sources)
+    numbered: Counter[str] = Counter()
+    labelled: list[tuple[str, ControlSource]] = []
+    for label, source in sources:
+        numbered[label] += 1
+        labelled.append((f"{label} #{numbered[label]}" if given[label] > 1 else label, source))
+    return tuple(labelled)
