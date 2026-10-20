@@ -21,6 +21,7 @@ from pernix.settings.core_settings import (
     ShutdownSettings,
     StatsSettings,
     locale_languages,
+    time_zone_name,
 )
 from pernix.settings.loader import load_settings
 from pernix.settings.section import ComponentMap, NamedComponents, Section
@@ -54,4 +55,5 @@ __all__ = [
     "StatsSettings",
     "load_settings",
     "locale_languages",
+    "time_zone_name",
 ]
