@@ -12,7 +12,7 @@ from pernix.errors import CallbackTimeout, IgnoreRequest, RetriesExhausted, Retr
 from pernix.events import RequestFailed, RequestIgnored, RequestRetried, ResponseReceived
 from pernix.fetchers.kept_pages import keeping_pages
 from pernix.inline_fetch import handling
-from pernix.items import ItemContext, is_item
+from pernix.items import ItemContext, PendingItems, is_item
 from pernix.request import Request
 from pernix.response import expect_response
 from pernix.retry_policy import Action, budget_spent, consult, retried_instead
@@ -37,8 +37,11 @@ __all__ = ["Again", "Dead", "Done", "PutItem", "RequestProcessor", "Settlement"]
 
 logger = logging.getLogger(__name__)
 
-type PutItem = Callable[[Any, ItemContext], Awaitable[None]]
-"""Takes each Item a Callback or an errback produces; waiting in it suspends the producer."""
+type PutItem = Callable[[Any, ItemContext, PendingItems], Awaitable[None]]
+"""Takes each Item a Callback or an errback produces, counting it in the attempt's Items until it is processed.
+
+Waiting in it suspends the producer.
+"""
 
 type Schedule = Callable[[Request], Awaitable[bool]]
 """Adds a Request to the Frontier; returns whether it was added."""
@@ -96,7 +99,7 @@ class RequestProcessor:
     Response that shows the Session logged out raises `LoginExpired`, a `Retry`. Callbacks, errbacks, and Events get the Request as it
     was sent, naming its Session. The outputs are dispatched as they come:
     Requests are scheduled, and Items, recognized with `pernix.items.is_item()`, are
-    handed to `put_item`.
+    handed to `put_item`, with the `PendingItems` of the attempt.
 
     After every attempt that produced a Response, raised while fetching, or raised
     `Retry` in the Callback, the retry policy decides. A retried Request goes back to
@@ -179,19 +182,21 @@ class RequestProcessor:
             stats.set("callbacks.timeouts", 0)
             stats.set("callbacks.errback_timeouts", 0)
 
-    async def attempt(self, lease: Lease) -> Settlement:
+    async def attempt(self, lease: Lease, items: PendingItems) -> Settlement:
         """Fetch a Request and run its Callback once, then close the pages it kept.
 
         Args:
             lease: The Lease on the Request.
+            items: Counts the Items the Callback and the errback produce until they
+                are processed.
 
         Returns:
-            How to settle the Lease.
+            How to settle the Lease, once the Items are processed.
         """
         async with keeping_pages() as keeping:
-            return await self._attempt(lease, keeping)
+            return await self._attempt(lease, keeping, items)
 
-    async def _attempt(self, lease: Lease, keeping: PageKeeping) -> Settlement:
+    async def _attempt(self, lease: Lease, keeping: PageKeeping, items: PendingItems) -> Settlement:
         sent = _Sent(lease.request)
         try:
             response = await self._fetch(lease, sent)
@@ -199,7 +204,7 @@ class RequestProcessor:
             return Again(wait.delay, wait.reason, count_attempt=False)
         except SessionError as exc:
             logger.error("Cannot send %r: %s", sent.request, exc)
-            return await self._fail(sent.request, exc)
+            return await self._fail(sent.request, exc, items)
         except IgnoreRequest as exc:
             logger.debug("Ignored %r: %s", sent.request, exc.reason)
             await self._events.emit(RequestIgnored(sent.request, exc.reason))
@@ -208,8 +213,8 @@ class RequestProcessor:
             decision = self._decide(sent.request, exc, lease.attempt)
             if decision.action is Action.ACCEPT:
                 logger.error("Fetching %r failed", sent.request, exc_info=exc)
-                return await self._fail(sent.request, exc)
-            return await self._retry_or_give_up(lease, sent.request, decision, cause=exc)
+                return await self._fail(sent.request, exc, items)
+            return await self._retry_or_give_up(lease, sent.request, decision, items, cause=exc)
         if response is None:
             # The domain is cooling down: wait in the Frontier, not in a worker.
             return Again(self._throttle.cooldown_left(lease.slot), "domain cooling down", count_attempt=False)
@@ -217,9 +222,9 @@ class RequestProcessor:
         request = sent.request  # naming its Session, for the Callback and the errback
         decision = self._decide(request, response, lease.attempt)
         if decision.action is not Action.ACCEPT:
-            return await self._retry_or_give_up(lease, request, decision, response=response)
+            return await self._retry_or_give_up(lease, request, decision, items, response=response)
         await self._events.emit(ResponseReceived(response))
-        error = await self._handle_response(request, response)
+        error = await self._handle_response(request, response, items)
         if error is None:
             return Done()
         failure = None if isinstance(error, Retry) else await keeping.failure(error)  # its kept page went away under it
@@ -227,8 +232,8 @@ class RequestProcessor:
         if judged is not None:
             decision = self._decide(request, judged, lease.attempt)
             if decision.action is not Action.ACCEPT:
-                return await self._retry_or_give_up(lease, request, decision, cause=judged)
-        return await self._fail(request, failure or error)
+                return await self._retry_or_give_up(lease, request, decision, items, cause=judged)
+        return await self._fail(request, failure or error, items)
 
     async def _fetch(self, lease: Lease, sent: _Sent) -> Response | None:
         """Fetch through the download chain in its slot, under its Session; `None` if the slot is cooling down.
@@ -268,6 +273,7 @@ class RequestProcessor:
         lease: Lease,
         request: Request,
         decision: Decision,
+        items: PendingItems,
         *,
         response: Response | None = None,
         cause: Exception | None = None,
@@ -278,7 +284,7 @@ class RequestProcessor:
             if spent >= budget.limit:
                 reason = budget_spent(decision.reason, budget)
                 logger.error("Gave up on %r after attempt %d: %s", request, lease.attempt, reason)
-                return await self._exhausted(request, reason, response, cause)
+                return await self._exhausted(request, reason, items, response, cause)
             logger.info(
                 "Retrying %r in %.2f s after attempt %d, as %s retry %d of %d: %s",
                 request,
@@ -306,23 +312,28 @@ class RequestProcessor:
             await self._events.emit(RequestRetried(request, lease.attempt, decision.delay, decision.reason))
             return Again(decision.delay, decision.reason, request=retried_instead(lease.request, decision))
         logger.error("Gave up on %r after %d attempts: %s", request, lease.attempt, decision.reason)
-        return await self._exhausted(request, decision.reason, response, cause)
+        return await self._exhausted(request, decision.reason, items, response, cause)
 
     async def _exhausted(
-        self, request: Request, reason: str, response: Response | None, cause: Exception | None
+        self,
+        request: Request,
+        reason: str,
+        items: PendingItems,
+        response: Response | None,
+        cause: Exception | None,
     ) -> Settlement:
         exhausted = RetriesExhausted(reason, response=response)
         exhausted.__cause__ = cause
-        return await self._fail(request, exhausted)
+        return await self._fail(request, exhausted, items)
 
-    async def _fail(self, request: Request, error: Exception) -> Settlement:
+    async def _fail(self, request: Request, error: Exception, items: PendingItems) -> Settlement:
         """Report a Request that failed for good, then run its errback."""
         await self._events.emit(RequestFailed(request, error))
         if request.errback is not None:
-            await self._run_errback(request, error)
+            await self._run_errback(request, error, items)
         return Dead(_describe(error))
 
-    async def _handle_response(self, request: Request, response: Response) -> Exception | None:
+    async def _handle_response(self, request: Request, response: Response, items: PendingItems) -> Exception | None:
         """Run the spider chain for a Response and dispatch its outputs; return what it raised, if anything."""
         callback = request.callback or self._spider.parse
         limit = _TimeLimit(_name(callback), self._callback_timeout)
@@ -342,9 +353,9 @@ class RequestProcessor:
                             self._count("callbacks.timeouts")
                         logger.exception("Callback %s failed for %r", _name(callback), response)
                         return exc
-                    await self._handle_output(output, request, response)
+                    await self._handle_output(output, request, response, items)
 
-    async def _run_errback(self, request: Request, error: Exception) -> None:
+    async def _run_errback(self, request: Request, error: Exception, items: PendingItems) -> None:
         limit = _TimeLimit(_name(request.errback), self._callback_timeout)
         with handling(request):
             async with aclosing(run_errback(request, error)) as outputs:
@@ -358,20 +369,22 @@ class RequestProcessor:
                             self._count("callbacks.errback_timeouts")
                         logger.exception("Errback %s failed for %r", _name(request.errback), request)
                         return
-                    await self._handle_output(output, request, None)
+                    await self._handle_output(output, request, None, items)
 
     def _count(self, key: str) -> None:
         if self._stats is not None:
             self._stats.inc(key)
 
-    async def _handle_output(self, output: object, request: Request, response: Response | None) -> None:
+    async def _handle_output(
+        self, output: object, request: Request, response: Response | None, items: PendingItems
+    ) -> None:
         match output:
             case None:
                 pass
             case Request():
                 await self._schedule(output)
             case _ if is_item(output):
-                await self._put_item(output, ItemContext(request, response))
+                await self._put_item(output, ItemContext(request, response), items)
             case _:
                 logger.warning("Ignoring unsupported output %r produced for %r", output, request)
 

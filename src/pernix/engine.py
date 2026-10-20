@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from pernix.callbacks import iterate_and_close
 from pernix.events import RequestDropped, RequestScheduled, SpiderIdle
+from pernix.items import PendingItems
 from pernix.logs import request_context
 from pernix.request_processor import Again, Dead, Done, PutItem, RequestProcessor
 from pernix.retry_policy import DefaultRetryPolicy
@@ -16,7 +17,7 @@ from pernix.settings import DomainSettings, RetrySettings
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from pernix.events import EventBus
     from pernix.frontiers import Frontier, Lease
@@ -44,11 +45,21 @@ class Engine:
     Each worker claims one Request at a time under a Lease, skipping the slots the
     Throttle blocks, renews the Lease while it works, and makes one attempt at the
     Request with a `RequestProcessor`: fetching, retry decision, Callback or
-    errback. The Lease is then settled as the attempt says: acknowledged, returned
-    for another attempt, or kept as a Dead Request. Because a Request stays leased
+    errback. The Lease is then settled as the attempt says, acknowledged, returned
+    for another attempt, or kept as a Dead Request, once the Items the Callback and
+    the errback yielded are processed: stored, dropped, or failed and passed through
+    the failure Pipelines. Meanwhile the worker goes on to the next Request, and the
+    Lease is still renewed. Each Request waiting so has an Item queued, in process,
+    or in a batch, so the Item queue bounds them. Because a Request stays leased
     until its Callback's outputs have been added, the Requests its Callback adds are
     always in the Frontier before it leaves. If the Run is cancelled, Requests in
-    flight are returned to the Frontier without counting an attempt.
+    flight, and those waiting for their Items, are returned to the Frontier without
+    counting an attempt.
+
+    When no attempt is in progress, and nothing else can happen before the Requests
+    waiting for their Items are settled, as nothing in the Frontier is ready or
+    delayed, or a Drain stops the claiming, the Items are flushed (`flush_items`), so
+    that those in a batch do not wait for it to fill or time out.
 
     The Run is idle once `start()` is exhausted and nothing is ready, delayed, or
     leased. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the Run ends when
@@ -57,8 +68,8 @@ class Engine:
     `RequestDropped`.
 
     `drain()` stops the claiming and the scheduling of the Requests `start()` and
-    `on_idle()` yield; the Requests in flight are finished, and the Requests their
-    Callbacks yield still enter the Frontier.
+    `on_idle()` yield; the Requests in flight are finished, with their Items, and the
+    Requests their Callbacks yield still enter the Frontier.
 
     Requests constructed in the spider chain resolve relative URLs against the
     Response handled by the layer, or the Callback, that constructs them. While a
@@ -75,6 +86,7 @@ class Engine:
         put_item: PutItem,
         events: EventBus,
         concurrency: int,
+        flush_items: Callable[[], None] | None = None,
         browser_concurrency: int = 0,
         lease_ttl: float = 60.0,
         retry_policy: RetryPolicy | None = None,
@@ -93,11 +105,15 @@ class Engine:
             handle: Runs the spider Middleware and the Callback for a Response,
                 yielding the outputs; it ends in `pernix.callbacks.run_callbacks()`.
             put_item: Takes every Item the Callbacks and errbacks produce, with
-                where it came from.
+                where it came from, and counts it in the `PendingItems` of its
+                attempt until it is processed.
             events: Where Request and Response Events are emitted.
             concurrency: The number of workers, each processing one Request at a
                 time, for the Requests that do not go to the browser Fetcher, or
                 for every Request without `browser_concurrency`.
+            flush_items: Has the Items taken so far processed, those in a batch
+                included, without waiting for the batch to fill or time out; `None`
+                when Items never wait in batches.
             browser_concurrency: The number of workers more, for the Requests that
                 go to the browser Fetcher, as `pernix.fetchers.is_rendered()` tells;
                 0 to have the `concurrency` workers process them too.
@@ -138,6 +154,11 @@ class Engine:
         self._throttle = throttle or Throttle(DomainSettings())
         self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
         self._draining = asyncio.Event()
+        self._flush_items = flush_items or (lambda: None)
+        self._attempts = 0
+        """The attempts in progress."""
+        self._waiting = 0
+        """The Requests whose attempts ended, waiting for their Items."""
         self._processor = RequestProcessor(
             spider,
             download=download,
@@ -211,12 +232,20 @@ class Engine:
             await self._frontier.wait()
 
     async def _work(self, rendered: bool | None) -> None:
-        """Process Requests of a kind, one at a time: rendered ones, the others, or any (`None`)."""
-        while not self._draining.is_set():
-            lease = await self._claim(rendered) or await self._wait_for_work(rendered)
-            if lease is not None:
-                with request_context(lease.id):  # records logged for the Request, its Callback's included
-                    await self._process(lease)
+        """Process Requests of a kind, one at a time: rendered ones, the others, or any (`None`).
+
+        A Request whose Items are still being processed once its attempt ends waits
+        for them in a task of the worker's, which goes on to the next; on a Drain, the
+        worker returns once they are settled.
+        """
+        async with asyncio.TaskGroup() as waiting:
+            while not self._draining.is_set():
+                lease = await self._claim(rendered) or await self._wait_for_work(rendered)
+                if lease is not None:
+                    with request_context(lease.id):  # records logged for the Request, its Callback's included
+                        await self._process(lease, waiting)
+                    await self._flush_if_stuck()
+            await self._flush_if_stuck()
 
     async def _claim(self, rendered: bool | None) -> Lease | None:
         leases = await self._frontier.claim(
@@ -251,10 +280,39 @@ class Engine:
                 raise
         return lease
 
-    async def _process(self, lease: Lease) -> None:
+    async def _process(self, lease: Lease, waiting: asyncio.TaskGroup) -> None:
+        """Make an attempt at a Request, and settle it here, or in `waiting` while its Items are processed."""
+        items = PendingItems()
         renewal = asyncio.create_task(self._keep_leased(lease))
+        self._attempts += 1
         try:
-            settlement = await self._processor.attempt(lease)
+            settlement = await self._processor.attempt(lease, items)
+        except BaseException as exc:
+            renewal.cancel()
+            await asyncio.wait([renewal])
+            if isinstance(exc, asyncio.CancelledError):
+                await self._return(lease)
+            raise
+        finally:
+            self._attempts -= 1
+        if not items.count:
+            await self._settle_once_processed(lease, settlement, items, renewal)
+            return
+        self._waiting += 1
+        waiting.create_task(self._settle_once_processed(lease, settlement, items, renewal, waited=True))
+
+    async def _settle_once_processed(
+        self,
+        lease: Lease,
+        settlement: Settlement,
+        items: PendingItems,
+        renewal: asyncio.Task[None],
+        *,
+        waited: bool = False,
+    ) -> None:
+        """Settle a Lease once the Items of its attempt are processed, while `renewal` renews it."""
+        try:
+            await items.wait()
             renewal.cancel()  # before settling, so a renewal never races the settlement
             settled = await self._settle(lease, settlement)
         except asyncio.CancelledError:
@@ -264,8 +322,24 @@ class Engine:
         finally:
             renewal.cancel()
             await asyncio.wait([renewal])
+            if waited:
+                self._waiting -= 1
         if not settled:
             logger.warning("The Lease on %r expired before it was settled; it may be processed again", lease.request)
+
+    async def _flush_if_stuck(self) -> None:
+        """Flush the Items when nothing else can happen before the Requests waiting for them are settled.
+
+        That is when no attempt is in progress, and a Drain stops the claiming, or
+        nothing else in the Frontier is ready, delayed, or leased.
+        """
+        if self._attempts or not self._waiting:
+            return
+        if not self._draining.is_set():
+            counts = await self._frontier.counts()
+            if counts.ready or counts.delayed or counts.leased > self._waiting:
+                return
+        self._flush_items()
 
     async def _keep_leased(self, lease: Lease) -> None:
         """Renew a Lease until cancelled, or until it is lost."""

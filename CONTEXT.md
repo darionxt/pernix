@@ -125,11 +125,11 @@ Retries a Request may have for one kind of failure that is not its own, such as 
 _Avoid_: retry quota
 
 **Drain**:
-Stop claiming new Requests, finish the in-flight ones, then end.
+Stop claiming new Requests, finish the in-flight ones and process their Items, then end.
 _Avoid_: graceful stop
 
 **Force Stop**:
-Cancel in-flight Requests, return them to the Frontier, discard the Items not processed yet, then end.
+Cancel in-flight Requests, discard the Items not processed yet, return those Requests and the ones the Items came from to the Frontier, then end.
 _Avoid_: kill
 
 **Grace Period**:

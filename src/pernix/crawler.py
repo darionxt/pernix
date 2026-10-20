@@ -33,7 +33,7 @@ from pernix.stats import Stats
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
 
     from pernix.account import Account
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from pernix.fetchers import StreamedResponse
     from pernix.inline_fetch import InlineFetch
     from pernix.items import ItemProcessor
+    from pernix.items.item_processor import Outlet
     from pernix.response import Response
     from pernix.shutdown import StopMode
     from pernix.spider import Spider
@@ -106,7 +107,7 @@ class Crawler:
         shutdown = settings.section(ShutdownSettings)
         self._close_timeout = shutdown.close_timeout or None
         self._shutdown = Shutdown(grace=shutdown.grace, close_timeout=self._close_timeout)
-        self._outlet: Callable[[Any], Awaitable[None]] | None = None
+        self._outlet: Outlet | None = None
         self._inline_fetch: InlineFetch | None = None
 
     @classmethod
@@ -188,12 +189,12 @@ class Crawler:
         The Requests the Callbacks yield meanwhile still enter the Frontier. A Force
         Stop (`"force"`) cancels the Requests in flight and returns them to the
         Frontier without counting an attempt, discards the Items not processed yet,
-        counting them as `items.discarded`, and closes the components, each within
-        `shutdown.close_timeout` seconds. The Feeds are closed either way, keeping
-        the Items written. A Force Stop while the Spider's Accounts are imported, or
-        while the components open, cancels that and ends the Run before it starts,
-        closing the components already open; one while they close limits the close
-        in progress too.
+        counting them as `items.discarded` and returning the Requests they came from
+        the same way, and closes the components, each within `shutdown.close_timeout`
+        seconds. The Feeds are closed either way, keeping the Items written. A Force
+        Stop while the Spider's Accounts are imported, or while the components open,
+        cancels that and ends the Run before it starts, closing the components
+        already open; one while they close limits the close in progress too.
 
         It may be called from a Callback, a component, or another task, and before
         the Run starts. A Force Stop requested during a Drain escalates it; anything
@@ -295,8 +296,12 @@ class Crawler:
         """
         if self._started or self._outlet is not None:
             raise RuntimeError("a Crawler runs only once; create a new one for another Run")
-        channel: asyncio.Queue[Any] = asyncio.Queue(1)
-        self._outlet = channel.put
+        channel: asyncio.Queue[tuple[Any, Callable[[], None]]] = asyncio.Queue(1)
+
+        async def outlet(item: Any, processed: Callable[[], None]) -> None:
+            await channel.put((item, processed))
+
+        self._outlet = outlet
         return ItemStream(self.crawl, self.stop, channel)
 
     async def crawl(self) -> RunResult:

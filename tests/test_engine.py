@@ -8,13 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pernix import IgnoreRequest, Request, Response, Retry, Spider, events
+from pernix import IgnoreRequest, Pipeline, Request, Response, Retry, Spider, events
 from pernix.callbacks import run_callbacks
 from pernix.engine import Engine
 from pernix.errors import BrowserLost, ConnectError, RetriesExhausted
 from pernix.frontiers import MemoryFrontier
+from pernix.items import ItemProcessor
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import DomainSettings, RetrySettings
+from pernix.stats import Stats
 from pernix.testing import FakeFetcher, make_response
 from pernix.throttle import Throttle
 
@@ -22,8 +24,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
     from pernix.engine import PutItem
-    from pernix.frontiers import Lease
-    from pernix.items import ItemContext
+    from pernix.frontiers import FrontierCounts, Lease
+    from pernix.items import ItemContext, PendingItems
     from pernix.middlewares import Download
     from pernix.retry_policy import Decision, RetryPolicy
     from pernix.testing import Answer
@@ -47,7 +49,7 @@ def _paths(site: FakeFetcher) -> list[str]:
 
 
 def _collect(items: list[Any], contexts: list[ItemContext] | None = None) -> PutItem:
-    async def put(item: Any, ctx: ItemContext) -> None:
+    async def put(item: Any, ctx: ItemContext, _pending: PendingItems) -> None:
         items.append(item)
         if contexts is not None:
             contexts.append(ctx)
@@ -55,7 +57,7 @@ def _collect(items: list[Any], contexts: list[ItemContext] | None = None) -> Put
     return put
 
 
-async def _discard(_item: Any, _ctx: ItemContext) -> None:
+async def _discard(_item: Any, _ctx: ItemContext, _pending: PendingItems) -> None:
     pass
 
 
@@ -861,7 +863,7 @@ async def test_a_drain_stops_scheduling_the_requests_of_start_and_wakes_idle_wor
             finally:
                 closed.set()
 
-    async def put_item(_item: Any, _ctx: ItemContext) -> None:
+    async def put_item(_item: Any, _ctx: ItemContext, _pending: PendingItems) -> None:
         put.set()
 
     site = _site({"/a": "<p>a</p>"})
@@ -968,3 +970,296 @@ async def test_a_drain_from_start_still_finishes_the_requests_in_flight() -> Non
     assert items == [{"page": "/a"}]
     counts = await frontier.counts()
     assert (counts.done, counts.ready) == (1, 0)
+
+
+# Settling once the Items are processed
+
+
+class HeldItems:
+    """Takes Items as the Item processing does, holding each one unprocessed until released.
+
+    Attributes:
+        items: The Items taken, in order.
+        hold: Whether the Items taken from now on are held.
+        stuck: Set once the Engine flushes the Items, having nothing else to do.
+    """
+
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+        self.hold = True
+        self.stuck = asyncio.Event()
+        self._held: list[PendingItems] = []
+        self._taken = asyncio.Event()
+
+    async def put(self, item: Any, _ctx: ItemContext, pending: PendingItems) -> None:
+        if self.hold:
+            pending.add()
+            self._held.append(pending)
+        self.items.append(item)
+        self._taken.set()
+
+    def flush(self) -> None:
+        self.stuck.set()
+
+    def release(self) -> None:
+        """Process every Item held."""
+        for pending in self._held:
+            pending.processed()
+        self._held.clear()
+
+    async def taken(self, count: int) -> None:
+        """Wait until `count` Items were taken."""
+        while len(self.items) < count:
+            self._taken.clear()
+            await self._taken.wait()
+
+
+def _holding_engine(
+    spider: Spider, site: FakeFetcher, frontier: MemoryFrontier, held: HeldItems, **kwargs: Any
+) -> Engine:
+    return Engine(
+        spider,
+        frontier=frontier,
+        download=site.fetch,
+        handle=run_callbacks(spider),
+        put_item=held.put,
+        flush_items=held.flush,
+        events=events.EventBus(timeout=5),
+        retry_policy=DefaultRetryPolicy(RetrySettings(delay_scale=0)),
+        **{"concurrency": 1, **kwargs},
+    )
+
+
+class Pages(Spider):
+    """Starts with /a and /b, and yields the paragraph of each."""
+
+    async def start(self) -> AsyncIterator[Request]:
+        for path in ("/a", "/b"):
+            yield Request(f"{SITE}{path}")
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        yield {"page": response.css("p::text").get()}
+
+
+async def test_a_request_stays_leased_until_its_items_are_processed_while_the_worker_goes_on() -> None:
+    spider, held = Pages(), HeldItems()
+    site, frontier = _site({"/a": "<p>a</p>", "/b": "<p>b</p>"}), MemoryFrontier()
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=site.fetch,
+        handle=run_callbacks(spider),
+        put_item=held.put,
+        events=events.EventBus(timeout=5),
+        concurrency=1,
+    )
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await held.taken(2)  # the one worker fetched /b while the Item of /a waits
+        counts = await frontier.counts()
+        held.release()
+        await run
+
+    assert _paths(site) == ["/a", "/b"]
+    assert (counts.leased, counts.done) == (2, 0)
+    assert (await frontier.counts()).done == 2
+
+
+async def test_the_lease_of_a_request_waiting_for_its_items_is_renewed() -> None:
+    now = 0.0
+    renewed = asyncio.Event()
+
+    class Renewals(MemoryFrontier):
+        async def renew(self, lease: Lease, ttl: float) -> Lease | None:
+            renewal = await super().renew(lease, ttl)
+            renewed.set()
+            return renewal
+
+    spider, held = Links(), HeldItems()
+    site = _site({"/a": "<p>a</p>"})
+    # The Frontier's clock moves only between renewals, so a slow event loop cannot let the Lease expire.
+    frontier = Renewals(clock=lambda: now)
+    engine = _holding_engine(spider, site, frontier, held, lease_ttl=0.06)
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await held.stuck.wait()
+        for _ in range(5):  # several times the Lease's lifetime in all, a renewal between steps
+            renewed.clear()
+            await renewed.wait()
+            now += 0.04
+        counts = await frontier.counts()
+        held.release()
+        await run
+
+    assert _paths(site) == ["/a"]
+    assert (counts.leased, counts.done) == (1, 0)
+    assert (await frontier.counts()).done == 1
+
+
+async def test_a_retry_returns_the_request_once_the_items_before_it_are_processed() -> None:
+    class Patient(Links):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            async for output in super().parse(response):
+                yield output
+            if "not ready" in response.text:
+                raise Retry("prices not ready")
+
+    held, frontier = HeldItems(), MemoryFrontier()
+    site = _site({"/a": ["<p>not ready</p>", "<p>a</p>"]})
+    run = asyncio.create_task(_holding_engine(Patient(), site, frontier, held).run())
+    async with asyncio.timeout(5):
+        await held.stuck.wait()
+        counts = await frontier.counts()
+        held.hold = False
+        held.release()
+        await run
+
+    assert (counts.leased, counts.ready, counts.delayed) == (1, 0, 0)
+    assert _paths(site) == ["/a", "/a"]
+    assert held.items == [{"page": "not ready"}, {"page": "a"}]
+    assert (await frontier.counts()).done == 1
+
+
+async def test_a_failed_request_is_kept_as_dead_once_the_items_of_its_errback_are_processed() -> None:
+    class Failing(Spider):
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(f"{SITE}/a", errback=self.failed)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"page": "a"}
+            raise ValueError("cannot parse")
+
+        async def failed(self, request: Request, error: Exception) -> AsyncIterator[Any]:
+            yield {"failed": request.url.removeprefix(SITE)}
+
+    held, frontier = HeldItems(), MemoryFrontier()
+    run = asyncio.create_task(_holding_engine(Failing(), _site({"/a": ""}), frontier, held).run())
+    async with asyncio.timeout(5):
+        await held.stuck.wait()
+        counts = await frontier.counts()
+        held.release()
+        await run
+
+    assert held.items == [{"page": "a"}, {"failed": "/a"}]
+    assert (counts.leased, counts.dead) == (1, 0)
+    assert (await frontier.counts()).dead == 1
+
+
+async def test_a_cancelled_run_returns_the_requests_waiting_for_their_items_without_counting_an_attempt() -> None:
+    held, frontier = HeldItems(), MemoryFrontier()
+    run = asyncio.create_task(_holding_engine(Links(), _site({"/a": "<p>a</p>"}), frontier, held).run())
+    async with asyncio.timeout(5):
+        await held.stuck.wait()
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    counts = await frontier.counts()
+    assert (counts.ready, counts.leased, counts.done) == (1, 0, 0)
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    assert lease.attempt == 1
+
+
+async def test_a_drain_settles_the_requests_in_flight_once_their_items_are_processed() -> None:
+    engine: Engine | None = None
+
+    class DrainsItself(Pages):
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            assert engine is not None
+            engine.drain()  # as self.crawler.stop() would
+            async for output in super().parse(response):
+                yield output
+
+    held, frontier = HeldItems(), MemoryFrontier()
+    engine = _holding_engine(DrainsItself(), _site({"/a": "<p>a</p>", "/b": "<p>b</p>"}), frontier, held)
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await held.stuck.wait()  # a Drain stops the claiming, so the Items are flushed
+        counts = await frontier.counts()
+        held.release()
+        await run
+
+    assert (counts.leased, counts.done) == (1, 0)
+    counts = await frontier.counts()
+    assert (counts.done, counts.ready) == (1, 1)
+
+
+async def test_items_in_a_batch_keep_their_requests_leased_until_the_batch_is_processed() -> None:
+    frontier = MemoryFrontier()
+    seen: list[FrontierCounts] = []
+
+    class Rows(Pipeline):
+        batch_size = 10
+        batch_timeout = 60.0  # the Run would wait this long for the batch
+
+        async def process_batch(self, items: list[Any], contexts: list[ItemContext]) -> None:
+            seen.append(await frontier.counts())
+
+    spider, bus = Links(), events.EventBus(timeout=5)
+    items = ItemProcessor([Rows()], [], bus, Stats())
+    site = _site({"/a": "<p>a</p><a href='/b'>b</a>", "/b": "<p>b</p>"})
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=site.fetch,
+        handle=run_callbacks(spider),
+        put_item=items.put,
+        flush_items=items.flush,
+        events=bus,
+        concurrency=1,
+    )
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        items.start(tasks)
+        await engine.run()
+        await items.join()
+
+    assert [(counts.leased, counts.done) for counts in seen] == [(2, 0)]
+    assert (await frontier.counts()).done == 2
+
+
+async def test_workers_go_on_while_items_wait_until_the_item_queue_is_full() -> None:
+    release, fourth = asyncio.Event(), asyncio.Event()
+
+    class Gate(Pipeline):
+        async def process(self, item: Any, ctx: ItemContext) -> Any:
+            await release.wait()
+            return item
+
+    class Many(Spider):
+        async def start(self) -> AsyncIterator[Request]:
+            for n in range(6):
+                yield Request(f"{SITE}/{n}")
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            if len(site.requests) == 4:
+                fourth.set()
+            yield {"page": response.url.removeprefix(SITE)}
+
+    spider, bus, frontier = Many(), events.EventBus(timeout=5), MemoryFrontier()
+    items = ItemProcessor([Gate()], [], bus, Stats(), queue_size=2)
+    site = _site({f"/{n}": "" for n in range(6)})
+    engine = Engine(
+        spider,
+        frontier=frontier,
+        download=site.fetch,
+        handle=run_callbacks(spider),
+        put_item=items.put,
+        flush_items=items.flush,
+        events=bus,
+        concurrency=1,
+    )
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        items.start(tasks)
+        run = tasks.create_task(engine.run())
+        await fourth.wait()
+        await asyncio.sleep(0.05)  # everything that can move has moved
+        counts = await frontier.counts()
+        fetched = len(site.requests)
+        release.set()
+        await run
+        await items.join()
+
+    # One Item in the Pipeline and two queued, their Requests waiting; the fourth Callback waits to queue its own.
+    assert fetched == 4
+    assert (counts.leased, counts.done, counts.ready) == (4, 0, 2)
+    assert (await frontier.counts()).done == 6
