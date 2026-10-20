@@ -447,9 +447,11 @@ def _launch_problem(message: str, settings: BrowserSettings, *, channel: str) ->
     """What to do about a browser that did not launch for want of something the user can install; `None` otherwise."""
     if "executable doesn't exist" in message.lower():
         return _missing_executable(settings)
-    if "is not found at" in message:  # a Chrome of the system, which patchright does not install by itself
-        found = message.splitlines()[0].split(": ", 1)[-1]
+    found = message.splitlines()[0].split(": ", 1)[-1]
+    if "is not found at" in found:  # a Chrome of the system, which patchright does not install by itself
         return f"{found}; install it, such as with: patchright install {channel}"
+    if "is not supported on" in found:
+        return f"{found}; name another browser in {settings.key('launch_options')}"
     if "XServer" in message or "$DISPLAY" in message:
         return _DISPLAY_HINT
     return None

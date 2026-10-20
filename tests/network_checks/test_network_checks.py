@@ -13,7 +13,6 @@ skipped without it.
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import TYPE_CHECKING
 
 import orjson
@@ -97,8 +96,10 @@ async def test_the_browser_sends_ech_from_dns_where_the_http_fetcher_does_not() 
     assert (_trace(http)["sni"], _trace(browser)["sni"]) == ("plaintext", "encrypted")  # no ECH over HTTP (§5.4)
 
 
-async def test_requests_through_a_proxy_leave_from_its_address_and_webrtc_tells_no_other() -> None:
-    proxy = os.environ.get("PERNIX_CHECK_PROXY")
+async def test_requests_through_a_proxy_leave_from_its_address_and_webrtc_tells_no_other(
+    check_proxy: str | None,
+) -> None:
+    proxy = check_proxy
     if not proxy:
         pytest.skip("PERNIX_CHECK_PROXY names no proxy to check the egress through")
     async with HTTPFetcher() as direct:

@@ -13,7 +13,12 @@ from pernix.browser import Evaluate, Render
 from pernix.crawler import Crawler
 from pernix.errors import ComponentError, SettingsError
 from pernix.fetchers import BrowserFetcher, BrowserSettings
-from pernix.fetchers.launched_browser import launch_browser, probe_browser, report_unpinned
+from pernix.fetchers.launched_browser import (
+    _launch_problem,  # pyright: ignore[reportPrivateUsage]
+    launch_browser,
+    probe_browser,
+    report_unpinned,
+)
 from pernix.fetchers.pinned_pair import BUNDLED_BROWSER
 from pernix.settings import CORE_SECTIONS, DEFAULT_LOCALE, load_settings
 
@@ -49,14 +54,41 @@ def test_the_preset_tells_whether_the_browser_runs_without_a_window_unless_headl
         _settings(tmp_path, **{"browser.preset": "headed"})
 
 
-async def test_a_browser_that_is_not_installed_is_named_with_how_to_install_it() -> None:
-    settings = BrowserSettings(launch_options={"channel": "msedge-canary"})  # installed nowhere it is tested
+@pytest.mark.parametrize(
+    ("message", "problem"),
+    [
+        (
+            "BrowserType.launch: Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome\n"
+            'Run "npx playwright install chrome"',
+            "Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome; install it, such as with: "
+            "patchright install chrome",
+        ),
+        (
+            "BrowserType.launch: Chromium distribution 'chrome' is not supported on linux-arm64",
+            "Chromium distribution 'chrome' is not supported on linux-arm64; name another browser in "
+            "browser.launch_options",
+        ),
+        (
+            "BrowserType.launch: Target page, context or browser has been closed\n"
+            "Looks like you launched a headed browser without having a XServer running.\n"
+            "Set either 'headless: true' or use 'xvfb-run <your-playwright-app>' before running Playwright.",
+            "the browser runs with a window, which needs a display; run it under a virtual one, such as with "
+            "xvfb-run, or set browser.headless = true",
+        ),
+        ("BrowserType.launch: Target page, context or browser has been closed", None),
+    ],
+    ids=["not installed", "not supported", "no display", "another failure"],
+)
+def test_a_browser_that_cannot_be_launched_is_told_with_what_to_do(message: str, problem: str | None) -> None:
+    assert _launch_problem(message, BrowserSettings(preset="stealth"), channel="chrome") == problem
 
-    with pytest.raises(ComponentError) as missing:
+
+async def test_a_browser_that_is_not_installed_fails_with_a_component_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("pernix.fetchers.launched_browser._launch_problem", lambda *_args, **_kwargs: "install it")
+    settings = BrowserSettings(launch_options={"channel": "chrome-canary"})  # installed nowhere it is tested
+
+    with pytest.raises(ComponentError, match=r"^install it$"):
         await launch_browser(settings)
-
-    assert "distribution 'msedge-canary' is not found at " in str(missing.value)
-    assert str(missing.value).endswith("; install it, such as with: patchright install msedge-canary")
 
 
 @pytest.mark.usefixtures("browser_engine")

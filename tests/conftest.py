@@ -25,6 +25,9 @@ pytest_plugins = ["pytester"]
 _NETWORK_CHECK = "network_check"
 """The marker of the checks in tests/network_checks, which only a real network can make."""
 
+_CHECK_PROXY = pytest.StashKey[str | None]()
+"""`PERNIX_CHECK_PROXY`, read before each test clears the `PERNIX_*` variables, which settings would take."""
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Add `--network-checks`, which runs the checks only a real, clean network can make."""
@@ -36,10 +39,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the marker of the network checks."""
+    """Register the marker of the network checks, and keep the proxy their egress check goes through."""
     config.addinivalue_line(
         "markers", f"{_NETWORK_CHECK}: a check that reaches real hosts, run only with --network-checks"
     )
+    config.stash[_CHECK_PROXY] = os.environ.get("PERNIX_CHECK_PROXY") or None
+
+
+@pytest.fixture
+def check_proxy(pytestconfig: pytest.Config) -> str | None:
+    """The proxy `PERNIX_CHECK_PROXY` names for the network checks, if any."""
+    return pytestconfig.stash[_CHECK_PROXY]
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
