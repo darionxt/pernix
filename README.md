@@ -145,7 +145,14 @@ class Shop(Spider):
 
 Page methods run any patchright code on the page: `setup` before it loads, and `action` once `wait_for` and the actions are done, before the screenshot; `PageMethod(method, optional=True, timeout=5)` lets one fail, logged, or limits its time. Like Callbacks, they are Spider methods, persisted by name, and they run in rendered Inline Fetches too. With `keep_page=True`, the Callback gets the page as `response.page`; the Run closes it, with its context, once the Callback ends, however it ends. It counts toward `browser.max_pages` meanwhile, and the rendered fetches the Callback makes share its slot. Only the Callback of a Request the Run fetches can keep a page: an Inline Fetch raises `ValueError`. A Callback that fails as its kept page crashed, or its browser was lost, is retried as the fetch would be.
 
-HTTP and the browser present one client: with the pinned Profile, HTTP requests carry the `User-Agent` and client hints of the bundled Chrome for Testing build on the platform the Run is on, and the browser, in headless mode, drops `HeadlessChrome` from its own User-Agent, as it is with a window. Both present the languages of `locale`. A Run warns about a Profile or a browser other than the Pinned Pair, and `pernix check` tells whether they are. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
+HTTP and the browser present one client: with the pinned Profile, HTTP requests carry the `User-Agent` and client hints of the bundled Chrome for Testing build on the platform the Run is on, and the browser, in headless mode, drops `HeadlessChrome` from its own User-Agent, as it is with a window. Both present the languages of `locale`. The browser's pages, their frames, and their web workers also present the first of them as the locale of `Intl`, and the time zone of `timezone`, an IANA name, or the machine's when it is not set. Both are ordinary settings, set in `Spider.settings` or any other layer:
+
+```python
+class Shop(Spider):
+    settings = {"locale": "de-DE,de,en-US,en", "timezone": "Europe/Berlin"}
+```
+
+A Run warns about a Profile or a browser other than the Pinned Pair, and `pernix check` tells whether they are. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
 
 ## Sessions
 
@@ -366,7 +373,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `failed_pipelines` | `{FailedItemsFile: 100}` | Pipelines that receive the Items a Pipeline failed on, as `FailedItem`s |
 | `feeds` | `{}` | Files Items are written to, as `{path_template: options}` |
 | `run_id` | `None` | Identifies the Run in logs and stats; `None` generates one |
-| `locale` | `["en-US", "en"]` | The languages the browser presents, as a list or `"en-US,en"`; the HTTP Fetcher sends the `Accept-Language` Chrome makes of them |
+| `locale` | `["en-US", "en"]` | The languages the browser presents, as a list or `"en-US,en"`; the HTTP Fetcher sends the `Accept-Language` Chrome makes of them, and the first is the locale of `Intl` in the browser |
+| `timezone` | `None` | The time zone of the browser's pages, their frames, and their web workers, an IANA name such as `"Europe/Berlin"`; `None` keeps the machine's |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
 | `domain.concurrency` | `8` | Fetches in progress at once per domain (host) |
 | `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |

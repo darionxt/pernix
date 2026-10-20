@@ -68,6 +68,15 @@ async def test_both_present_the_languages_of_the_locale(server: WireServer, loca
 
 
 @pytest.mark.usefixtures("browser_engine")
+async def test_the_locale_and_the_time_zone_of_intl_change_nothing_on_the_wire(server: WireServer) -> None:
+    locale = ("de-DE", "de", "en-US", "en")
+
+    http, browser = await run_both(server, CASES["a resumed connection"], locale=locale, timezone="Europe/Berlin")
+
+    assert_one_client(http, browser)
+
+
+@pytest.mark.usefixtures("browser_engine")
 async def test_a_profile_of_another_chrome_version_breaks_the_contract(server: WireServer) -> None:
     http, browser = await run_both(server, [Step("/")], impersonate="chrome99")
 
