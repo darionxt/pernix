@@ -28,7 +28,7 @@ from pernix.fetchers.chain_cookies import ChainCookies
 from pernix.fetchers.chain_hints import ChainHints
 from pernix.fetchers.chrome_headers import ChromeRequest, HopHints, chrome_request
 from pernix.fetchers.client_hints import DEFAULT_HINTS, HintValues, sent_hints
-from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
+from pernix.fetchers.curl_session_pool import ClientHintsCallback, CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings, check_profile
 from pernix.fetchers.network_guard import current_guard
@@ -416,9 +416,15 @@ class HTTPFetcher:
         set_cookies: list[str] = []
         restarted: set[str | None] = set()
         redirected_from: str | None = None
+        missing: list[tuple[str, ...]] = []  # the hints a response's Critical-CH needs, as its headers arrive
+
+        def receive_hints(url: str, accept_ch: str | None, critical_ch: str | None) -> None:
+            missing.append(hints.receive(url, accept_ch, critical_ch))
+
         while True:
             pinned = await self._check_hop(hop.url, proxy, resolve_timeout=timeout, redirected_from=redirected_from)
             sent = None if chrome is None else chrome.next(hop)
+            missing.clear()
             result, transfer = await self._send(
                 curl,
                 hop,
@@ -429,15 +435,12 @@ class HTTPFetcher:
                 limit=limit,
                 pinned=pinned,
                 sent=sent,
+                on_client_hints=receive_hints if top_level else None,
             )
             if sent is None or sent.credentials:  # a response no cookie goes with sets none
                 set_cookies += _set_cookies(result)
-            missing = (
-                hints.receive(hop.url, _joined(result, "accept-ch"), _joined(result, "critical-ch"))
-                if top_level
-                else ()
-            )
-            if chrome is not None and url_origin(hop.url) not in restarted and chrome.restarts(hop.url, missing):
+            needed = missing[-1] if missing else ()
+            if chrome is not None and url_origin(hop.url) not in restarted and chrome.restarts(hop.url, needed):
                 logger.debug("Sending %s again with the client hints the Critical-CH of %s needs", request.url, hop.url)
                 await _discard(result)
                 restarted.add(url_origin(hop.url))
@@ -506,13 +509,16 @@ class HTTPFetcher:
         limit: int | None,
         pinned: PinnedHost | None,
         sent: ChromeRequest | None,
+        on_client_hints: ClientHintsCallback | None = None,
     ) -> tuple[curl_cffi.Response, Transfer]:
         """Send one hop of a redirect chain and wait for its response headers, without following a redirect.
 
         Waiting for the headers is limited precisely with asyncio; once they arrived,
         curl limits each pause in the body to whole seconds. A pinned host is
         reached at the addresses it was checked at. With the pinned Profile, `sent`
-        holds the headers Chrome sends, which replace curl's own.
+        holds the headers Chrome sends, which replace curl's own. `on_client_hints`
+        is told of the client hints the response asks for as its headers arrive, as
+        the cookies it sets are kept then, even if its body fails.
         """
         credentials = sent is None or sent.credentials
         shaped: dict[str, Any] = {}
@@ -541,6 +547,7 @@ class HTTPFetcher:
                     http_version=_http_version(hop.url),
                     body_limit=limit,
                     resolve=_resolve_entries(pinned),
+                    on_client_hints=on_client_hints,
                     **shaped,
                 )
         except TimeoutError:
@@ -731,12 +738,6 @@ def _top_level(request: Request) -> bool:
         return request_kind(request) in ("navigation", "form")
     except ValueError:
         return False  # a destination pernix makes no request for, sent as it is by another Profile
-
-
-def _joined(response: curl_cffi.Response, name: str) -> str | None:
-    """The values of a response header, joined with commas, as Chrome reads a list; `None` without one."""
-    values = [value for value in response.headers.get_list(name) if value is not None]
-    return ", ".join(values) if values else None
 
 
 def _set_cookies(response: curl_cffi.Response) -> list[str]:

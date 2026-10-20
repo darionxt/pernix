@@ -127,6 +127,17 @@ async def test_a_first_answer_dropped_for_critical_ch_is_not_held_to_the_body_li
     assert [received.path for received in server.received] == ["/critical", "/critical", "/large"]
 
 
+async def test_the_hints_a_response_asks_for_are_kept_even_when_its_body_fails(server: LoopbackServer) -> None:
+    server.route("/large", "x" * 200_000, headers=[ARCH])
+    session = Session()
+
+    async with HTTPFetcher(HTTPSettings(max_body_size=1000)) as fetcher:
+        with pytest.raises(ResponseTooLarge):
+            await fetcher.fetch(Request(server.url("/large")), session=session)
+
+    assert session.client_hints == {server.base_url: ("sec-ch-ua-arch",)}
+
+
 async def test_critical_ch_sends_a_navigation_again_once_for_each_origin(server: LoopbackServer) -> None:
     asking = [("Location", "/b"), ARCH, ("Critical-CH", "Sec-CH-UA-Arch")]
     server.route("/a", status=302, headers=asking)
