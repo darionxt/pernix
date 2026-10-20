@@ -136,7 +136,8 @@ _Avoid_: kill
 How long a Drain may take before it turns into a Force Stop.
 
 **Pause**:
-Stop claiming new Requests while the Worker stays alive.
+Stop claiming new Requests while the Worker stays alive, finishing the in-flight ones, until resumed. A paused Run never ends on its own; a Drain or a Force Stop still ends it.
+_Avoid_: suspend
 
 **Finite Run**:
 A Run that ends automatically once the Frontier is drained.
