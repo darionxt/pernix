@@ -105,7 +105,7 @@ async def test_the_time_outputs_wait_to_be_handed_on_does_not_count() -> None:
     assert report.stats["callbacks.timeouts"] == 0
 
 
-async def test_a_callback_that_spends_its_time_without_awaiting_is_stopped_before_its_next_output() -> None:
+async def test_an_output_given_after_the_time_ran_out_without_awaiting_is_not_taken() -> None:
     class Busy(Spider):
         start_urls = (f"{SHOP}/",)
 
@@ -116,7 +116,50 @@ async def test_a_callback_that_spends_its_time_without_awaiting_is_stopped_befor
 
     report = await _crawl(Busy, _shop("/"), {"callbacks.timeout": 0.5})
 
-    assert report.items == [{"n": 0}, {"n": 1}]  # the time ran out while the second came
+    assert report.items == [{"n": 0}]  # the second came after the time ran out
+    assert report.stats["callbacks.timeouts"] == 1
+    assert report.stats["requests.failed_by_error.CallbackTimeout"] == 1
+
+
+async def test_a_callback_ending_after_the_time_ran_out_without_awaiting_fails_all_the_same() -> None:
+    class Late(Spider):
+        start_urls = (f"{SHOP}/",)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            yield {"n": 0}
+            time.sleep(0.6)  # noqa: ASYNC251
+
+    report = await _crawl(Late, _shop("/"), {"callbacks.timeout": 0.5})
+
+    assert report.items == [{"n": 0}]
+    assert report.stats["callbacks.timeouts"] == 1
+    assert (report.stats["frontier.dead"], report.stats["frontier.done"]) == (1, 0)
+
+
+async def test_a_callback_stopped_after_its_time_ran_out_fails_with_its_cleanup_and_the_run_goes_on() -> None:
+    errors: list[Exception] = []
+
+    class Untidy(Spider):
+        async def start(self) -> AsyncIterator[Request]:
+            yield Request(f"{SHOP}/", errback=self.failed)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            try:
+                time.sleep(0.6)  # noqa: ASYNC251
+                yield {"late": True}
+            finally:
+                raise ValueError("cleanup failed")
+
+        async def failed(self, request: Request, error: Exception) -> None:
+            errors.append(error)
+
+    report = await _crawl(Untidy, _shop("/"), {"callbacks.timeout": 0.5})
+
+    assert report.reason == "finished"
+    assert report.items == []
+    [error] = errors
+    assert isinstance(error, CallbackTimeout)
+    assert isinstance(error.__cause__, ValueError)
     assert report.stats["callbacks.timeouts"] == 1
 
 

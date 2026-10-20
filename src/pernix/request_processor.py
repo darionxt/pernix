@@ -20,7 +20,7 @@ from pernix.sending import IndependentSending, NotYet
 from pernix.throttle import COOLDOWN_STATUSES, SESSION_COOLDOWN_STATUSES
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from pernix.events import EventBus
     from pernix.fetchers.kept_pages import PageKeeping
@@ -112,9 +112,10 @@ class RequestProcessor:
     With `callback_timeout`, the spider chain has that many seconds in all to
     produce the outputs of a Response, and each errback as many for its own; the
     time spent dispatching the outputs does not count. Once the time runs out, it is
-    cancelled at the `await` it is in, or stopped before its next output, and raises
-    `CallbackTimeout`: a Callback fails with it as with any error of its own, and an
-    errback is logged as failing.
+    cancelled at the `await` it is in, or, running without waiting, it is stopped as
+    soon as it gives an output, which is not taken, or ends; it raises
+    `CallbackTimeout`, which a Callback fails with as with any error of its own, and
+    an errback is logged as failing.
 
     The pages a rendered fetch keeps for the Callback (`Render(keep_page=True)`) are
     closed once the attempt ends, however it ends. A Callback that fails while the
@@ -394,7 +395,7 @@ class _TimeLimit:
         self._left = seconds or 0.0
         self.ran_out = False
 
-    async def next(self, outputs: AsyncIterator[object]) -> object:
+    async def next(self, outputs: AsyncGenerator[object]) -> object:
         """Wait for the next output, within the time left, which only this wait takes from.
 
         Args:
@@ -405,29 +406,41 @@ class _TimeLimit:
 
         Raises:
             StopAsyncIteration: There are no more outputs.
-            pernix.errors.CallbackTimeout: The time ran out, while the producer waited,
-                which cancelled it at the `await` it was in, or before it was asked.
+            pernix.errors.CallbackTimeout: The time ran out: while the producer waited,
+                which cancelled it at the `await` it was in, or while it ran without
+                waiting, and it then gave an output, which is not taken, or ended. A
+                producer left suspended is closed first, its cleanup failing with it.
         """
         seconds = self._seconds
         if seconds is None:
             return await anext(outputs)
-        if self._left <= 0:  # spent between outputs that came without waiting
-            raise self._ran_out(seconds)
-        loop = asyncio.get_running_loop()
-        started = loop.time()
+        started = asyncio.get_running_loop().time()
         scope = asyncio.timeout(self._left)
         try:
             async with scope:
                 output = await anext(outputs)
+        except StopAsyncIteration:
+            if self._spent(started, scope):  # it ended once its time ran out, without waiting or once cancelled
+                raise self._ran_out(seconds) from None
+            raise
         except Exception as exc:
-            if scope.expired():  # once cancelled, the producer may have raised something else, or ended
+            if scope.expired():  # once cancelled, it raised something else
                 raise self._ran_out(seconds) from exc
             raise
-        finally:
-            self._left -= loop.time() - started
-        if scope.expired():  # the producer swallowed its cancellation and went on
-            raise self._ran_out(seconds)
+        if self._spent(started, scope):
+            # It swallowed its cancellation and went on, or ran past its time without waiting.
+            timeout = self._ran_out(seconds)
+            try:
+                await outputs.aclose()  # its cleanup is the Callback's, so it fails with it
+            except Exception as exc:
+                raise timeout from exc
+            raise timeout
         return output
+
+    def _spent(self, started: float, scope: asyncio.Timeout) -> bool:
+        """Take the time a wait since `started` took from the time left; return whether the time ran out."""
+        self._left -= asyncio.get_running_loop().time() - started
+        return scope.expired() or self._left <= 0
 
     def _ran_out(self, seconds: float) -> CallbackTimeout:
         self.ran_out = True
