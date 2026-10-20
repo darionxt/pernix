@@ -45,6 +45,7 @@ class _Entry:
     id: str
     cookies: dict[CookieKey, Cookie]
     local_storage: dict[str, dict[str, str]]
+    client_hints: dict[str, tuple[str, ...]]
     proxy: str | None
     profile: str | None
     account: str | None
@@ -70,6 +71,7 @@ class _Entry:
         return SessionState(
             cookies=list(self.cookies.values()),
             local_storage={origin: dict(items) for origin, items in self.local_storage.items()},
+            client_hints=dict(self.client_hints),
             proxy=self.proxy,
             profile=self.profile,
             account=self.account,
@@ -94,6 +96,11 @@ class _Entry:
                 self.local_storage[origin] = dict(items)
             else:
                 self.local_storage.pop(origin, None)
+        for origin, hints in delta.client_hints.items():
+            if hints:
+                self.client_hints[origin] = hints
+            else:
+                self.client_hints.pop(origin, None)
         if delta.proxy is not msgspec.UNSET:
             self.proxy = delta.proxy
 
@@ -458,6 +465,7 @@ class MemorySessionPool:
             id=session.id,
             cookies={cookie_key(cookie): cookie for cookie in session.cookies},
             local_storage={origin: dict(items) for origin, items in session.local_storage.items()},
+            client_hints=dict(session.client_hints),
             proxy=session.proxy,
             profile=session.profile,
             account=session.account,

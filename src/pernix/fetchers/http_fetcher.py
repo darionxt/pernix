@@ -25,7 +25,9 @@ from pernix.errors import (
 )
 from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.chain_cookies import ChainCookies
-from pernix.fetchers.chrome_headers import ChromeRequest, chrome_request
+from pernix.fetchers.chain_hints import ChainHints
+from pernix.fetchers.chrome_headers import ChromeRequest, HopHints, chrome_request
+from pernix.fetchers.client_hints import DEFAULT_HINTS, HintValues, sent_hints
 from pernix.fetchers.curl_session_pool import CurlSession, CurlSessionPool, Transfer
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings, check_profile
@@ -34,10 +36,10 @@ from pernix.fetchers.pinned_pair import client_headers
 from pernix.fetchers.redirects import Hop, redirect_target, redirected
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
-from pernix.request_kinds import request_kind
+from pernix.request_kinds import is_document, request_kind
 from pernix.response import Redirect, Response
 from pernix.settings import DEFAULT_LOCALE, CoreSettings, NetworkSettings, ResponseSettings, Section, locale_languages
-from pernix.urls import with_ascii_host
+from pernix.urls import url_host, url_origin, with_ascii_host
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Sequence
@@ -172,12 +174,25 @@ class HTTPFetcher:
     settings, the Request, or the Session, sends the Request's headers as they are,
     after its own.
 
+    The responses of a top-level navigation or form submission, its redirects
+    included, ask for client hints with `Accept-CH`, for their origin
+    (`pernix.fetchers.client_hints`). With the pinned Profile, the hints an origin
+    asked for go with the navigations to it, and with the requests its pages make to
+    it, as Chrome sends them, in its order; those a navigation sends stay on when it
+    is redirected, even to another origin, as Chrome's do. A navigation (a GET) whose
+    response's `Critical-CH` names a hint its `Accept-CH` asks for that it did not
+    send is sent again from the Request's URL, once for each origin, with the hints:
+    the response dropped is not a redirect, and is not in `Response.history`, but
+    the cookies it set are kept.
+
     A Request sent under a Session (`session=`) also sends the Session's cookies that
     match each hop, and the cookies set during the fetch, on redirects included, are
     kept in the Session as the headers of each hop arrive, even if a later hop fails;
-    the Request's own cookies are not. The Session's proxy and
-    Profile apply unless the Request names its own, an empty proxy for none, and each
-    Session has curl sessions of its own, so two Sessions never share a connection.
+    the Request's own cookies are not. So are the client hints its responses ask
+    for, which a fetch without a Session keeps within its own redirect chain only.
+    The Session's proxy and Profile apply unless the Request names its own, an empty
+    proxy for none, and each Session has curl sessions of its own, so two Sessions
+    never share a connection.
 
     Under a network guard (`pernix.fetchers.network_guard`), as in tests, only
     loopback hosts are reached: each hop is checked before it is sent, and others
@@ -224,6 +239,7 @@ class HTTPFetcher:
         """
         self._settings = settings or HTTPSettings()
         self._client_headers = client_headers(locale_languages(locale))
+        self._hint_values = HintValues()
         self._max_clients = max_clients
         self._default_encoding = default_encoding
         self._address_guard = (
@@ -380,17 +396,25 @@ class HTTPFetcher:
     ) -> _Fetched:
         """Send a Request and wait for the headers of its last response, following redirects one hop at a time.
 
-        The `Set-Cookie` headers of each hop apply to the cookies of the next ones, and
-        the body of each redirect is dropped.
+        The `Set-Cookie` headers of each hop apply to the cookies of the next ones, as
+        the `Accept-CH` of a top-level navigation's apply to its client hints, and the
+        body of each redirect is dropped. A navigation whose `Critical-CH` needs hints
+        it did not send starts again.
         """
         proxy = request_proxy(request, session)
         timeout = request.timeout or self._settings.timeout
         max_redirects = self._settings.max_redirects
         cookies = ChainCookies(request, session)
-        hop = Hop(request.method, _curl_url(request), _without_cookies(request.headers), request.body)
-        chrome = _ChromeHops(request, self._client_headers) if profile == DEFAULT_PROFILE else None
+        hints = ChainHints(session)
+        top_level = _top_level(request)
+        first = Hop(request.method, _curl_url(request), _without_cookies(request.headers), request.body)
+        hop = first
+        chrome = (
+            _ChromeHops(request, self._client_headers, hints, self._hint_values) if profile == DEFAULT_PROFILE else None
+        )
         history: list[Redirect] = []
         set_cookies: list[str] = []
+        restarted: set[str | None] = set()
         redirected_from: str | None = None
         while True:
             pinned = await self._check_hop(hop.url, proxy, resolve_timeout=timeout, redirected_from=redirected_from)
@@ -408,6 +432,18 @@ class HTTPFetcher:
             )
             if sent is None or sent.credentials:  # a response no cookie goes with sets none
                 set_cookies += _set_cookies(result)
+            missing = (
+                hints.receive(hop.url, _joined(result, "accept-ch"), _joined(result, "critical-ch"))
+                if top_level
+                else ()
+            )
+            if chrome is not None and url_origin(hop.url) not in restarted and chrome.restarts(hop.url, missing):
+                logger.debug("Sending %s again with the client hints the Critical-CH of %s needs", request.url, hop.url)
+                await _discard(result)
+                restarted.add(url_origin(hop.url))
+                chrome.restart()
+                history, redirected_from, hop = [], None, first
+                continue
             try:
                 target = redirect_target(result.url, result.status_code, _location(result))
             except FetchError:
@@ -550,9 +586,15 @@ class HTTPFetcher:
 
 
 class _ChromeHops:
-    """Makes the headers Chrome sends on each hop of a Request's redirect chain, with the pinned Profile."""
+    """Makes the headers Chrome sends on each hop of a Request's redirect chain, with the pinned Profile.
 
-    def __init__(self, request: Request, client: list[tuple[str, str]]) -> None:
+    A navigation, a form submission, or an iframe's sends the client hints of the
+    origin of its first hop, and adds those of each origin it is redirected to that
+    it did not send yet. A page's other requests send the page's hints when they go
+    to the page's origin first, and keep them.
+    """
+
+    def __init__(self, request: Request, client: list[tuple[str, str]], hints: ChainHints, values: HintValues) -> None:
         """Read the kind of a Request, and the page it comes from.
 
         Raises:
@@ -561,19 +603,69 @@ class _ChromeHops:
         self._kind: RequestKind = request_kind(request)
         self._referrer = request.headers.get("Referer") or None
         self._client = client
+        self._hints = hints
+        self._values = values
         self._chain: list[str] = []
+        self._first: tuple[str, ...] = ()
+        self._added: list[str] = []
+        self._restarted = False
+        self._first_sent: frozenset[str] = frozenset()
+        """The names of the headers the first hop sent, as Chrome compares the hints `Critical-CH` needs to."""
 
     def next(self, hop: Hop) -> ChromeRequest:
         """The headers of the next hop, the first included."""
         self._chain.append(hop.url)
-        return chrome_request(
+        sent = chrome_request(
             self._kind,
             chain=self._chain,
             method=hop.method,
             own=hop.headers.items(),
             referrer=self._referrer,
             client=self._client,
+            hints=self._placed(hop.url),
         )
+        if len(self._chain) == 1:
+            self._first_sent = frozenset(sent.order.split(","))
+        return sent
+
+    def restarts(self, url: str, missing: tuple[str, ...]) -> bool:
+        """Whether a navigation starts again for the hints a response's `Critical-CH` needs, as Chrome does.
+
+        Args:
+            url: The URL of the response.
+            missing: The hints its `Critical-CH` needs that its origin had not asked
+                for, from `ChainHints.receive()`.
+
+        Returns:
+            Whether the Request is a navigation, a GET, and its first hop did not
+            send a hint its origin now asks for.
+        """
+        if self._kind != "navigation" or not missing:
+            return False
+        return any(hint not in self._first_sent for hint in sent_hints(self._hints.asked(url)))
+
+    def restart(self) -> None:
+        """Start the chain again, with every client hint after `Accept`, as Chrome sends a navigation again."""
+        self._chain = []
+        self._added = []
+        self._restarted = True
+
+    def _placed(self, url: str) -> HopHints:
+        """The client hints of the hop to a URL, the last of the chain."""
+        wanted = self._wanted(url)
+        if len(self._chain) == 1:
+            self._first = wanted
+        elif is_document(self._kind):
+            carried = {*DEFAULT_HINTS, *self._first, *self._added}
+            self._added += [hint for hint in sent_hints(wanted) if hint not in carried]
+        return HopHints(self._first, tuple(self._added), self._restarted, self._values.values(url_host(url) or ""))
+
+    def _wanted(self, url: str) -> tuple[str, ...]:
+        """The hints asked for by the origin that a hop to a URL sends those of, as Chrome picks it."""
+        if self._kind in ("navigation", "form"):
+            return self._hints.asked(url)
+        page = (url_origin(self._referrer) if self._referrer else None) or url_origin(self._chain[0])
+        return self._hints.asked(url) if url_origin(url) == page else ()
 
 
 async def _chunks(result: curl_cffi.Response, request: Request, transfer: Transfer) -> AsyncIterator[bytes]:
@@ -630,6 +722,20 @@ def _resolve_entries(pinned: PinnedHost | None) -> list[str]:
         return []
     addresses = ",".join(f"[{address}]" if ":" in address else address for address in pinned.addresses)
     return [f"+{pinned.host}:{pinned.port}:{addresses}"]
+
+
+def _top_level(request: Request) -> bool:
+    """Whether a Request is a top-level navigation or a form submission, whose responses ask for client hints."""
+    try:
+        return request_kind(request) in ("navigation", "form")
+    except ValueError:
+        return False  # a destination pernix makes no request for, sent as it is by another Profile
+
+
+def _joined(response: curl_cffi.Response, name: str) -> str | None:
+    """The values of a response header, joined with commas, as Chrome reads a list; `None` without one."""
+    values = [value for value in response.headers.get_list(name) if value is not None]
+    return ", ".join(values) if values else None
 
 
 def _set_cookies(response: curl_cffi.Response) -> list[str]:

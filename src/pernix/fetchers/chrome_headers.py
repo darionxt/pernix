@@ -10,6 +10,15 @@ by Chrome's default policy, `strict-origin-when-cross-origin`, the `Origin`, and
 navigation typed in, or, for the other kinds, made by a page of its own origin that
 sends no `Referer`.
 
+The client hints an origin asked for (`pernix.fetchers.client_hints`) go where
+Chrome adds them: in a navigation, a form submission, or an iframe's, in Chrome's
+order in the place of `sec-ch-ua`, `sec-ch-ua-mobile`, and `sec-ch-ua-platform`,
+those a redirect adds after `Sec-Fetch-*`, and all of them after `Accept` once a
+navigation is sent again for `Critical-CH`; in the other kinds, after
+`sec-ch-ua-mobile`, where Chrome orders them by a hash of their names, which this
+does not follow. A `fetch()` that has gone to another origin than its page's sends
+`DEFAULT_HINTS` alone.
+
 To an origin that is not potentially trustworthy, such as plain `http://` to a host
 other than a loopback one, Chrome sends no client hints and no `Sec-Fetch-*`, and
 accepts only gzip and deflate. Over HTTP/1.1, curl puts `Host` and `Connection`
@@ -26,21 +35,22 @@ from __future__ import annotations
 
 import ipaddress
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING
 
 from ada_url import URL
 from publicsuffixlist import PublicSuffixList
 
-from pernix.urls import is_loopback_host, url_host
+from pernix.fetchers.client_hints import DEFAULT_HINTS, HINTS, sent_hints
+from pernix.urls import is_potentially_trustworthy, url_host, url_origin
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from pernix.request_kinds import RequestKind
 
-__all__ = ["ChromeRequest", "chrome_request", "site_relation"]
+__all__ = ["ChromeRequest", "HopHints", "chrome_request", "site_relation"]
 
 _ACCEPT_DOCUMENT = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,"
@@ -177,9 +187,7 @@ Its `Referer` names the page it comes from, and its `Sec-Fetch-Dest` its kind.
 """
 
 _SECURE_ONLY = (
-    "sec-ch-ua",
-    "sec-ch-ua-mobile",
-    "sec-ch-ua-platform",
+    *HINTS,
     "sec-fetch-site",
     "sec-fetch-mode",
     "sec-fetch-user",
@@ -187,6 +195,27 @@ _SECURE_ONLY = (
     "sec-fetch-storage-access",
 )
 """Headers Chrome sends to potentially trustworthy origins only: the client hints and the fetch metadata."""
+
+
+@dataclass(frozen=True, slots=True)
+class HopHints:
+    """The client hints of one hop, but `DEFAULT_HINTS`, and where Chrome puts them.
+
+    Attributes:
+        first: The hints the origin the request went to first asked for, as Chrome
+            adds those it sends: a navigation's, a form submission's, an iframe's
+            of its page's origin, or those of a page that makes a request to its
+            own origin.
+        added: The hints redirects added to a navigation, a form submission, or
+            an iframe's, in the order added.
+        restarted: Whether the navigation was sent again for `Critical-CH`.
+        values: The value of each hint.
+    """
+
+    first: tuple[str, ...] = ()
+    added: tuple[str, ...] = ()
+    restarted: bool = False
+    values: Mapping[str, str] = field(default_factory=dict[str, str])
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +247,7 @@ def chrome_request(
     own: Iterable[tuple[str, str]],
     referrer: str | None,
     client: Iterable[tuple[str, str]],
+    hints: HopHints | None = None,
 ) -> ChromeRequest:
     """Make the headers Chrome sends for one hop of a request.
 
@@ -231,6 +261,7 @@ def chrome_request(
             names it; `None` for none.
         client: The headers that name the client: `sec-ch-ua`, `sec-ch-ua-mobile`,
             `sec-ch-ua-platform`, `User-Agent`, and `Accept-Language`.
+        hints: The other client hints of the hop; none when `None`.
 
     Returns:
         The headers and how curl sends them.
@@ -263,6 +294,8 @@ def chrome_request(
     if site == "cross-site" and kind in ("iframe", "style", "script", "image"):
         values["sec-fetch-storage-access"] = "active"
     cors = kind == "fetch" and any(_origin(hop) != initiator for hop in chain)
+    hints = HopHints() if hints is None or cors else hints
+    values |= {name: value for name, value in hints.values.items() if name in (*hints.first, *hints.added)}
     origin = _sent_origin(kind, method, initiator, chain, cors=cors)
     if origin is not None:
         values["origin"] = origin
@@ -273,7 +306,8 @@ def chrome_request(
         for name in _SECURE_ONLY:
             values.pop(name, None)
         values["accept-encoding"] = "gzip, deflate"
-    return _arranged(shape, values, own, document=document, credentials=not cors)
+    order = _hinted(shape.order, hints, document=document)
+    return _arranged(order, shape.weight, values, own, document=document, credentials=not cors)
 
 
 def site_relation(initiator: str | None, url: str) -> str:
@@ -297,11 +331,36 @@ def site_relation(initiator: str | None, url: str) -> str:
     return "cross-site"
 
 
+def _hinted(order: Sequence[str], hints: HopHints, *, document: bool) -> list[str]:
+    """The headers of a kind with the client hints of a hop, where Chrome puts them."""
+    names = list(order)
+    if not document:
+        at = names.index("sec-ch-ua-mobile") + 1
+        names[at:at] = [hint for hint in sent_hints(hints.first) if hint not in DEFAULT_HINTS]
+        return names
+    block = list(sent_hints(hints.first))
+    start = names.index(DEFAULT_HINTS[0])
+    names[start : start + len(DEFAULT_HINTS)] = [] if hints.restarted else block
+    if hints.restarted:
+        at = names.index("Accept") + 1
+        names[at:at] = block
+    if hints.added:
+        at = 1 + max(index for index, name in enumerate(names) if name.lower().startswith("sec-fetch-"))
+        names[at:at] = hints.added
+    return names
+
+
 def _arranged(
-    shape: _Shape, values: dict[str, str], own: Iterable[tuple[str, str]], *, document: bool, credentials: bool
+    order: Sequence[str],
+    weight: int,
+    values: dict[str, str],
+    own: Iterable[tuple[str, str]],
+    *,
+    document: bool,
+    credentials: bool,
 ) -> ChromeRequest:
     """Put the kind's headers and the Request's own in Chrome's order."""
-    names = {name.lower() for name in shape.order}
+    names = {name.lower() for name in order}
     replaced: dict[str, list[tuple[str, str]]] = {}
     added: list[tuple[str, str]] = []
     for name, value in own:
@@ -313,21 +372,21 @@ def _arranged(
         else:
             added.append((name, value))
     arranged: list[tuple[str, str]] = []
-    order: list[str] = []
-    for name in shape.order:
+    sent: list[str] = []
+    for name in order:
         key = name.lower()
         if not document and key == _PAGE_BLOCK:
             arranged += added
-            order += [added_name.lower() for added_name, _ in added]
-        order.append(key)
+            sent += [added_name.lower() for added_name, _ in added]
+        sent.append(key)
         if key in replaced:
             arranged += replaced[key]
         elif key in values:
             arranged.append((name, values[key]))
     if document:
         arranged += added
-        order += [added_name.lower() for added_name, _ in added]
-    return ChromeRequest(arranged, ",".join(dict.fromkeys(order)), shape.weight, credentials)
+        sent += [added_name.lower() for added_name, _ in added]
+    return ChromeRequest(arranged, ",".join(dict.fromkeys(sent)), weight, credentials)
 
 
 def _chain_site(initiator: str | None, chain: Sequence[str]) -> str:
@@ -398,11 +457,7 @@ def _sent_referrer(referrer: str, url: str) -> str | None:
 
 
 def _origin(url: str) -> str | None:
-    try:
-        origin = URL(url).origin
-    except ValueError:
-        return None
-    return None if origin == "null" else origin
+    return url_origin(url)
 
 
 def _site(url_or_origin: str) -> tuple[str, str]:
@@ -421,10 +476,7 @@ def _site(url_or_origin: str) -> tuple[str, str]:
 
 def _trustworthy(url: str) -> bool:
     """Whether a URL's origin is potentially trustworthy: HTTPS, or a loopback host."""
-    if url[:8].lower() == "https://":
-        return True
-    host = url_host(url)
-    return host is not None and is_loopback_host(host)
+    return is_potentially_trustworthy(url)
 
 
 @cache

@@ -56,7 +56,7 @@ _Avoid_: dedup key, hash, and "fingerprint" for client characteristics (that is 
 ### Identity
 
 **Session**:
-The identity a Request is sent under: cookies and browser storage state, a bound proxy, a Profile, and optionally an Account. HTTP and the browser share the same Session.
+The identity a Request is sent under: cookies and browser storage state, the client hints each origin asked for, a bound proxy, a Profile, and optionally an Account. HTTP and the browser share the same Session.
 _Avoid_: identity, client session
 
 **Session Pool**:

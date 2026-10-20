@@ -259,3 +259,38 @@ async def test_the_pages_a_page_opened_are_closed_with_it(server: LoopbackServer
         pages = list(fetcher._contexts._waiting[0].context.pages)  # pyright: ignore[reportPrivateUsage]
 
     assert pages == []
+
+
+def _arch(request: ReceivedRequest) -> list[str]:
+    return [value for name, value in request.headers if name.lower() == "sec-ch-ua-arch"]
+
+
+async def test_the_hints_a_page_is_asked_for_are_kept_in_the_session(server: LoopbackServer) -> None:
+    server.route("/asking", "<p>asking</p>", headers=[*HTML, ("Accept-CH", "Sec-CH-UA-Arch")])
+    server.route("/later", "<p>later</p>", headers=HTML)
+    session = Session("alice")
+
+    async with BrowserFetcher() as fetcher:
+        await fetcher.fetch(_render(server.url("/asking")), session=session)
+        await fetcher.fetch(_render(server.url("/later")), session=session)
+
+    assert session.client_hints == {server.base_url: ("sec-ch-ua-arch",)}
+    asking, later = (request for request in server.received if request.path in ("/asking", "/later"))
+    assert (_arch(asking), _arch(later)) == ([], ['"x86"'])
+
+
+@pytest.mark.parametrize("kept", [8, 0], ids=["kept", "new"])
+async def test_a_context_is_taught_the_sessions_hints_without_asking_the_server(
+    server: LoopbackServer, kept: int
+) -> None:
+    server.route("/page", "<p>page</p>", headers=HTML)
+    session = Session("alice", client_hints={server.base_url: ("sec-ch-ua-arch",)})
+
+    async with BrowserFetcher(BrowserSettings(max_idle_contexts=kept)) as fetcher:
+        await fetcher.fetch(_render(server.url("/page")), session=session)
+        session.client_hints.clear()  # as an HTTP fetch of the Session forgot them meanwhile
+        await fetcher.fetch(_render(server.url("/page")), session=session)
+
+    assert [request.path for request in server.received] == ["/page", "/page"]
+    first, second = server.received
+    assert (_arch(first), _arch(second)) == (['"x86"'], [])

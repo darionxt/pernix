@@ -99,6 +99,8 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
         removed: The cookies removed.
         local_storage: The origins whose localStorage changed, each with all of it;
             an empty one for an origin cleared.
+        client_hints: The origins whose client hints changed, each with all of them;
+            none for an origin that asks for none any more.
         proxy: The proxy the Session was bound to instead of its own, or `None`
             when it was unbound; unset when it kept its proxy.
     """
@@ -106,6 +108,7 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
     cookies: list[Cookie] = msgspec.field(default_factory=list[Cookie])
     removed: list[CookieRemoval] = msgspec.field(default_factory=list[CookieRemoval])
     local_storage: dict[str, dict[str, str]] = msgspec.field(default_factory=dict[str, dict[str, str]])
+    client_hints: dict[str, tuple[str, ...]] = msgspec.field(default_factory=dict[str, tuple[str, ...]])
     proxy: str | msgspec.UnsetType | None = msgspec.UNSET
 
     @classmethod
@@ -138,6 +141,10 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
             origin: items for origin, items in after.local_storage.items() if before.local_storage.get(origin) != items
         }
         storage.update({origin: {} for origin in before.local_storage if origin not in after.local_storage})
+        hints = {
+            origin: hints for origin, hints in after.client_hints.items() if before.client_hints.get(origin) != hints
+        }
+        hints.update({origin: () for origin in before.client_hints if origin not in after.client_hints})
         return cls(
             cookies=[cookie for key, cookie in new.items() if old.get(key) != cookie],
             removed=[
@@ -148,13 +155,17 @@ class StateDelta(msgspec.Struct, frozen=True, kw_only=True):
                 if key not in new
             ],
             local_storage=storage,
+            client_hints=hints,
             proxy=msgspec.UNSET if after.proxy == before.proxy else after.proxy,
         )
 
     @property
     def empty(self) -> bool:
         """Whether the delta changes nothing."""
-        return not (self.cookies or self.removed or self.local_storage) and self.proxy is msgspec.UNSET
+        return (
+            not (self.cookies or self.removed or self.local_storage or self.client_hints)
+            and self.proxy is msgspec.UNSET
+        )
 
 
 class SessionPool(Protocol):

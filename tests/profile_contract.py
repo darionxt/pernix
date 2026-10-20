@@ -45,7 +45,7 @@ from wire_capture import GREASE
 from wire_server import HOST
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 
     from pernix.browser import Action
     from wire_capture import ClientHello, Extension, Frame
@@ -141,6 +141,7 @@ async def run_both(
     impersonate: str | None = None,
     locale: Sequence[str] = DEFAULT_LOCALE,
     launch_options: Mapping[str, Any] | None = None,
+    new_session: Callable[[], Session] | None = None,
 ) -> tuple[Capture, Capture]:
     """Make the requests of a case with the HTTP Fetcher, then with the browser Fetcher, under one Session.
 
@@ -151,12 +152,17 @@ async def run_both(
         locale: The languages both present.
         launch_options: Options the browser is launched with, over those that make
             it trust the server.
+        new_session: Makes a Session for each Fetcher instead, so that what the
+            HTTP Fetcher keeps in its own, such as client hints, does not reach the
+            browser's.
 
     Returns:
         What the HTTP Fetcher put on the wire, and what the browser did.
     """
-    session = Session()
+    session = Session() if new_session is None else new_session()
     http = await capture_http(server, steps, session, impersonate=impersonate, locale=locale)
+    if new_session is not None:
+        session = new_session()
     return http, await capture_browser(server, steps, session, locale=locale, launch_options=launch_options)
 
 
@@ -223,7 +229,9 @@ async def capture_browser(
     return await _captured(server, since)
 
 
-def differences(http: Capture, browser: Capture, *, leaving_out: Collection[str] = ()) -> list[str]:
+def differences(
+    http: Capture, browser: Capture, *, leaving_out: Collection[str] = (), values_left_out: Collection[str] = ()
+) -> list[str]:
     """Compare what the two Fetchers put on the wire.
 
     Args:
@@ -231,12 +239,14 @@ def differences(http: Capture, browser: Capture, *, leaving_out: Collection[str]
         browser: What the browser Fetcher did.
         leaving_out: The observations not compared, by the end of their names,
             such as `HPACK`, for a known difference.
+        values_left_out: The headers whose values are not compared, by name, such
+            as those that tell of a measurement; where they go still is.
 
     Returns:
         Each difference, naming what differs and showing both sides; none when
         both presented one client.
     """
-    sent, shown = describe(http), describe(browser)
+    sent, shown = describe(http, values_left_out=values_left_out), describe(browser, values_left_out=values_left_out)
     found: list[str] = []
     for name in dict.fromkeys([*sent, *shown]):
         if any(name.endswith(f"> {left_out}") for left_out in leaving_out):
@@ -256,26 +266,30 @@ def differences(http: Capture, browser: Capture, *, leaving_out: Collection[str]
     return found
 
 
-def assert_one_client(http: Capture, browser: Capture, *, leaving_out: Collection[str] = ()) -> None:
+def assert_one_client(
+    http: Capture, browser: Capture, *, leaving_out: Collection[str] = (), values_left_out: Collection[str] = ()
+) -> None:
     """Fail unless the two Fetchers presented one client.
 
     Args:
         http: What the HTTP Fetcher did.
         browser: What the browser Fetcher did.
         leaving_out: The observations not compared, by the end of their names.
+        values_left_out: The headers whose values are not compared, by name.
 
     Raises:
         AssertionError: They differ; the message names each difference.
     """
-    found = differences(http, browser, leaving_out=leaving_out)
+    found = differences(http, browser, leaving_out=leaving_out, values_left_out=values_left_out)
     assert not found, "the HTTP Fetcher and the browser differ on the wire:\n" + "\n".join(found)
 
 
-def describe(capture: Capture) -> dict[str, Observed]:
+def describe(capture: Capture, *, values_left_out: Collection[str] = ()) -> dict[str, Observed]:
     """What a capture shows, by name, without what no client can make match.
 
     Args:
         capture: What one Fetcher put on the wire.
+        values_left_out: The headers whose values are left out, by name.
 
     Returns:
         The observations, such as `connection 1 > ClientHello > cipher suites`, in
@@ -303,7 +317,10 @@ def describe(capture: Capture) -> dict[str, Observed]:
             observed[f"{prefix} > HPACK"] = tuple(
                 str(representation) for representation in request.block.representations
             )
-        observed[f"{prefix} > headers"] = tuple(f"{name}: {value}" for name, value in request.headers)
+        left_out = {name.lower() for name in values_left_out}
+        observed[f"{prefix} > headers"] = tuple(
+            f"{name}: {'(left out)' if name.lower() in left_out else value}" for name, value in request.headers
+        )
     return observed
 
 

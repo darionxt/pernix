@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from pernix.fetchers.chrome_headers import ChromeRequest, chrome_request, site_relation
+from pernix.fetchers.chrome_headers import ChromeRequest, HopHints, chrome_request, site_relation
+from pernix.fetchers.client_hints import HintValues
 from pernix.fetchers.pinned_pair import client_headers
 
 if TYPE_CHECKING:
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 
 CLIENT = client_headers(["en-US", "en"], platform="Linux")
 PAGE = "https://shop.example/books/1?tab=2#reviews"
+VALUES = HintValues("Linux", salt=1).values("shop.example")
 
 
 def _made(
@@ -23,9 +25,12 @@ def _made(
     method: str = "GET",
     referrer: str | None = PAGE,
     own: list[tuple[str, str]] | None = None,
+    hints: HopHints | None = None,
 ) -> ChromeRequest:
     chain = [url] if isinstance(url, str) else url
-    return chrome_request(kind, chain=chain, method=method, own=own or [], referrer=referrer, client=CLIENT)
+    return chrome_request(
+        kind, chain=chain, method=method, own=own or [], referrer=referrer, client=CLIENT, hints=hints
+    )
 
 
 def _headers(made: ChromeRequest) -> dict[str, str]:
@@ -266,3 +271,99 @@ def test_a_form_from_an_https_page_to_another_scheme_sends_a_null_origin() -> No
     made = _made("form", "http://shop.example/submit", method="POST")
 
     assert _headers(made)["origin"] == "null"
+
+
+def _asked(first: tuple[str, ...], *, added: tuple[str, ...] = (), restarted: bool = False) -> HopHints:
+    return HopHints(first, added, restarted, VALUES)
+
+
+def _hints(made: ChromeRequest) -> list[str]:
+    return [name for name, _ in made.headers if name.startswith("sec-ch-") or name in ("device-memory", "dpr")]
+
+
+def test_a_navigation_sends_the_hints_its_origin_asked_for_in_place_of_the_default_ones() -> None:
+    asked = ("device-memory", "sec-ch-ua-arch", "sec-ch-ua-model", "width", "save-data")
+    made = _made("navigation", "https://shop.example/", hints=_asked(asked))
+
+    assert [name for name, _ in made.headers][:8] == [
+        "Connection",
+        "device-memory",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-model",
+        "Upgrade-Insecure-Requests",
+    ]
+    assert (_headers(made)["sec-ch-ua-arch"], _headers(made)["sec-ch-ua-model"]) == ('"x86"', '""')
+    assert "sec-ch-ua-arch" in made.order.split(",")
+
+
+def test_a_form_submission_sends_its_hints_after_cache_control() -> None:
+    own = [("Content-Type", "application/x-www-form-urlencoded")]
+    made = _made("form", "https://shop.example/submit", method="POST", own=own, hints=_asked(("sec-ch-ua-arch",)))
+
+    assert [name for name, _ in made.headers][:6] == [
+        "Connection",
+        "Cache-Control",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-platform",
+    ]
+
+
+def test_a_navigation_sent_again_for_critical_ch_puts_every_hint_after_accept() -> None:
+    made = _made("navigation", "https://shop.example/", hints=_asked(("sec-ch-ua-arch",), restarted=True))
+
+    assert [name for name, _ in made.headers][1:9] == [
+        "Upgrade-Insecure-Requests",
+        "User-Agent",
+        "Accept",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-platform",
+        "Sec-Fetch-Site",
+    ]
+
+
+def test_the_hints_a_redirect_adds_go_after_the_fetch_metadata() -> None:
+    chain = ["https://shop.example/a", "https://shop.example/b"]
+    made = _made("navigation", chain, hints=_asked(("sec-ch-ua-arch",), added=("sec-ch-ua-model",)))
+
+    names = [name for name, _ in made.headers]
+    assert names[names.index("Sec-Fetch-Dest") + 1 : names.index("Sec-Fetch-Dest") + 3] == [
+        "sec-ch-ua-model",
+        "Referer",
+    ]
+    assert names.index("sec-ch-ua-arch") < names.index("Upgrade-Insecure-Requests")
+
+
+def test_a_pages_request_sends_its_hints_after_the_default_ones() -> None:
+    made = _made("script", "https://shop.example/app.js", hints=_asked(("sec-ch-ua-arch", "sec-ch-ua-model")))
+
+    assert _hints(made) == ["sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-arch", "sec-ch-ua-model"]
+
+
+def test_a_fetch_that_left_its_pages_origin_sends_the_default_hints_alone() -> None:
+    chain = ["https://shop.example/api", "https://cdn.example/api"]
+    made = _made("fetch", chain, hints=_asked(("sec-ch-ua-arch",)))
+
+    assert _hints(made) == ["sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile"]
+
+
+def test_an_insecure_origin_gets_no_hint() -> None:
+    made = _made("navigation", "http://shop.example/", referrer=None, hints=_asked(("sec-ch-ua-arch", "dpr")))
+
+    assert _hints(made) == []
+    assert not [name for name, _ in made.headers if name in ("dpr", "device-memory")]
+
+
+def test_a_hint_of_the_requests_own_replaces_the_one_sent_in_place() -> None:
+    made = _made(
+        "navigation", "https://shop.example/", own=[("Sec-CH-UA-Arch", '"arm"')], hints=_asked(("sec-ch-ua-arch",))
+    )
+
+    assert [name for name, _ in made.headers][2:5] == ["sec-ch-ua-mobile", "Sec-CH-UA-Arch", "sec-ch-ua-platform"]
+    assert _headers(made)["sec-ch-ua-arch"] == '"arm"'

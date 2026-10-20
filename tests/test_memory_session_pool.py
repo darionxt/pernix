@@ -291,6 +291,18 @@ async def test_local_storage_is_replaced_per_origin() -> None:
     assert (await pool.load_state(lease)).local_storage == {"https://a.example": {"k": "2"}}
 
 
+async def test_client_hints_are_replaced_per_origin_the_later_save_winning() -> None:
+    pool, _ = _pool()
+    pool.add(Session("s", client_hints={"https://a.example": ("dpr",), "https://b.example": ("dpr",)}))
+    lease = await pool.acquire(session="s")
+    assert lease is not None
+
+    await pool.save_state(lease, StateDelta(client_hints={"https://a.example": ("sec-ch-ua-arch",)}))
+    await pool.save_state(lease, StateDelta(client_hints={"https://a.example": ("rtt",), "https://b.example": ()}))
+
+    assert (await pool.load_state(lease)).client_hints == {"https://a.example": ("rtt",)}
+
+
 async def test_the_state_loaded_is_a_copy() -> None:
     pool, _ = _pool()
     pool.add(Session("s", local_storage={"https://a.example": {"k": "1"}}))

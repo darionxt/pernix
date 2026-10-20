@@ -13,9 +13,11 @@ __all__ = [
     "document_base",
     "is_absolute",
     "is_loopback_host",
+    "is_potentially_trustworthy",
     "join_url",
     "normalize_url",
     "url_host",
+    "url_origin",
     "with_ascii_host",
 ]
 
@@ -132,6 +134,40 @@ def is_loopback_host(host: str) -> bool:
         return ipaddress.ip_address(name).is_loopback
     except ValueError:
         return False
+
+
+def is_potentially_trustworthy(url: str) -> bool:
+    """Whether a URL's origin is potentially trustworthy, as browsers tell: HTTPS, or a loopback host.
+
+    Browsers send client hints and fetch metadata to such origins only.
+
+    Args:
+        url: The URL.
+
+    Returns:
+        Whether it is an `https://` URL, or one whose host is a loopback one.
+    """
+    if url[:8].lower() == "https://":
+        return True
+    host = url_host(url)
+    return host is not None and is_loopback_host(host)
+
+
+def url_origin(url: str) -> str | None:
+    """Return the origin of a URL, as WHATWG URLs serialize it, such as `https://example.com:8443`.
+
+    Args:
+        url: The URL.
+
+    Returns:
+        The origin; `None` for an opaque one, such as that of a `data:` URL, or for
+        a URL WHATWG URLs reject.
+    """
+    try:
+        origin = URL(url).origin
+    except ValueError:
+        return None
+    return None if origin == "null" else origin
 
 
 def url_host(url: str) -> str | None:

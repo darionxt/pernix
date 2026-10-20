@@ -15,6 +15,7 @@ def _session() -> Session:
         "s1",
         cookies=[Cookie(name="token", value="s3cr3t", domain="example.com", created=NOW, modified=NOW)],
         local_storage={"https://example.com": {"key": "st0red"}},
+        client_hints={"https://example.com": ["sec-ch-ua-arch", "sec-ch-ua-model"], "https://empty.example": []},
         proxy="http://user:pa55@proxy.example:8080",
         profile="chrome150",
         account="alice",
@@ -41,6 +42,7 @@ def test_the_state_round_trips_through_msgspec() -> None:
         {"https://example.com": {"key": "st0red"}},
     )
     assert (restored.proxy, restored.profile, restored.account) == (session.proxy, "chrome150", "alice")
+    assert restored.client_hints == {"https://example.com": ("sec-ch-ua-arch", "sec-ch-ua-model")}
 
 
 def test_the_state_is_a_copy() -> None:
@@ -49,9 +51,11 @@ def test_the_state_is_a_copy() -> None:
 
     session.cookies.receive("https://example.com/", ["other=1"], now=NOW)
     session.local_storage["https://example.com"]["key"] = "changed"
+    session.client_hints["https://other.example"] = ("dpr",)
 
     assert [cookie.name for cookie in state.cookies] == ["token"]
     assert state.local_storage == {"https://example.com": {"key": "st0red"}}
+    assert list(state.client_hints) == ["https://example.com"]
 
 
 @pytest.mark.parametrize("described", [repr, str])
@@ -63,8 +67,8 @@ def test_cookies_storage_and_proxy_credentials_never_appear_in_a_repr(described:
         assert "st0red" not in text
         assert "pa55" not in text
     assert repr(session) == (
-        "Session('s1', cookies=1, local_storage=1 origins, proxy='http://***@proxy.example:8080', "
-        "profile='chrome150', account='alice')"
+        "Session('s1', cookies=1, local_storage=1 origins, client_hints=1 origins, "
+        "proxy='http://***@proxy.example:8080', profile='chrome150', account='alice')"
     )
 
 

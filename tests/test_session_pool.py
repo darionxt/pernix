@@ -38,6 +38,19 @@ def test_a_delta_holds_the_origins_whose_storage_changed() -> None:
     }
 
 
+def test_a_delta_holds_the_origins_whose_client_hints_changed() -> None:
+    before = SessionState(client_hints={"https://a.example": ("dpr",), "https://b.example": ("dpr",)})
+    after = SessionState(client_hints={"https://a.example": ("sec-ch-ua-arch",), "https://b.example": ("dpr",)})
+
+    delta = StateDelta.between(before, after, now=NOW)
+    gone = StateDelta.between(after, SessionState(), now=NOW)
+
+    assert delta.client_hints == {"https://a.example": ("sec-ch-ua-arch",)}
+    assert gone.client_hints == {"https://a.example": (), "https://b.example": ()}
+    assert not gone.empty
+    assert msgspec.json.decode(msgspec.json.encode(delta), type=StateDelta) == delta
+
+
 def test_an_unchanged_state_gives_an_empty_delta() -> None:
     state = SessionState(cookies=[_cookie("a", "1")], local_storage={"https://a.example": {"k": "1"}})
 

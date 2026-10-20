@@ -29,6 +29,7 @@ from pernix.fetchers.address_guard import AddressGuard
 from pernix.fetchers.address_guard_proxy import check_launch_options
 from pernix.fetchers.browser_cookies import request_cookie
 from pernix.fetchers.browser_generations import Generations, names_closed_target
+from pernix.fetchers.browser_hints import accepted_hints
 from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.kept_pages import KeptPage, page_keeping, sharing_a_kept_slot
@@ -139,7 +140,12 @@ class BrowserFetcher:
     the browser does not tell, such as an unspecified SameSite or when a cookie was
     first set, are kept from the Session's cookie jar; a cookie the page made without
     SameSite is held as Lax, as the browser reports it. The localStorage of frames
-    from other sites, which the browser partitions, is not kept. At most
+    from other sites, which the browser partitions, is not kept. The client hints
+    the responses to the navigations of the page's main frame ask for with
+    `Accept-CH` are kept in the Session too, and before each fetch the context is
+    taught those of each of the Session's origins that it does not keep, with a
+    navigation a route answers in the browser, for which Chrome only connects to the
+    origin (`pernix.fetchers.browser_hints`). At most
     `browser.max_idle_contexts` contexts are kept idle between fetches, and one is
     closed once idle for `browser.context_idle` seconds; a Retired Session is
     never leased again, so its context goes that way too.
@@ -567,7 +573,8 @@ class BrowserFetcher:
         if kept is None or session is None:
             return  # its context is closed, with the pages
         try:
-            await kept.merge(page, session, now=time.time(), close_pages=not keep_open)
+            accepted = await accepted_hints(watch.navigations)
+            await kept.merge(page, session, now=time.time(), close_pages=not keep_open, accepted=accepted)
         except Exception:
             kept.broken = True
             logger.warning(
@@ -832,6 +839,8 @@ class _PageLoad:
         self.shown: PageResponse | None = None
         self.failed: PageRequest | None = None
         self.refused: str | None = None
+        self.navigations: list[PageResponse] = []
+        """The responses to the navigations of the main frame, its redirects included, in order."""
         self._arrived: PageResponse | None = None
         """The navigation response the main frame has not committed yet."""
         self._proxy = proxy
@@ -860,6 +869,7 @@ class _PageLoad:
 
     def _on_response(self, response: PageResponse) -> None:
         if response.request.is_navigation_request() and response.frame == self.page.main_frame:
+            self.navigations.append(response)
             self.document = response
             self._arrived = None if response.status in _NO_CONTENT else response  # those never commit
 
