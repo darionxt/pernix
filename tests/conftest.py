@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import sys
 import textwrap
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -13,26 +15,119 @@ import netguard
 from pernix.errors import ComponentError
 from pernix.fetchers import BrowserSettings
 from pernix.fetchers.launched_browser import launch_browser
+from pernix.logs.redaction import MASK
+from pernix.proxies.proxy_url import proxy_address, proxy_credentials
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Generator, Iterator, Mapping
     from pathlib import Path
 
     from pernix.testing import LoopbackServer
 
 pytest_plugins = ["pytester"]
 
+_NETWORK_CHECK = "network_check"
+"""The marker of the checks in tests/network_checks, which only a real network can make."""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckProxy:
+    """The proxy `--network-checks-proxy` names, which a check shows without its credentials.
+
+    Attributes:
+        url: The proxy's URL, credentials included, to go through.
+    """
+
+    url: str = field(repr=False)
+
+    def __str__(self) -> str:
+        return proxy_address(self.url)
+
+    def __repr__(self) -> str:
+        return f"CheckProxy({proxy_address(self.url)!r})"
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add `--network-checks`, which runs the checks only a real, clean network can make, and the proxy they use."""
+    parser.addoption(
+        "--network-checks",
+        action="store_true",
+        help="run the checks of tests/network_checks, which reach real hosts; meant for a clean network",
+    )
+    parser.addoption(
+        "--network-checks-proxy",
+        metavar="URL",
+        default=None,
+        help="the proxy the network checks check the egress through; that check is skipped without it",
+    )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the marker of the network checks."""
+    config.addinivalue_line(
+        "markers", f"{_NETWORK_CHECK}: a check that reaches real hosts, run only with --network-checks"
+    )
+
+
+@pytest.fixture
+def check_proxy(pytestconfig: pytest.Config) -> CheckProxy | None:
+    """The proxy `--network-checks-proxy` names for the network checks, if any."""
+    url = pytestconfig.getoption("--network-checks-proxy")
+    return CheckProxy(url) if url else None
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip the network checks unless asked for; those asked for may reach any host."""
+    run = bool(config.getoption("--network-checks"))
+    skip = pytest.mark.skip(reason="a network check, which reaches real hosts; run it with --network-checks")
+    for item in items:
+        if item.get_closest_marker(_NETWORK_CHECK) is not None:
+            item.add_marker(pytest.mark.pernix_network if run else skip)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Show the proxy of the network checks without its credentials in what they report, their tracebacks included."""
+    report = yield
+    url = item.config.getoption("--network-checks-proxy")
+    if url and call.excinfo is not None and item.get_closest_marker(_NETWORK_CHECK) is not None:
+        if report.longrepr is not None and not isinstance(report.longrepr, tuple):
+            report.longrepr = _without_credentials(str(report.longrepr), url)
+        report.sections = [(title, _without_credentials(text, url)) for title, text in report.sections]
+    return report
+
+
+def _without_credentials(text: str, url: str) -> str:
+    """A text with a proxy's URL in it shown without its credentials, and its credentials masked wherever else.
+
+    A credential is masked as written, and as the `repr` of a string, or JSON,
+    escapes it, as a traceback shows the values of its frames.
+    """
+    text = text.replace(url, proxy_address(url))
+    forms = {
+        form
+        for credential in proxy_credentials(url)
+        for form in (credential, repr(credential)[1:-1], json.dumps(credential)[1:-1])
+    }
+    for form in sorted(forms, key=len, reverse=True):  # the longest first, so that none is left in part
+        text = text.replace(form, MASK)
+    return text
+
+
 _LAUNCH_TIMEOUT = 60
 """Seconds the browser may take to start for the tests, before they fail with its log."""
 
 
 @pytest.fixture(autouse=True)
-def _block_external_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests must never reach the external network.
+def _block_external_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must never reach the external network, but the network checks, run only when asked for.
 
     This covers Python sockets only; native transports are guarded at the Fetcher level.
     """
-    netguard.install(monkeypatch)
+    if request.node.get_closest_marker(_NETWORK_CHECK) is None:
+        netguard.install(monkeypatch)
 
 
 @pytest.fixture(autouse=True)

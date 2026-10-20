@@ -156,6 +156,8 @@ class Shop(Spider):
 
 A Run warns about a Profile or a browser other than the Pinned Pair, and `pernix check` tells whether they are. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).
 
+For sites that look harder at the client, `browser.preset = "stealth"` launches the system's own Google Chrome instead, with a window, its pages without a viewport of their own, so that they get the window's and the screen's real sizes. It needs Google Chrome installed (`patchright install chrome` installs it), and a display: on a server, run under a virtual one, such as with `xvfb-run`; `browser.max_pages` windows open at once. The HTTP Fetcher keeps presenting the bundled build, whose TLS curl-cffi has, so the Sessions used by both present two clients, which a Run tells once; render what the site looks at.
+
 ## Sessions
 
 ```python
@@ -221,7 +223,7 @@ class Shop(Spider):
 
 Once a source is set, Requests go through proxies: those of `proxies.urls`, of `proxies.file`, a text file of one per line, of `proxies.api`, a URL answering with one per line, and of `proxies.provider`, a `ProxyProvider` of your own, such as one reading a database, all used together. The file, the API, and the provider are read again every `proxies.refresh` seconds, if set. A proxy is a URL with its port, `http` when the scheme is left out, or `host:port:user:password`, and all of it tells proxies apart, credentials included, so that sticky sessions on one gateway stay apart. `proxies.urls` and providers also take `Proxy` records, tables in settings, whose `tags` binding policies select them by, and whose `expires` tells when they stop working: an expired proxy is used no more, and its Sessions are bound to others.
 
-Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down, unless `proxies.max_sessions` limits how many share one: with 1, no two do, and the Sessions that find none wait. `proxies.rebind = "every_lease"` binds a Session to another proxy at each Lease, so its Leases go through the proxies in turn. For sites that tie an Account to one address, `proxies.rebind = "retired"` has a Session wait for its proxy while it cools down, cooling down with it, and bind it to another only once it is Retired or no longer listed, and `"never"` Retires the Session with it, while the Run goes on with the others. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats.
+Without a Session Pool, each attempt goes through the next proxy in turn, so a retry goes through another. A Session is bound to one proxy, which its HTTP and rendered Requests all go through while it is available; Sessions bound while enough proxies are available get one each, but bindings are not exclusive, so Sessions share proxies once there are more of them, or once some cool down, unless `proxies.max_sessions` limits how many share one: with 1, no two do, and the Sessions that find none wait. `proxies.rebind = "every_lease"` binds a Session to another proxy at each Lease, so its Leases go through the proxies in turn. For sites that tie an Account to one address, `proxies.rebind = "retired"` has a Session wait for its proxy while it cools down, cooling down with it, and bind it to another only once it is Retired or no longer listed, and `"never"` Retires the Session with it, while the Run goes on with the others. `Request(proxy=...)` goes through its own instead, and `proxy=""` through none. A proxy that fails, with a `ProxyError`, cools down for `proxies.cooldown`, doubled with each failure in a row, and is Retired after `proxies.max_failures` in a row; its Request is retried through another, and its Sessions are bound to another. While every proxy cools down, Requests wait; once none ever can be used, the Run drains. Proxy credentials never appear in the logs or the stats. With a Proxy Pool, the browser keeps WebRTC off UDP, which no proxy carries, so that a page cannot learn the machine's own address from a STUN server; a Run whose Requests name their own proxies, without a pool, sets it itself, with `browser.launch_options = {args = ["--webrtc-ip-handling-policy=disable_non_proxied_udp"]}`.
 
 How Sessions are bound is up to a binding policy, which `proxies.binding` replaces. Its `bind(binding)` is told of the Session, its Account, its proxy, why it is being bound, and the candidates, each with its health, tags, and Sessions, and returns the proxy to bind, or `None` to wait; the pool binds it only while it has room, and asks again if another Session took the last first. Returning `binding.current` keeps the Session on its proxy whatever becomes of it: while the proxy cools down, the Session waits for it, and once it is Retired or no longer listed, the Session is Retired with it.
 
@@ -440,7 +442,8 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `http.max_body_size` | `104857600` | Bytes a body may have at most (100 MiB); `0` for no limit |
 | `http.pool_size` / `http.pool_idle` | `8` / `300.0` | curl sessions kept, one per Profile, and seconds one is kept unused |
 | `http.inherit_referer` | `false` | Whether a Request constructed in a Callback without a `Referer` takes the page its Response belongs to |
-| `browser.headless` | `true` | Runs the browser without a window, in Chrome's new headless mode |
+| `browser.preset` | `"bundled"` | `bundled`, Chrome for Testing without a window; `stealth`, the system's own Chrome with a window, its pages without a viewport of their own |
+| `browser.headless` | unset | Runs the browser without a window, in Chrome's new headless mode; unset, as the preset does |
 | `browser.timeout` | `30.0` | Seconds a page may take to load; `Request(timeout=...)` overrides it |
 | `browser.deadline` | `180.0` | Seconds a whole rendered fetch may take, starting the browser included, once it may open its page |
 | `browser.launch_options` | `{}` | Options passed as they are to patchright's `launch()`, such as `executable_path` or `args` |
@@ -719,6 +722,12 @@ uv run pytest
 uv run ruff check
 uv run ruff format --check
 uv run pyright
+```
+
+The checks only a real network can make, of HTTP/3, ECH, the headers real servers see, the egress through a proxy, and cancellation, reach real hosts, so they run only when asked for, on a clean network, without a proxy or a VPN that ends connections or blocks UDP; the egress check goes through the proxy `--network-checks-proxy` names, which it shows without its credentials:
+
+```bash
+uv run pytest --network-checks --network-checks-proxy=http://user:password@proxy.example:8080 tests/network_checks
 ```
 
 curl-cffi and patchright are pinned to exact versions, as their Profile and browser build form a Pinned Pair: upgrade either only with `uv run pytest tests/test_profile_contract.py` passing, which needs the browser engine. See [ADR 0010](docs/adr/0010-consistency-over-synthetic-fingerprints.md).

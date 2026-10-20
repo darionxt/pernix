@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from patchright.async_api._context_manager import PlaywrightContextManager
 
     from pernix.fetchers.address_guard import AddressGuard
-    from pernix.fetchers.browser_settings import BrowserSettings
+    from pernix.fetchers.browser_settings import BrowserSettings, Preset
 
 __all__ = [
     "LOOPBACK_BYPASS",
@@ -58,6 +58,10 @@ _HEADLESS = "HeadlessChrome/"
 
 _EXTRA_HINT = "rendering needs patchright; install it with: pip install 'pernix[browser]'"
 _ENGINE_HINT = "the browser engine is not installed; install it with: pernix browser install"
+_DISPLAY_HINT = (
+    "the browser runs with a window, which needs a display; run it under a virtual one, such as with xvfb-run, "
+    "or set browser.headless = true"
+)
 
 
 @dataclass(slots=True)
@@ -90,6 +94,9 @@ class LaunchedBrowser:
             machine's.
         intl_locale: The locale of `Intl` its pages present, with their frames and
             web workers; `None` for the machine's.
+        preset: How it was launched, `browser.preset`: its contexts' pages have
+            no viewport of their own under `stealth`, so that they get the
+            window's.
     """
 
     playwright: Playwright
@@ -103,6 +110,7 @@ class LaunchedBrowser:
     context_proxy: ProxySettings | None = None
     timezone: str | None = None
     intl_locale: str | None = None
+    preset: Preset = "bundled"
 
     async def new_context(
         self,
@@ -126,9 +134,12 @@ class LaunchedBrowser:
         Returns:
             The context, without pages, presenting `user_agent` and `timezone`, if
             set: patchright's `timezone_id` sets the time zone of every page, frame,
-            and web worker, without moving a header.
+            and web worker, without moving a header. Under the `stealth` preset, its
+            pages have no viewport of their own.
         """
         options: dict[str, Any] = {}
+        if self.preset == "stealth":
+            options["no_viewport"] = True
         if self.user_agent is not None:
             options["user_agent"] = self.user_agent
         if self.timezone is not None:
@@ -193,11 +204,13 @@ async def launch_browser(
     locale: Sequence[str] = DEFAULT_LOCALE,
     timezone: str | None = None,
     address_guard: AddressGuard | None = None,
+    proxy_pool: bool = False,
 ) -> LaunchedBrowser:
     """Start patchright and launch a browser.
 
-    The browser is Chrome for Testing, in the new headless mode unless
-    `browser.headless` is off, with `browser.launch_options` over those defaults.
+    The browser is Chrome for Testing, in the new headless mode, or, under the
+    `stealth` preset, the system's own Chrome with a window, as `browser.headless`
+    may change, with `browser.launch_options` over those defaults.
     It presents the languages of `locale`, through Chrome's `--accept-lang`, unless
     the `args` of `launch_options` set it, and the first of them as the locale of
     `Intl`; its contexts present its User-Agent without `HeadlessChrome`, as it is
@@ -212,8 +225,9 @@ async def launch_browser(
     proxy of their own go through a proxy that checks every host
     (`pernix.fetchers.address_guard_proxy`) instead. Under the network guard,
     whatever `launch_options` say, they go through the refusing proxy, which
-    refuses every host but loopback ones. Under either guard, WebRTC is kept off
-    UDP, which would go around the proxy.
+    refuses every host but loopback ones. Under either guard, and with a Proxy Pool,
+    WebRTC is kept off UDP, which would go around the proxies, telling pages the
+    machine's own address.
 
     Args:
         settings: The browser settings.
@@ -221,13 +235,15 @@ async def launch_browser(
         timezone: The time zone to present, an IANA name; `None` for the machine's.
         address_guard: The address guard that checks the hosts the browser reaches,
             if any.
+        proxy_pool: Whether the Run goes through a Proxy Pool.
 
     Returns:
         The running browser.
 
     Raises:
         pernix.errors.ComponentError: patchright or its browser engine is not
-            installed, or the executable `launch_options` name does not exist.
+            installed, the browser the preset or `launch_options` names is not,
+            or one with a window has no display.
     """
     try:
         from patchright.async_api import Error, async_playwright  # an optional dependency, imported when needed
@@ -237,10 +253,10 @@ async def launch_browser(
     if not any(arg.startswith("--accept-lang=") for arg in args):
         args.append(f"--accept-lang={','.join(locale)}")
     options: dict[str, Any] = {
-        "channel": "chromium",
+        "channel": "chrome" if settings.preset == "stealth" else "chromium",
         **settings.launch_options,
         "args": args,
-        "headless": settings.headless,
+        "headless": settings.runs_headless,
     }
     network_guard = current_guard()
     refusing_proxy: RefusingProxy | None = None
@@ -259,14 +275,15 @@ async def launch_browser(
             guard_proxy = AddressGuardProxy(address_guard, network_guard=network_guard)
             await guard_proxy.start()
             context_proxy = {"server": guard_proxy.url, "bypass": _NO_BYPASS}
-        if address_guard is not None or network_guard is not None:
+        if address_guard is not None or network_guard is not None or proxy_pool:
             options["args"] = [*options["args"], _WEBRTC_PROXIED_ONLY]
         playwright = await _start(async_playwright())
         try:
             browser = await playwright.chromium.launch(**options)
         except Error as exc:
-            if "executable doesn't exist" in str(exc).lower():
-                raise ComponentError(_missing_executable(settings)) from exc
+            problem = _launch_problem(str(exc), settings, channel=str(options["channel"]))
+            if problem is not None:
+                raise ComponentError(problem) from exc
             raise
         devtools, processes = await _inspect(browser)
         user_agent = await _headed_user_agent(devtools)
@@ -288,6 +305,7 @@ async def launch_browser(
         context_proxy,
         timezone=timezone,
         intl_locale=locale[0],
+        preset=settings.preset,
     )
 
 
@@ -303,7 +321,7 @@ async def probe_browser(settings: BrowserSettings, *, locale: Sequence[str] = DE
 
     Returns:
         The browser's name and version, and whether it is the bundled build, such
-        as `chromium 151.0.7922.34 (bundled)`.
+        as `chromium 151.0.7922.34 (bundled)`, or the stealth preset's.
 
     Raises:
         pernix.errors.ComponentError: patchright or its browser engine is not
@@ -318,8 +336,13 @@ async def probe_browser(settings: BrowserSettings, *, locale: Sequence[str] = DE
     try:
         await report_unpinned(launched, locale)
         version = launched.browser.version
-        bundled = "bundled" if version == BUNDLED_BROWSER.version else f"not the bundled {BUNDLED_BROWSER.version}"
-        return f"{launched.browser.browser_type.name} {version} ({bundled})"
+        if version == BUNDLED_BROWSER.version:
+            pinned = "bundled"
+        elif settings.preset == "stealth":
+            pinned = f"stealth preset; the HTTP Fetcher presents the bundled {BUNDLED_BROWSER.version}"
+        else:
+            pinned = f"not the bundled {BUNDLED_BROWSER.version}"
+        return f"{launched.browser.browser_type.name} {version} ({pinned})"
     finally:
         await launched.close()
 
@@ -329,13 +352,22 @@ async def report_unpinned(launched: LaunchedBrowser, locale: Sequence[str]) -> N
 
     That is a browser other than the bundled build, or one presenting other
     languages than `locale`, as Chrome does for some lists, which it replaces.
+    Under the `stealth` preset, which launches another browser on purpose, the
+    first is told at INFO instead.
 
     Args:
         launched: The browser.
         locale: The languages it was launched to present.
     """
     version = launched.browser.version
-    if version != BUNDLED_BROWSER.version:
+    if version != BUNDLED_BROWSER.version and launched.preset == "stealth":
+        logger.info(
+            "The stealth preset launched the browser %s, while the HTTP Fetcher presents the bundled build %s with "
+            "the pinned Profile, so the Sessions both use present two clients",
+            version,
+            BUNDLED_BROWSER.version,
+        )
+    elif version != BUNDLED_BROWSER.version:
         logger.warning(
             "The browser is %s, not the bundled build %s, which the HTTP Fetcher presents with the pinned Profile, "
             "so the two present different clients",
@@ -409,6 +441,20 @@ def require_patchright() -> None:
     """
     if importlib.util.find_spec("patchright") is None:
         raise ComponentError(_EXTRA_HINT)
+
+
+def _launch_problem(message: str, settings: BrowserSettings, *, channel: str) -> str | None:
+    """What to do about a browser that did not launch for want of something the user can install; `None` otherwise."""
+    if "executable doesn't exist" in message.lower():
+        return _missing_executable(settings)
+    found = message.splitlines()[0].split(": ", 1)[-1]
+    if "is not found at" in found:  # a Chrome of the system, which patchright does not install by itself
+        return f"{found}; install it, such as with: patchright install {channel}"
+    if "is not supported on" in found:
+        return f"{found}; name another browser in {settings.key('launch_options')}"
+    if "XServer" in message or "$DISPLAY" in message:
+        return _DISPLAY_HINT
+    return None
 
 
 def _missing_executable(settings: BrowserSettings) -> str:
