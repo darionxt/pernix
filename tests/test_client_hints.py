@@ -142,3 +142,13 @@ def test_device_memory_is_rounded_as_chrome_rounds_it(
         assert device_memory() == gigabytes
     finally:
         device_memory.cache_clear()
+
+
+def test_each_response_sets_the_sessions_hints_whatever_its_chain_held() -> None:
+    session = Session(client_hints={SHOP: ("sec-ch-ua-arch",)})
+    first, second = ChainHints(session), ChainHints(session)  # concurrent fetches of the Session
+
+    first.receive(f"{SHOP}/", "sec-ch-ua-model", None)
+    second.receive(f"{SHOP}/", "sec-ch-ua-arch", None)
+
+    assert session.client_hints == {SHOP: ("sec-ch-ua-arch",)}

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from pernix import Cookie, Request, Session
+from pernix.browser import Evaluate, Render
 from pernix.fetchers import BrowserFetcher, BrowserSettings
 from pernix.fetchers.network_guard import blocking_network
 from pernix.testing import ReceivedRequest, Reply
@@ -294,3 +295,28 @@ async def test_a_context_is_taught_the_sessions_hints_without_asking_the_server(
     assert [request.path for request in server.received] == ["/page", "/page"]
     first, second = server.received
     assert (_arch(first), _arch(second)) == (['"x86"'], [])
+
+
+SERVICE_WORKER = (
+    "self.addEventListener('install', () => self.skipWaiting());"
+    "self.addEventListener('activate', (event) => event.waitUntil(clients.claim()));"
+    "self.addEventListener('fetch', (event) => event.respondWith(fetch(event.request)));"
+)
+
+
+async def test_teaching_a_context_hints_goes_around_the_service_worker_of_their_origin(server: LoopbackServer) -> None:
+    server.route("/", "<p>home</p>", headers=[*HTML, ("Accept-CH", "Sec-CH-UA-Model")])
+    server.route("/sw.js", SERVICE_WORKER, headers=[("Content-Type", "text/javascript")])
+    registering = "<script>window.ready = navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready)</script>"
+    server.route("/installing", registering, headers=HTML)
+    session = Session("alice")
+    installed = Render(actions=(Evaluate("window.ready.then(() => true)"),))
+
+    async with BrowserFetcher() as fetcher:
+        await fetcher.fetch(Request(server.url("/installing"), render=installed), session=session)
+        session.client_hints[server.base_url] = ("sec-ch-ua-arch",)  # as an HTTP fetch of the Session asked meanwhile
+        await fetcher.fetch(_render(server.url("/installing")), session=session)
+        kept = fetcher._contexts._waiting[0]  # pyright: ignore[reportPrivateUsage]
+
+    assert "/" not in [request.path for request in server.received]
+    assert kept.client_hints == {server.base_url: ("sec-ch-ua-arch",)}

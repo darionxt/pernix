@@ -4,9 +4,10 @@ Chrome keeps the client hints an origin asked for with its profile, and offers n
 other way to set them than a response's `Accept-CH`. A context learns those of a
 Session's origins from a navigation to each that a route answers in the browser
 itself, with an `Accept-CH` naming them, or an empty one to forget them, so the
-request never leaves the browser. Chrome still connects to the origin ahead of the
-navigation, as it does for every navigation: one TLS handshake, which the next
-navigation there may use, and no request.
+request never leaves the browser; the page bypasses service workers, which would
+take the navigation before the route. Chrome still connects to the origin ahead
+of the navigation, as it does for every navigation: one TLS handshake, which the
+next navigation there may use, and no request.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from patchright.async_api import BrowserContext, Response
+    from patchright.async_api import BrowserContext, Response, Route
 
 __all__ = ["accepted_hints", "teach_hints"]
 
@@ -33,15 +34,28 @@ async def teach_hints(context: BrowserContext, origin: str, hints: Sequence[str]
         hints: The hints; none to forget those it kept.
 
     Raises:
-        Exception: The page could not be opened, or the navigation did not commit.
+        Exception: The page could not be opened, the navigation did not commit, or
+            something else than the route answered it.
     """
     headers = {"Content-Type": "text/html", "Accept-CH": ", ".join(hints)}
+    answered: list[str] = []
+
+    async def answer(route: Route) -> None:
+        if route.request.is_navigation_request():
+            answered.append(route.request.url)
+        await route.fulfill(status=200, headers=headers, body="")
+
     page = await context.new_page()
     try:
-        await page.route("**/*", lambda route: route.fulfill(status=200, headers=headers, body=""))
+        devtools = await context.new_cdp_session(page)
+        await devtools.send("Network.enable")  # pyright: ignore[reportUnknownMemberType]  # untyped
+        await devtools.send("Network.setBypassServiceWorker", {"bypass": True})  # pyright: ignore[reportUnknownMemberType]
+        await page.route("**/*", answer)
         await page.goto(f"{origin}/", wait_until="commit", timeout=_TEACHING_TIMEOUT * 1000)
     finally:
         await page.close()
+    if not answered:
+        raise RuntimeError(f"the navigation that teaches the client hints of {origin} was answered elsewhere")
 
 
 async def accepted_hints(navigations: Sequence[Response]) -> list[tuple[str, str]]:

@@ -68,6 +68,7 @@ class ChainHints:
             if accepted is None or critical is None
             else tuple(hint for hint in critical if hint in accepted and hint not in before)
         )
-        if keep_accepted(self._asked, url, accept_ch) and self._session is not None:
+        keep_accepted(self._asked, url, accept_ch)
+        if self._session is not None:  # whatever the chain held, as another fetch of the Session may have changed it
             keep_accepted(self._session.client_hints, url, accept_ch)
         return missing
