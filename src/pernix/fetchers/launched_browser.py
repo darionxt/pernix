@@ -43,6 +43,9 @@ LOOPBACK_BYPASS = "<-loopback>,localhost,*.localhost,127.0.0.1/8,[::1]"
 _NO_BYPASS = "<-loopback>"
 """Proxy bypass rules that send loopback hosts to the proxy too, which Chrome would otherwise reach directly."""
 
+_BYPASS_ALL = "*"
+"""Proxy bypass rules that bypass every host, so that a context with them reaches each directly."""
+
 _WEBRTC_PROXIED_ONLY = "--webrtc-ip-handling-policy=disable_non_proxied_udp"
 """Keeps WebRTC off UDP, which no proxy carries, so that it goes through the proxy, over TCP, or nowhere."""
 
@@ -64,15 +67,23 @@ class LaunchedBrowser:
         browser: The browser.
         guarded: Whether it was launched under the network guard, so that only
             loopback hosts are reached without a proxy of the Request's own.
-        refusing_proxy: Where a guarded browser sends everything else.
+        refusing_proxy: The proxy the browser was launched with, which refuses
+            what it is sent: the browser's own requests, which belong to no
+            context, and, under the network guard, everything but loopback
+            traffic; `None` for a proxy `browser.launch_options` set.
         devtools: A session of the browser's DevTools protocol, which `probe()`
             goes through; `None` if the browser has none.
         processes: The processes of the browser and of its driver; `None` if they
             cannot be found, as without psutil.
         user_agent: The User-Agent its contexts present: its own, without
             `HeadlessChrome`, in headless mode; `None` for its own.
-        guard_proxy: Where a browser launched while `network.public_only` is on
-            sends all its traffic, the proxy that checks every host it reaches.
+        guard_proxy: Where the contexts of a browser launched while
+            `network.public_only` is on send all their traffic, the proxy that
+            checks every host they reach.
+        context_proxy: The proxy of the contexts without one of their own: the
+            guard proxy, or none, bypassing every host, so that the launch proxy
+            takes only the browser's own requests; `None` to leave them the
+            launch proxy, as under the network guard alone.
     """
 
     playwright: Playwright
@@ -83,6 +94,7 @@ class LaunchedBrowser:
     processes: BrowserProcesses | None = None
     user_agent: str | None = None
     guard_proxy: AddressGuardProxy | None = None
+    context_proxy: ProxySettings | None = None
 
     async def new_context(
         self,
@@ -95,8 +107,8 @@ class LaunchedBrowser:
 
         Args:
             proxy: The proxy URL every request of the context goes through, loopback
-                ones included; without one, the browser's own applies, as the
-                proxy that checks hosts for `network.public_only` does.
+                ones included; without one, `context_proxy`, if set, else the one
+                the browser was launched with.
             local_storage: The localStorage the context starts with, by origin, then
                 by key.
             blocks_service_workers: Keep its pages from registering service
@@ -111,6 +123,8 @@ class LaunchedBrowser:
             options["user_agent"] = self.user_agent
         if proxy:
             options["proxy"] = _proxy_settings(proxy)
+        elif self.context_proxy is not None:
+            options["proxy"] = self.context_proxy
         if local_storage:
             options["storage_state"] = _storage_state(local_storage)
         if blocks_service_workers:
@@ -149,11 +163,18 @@ async def launch_browser(
     `browser.headless` is off, with `browser.launch_options` over those defaults.
     It presents the languages of `locale`, through Chrome's `--accept-lang`, unless
     the `args` of `launch_options` set it; its contexts present its User-Agent
-    without `HeadlessChrome`, as it is with a window. With an address guard, as
-    `network.public_only` asks, all its traffic goes through a proxy that checks
-    every host (`pernix.fetchers.address_guard_proxy`). Under the network guard,
-    every connection to a host other than a loopback one goes to a proxy that
-    refuses it, whatever `launch_options` say. Under either, WebRTC is kept off
+    without `HeadlessChrome`, as it is with a window.
+
+    It is launched with a proxy that refuses what it is sent, unless
+    `launch_options` set one, so that its own requests, which belong to no context
+    and so ignore the contexts' proxies, such as those checking the network time
+    or its Google accounts, leave nothing from the machine: its contexts are
+    given a proxy each, their own, or, without one, none, bypassing every host.
+    With an address guard, as `network.public_only` asks, the contexts without a
+    proxy of their own go through a proxy that checks every host
+    (`pernix.fetchers.address_guard_proxy`) instead. Under the network guard,
+    whatever `launch_options` say, they go through the refusing proxy, which
+    refuses every host but loopback ones. Under either guard, WebRTC is kept off
     UDP, which would go around the proxy.
 
     Args:
@@ -185,16 +206,20 @@ async def launch_browser(
     network_guard = current_guard()
     refusing_proxy: RefusingProxy | None = None
     guard_proxy: AddressGuardProxy | None = None
+    context_proxy: ProxySettings | None = None
     playwright: Playwright | None = None
     try:
+        if network_guard is not None or "proxy" not in options:
+            refusing_proxy = RefusingProxy()
+            await refusing_proxy.start()
+            bypass = LOOPBACK_BYPASS if network_guard is not None else _NO_BYPASS
+            options["proxy"] = {"server": refusing_proxy.url, "bypass": bypass}
+            if network_guard is None:
+                context_proxy = {"server": refusing_proxy.url, "bypass": _BYPASS_ALL}
         if address_guard is not None:
             guard_proxy = AddressGuardProxy(address_guard, network_guard=network_guard)
             await guard_proxy.start()
-            options["proxy"] = {"server": guard_proxy.url, "bypass": _NO_BYPASS}
-        elif network_guard is not None:
-            refusing_proxy = RefusingProxy()
-            await refusing_proxy.start()
-            options["proxy"] = {"server": refusing_proxy.url, "bypass": LOOPBACK_BYPASS}
+            context_proxy = {"server": guard_proxy.url, "bypass": _NO_BYPASS}
         if address_guard is not None or network_guard is not None:
             options["args"] = [*options["args"], _WEBRTC_PROXIED_ONLY]
         playwright = await _start(async_playwright())
@@ -212,7 +237,9 @@ async def launch_browser(
         await _close_proxies(refusing_proxy, guard_proxy)
         raise
     guarded = network_guard is not None
-    return LaunchedBrowser(playwright, browser, guarded, refusing_proxy, devtools, processes, user_agent, guard_proxy)
+    return LaunchedBrowser(
+        playwright, browser, guarded, refusing_proxy, devtools, processes, user_agent, guard_proxy, context_proxy
+    )
 
 
 async def probe_browser(settings: BrowserSettings, *, locale: Sequence[str] = DEFAULT_LOCALE) -> str:

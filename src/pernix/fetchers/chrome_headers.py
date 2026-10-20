@@ -24,6 +24,7 @@ their names, which this does not follow.
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import itertools
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 
     from pernix.request_kinds import RequestKind
 
-__all__ = ["ChromeRequest", "chrome_request", "site_relation"]
+__all__ = ["ChromeRequest", "chrome_request", "site_relation", "through_proxy", "tunnel_headers"]
 
 _ACCEPT_DOCUMENT = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,"
@@ -274,6 +275,46 @@ def chrome_request(
             values.pop(name, None)
         values["accept-encoding"] = "gzip, deflate"
     return _arranged(shape, values, own, document=document, credentials=not cors)
+
+
+def through_proxy(request: ChromeRequest) -> ChromeRequest:
+    """Make a request as Chrome sends it to an HTTP proxy that it goes through without a tunnel, as an `http://` one.
+
+    Chrome sends `Proxy-Connection` in the place of `Connection`, and, once the
+    proxy asked for credentials, `Proxy-Authorization` after it, where curl then
+    puts its own.
+
+    Args:
+        request: The request as Chrome sends it to its server.
+
+    Returns:
+        The request as Chrome sends it to the proxy.
+    """
+    headers = [
+        ("Proxy-Connection", value) if name.lower() == "connection" else (name, value)
+        for name, value in request.headers
+    ]
+    order = ",".join(
+        "proxy-connection,proxy-authorization" if name == "connection" else name for name in request.order.split(",")
+    )
+    return dataclasses.replace(request, headers=headers, order=order)
+
+
+def tunnel_headers(request: ChromeRequest) -> list[tuple[str, str]]:
+    """Make the headers, but `Host`, of the `CONNECT` Chrome sends an HTTP proxy for a tunnel that carries a request.
+
+    They are `Proxy-Connection` and the request's `User-Agent`, in Chrome's order;
+    once the proxy asked for credentials, Chrome adds `Proxy-Authorization` last.
+
+    Args:
+        request: The request the tunnel carries.
+
+    Returns:
+        The headers, in order.
+    """
+    headers = [("Proxy-Connection", "keep-alive")]
+    headers += [(name, value) for name, value in request.headers if name.lower() == "user-agent"][:1]
+    return headers
 
 
 def site_relation(initiator: str | None, url: str) -> str:
