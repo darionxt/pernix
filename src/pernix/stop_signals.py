@@ -29,9 +29,11 @@ _DEFAULTS: dict[signal.Signals, _Handler] = {
 class StopSignals:
     """Stops a Run on SIGINT and SIGTERM.
 
-    The first signal drains the Run, and the second force-stops it. Any further one
-    gets Python's default handling: SIGINT raises `KeyboardInterrupt`, and SIGTERM
-    ends the process at once, which helps when sync code blocks the event loop.
+    The first signal drains the Run, and the second force-stops it; both name the
+    signal to `Crawler.stop()`, so that the Run's outcome file records the exit code
+    130 the program exits with. Any further one gets Python's default handling:
+    SIGINT raises `KeyboardInterrupt`, and SIGTERM ends the process at once, which
+    helps when sync code blocks the event loop.
 
     Used as a context manager inside the event loop, it installs its handlers on
     entry and restores the previous ones on exit. Signal handlers belong to the main
@@ -81,11 +83,11 @@ class StopSignals:
         if mode == "force":
             for other, handler in _DEFAULTS.items():
                 signal.signal(other, handler)
-        loop.call_soon_threadsafe(self._stop, signal.Signals(signum).name, mode)
+        loop.call_soon_threadsafe(self._stop, signal.Signals(signum), mode)
 
-    def _stop(self, name: str, mode: StopMode) -> None:
+    def _stop(self, signum: signal.Signals, mode: StopMode) -> None:
         if mode == "drain":
-            logger.warning("Received %s: draining the Run; send it again to stop now", name)
+            logger.warning("Received %s: draining the Run; send it again to stop now", signum.name)
         else:
-            logger.warning("Received %s while draining: stopping the Run now", name)
-        self._crawler.stop(mode)
+            logger.warning("Received %s while draining: stopping the Run now", signum.name)
+        self._crawler.stop(mode, signal=signum)

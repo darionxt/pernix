@@ -72,6 +72,18 @@ def test_run_runs_a_spider_with_its_arguments_and_options(
     assert sorted(item["page"] for item in _items(tmp_path / "r1.jsonl")) == [1, 2]
 
 
+def test_the_outcome_file_tells_how_the_run_ended(
+    pages: LoopbackServer, write_spider: WriteSpider, tmp_path: Path
+) -> None:
+    path = write_spider("cli_pages_outcome", PAGES)
+
+    code = main(["run", str(path), "--run-id", "r1", "-s", f"outcome_file={tmp_path / '{run_id}.json'}"])
+
+    outcome = orjson.loads((tmp_path / "r1.json").read_bytes())
+    assert code == outcome["exit_code"] == 0
+    assert (outcome["run_id"], outcome["spider"], outcome["reason"]) == ("r1", "pages", "finished")
+
+
 @pytest.mark.parametrize(
     ("argv", "problem"),
     [

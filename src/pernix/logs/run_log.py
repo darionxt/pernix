@@ -80,6 +80,11 @@ class RunLog:
         """Counters of the records logged for the Run, including the dropped ones."""
         return self.handler.counts
 
+    @property
+    def redactor(self) -> Redactor:
+        """Masks text as the records written from now on are masked, such as for the Run's outcome file."""
+        return self._redactor
+
     def mask(self, secrets: Iterable[str]) -> None:
         """Mask more values wherever they occur, in the records written from now on.
 
