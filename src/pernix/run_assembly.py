@@ -537,6 +537,10 @@ def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Pat
     if template is None:
         return None
     path = _feed_path(crawler, template)
+    try:
+        resolved = path.resolve()
+    except (OSError, ValueError) as exc:  # such as a NUL in it
+        raise SettingsError([f"outcome_file {template!r}: invalid path: {exc}"]) from exc
     others = [(f"feeds[{feed!r}]", feed) for feed in crawler.settings.section(FeedSettings).feeds]
     if output is not None:
         others.append(("output", os.fspath(output)))
@@ -545,8 +549,8 @@ def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Pat
         others.append(("items.failed_output", failed_output))
     problems: list[str] = []
     for label, other in others:
-        with contextlib.suppress(SettingsError):  # building the Feeds reports an invalid path
-            if _feed_path(crawler, other).resolve() == path.resolve():
+        with contextlib.suppress(OSError, ValueError):  # an invalid path is the other output's problem
+            if _feed_path(crawler, other).resolve() == resolved:
                 problems.append(f"{label} and outcome_file both write {path}")
     if problems:
         raise SettingsError(problems)

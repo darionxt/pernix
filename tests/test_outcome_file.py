@@ -339,6 +339,31 @@ async def test_the_file_never_replaces_another_output(
     assert "The outcome file is not written: " in caplog.text
 
 
+async def test_an_output_whose_path_cannot_be_resolved_leaves_the_run_its_own_error(
+    pages: LoopbackServer, tmp_path: Path
+) -> None:
+    crawler = _crawler(_pages(pages), {"outcome_file": str(tmp_path / "outcome.json")}, output="invalid\0.unknown")
+
+    with pytest.raises(SettingsError, match="cannot infer the feed format"):
+        await crawler.crawl()
+
+    outcome = _outcome(tmp_path / "outcome.json")
+    assert (outcome["exit_code"], outcome["error"]["type"]) == (2, "SettingsError")
+
+
+async def test_an_outcome_file_whose_path_cannot_be_resolved_is_a_configuration_error(
+    pages: LoopbackServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    crawler = _crawler(_pages(pages), {"outcome_file": f"{tmp_path}/invalid\0.json"})
+
+    with pytest.raises(SettingsError, match=r"outcome_file .*: invalid path"):
+        await crawler.crawl()
+
+    assert "The outcome file is not written: outcome_file" in caplog.text
+    assert pages.received == []
+    assert _names(tmp_path) == []
+
+
 def _write(path: Path, error: BaseException, *, stats: Mapping[str, Any] | None = None) -> None:
     """Write the outcome file of a failed Run of an idle Spider, with these stats."""
 
