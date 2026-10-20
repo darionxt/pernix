@@ -326,7 +326,7 @@ async with Search.stream_items(keyword="dune") as items:  # the Items that pass 
 
 Keyword arguments other than `settings=` and `output=` are Spider arguments, declared by the parameters of `__init__`. Strings, as from a command line, are converted to the annotated types: `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; `__init__` may raise `ValueError` to reject a value. `run()` and `crawl()` return a `RunResult` with the `run_id`, the `reason` the Run ended, and the final stats. `stream_items()` holds one Item at a time, so a slow consumer pauses the Callbacks; leaving the loop early stops the Run.
 
-`crawler.stop()` drains a Run: no new Request is claimed, and the Requests in flight and the queued Items are finished within `shutdown.grace`. `crawler.stop("force")` cancels the Requests in flight and returns them to the Frontier, and discards the Items not processed yet; the Feeds are still completed. `run()` drains on the first SIGINT or SIGTERM and force-stops on the second, and ends the process with an exit code when the Run does not complete:
+`crawler.stop()` drains a Run: no new Request is claimed, and the Requests in flight and the queued Items are finished within `shutdown.grace`. `crawler.stop("force")` cancels the Requests in flight and returns them to the Frontier, and discards the Items not processed yet; the Feeds are still completed. `crawler.pause()` holds a Run without ending it, as when a downstream store is down: no new Request is claimed or taken from `start()`, the Requests in flight finish, and the Run does not end on its own until `crawler.resume()`, a Drain, or a Force Stop; `SpiderPaused` and `SpiderResumed` tell, and `run.paused_seconds` counts the time. `run()` drains on the first SIGINT or SIGTERM and force-stops on the second, and ends the process with an exit code when the Run does not complete:
 
 | Exit code | Meaning |
 | --- | --- |
@@ -577,6 +577,7 @@ src/pernix/
 ├── inline_fetch.py      Inline Fetch: fetching in place, retried in place, and streamed
 ├── sending.py           how a Request is sent: as it is, or through the Run's next proxy; Sender
 ├── shutdown.py          Drain, its grace period, and Force Stop
+├── pausing.py           Pause and resume: holding the Engine, their Events, the time paused
 ├── runner.py            run() as a program: exit codes
 ├── __main__.py          python -m pernix
 ├── stop_signals.py      SIGINT and SIGTERM stop a Run

@@ -121,8 +121,8 @@ class Spider:
     async def on_idle(self) -> AsyncIterator[Request]:
         """Yield more Requests once the Frontier is idle; the Run ends when none are added.
 
-        It runs whenever nothing is ready, delayed, or being processed, after the
-        `SpiderIdle` Event. The Run ends once it adds no new Request to the Frontier,
+        It runs whenever nothing is ready, delayed, or being processed, and the Run
+        is not paused, after the `SpiderIdle` Event. The Run ends once it adds no new Request to the Frontier,
         including when everything it yields is a duplicate or vetoed. As in `start()`,
         URLs must be absolute.
 

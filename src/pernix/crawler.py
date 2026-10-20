@@ -14,6 +14,7 @@ from pernix.errors import CONFIGURATION_ERRORS
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
 from pernix.items import ItemStream
 from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
+from pernix.pausing import Pausing
 from pernix.request import Request
 from pernix.run_assembly import RunAssembly
 from pernix.run_result import RunResult
@@ -106,6 +107,7 @@ class Crawler:
         shutdown = settings.section(ShutdownSettings)
         self._close_timeout = shutdown.close_timeout or None
         self._shutdown = Shutdown(grace=shutdown.grace, close_timeout=self._close_timeout)
+        self._pausing = Pausing(spider, self.events)
         self._outlet: Callable[[Any], Awaitable[None]] | None = None
         self._inline_fetch: InlineFetch | None = None
 
@@ -206,6 +208,40 @@ class Crawler:
             ValueError: `mode` is neither.
         """
         self._shutdown.request(mode)
+
+    @property
+    def paused(self) -> bool:
+        """Whether the Run is paused, or will start paused; `False` once it is stopping or over."""
+        return self._shutdown.mode is None and self._pausing.paused
+
+    def pause(self) -> None:
+        """Pause the Run: stop claiming new Requests until `resume()`; it returns at once.
+
+        The Requests in flight finish, with their Callbacks, Inline Fetches, and Items,
+        and are settled as usual, so a paused Run holds no Lease once they are done.
+        No Request is taken from `start()` or `on_idle()` meanwhile, though the one
+        being produced still enters the Frontier, and the Run is not idle, so it does
+        not end on its own; a Drain or a Force Stop still ends it. Lease renewals,
+        Cooldowns, proxy refreshes, and stats snapshots go on. Pausing is logged and
+        emitted as `SpiderPaused`, and the time spent paused is counted in
+        `run.pauses` and `run.paused_seconds`.
+
+        It may be called from a Callback, a component, or another task. Called before
+        the Run starts, the Run starts paused, emitting `SpiderPaused` after
+        `SpiderOpened`. Called again while paused, once a stop was requested, or after
+        the Run, it does nothing.
+        """
+        if self._shutdown.mode is None:
+            self._pausing.pause()
+
+    def resume(self) -> None:
+        """Resume a paused Run: claim Requests again; it returns at once.
+
+        Resuming is logged and emitted as `SpiderResumed`. Called while not paused,
+        once a stop was requested, or after the Run, it does nothing.
+        """
+        if self._shutdown.mode is None:
+            self._pausing.resume()
 
     async def fetch(self, request: Request | str) -> Response:
         """Fetch a Request in place and return its Response: an Inline Fetch.
@@ -312,7 +348,8 @@ class Crawler:
         Feeds and the stats are reported; once it is done, the queued Items and the
         pending batches are processed. Then `SpiderClosed` is emitted, the final stats
         snapshot is taken, and the components are closed in reverse order, which
-        finishes the Feed files. `stop()` ends the Run early.
+        finishes the Feed files. `stop()` ends the Run early, and `pause()` holds it
+        until `resume()`.
 
         An error that ends the Run is logged, with its traceback unless it is a
         configuration error, and raised.
@@ -357,7 +394,9 @@ class Crawler:
                 # The Accounts come before the components are built, as they make up the Session Pool.
                 if await self._shutdown.run_stage(import_accounts()):
                     return self._forced_before_start()
-                run = RunAssembly.build(self, run_log, output=self._output, outlet=self._outlet, accounts=accounts)
+                run = RunAssembly.build(
+                    self, run_log, output=self._output, outlet=self._outlet, accounts=accounts, pausing=self._pausing
+                )
                 self._shutdown.attach(run.engine)
                 try:
                     if await self._shutdown.run_stage(self._open(lifecycle, run.components, run.feeds)):
@@ -370,6 +409,7 @@ class Crawler:
                     await run.frontier.close()
         finally:
             self._shutdown.end()
+            self._pausing.end()  # also when the Engine never ran
 
     def _forced_before_start(self) -> RunResult:
         self.stats.set("run.reason", "forced")  # as the reporter records it once a Run started

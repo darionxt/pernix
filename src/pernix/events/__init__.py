@@ -13,6 +13,8 @@ from pernix.events.lifecycle_events import (
     SpiderClosed,
     SpiderIdle,
     SpiderOpened,
+    SpiderPaused,
+    SpiderResumed,
     StatsSnapshot,
 )
 
@@ -32,6 +34,8 @@ __all__ = [
     "SpiderClosed",
     "SpiderIdle",
     "SpiderOpened",
+    "SpiderPaused",
+    "SpiderResumed",
     "StatsSnapshot",
     "Subscriber",
     "Veto",
