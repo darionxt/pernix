@@ -668,7 +668,9 @@ src/pernix/
 │   └── streamed_response.py a Response whose body is read as it arrives
 ├── frontiers/
 │   ├── frontier.py      Frontier protocol, Lease
-│   └── memory_frontier.py in-memory Frontier, rendered Requests queued apart
+│   ├── memory_frontier.py in-memory Frontier, rendered Requests queued apart
+│   ├── sqlite_frontier.py SQLiteFrontier: a Frontier in one SQLite file, used from a thread of its own
+│   └── sqlite_store.py  its schema, and its operations, one transaction each
 ├── middlewares/
 │   ├── middleware.py    download Middleware, NodeMiddleware, the download chain
 │   └── spider_middleware.py spider Middleware and their chain

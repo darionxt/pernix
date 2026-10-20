@@ -1,14 +1,25 @@
 """The conformance suite every Frontier backend must pass.
 
 Subclass `FrontierConformance` in a class whose name starts with `Test` and
-implement `make_frontier()`; pytest then runs every test against the backend. The
-tests are coroutines, so they need pytest-asyncio. A backend needing asynchronous
-setup or teardown can override the `frontier` fixture.
+implement `make_frontier()`; pytest then runs every test against the backend. A
+persistent backend also implements `reopen()`, so the tests check that it keeps
+every state it stores: Requests ready, delayed, leased, and dead, Leases and their
+tokens, attempts, retry budgets, and the Fingerprints of done Requests. Each test
+closes the Frontiers it made. The tests are coroutines, so they need pytest-asyncio.
+A backend needing asynchronous setup or teardown can override the `frontier`
+fixture.
 
 Example:
-    >>> class TestRedisFrontier(FrontierConformance):
+    >>> class TestSQLiteFrontier(FrontierConformance):
+    ...     @pytest.fixture(autouse=True)
+    ...     def _storage(self, tmp_path):
+    ...         self.path = tmp_path / "frontier.db"
+    ...
     ...     def make_frontier(self, clock):
-    ...         return RedisFrontier(url, clock=clock)
+    ...         return SQLiteFrontier(self.path, Spider(), clock=clock)
+    ...
+    ...     async def reopen(self, frontier, clock):
+    ...         return SQLiteFrontier(self.path, Spider(), clock=clock)
 """
 
 from __future__ import annotations
@@ -17,11 +28,12 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import pytest_asyncio
 
 from pernix.request import Request
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
     from pernix.frontiers import Frontier, Lease
 
@@ -76,7 +88,8 @@ class FrontierConformance:
 
         Returns:
             The Frontier, using the default Fingerprint function and host slots, and
-            telling rendered Requests apart with `pernix.fetchers.is_rendered()`.
+            telling rendered Requests apart with `pernix.fetchers.is_rendered()`;
+            the suite closes it after the test.
         """
         raise NotImplementedError
 
@@ -89,7 +102,8 @@ class FrontierConformance:
 
         Returns:
             `frontier` itself by default; persistent backends return a new Frontier
-            reading what the closed one stored.
+            reading what the closed one stored, which the suite closes after the
+            test.
         """
         return frontier
 
@@ -98,14 +112,25 @@ class FrontierConformance:
         """The clock of the Frontier under test."""
         return FakeClock()
 
-    @pytest.fixture
-    def frontier(self, clock: FakeClock) -> Frontier:
-        """An empty Frontier of the backend under test."""
-        return self.make_frontier(clock)
+    @pytest_asyncio.fixture
+    async def frontier(self, clock: FakeClock) -> AsyncIterator[Frontier]:
+        """An empty Frontier of the backend under test, closed after the test with those reopened from it."""
+        self._opened = [self.make_frontier(clock)]
+        yield self._opened[0]
+        for frontier in self._opened:
+            await frontier.close()
 
     async def _claim_one(self, frontier: Frontier, ttl: float = TTL) -> Lease:
         [lease] = await frontier.claim("worker-1", 1, ttl)
         return lease
+
+    async def _reopened(self, frontier: Frontier, clock: FakeClock) -> Frontier:
+        """Close a Frontier and open it again, to be closed after the test."""
+        await frontier.close()
+        self._opened.remove(frontier)
+        reopened = await self.reopen(frontier, clock)
+        self._opened.append(reopened)
+        return reopened
 
     # Adding and deduplication
 
@@ -403,8 +428,112 @@ class FrontierConformance:
         await frontier.ack(await self._claim_one(frontier))
         before = await frontier.counts()
 
-        await frontier.close()
-        reopened = await self.reopen(frontier, clock)
+        reopened = await self._reopened(frontier, clock)
 
         assert await reopened.counts() == before
         assert await reopened.add([_page(1), _page(2)]) == [False, False]
+
+    # Reopening, which persistent backends must survive
+
+    async def test_ready_requests_keep_their_order_and_kind_across_a_reopen(
+        self, frontier: Frontier, clock: FakeClock
+    ) -> None:
+        requests = [
+            _page(1, kwargs={"page": 1}, meta={"depth": 2, "path": ["a", "b"]}),
+            Request("https://other.example/2", render=True, headers={"X-Trace": "2"}, cookies={"session": "s"}),
+            _page(3, priority=5, method="POST", body=b"q=3"),
+            _page(1, dont_filter=True),
+        ]
+        await frontier.add(requests)
+
+        reopened = await self._reopened(frontier, clock)
+
+        leases = await reopened.claim("worker-1", 10, TTL)
+        assert [lease.request for lease in leases] == [requests[2], requests[0], requests[1], requests[3]]
+        assert [(lease.slot, lease.rendered, lease.attempt) for lease in leases] == [
+            ("example.com", False, 1),
+            ("example.com", False, 1),
+            ("other.example", True, 1),
+            ("example.com", False, 1),
+        ]
+
+    async def test_leases_and_their_tokens_survive_a_reopen(self, frontier: Frontier, clock: FakeClock) -> None:
+        await frontier.add([_page(1)])
+        first = await self._claim_one(frontier)
+        assert await frontier.nack(first)
+        second = await self._claim_one(frontier)
+
+        reopened = await self._reopened(frontier, clock)
+
+        assert (await reopened.counts()).leased == 1
+        assert not await reopened.ack(first)
+        assert await reopened.renew(second, TTL) is not None
+        assert await reopened.nack(second, count_attempt=False)
+        third = await self._claim_one(reopened)
+        assert (third.id, third.attempt) == (second.id, 2)
+        assert first.token < second.token < third.token
+
+    async def test_lease_expiry_survives_a_reopen(self, frontier: Frontier, clock: FakeClock) -> None:
+        await frontier.add([_page(1)])
+        stale = await self._claim_one(frontier, ttl=10.0)
+
+        reopened = await self._reopened(frontier, clock)
+        clock.advance(9.9)
+        assert await reopened.claim("worker-2", 1, TTL) == []
+        clock.advance(0.1)
+
+        fresh = await self._claim_one(reopened)
+        assert (fresh.id, fresh.attempt, fresh.expires_at) == (stale.id, 2, clock.now + TTL)
+        assert not await reopened.ack(stale)
+
+    async def test_delays_survive_a_reopen(self, frontier: Frontier, clock: FakeClock) -> None:
+        await frontier.add([_page(1)])
+        assert await frontier.nack(await self._claim_one(frontier), delay=10.0, reason="HTTP 503")
+
+        reopened = await self._reopened(frontier, clock)
+        assert (await reopened.counts()).delayed == 1
+        clock.advance(9.9)
+        assert await reopened.claim("worker-1", 1, TTL) == []
+        clock.advance(0.1)
+
+        assert (await self._claim_one(reopened)).attempt == 2
+
+    async def test_attempts_and_retry_budgets_survive_a_reopen(self, frontier: Frontier, clock: FakeClock) -> None:
+        await frontier.add([_page(1)])
+        assert await frontier.nack(await self._claim_one(frontier), reason="HTTP 503")
+        assert await frontier.nack(await self._claim_one(frontier), budget="browser_lost")
+
+        reopened = await self._reopened(frontier, clock)
+
+        lease = await self._claim_one(reopened)
+        assert (lease.attempt, dict(lease.spent)) == (2, {"browser_lost": 1})
+
+    async def test_a_request_returned_with_another_survives_a_reopen(
+        self, frontier: Frontier, clock: FakeClock
+    ) -> None:
+        await frontier.add([_page(1)])
+        lease = await self._claim_one(frontier)
+        rendered = lease.request.replace(render=True)
+        assert await frontier.nack(lease, budget="blocked", request=rendered)
+
+        reopened = await self._reopened(frontier, clock)
+
+        [again] = await reopened.claim("worker-1", 10, TTL, rendered=True)
+        assert (again.id, again.request, again.rendered, dict(again.spent)) == (
+            lease.id,
+            rendered,
+            True,
+            {"blocked": 1},
+        )
+        assert await reopened.add([_page(1)]) == [False]
+
+    async def test_dead_requests_survive_a_reopen(self, frontier: Frontier, clock: FakeClock) -> None:
+        await frontier.add([_page(1)])
+        assert await frontier.dead(await self._claim_one(frontier), "ValueError: cannot parse")
+
+        reopened = await self._reopened(frontier, clock)
+
+        counts = await reopened.counts()
+        assert (counts.dead, counts.unfinished) == (1, 0)
+        assert await reopened.claim("worker-1", 1, TTL) == []
+        assert await reopened.add([_page(1)]) == [False]
