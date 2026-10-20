@@ -1246,6 +1246,37 @@ async def test_a_paused_run_flushes_the_items_and_holds_no_lease_once_they_are_p
     assert (await frontier.counts()).done == 2
 
 
+async def test_a_pause_flushes_the_items_while_the_workers_wait_for_work() -> None:
+    spider, held, frontier = Links(), HeldItems(), MemoryFrontier()
+    waiting_for_work = asyncio.Event()
+
+    class Watched(Throttle):
+        async def wait(self) -> None:
+            if held.items:  # once the attempt at /a handed its Request over
+                waiting_for_work.set()
+            await super().wait()
+
+    [_] = await frontier.add([Request(f"{SITE}/later")])
+    [later] = await frontier.claim("worker-0", 1, 30.0)
+    await frontier.nack(later, delay=60.0, count_attempt=False)  # so nothing else lets the Items be flushed
+    pausing = Pausing(spider, events.EventBus(timeout=5))
+    throttle = Watched(DomainSettings())
+    engine = _holding_engine(spider, _site({"/a": "<p>a</p>"}), frontier, held, pausing=pausing, throttle=throttle)
+    run = asyncio.create_task(engine.run())
+    async with asyncio.timeout(5):
+        await waiting_for_work.wait()
+        flushed_before = held.stuck.is_set()
+        pausing.pause()  # as self.crawler.pause() would
+        await held.stuck.wait()
+        engine.drain()
+        held.release()
+        await run
+
+    assert not flushed_before
+    counts = await frontier.counts()
+    assert (counts.done, counts.delayed) == (1, 1)
+
+
 async def test_items_in_a_batch_keep_their_requests_leased_until_the_batch_is_processed() -> None:
     frontier = MemoryFrontier()
     seen: list[FrontierCounts] = []

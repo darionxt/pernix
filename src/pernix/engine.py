@@ -321,7 +321,7 @@ class Engine:
         return leases[0] if leases else None
 
     async def _wait_for_work(self, rendered: bool | None) -> Lease | None:
-        """Wait until the Frontier changes, a blocked slot may start again, or a Drain begins; return a Lease found meanwhile.
+        """Wait until the Frontier changes, a blocked slot may start again, or a Drain or a Pause begins; return a Lease found meanwhile.
 
         Paused or drained, it returns at once, for the worker to wait for that instead.
         """
@@ -332,6 +332,7 @@ class Engine:
             asyncio.Task(self._frontier.wait(), loop=loop, eager_start=True),
             asyncio.Task(self._throttle.wait(), loop=loop, eager_start=True),
             asyncio.Task(self._draining.wait(), loop=loop, eager_start=True),
+            asyncio.Task(self._pausing.holding(), loop=loop, eager_start=True),  # so that a Pause flushes the Items
         ]
         lease: Lease | None = None
         try:
