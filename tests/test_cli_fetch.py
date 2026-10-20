@@ -149,6 +149,15 @@ def test_the_project_settings_and_middleware_apply(site: LoopbackServer, capsys:
     assert capsys.readouterr().out == "<h1>Dune</h1>"
 
 
+def test_the_run_of_fetch_writes_no_outcome_file(
+    site: LoopbackServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PERNIX_OUTCOME_FILE", str(tmp_path / "outcome.json"))
+
+    assert main(["fetch", site.url("/page")]) == 0
+    assert not (tmp_path / "outcome.json").exists()
+
+
 @pytest.mark.usefixtures("browser_engine")
 def test_the_browser_fetcher_prints_the_rendered_page(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["fetch", site.url("/scripted"), "--fetcher", "browser"]) == 0
