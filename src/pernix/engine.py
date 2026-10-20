@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from pernix.callbacks import iterate_and_close
 from pernix.events import RequestDropped, RequestScheduled, SpiderIdle
 from pernix.logs import request_context
+from pernix.pausing import Pausing
 from pernix.request_processor import Again, Dead, Done, PutItem, RequestProcessor
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import DomainSettings, RetrySettings
@@ -50,15 +51,17 @@ class Engine:
     always in the Frontier before it leaves. If the Run is cancelled, Requests in
     flight are returned to the Frontier without counting an attempt.
 
-    The Run is idle once `start()` is exhausted and nothing is ready, delayed, or
-    leased. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the Run ends when
-    it adds no Request. Every Request passes the `RequestScheduled` gate before
-    entering the Frontier; a vetoed or duplicate Request is emitted as
-    `RequestDropped`.
+    The Run is idle once `start()` is exhausted, nothing is ready, delayed, or leased,
+    and it is not paused. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the
+    Run ends when it adds no Request, once it is not paused. Every Request passes the
+    `RequestScheduled` gate before entering the Frontier; a vetoed or duplicate
+    Request is emitted as `RequestDropped`.
 
     `drain()` stops the claiming and the scheduling of the Requests `start()` and
     `on_idle()` yield; the Requests in flight are finished, and the Requests their
-    Callbacks yield still enter the Frontier.
+    Callbacks yield still enter the Frontier. A Pause, which its `Pausing` carries
+    out, stops the same until the Run is resumed; the Request `start()` or
+    `on_idle()` is producing meanwhile still enters the Frontier.
 
     Requests constructed in the spider chain resolve relative URLs against the
     Response handled by the layer, or the Callback, that constructs them. While a
@@ -83,6 +86,7 @@ class Engine:
         sender: Sender | None = None,
         callback_timeout: float | None = None,
         stats: Stats | None = None,
+        pausing: Pausing | None = None,
     ) -> None:
         """Wire the Engine to its collaborators.
 
@@ -116,6 +120,8 @@ class Engine:
                 outputs of a Response, and an errback its own, before it fails with
                 `CallbackTimeout`; `None` for no limit.
             stats: Where, with a limit, the timeouts are counted.
+            pausing: Pauses and resumes the Run, and emits its Events; by default,
+                one of its own, which nothing pauses.
 
         Raises:
             ValueError: `concurrency` is less than 1, `browser_concurrency` is
@@ -138,6 +144,7 @@ class Engine:
         self._throttle = throttle or Throttle(DomainSettings())
         self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
         self._draining = asyncio.Event()
+        self._pausing = pausing or Pausing(spider, events)
         self._processor = RequestProcessor(
             spider,
             download=download,
@@ -153,12 +160,24 @@ class Engine:
         )
 
     async def run(self) -> None:
-        """Run until the Run is idle and `Spider.on_idle()` adds no more Requests, or until drained."""
+        """Run until the Run is idle and `Spider.on_idle()` adds no more Requests, or until drained.
+
+        The Pausing begins with it, and ends once it is done, or drained.
+        """
+        self._pausing.begin()
+        try:
+            await self._run()
+        finally:
+            self._pausing.end()
+
+    async def _run(self) -> None:
         async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self._pausing.announce())
             workers = [tasks.create_task(self._work(rendered)) for rendered in self._kinds]
             feeding = tasks.create_task(self._feed())
             draining = tasks.create_task(self._draining.wait())
             await asyncio.wait([feeding, draining], return_when=asyncio.FIRST_COMPLETED)
+            self._pausing.end()  # lets the announcing return once the changes are emitted
             if feeding.done():
                 feeding.result()  # a cancellation from start() or on_idle() is not an ending
             if self._draining.is_set():  # the feeding may have stopped for the Drain, with work in flight
@@ -171,23 +190,27 @@ class Engine:
     def drain(self) -> None:
         """Stop claiming Requests and scheduling those of `start()` and `on_idle()`.
 
-        `run()` returns once the Requests in flight are finished. Calling it again
+        `run()` returns once the Requests in flight are finished. It ends the
+        Pausing, so a paused Run is drained without being resumed. Calling it again
         does nothing.
         """
         self._draining.set()
+        self._pausing.end()
 
     async def _feed(self) -> None:
         """Schedule the Requests of `start()`, then those of `on_idle()` whenever the Run is idle, until it adds none.
 
         Scheduling into the Frontier need not suspend, so the Drain is checked before
-        each step rather than left to cancelling this task.
+        each step rather than left to cancelling this task. A paused Run ends only
+        once it is resumed.
         """
         await self._schedule_all(self._spider.start(), "start()")
         while not self._draining.is_set():
             await self._until_idle()
             await self._events.emit(SpiderIdle(self._spider))
             if self._draining.is_set() or not await self._schedule_all(self._spider.on_idle(), "on_idle()"):
-                return
+                break
+        await self._pausing.released()
 
     async def _schedule_all(self, requests: AsyncIterator[Request], source: str) -> int:
         """Schedule the Requests a Spider method yields, until a Drain; return how many were added."""
@@ -195,6 +218,9 @@ class Engine:
         try:
             async with aclosing(iterate_and_close(requests)) as pending:
                 while not self._draining.is_set():
+                    if self._pausing.held:
+                        await self._pausing.released()
+                        continue
                     try:
                         request = await anext(pending)
                     except StopAsyncIteration:
@@ -207,12 +233,21 @@ class Engine:
         return added
 
     async def _until_idle(self) -> None:
-        while (await self._frontier.counts()).unfinished:
-            await self._frontier.wait()
+        """Wait until nothing is ready, delayed, or leased while the Run is not paused."""
+        while True:
+            await self._pausing.released()
+            idle = not (await self._frontier.counts()).unfinished
+            if idle and not self._pausing.held:  # paused while the Frontier counted
+                return
+            if not idle:
+                await self._frontier.wait()
 
     async def _work(self, rendered: bool | None) -> None:
         """Process Requests of a kind, one at a time: rendered ones, the others, or any (`None`)."""
         while not self._draining.is_set():
+            if self._pausing.held:
+                await self._pausing.released()
+                continue
             lease = await self._claim(rendered) or await self._wait_for_work(rendered)
             if lease is not None:
                 with request_context(lease.id):  # records logged for the Request, its Callback's included
@@ -225,7 +260,10 @@ class Engine:
         return leases[0] if leases else None
 
     async def _wait_for_work(self, rendered: bool | None) -> Lease | None:
-        """Wait until the Frontier changes, a blocked slot may start again, or a Drain begins; return a Lease found meanwhile."""
+        """Wait until the Frontier changes, a blocked slot may start again, or a Drain begins; return a Lease found meanwhile.
+
+        Paused or drained, it returns at once, for the worker to wait for that instead.
+        """
         loop = asyncio.get_running_loop()
         # Started eagerly, the waits register for changes before the claim below, so a
         # change made between an empty claim and the wait cannot go unnoticed.
@@ -236,10 +274,10 @@ class Engine:
         ]
         lease: Lease | None = None
         try:
-            if not self._draining.is_set():
+            if not self._draining.is_set() and not self._pausing.held:
                 lease = await self._claim(rendered)
-            if lease is None:
-                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+                if lease is None:
+                    await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for wait in waits:
                 wait.cancel()

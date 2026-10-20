@@ -21,6 +21,7 @@ from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
+from pernix.pausing import Pausing
 from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies
 from pernix.proxies.run_proxies import ProxySupply, RunProxies
@@ -145,6 +146,7 @@ class RunAssembly:
         output: str | os.PathLike[str] | None = None,
         outlet: Callable[[Any], Awaitable[None]] | None = None,
         accounts: Sequence[Account] = (),
+        pausing: Pausing | None = None,
     ) -> RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
@@ -164,6 +166,8 @@ class RunAssembly:
             outlet: Receives every Item that passes the Pipelines, after the Feeds.
             accounts: The Accounts the Spider gave, whose Sessions the Session Pool
                 holds, if one is enabled.
+            pausing: Pauses and resumes the Run, for the Engine; its counts are
+                reported in the stats. Defaults to one that nothing pauses.
 
         Returns:
             The assembly.
@@ -220,6 +224,7 @@ class RunAssembly:
         ):
             problems.raise_them()
         core_stats = CoreStats(crawler.stats)
+        pausing = pausing or Pausing(crawler.spider, events)
         frontier = MemoryFrontier(fingerprint=fingerprint)
         throttle = Throttle(settings.section(DomainSettings))
         proxies = proxying.proxies
@@ -251,6 +256,7 @@ class RunAssembly:
             sender=sender,
             callback_timeout=settings.section(CallbackSettings).timeout,
             stats=crawler.stats,
+            pausing=pausing,
         )
         inline_fetch = InlineFetch(
             download=download,
@@ -279,7 +285,7 @@ class RunAssembly:
             frontier=frontier,
             engine=engine,
             inline_fetch=inline_fetch,
-            reporter=_reporter(crawler, frontier, throttle, run_log, proxying.pool),
+            reporter=_reporter(crawler, frontier, throttle, run_log, proxying.pool, pausing),
         )
 
 
@@ -636,14 +642,20 @@ def _retry_policy(crawler: Crawler) -> RetryPolicy:
 
 
 def _reporter(
-    crawler: Crawler, frontier: Frontier, throttle: Throttle, run_log: RunLog, proxies: MemoryProxyPool | None
+    crawler: Crawler,
+    frontier: Frontier,
+    throttle: Throttle,
+    run_log: RunLog,
+    proxies: MemoryProxyPool | None,
+    pausing: Pausing,
 ) -> StatsReporter:
-    """The reporter of the Run's stats, reading the Frontier, the Throttle, the proxies, and the log counts.
+    """The reporter of the Run's stats, reading the pauses, the Frontier, the Throttle, the proxies, and the log counts.
 
     It samples the event loop lag, which beats for a watchdog of the loop, unless
     `loop.block_threshold` is 0.
     """
     gauges: dict[str, Gauge] = {
+        "run": pausing.counts,
         "frontier": frontier.counts,
         "throttle": lambda: throttle.stats,
         "log": lambda: run_log.counts,

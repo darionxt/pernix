@@ -434,7 +434,9 @@ Core Events:
 | Event | Dispatch | When |
 | --- | --- | --- |
 | `SpiderOpened` | observe | Components are open; nothing has been fetched yet |
-| `SpiderIdle` | observe | Nothing is ready, delayed, or leased, and `start()` is exhausted; `Spider.on_idle()` runs next |
+| `SpiderIdle` | observe | Nothing is ready, delayed, or leased, `start()` is exhausted, and the Run is not paused; `Spider.on_idle()` runs next |
+| `SpiderPaused` | observe | The Run was paused (§6.6): it claims no new Request until resumed, though the Requests in flight still finish |
+| `SpiderResumed(paused_for)` | observe | The Run was resumed after `paused_for` seconds; it claims Requests again once this is emitted |
 | `SpiderClosed(reason)` | observe, reverse | The Run ended: `finished` on its own, `drained` after a Drain, `forced` after a Force Stop (§6.6), `failed` by an error, or `cancelled` from outside |
 | `RequestScheduled` | gate (fail-open) | A Request is about to enter the Frontier |
 | `RequestDropped(reason)` | observe | A Request was vetoed, or was a duplicate |
@@ -514,7 +516,7 @@ Keyword arguments of `run()`, `crawl()`, and `stream_items()` are Spider argumen
 - `run()` and `crawl()` return a `RunResult(run_id, reason, stats)`, where `reason` is `finished`, `drained`, or `forced`, and `stats` is the final snapshot.
 - `run()` behaves as a program: it creates its own event loop, installs the stop signals (§6.6) in the main thread, and ends the process when the Run does not complete. A configuration error (invalid settings, Spider arguments, or components, all found before anything is opened) is written to stderr, or logged by the Run, without a traceback, and exits with 2; a failed Run is logged with its traceback and exits with 1; a Run stopped by a signal exits with 130, whether it drained or was forced. A Run that finished, or that code stopped, returns.
 - With the `outcome_file` setting, the Run writes how it ended, with its `reason` and the exit code above, as its last step, whether `run()`, `crawl()`, `stream_items()`, or `pernix run` runs it (§8).
-- `crawl()` and `stream_items()` are library calls: errors are raised, signals are left to the application, and cancelling the task stops the Run like a Force Stop (`cancelled`). For finer control, `Crawler.from_spider(Books, args=..., settings=...)` gives the Crawler, with `crawl()`, `stream_items()`, and `stop()`.
+- `crawl()` and `stream_items()` are library calls: errors are raised, signals are left to the application, and cancelling the task stops the Run like a Force Stop (`cancelled`). For finer control, `Crawler.from_spider(Books, args=..., settings=...)` gives the Crawler, with `crawl()`, `stream_items()`, `stop()`, `pause()`, and `resume()`.
 - `stream_items()` yields the Items that pass every Pipeline, the same ones the Feeds receive, holding one at a time. A slow consumer therefore pauses the Item processing, then the Callbacks once the Item queue is full, and so the fetching. The Run starts with the first iteration; if it fails, the error is raised after the Items already received. Leaving early (`break`, an exception, leaving `async with`) force-stops the Run: `async with` or `aclose()` waits for it to stop, while an abandoned stream stops once it is garbage-collected.
 
 | Command | Purpose |
@@ -861,7 +863,7 @@ Engine integration:
 - Each worker claims one Request at a time and renews its Lease every third of `frontier.lease_ttl` (60 s by default) while it works.
 - The Lease is acknowledged only after the Callback's outputs have been added, so the Requests a Callback adds are in the Frontier before their parent leaves it, and the Run can never end early.
 - A Request that was fetched and handled, or ignored with `IgnoreRequest`, is acknowledged; one whose fetch or Callback failed is kept as a Dead Request with the error as the reason. Retries return Requests with `nack` (§6.4).
-- A Finite Run is idle once `start()` is exhausted and nothing is ready, delayed, or leased. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the Run ends when it adds no new Request to the Frontier, including when everything it yields is a duplicate or vetoed.
+- A Finite Run is idle once `start()` is exhausted, nothing is ready, delayed, or leased, and it is not paused (§6.6). Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the Run ends when it adds no new Request to the Frontier, including when everything it yields is a duplicate or vetoed.
 
 | Implementation | Role |
 | --- | --- |
@@ -948,13 +950,15 @@ Rules:
 | --- | --- |
 | `drain` | Stop claiming new Requests and finish the in-flight ones within a grace period |
 | `force` | Cancel in-flight Requests, return them to the Frontier (not counted as failures), and close components |
-| `pause` / `resume` | Stop or resume claiming; the process stays alive (planned, with the Platform's control sources) |
+| `pause` / `resume` | Stop claiming new Requests until resumed, finishing the in-flight ones; the process stays alive, and the Run does not end on its own meanwhile |
 
 - `crawler.stop(mode="drain")` requests a stop; it returns at once, and can be called from a Callback, a component, or another task, even before the Run starts. A Force Stop requested during a Drain escalates it; any other repeated request, and any request after the Run, does nothing. `signal=` names the signal that asked for the stop, as `run()` and the CLI do, so that the outcome file records the exit code 130 (§8).
 - **Drain**: the workers stop claiming, and the iteration of `start()` stops; `on_idle()` is not called. The Requests in flight are finished, and the Requests their Callbacks yield still enter the Frontier, where a later Run can resume them. The queued Items are processed. All of it must end within `shutdown.grace` (20 s); then the Drain turns into a Force Stop. The Run ends as `drained`.
 - **Force Stop**: the Requests in flight are cancelled and returned with `nack(count_attempt=False)`. The Item processing is cancelled too: the Items queued or in process are discarded, counted as `items.discarded`, and logged as a warning. The components are then closed as usual, but each within `shutdown.close_timeout` (5 s), so a stuck close cannot hold the process; a sync `close()` cannot be cancelled. The Feeds are completed, keeping the Items written. The Run ends as `forced`. A cancelled Run is closed the same way.
 - Stopping covers the whole Run, from importing the Spider's Accounts (§5.3) and opening the components to closing them. A Drain requested while the Accounts are imported or the components open applies once the work starts, and its grace period runs from the request. A Force Stop while the Accounts are imported cancels the import, and one while the components open cancels the opening and closes the components already open; the Run ends as `forced` without `SpiderOpened` or `SpiderClosed`, as when opening fails. A Force Stop while they close, including one a Drain turns into after its grace period, limits the close in progress and the rest to `shutdown.close_timeout`.
 - Requests from `start()` and `on_idle()` are checked against the Drain before each one, since adding to the Frontier need not suspend.
+- **Pause**: `crawler.pause()` holds a Run without ending it, as when a downstream store is down or a site asked for a break; `crawler.resume()` picks it up again. Both return at once and may be called from a Callback, a component, or another task; `crawler.paused` tells whether the Run is paused. The workers stop claiming at once, and no Request is taken from `start()` or `on_idle()`, though the one being produced, such as after an Inline Fetch, still enters the Frontier. The Requests in flight finish, with their Callbacks, Inline Fetches, and Items, and are settled as usual, so a paused Run holds no Lease once they are done. Lease renewals, Cooldowns, proxy refreshes, stats snapshots, and the Item processing go on. A paused Run is never idle, so `SpiderIdle` is not emitted and `on_idle()` does not run, and it does not end on its own, even with nothing left to fetch; it ends once resumed, or with a Drain, as `drained`, or a Force Stop, as `forced`, neither of which resumes it.
+- Pausing and resuming are logged, and emitted as `SpiderPaused` and `SpiderResumed(paused_for)`, in the order requested; a resumed Run claims again once `SpiderResumed` is emitted, so none of its Events come before. `run.pauses` and `run.paused_seconds` count them (§8). A pause requested before the Run starts takes effect when its work does: `SpiderPaused` follows `SpiderOpened`, and nothing is claimed or taken from `start()` until it is resumed. A repeated request, and any request once a stop was requested or after the Run, does nothing. No signal pauses a Run; Pause comes from code or from a control source (§8).
 - Signals, in `run()` and the CLI: the first SIGINT/SIGTERM triggers a Drain, and the second triggers a Force Stop. Any further one gets Python's default handling (`KeyboardInterrupt`, or termination), an escape hatch when sync code blocks the event loop. The defaults of 20 s and 5 s together stay below the usual 30 s a container platform waits before killing a process.
 - Each stage of shutdown is fault-tolerant on its own, and multiple exceptions are aggregated into an ExceptionGroup and reported together; a close that times out is one of them.
 
@@ -1000,7 +1004,8 @@ Rules:
 
 | Key | Meaning |
 | --- | --- |
-| `run.id`, `run.spider`, `run.started_at`, `run.finished_at`, `run.elapsed`, `run.reason` | The Run; times in UTC ISO 8601, `elapsed` in seconds, `reason` as in `SpiderClosed` |
+| `run.id`, `run.spider`, `run.started_at`, `run.finished_at`, `run.elapsed`, `run.reason` | The Run; times in UTC ISO 8601, `elapsed` in seconds, paused time included, `reason` as in `SpiderClosed` |
+| `run.pauses`, `run.paused_seconds` | Times the Run was paused, and the seconds it spent paused, a pause in progress included (§6.6) |
 | `requests.enqueued` | Requests that entered the Frontier |
 | `requests.dropped`, `requests.dropped_by_reason.<reason>` | Requests vetoed or dropped as duplicates, such as `duplicate` and `offsite` |
 | `requests.retried`, `requests.retried_by_budget.<budget>`, `requests.ignored` | Attempts retried, and those of them under a retry budget, by its name (§6.4); Requests ignored |
@@ -1026,7 +1031,7 @@ Rules:
 
 **Control**
 
-- Control through OS signals is supported (§6.6); within a program, `crawler.stop(mode)` can be called, and `pause()` and `resume()` are planned.
+- Control through OS signals is supported (§6.6); within a program, `crawler.stop(mode)`, `crawler.pause()`, and `crawler.resume()` can be called (§6.6).
 - Pluggable `ControlSource`: for example, reading pause/drain/stop commands from a Redis key. The framework only reads the control state and responds to it; writing it is done by the Platform.
 
 **Outcome**
