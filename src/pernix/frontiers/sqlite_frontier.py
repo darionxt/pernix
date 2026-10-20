@@ -4,8 +4,10 @@ import asyncio
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from pernix.fetchers.fetcher_dispatch import is_rendered
@@ -15,7 +17,7 @@ from pernix.frontiers.sqlite_store import FrontierStore, RequestRow
 from pernix.request_codec import decode_request, encode_request
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
     from concurrent.futures import Future
 
     from pernix.frontiers.frontier import FrontierCounts, Lease
@@ -23,6 +25,9 @@ if TYPE_CHECKING:
     from pernix.spider import Spider
 
 __all__ = ["SQLiteFrontier"]
+
+_seen: ContextVar[Mapping[SQLiteFrontier, int]] = ContextVar("pernix_frontier_seen", default=MappingProxyType({}))
+"""How many changes each SQLiteFrontier had made when the current task last used it."""
 
 
 class SQLiteFrontier:
@@ -48,9 +53,9 @@ class SQLiteFrontier:
     and proxy credentials. An operation once called completes even if its caller is
     cancelled, and a claim cancelled gives back the Requests it leased, without
     counting an attempt. `wait()` returns on the changes made through this Frontier
-    and when the next deadline falls due, so one process at a time should use a
-    database. Dead Requests can be inspected in the table `requests`, with their
-    `url` and `reason`.
+    since the calling task last used it, and when the next deadline falls due, so
+    one process at a time should use a database. Dead Requests can be inspected in
+    the table `requests`, with their `url` and `reason`.
 
     Example:
         >>> frontier = SQLiteFrontier("run/frontier.db", spider)
@@ -82,9 +87,13 @@ class SQLiteFrontier:
         self._fingerprint = fingerprint
         self._slot_of = slot_of
         self._clock = clock
-        self._store = FrontierStore(os.fspath(path), partial(decode_request, spider=spider))
+        self._store = FrontierStore(os.fspath(path), partial(decode_request, spider=spider), clock)
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pernix-frontier")
         self._changed = asyncio.Event()
+        self._changes = 0
+        """The operations that changed something, counted in the thread as they end."""
+        self._notified = 0
+        """The changes the waiters were woken for, counted on the event loop."""
         self._closed = False
 
     async def add(self, requests: Sequence[Request]) -> list[bool]:
@@ -100,7 +109,7 @@ class SQLiteFrontier:
             self._row(request, None if request.dont_filter else self._key(request), self._slot_of(request))
             for request in requests
         ]
-        return await self._call(lambda now: self._store.add(now, rows))
+        return await self._call(lambda: self._store.add(rows))
 
     async def claim(
         self,
@@ -122,23 +131,23 @@ class SQLiteFrontier:
             raise ValueError(f"limit must be at least 1, got {limit}")
         _check_ttl(ttl)
         skipped = frozenset(skip_slots)
-        claimed = self._submit(lambda now: self._store.claim(now, worker_id, limit, ttl, skipped, rendered))
+        claimed = self._submit(lambda: self._store.claim(worker_id, limit, ttl, skipped, rendered))
         try:
-            return await asyncio.shield(asyncio.wrap_future(claimed))
+            return self._seeing(await asyncio.shield(asyncio.wrap_future(claimed)))
         except asyncio.CancelledError:
             if not self._closed:  # the claim goes on in the thread; what it leases goes back after it
-                self._submit(lambda now: self._release(now, claimed))
+                self._submit(lambda: self._release(claimed))
             raise
 
     async def renew(self, lease: Lease, ttl: float) -> Lease | None:
         """Extend a Lease; see `Frontier.renew()`."""
         _check_ttl(ttl)
-        expires_at = await self._call(lambda now: self._store.renew(now, lease, ttl))
+        expires_at = await self._call(lambda: self._store.renew(lease, ttl))
         return None if expires_at is None else replace(lease, expires_at=expires_at)
 
     async def ack(self, lease: Lease) -> bool:
         """Mark a leased Request as done, keeping its Fingerprint; see `Frontier.ack()`."""
-        return await self._call(lambda now: self._store.ack(now, lease))
+        return await self._call(lambda: self._store.ack(lease))
 
     async def nack(
         self,
@@ -158,8 +167,7 @@ class SQLiteFrontier:
         """
         replacement = None if request is None else self._row(request, None, lease.slot)
         return await self._call(
-            lambda now: self._store.nack(
-                now,
+            lambda: self._store.nack(
                 lease,
                 delay=delay,
                 count_attempt=count_attempt,
@@ -171,15 +179,22 @@ class SQLiteFrontier:
 
     async def dead(self, lease: Lease, reason: str) -> bool:
         """Keep a leased Request as a Dead Request, with the reason; see `Frontier.dead()`."""
-        return await self._call(lambda now: self._store.dead(now, lease, reason))
+        return await self._call(lambda: self._store.dead(lease, reason))
 
     async def counts(self) -> FrontierCounts:
         """Count the Requests in each state, done ones included; see `Frontier.counts()`."""
         return await self._call(self._store.counts)
 
     async def wait(self) -> None:
-        """Wait for a change made through this Frontier, or for the next deadline; see `Frontier.wait()`."""
+        """Wait for a change made through this Frontier, or for the next deadline; see `Frontier.wait()`.
+
+        It returns at once if a change was made since the calling task last used
+        this Frontier: the task may have checked what it waits for then, and the
+        change came while that check was waiting for the database.
+        """
         changed = self._changed  # a change the operation below makes sets this one
+        if _seen.get().get(self, self._notified) < self._notified:
+            return
         due = await self._call(self._store.next_due)
         try:
             async with asyncio.timeout(None if due is None else max(0.0, due - self._clock())):
@@ -208,36 +223,44 @@ class SQLiteFrontier:
         data = encode_request(request, self._spider)
         return RequestRow(fingerprint, slot, is_rendered(request), request.priority, request.url, data)
 
-    async def _call[T](self, operation: Callable[[float], T]) -> T:
-        """Run an operation of the store at the time now; it completes even if the caller is cancelled."""
-        return await asyncio.shield(asyncio.wrap_future(self._submit(operation)))
+    async def _call[T](self, operation: Callable[[], T]) -> T:
+        """Run an operation of the store; it completes even if the caller is cancelled."""
+        return self._seeing(await asyncio.shield(asyncio.wrap_future(self._submit(operation))))
 
-    def _submit[T](self, operation: Callable[[float], T]) -> Future[T]:
-        """Queue an operation of the store at the time now, waking the waiters once it changed something.
+    def _submit[T](self, operation: Callable[[], T]) -> Future[tuple[T, int]]:
+        """Queue an operation of the store, waking the waiters once it changed something.
 
         Operations run one at a time, in the order they are submitted, in the
         Frontier's thread and its own context, so the Requests restored there take
-        nothing from the caller's, such as the page a Callback handles.
+        nothing from the caller's, such as the page a Callback handles. Each gives
+        its result with the number of changes made by then.
         """
         if self._closed:
             raise RuntimeError("the Frontier is closed")
         loop = asyncio.get_running_loop()
-        now = self._clock()
 
-        def run() -> T:
-            result = operation(now)
+        def run() -> tuple[T, int]:
+            result = operation()
             if self._store.changed:  # waiters wake up even if the caller was cancelled
+                self._changes += 1
                 loop.call_soon_threadsafe(self._notify)
-            return result
+            return result, self._changes
 
         return self._executor.submit(run)
 
-    def _release(self, now: float, claimed: Future[list[Lease]]) -> None:
+    def _seeing[T](self, outcome: tuple[T, int]) -> T:
+        """Record, for the calling task, how many changes the result of an operation saw; return the result."""
+        result, changes = outcome
+        _seen.set({**_seen.get(), self: changes})
+        return result
+
+    def _release(self, claimed: Future[tuple[list[Lease], int]]) -> None:
         """Give back what a cancelled claim leased; it ran before, in the same thread."""
         if claimed.exception() is None:
-            self._store.release(now, claimed.result())
+            self._store.release(claimed.result()[0])
 
     def _notify(self) -> None:
+        self._notified += 1
         self._changed.set()
         self._changed = asyncio.Event()
 

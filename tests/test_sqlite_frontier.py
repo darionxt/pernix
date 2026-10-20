@@ -226,6 +226,32 @@ async def test_a_claim_cancelled_while_it_waits_gives_its_leases_back(opened: Op
     assert lease.attempt == 1
 
 
+async def test_wait_returns_for_a_change_made_since_the_task_last_used_the_frontier(opened: Opener) -> None:
+    frontier = opened()
+    await frontier.add([Request(URL)])
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    assert (await frontier.counts()).leased == 1  # as the Engine finds a Run not idle yet
+    await asyncio.create_task(frontier.ack(lease))  # settled by another task, before this one waits
+
+    async with asyncio.timeout(5):
+        await frontier.wait()
+
+
+async def test_an_operation_takes_the_time_once_it_holds_the_database(opened: Opener, path: Path) -> None:
+    clock = FakeClock()
+    frontier = opened(clock=clock)
+    await frontier.add([Request(URL)])
+    with _database(path) as holder:
+        holder.execute("BEGIN IMMEDIATE")
+        claiming = asyncio.create_task(frontier.claim("worker-1", 1, 10.0))
+        await asyncio.sleep(0)
+        clock.advance(20.0)  # while the claim waits for the database
+        holder.execute("COMMIT")
+
+    [lease] = await claiming
+    assert lease.expires_at == clock.now + 10.0
+
+
 async def test_wait_returns_when_a_delay_passes(opened: Opener) -> None:
     clock = FakeClock()
     frontier = opened(clock=clock)

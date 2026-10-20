@@ -137,11 +137,12 @@ class RequestRow:
 class FrontierStore:
     """The Requests of a Frontier in a SQLite database, run through the Lease state machine.
 
-    Each operation is one transaction. It first makes the delays that passed ready,
-    and the Requests whose Leases expired, counting an attempt, as `MemoryFrontier`
-    does. The database is opened by the first operation, and created if it is
-    missing, readable by its owner only. Times are seconds on the Frontier's clock,
-    given to each operation.
+    Each operation is one transaction. It reads the time once it holds the
+    database, so that the time it waited for it is taken from no Lease or delay,
+    and first makes the delays that passed ready, and the Requests whose Leases
+    expired, counting an attempt, as `MemoryFrontier` does. The database is opened
+    by the first operation, and created if it is missing, readable by its owner
+    only.
 
     Attributes:
         changed: Whether the last operation changed something a waiting Worker may
@@ -149,34 +150,35 @@ class FrontierStore:
             that came sooner.
     """
 
-    def __init__(self, path: str, restore: Callable[[bytes], Request]) -> None:
+    def __init__(self, path: str, restore: Callable[[bytes], Request], clock: Callable[[], float]) -> None:
         """Configure the store; the database is not opened yet.
 
         Args:
             path: The database file.
             restore: Decodes a Request stored as `RequestRow.data`.
+            clock: The Frontier's clock, in seconds.
         """
         self._path = path
         self._restore = restore
+        self._clock = clock
         self._connection: sqlite3.Connection | None = None
         self._sequences = itertools.count(1)
         self._tokens = itertools.count(1)
         self.changed = False
 
-    def add(self, now: float, rows: Sequence[RequestRow]) -> list[bool]:
+    def add(self, rows: Sequence[RequestRow]) -> list[bool]:
         """Store each Request whose Fingerprint is new; see `Frontier.add()`.
 
         Returns:
             For each Request, whether it was stored.
         """
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, _):
             added = [self._insert(connection, row) for row in rows]
         self.changed |= any(added)
         return added
 
     def claim(
         self,
-        now: float,
         worker_id: str,
         limit: int,
         ttl: float,
@@ -189,7 +191,7 @@ class FrontierStore:
             SerializationError: A Request to lease cannot be restored; nothing is
                 leased, and it stays ready.
         """
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, now):
             due = self._next_due(connection)
             leases: list[Lease] = []
             while len(leases) < limit and (found := self._first_ready(connection, skip_slots, rendered)) is not None:
@@ -198,21 +200,21 @@ class FrontierStore:
             self.changed = True  # waiters wake up by the earliest deadline, which is now sooner
         return leases
 
-    def renew(self, now: float, lease: Lease, ttl: float) -> float | None:
+    def renew(self, lease: Lease, ttl: float) -> float | None:
         """Extend a Lease; see `Frontier.renew()`.
 
         Returns:
             When the Lease now expires, or `None` if it is no longer valid.
         """
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, now):
             if self._leased(connection, lease) is None:
                 return None
             connection.execute("UPDATE requests SET due = ? WHERE id = ?", (now + ttl, int(lease.id)))
         return now + ttl
 
-    def ack(self, now: float, lease: Lease) -> bool:
+    def ack(self, lease: Lease) -> bool:
         """Mark a leased Request as done, keeping only its Fingerprint; see `Frontier.ack()`."""
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, _):
             if self._leased(connection, lease) is None:
                 return False
             connection.execute("DELETE FROM requests WHERE id = ?", (int(lease.id),))
@@ -221,7 +223,6 @@ class FrontierStore:
 
     def nack(
         self,
-        now: float,
         lease: Lease,
         *,
         delay: float,
@@ -233,7 +234,6 @@ class FrontierStore:
         """Return a leased Request; see `Frontier.nack()`.
 
         Args:
-            now: The time.
             lease: The Lease.
             delay: Seconds before it can be claimed again.
             count_attempt: Count this as a failed attempt.
@@ -245,25 +245,24 @@ class FrontierStore:
         Returns:
             `False` if the Lease is no longer valid, and nothing changed.
         """
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, now):
             returned = self._return(connection, now, lease, delay, count_attempt, reason, budget, replacement)
         self.changed |= returned
         return returned
 
-    def release(self, now: float, leases: Sequence[Lease]) -> None:
+    def release(self, leases: Sequence[Lease]) -> None:
         """Return Requests whose Leases never reached a Worker, without counting an attempt.
 
         Args:
-            now: The time.
             leases: The Leases.
         """
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, now):
             for lease in leases:
                 self.changed |= self._return(connection, now, lease, 0.0, False, "cancelled", None, None)
 
-    def dead(self, now: float, lease: Lease, reason: str) -> bool:
+    def dead(self, lease: Lease, reason: str) -> bool:
         """Keep a leased Request as a Dead Request; see `Frontier.dead()`."""
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, _):
             if self._leased(connection, lease) is None:
                 return False
             connection.execute(
@@ -272,15 +271,15 @@ class FrontierStore:
         self.changed = True
         return True
 
-    def counts(self, now: float) -> FrontierCounts:
+    def counts(self) -> FrontierCounts:
         """Count the Requests in each state; see `Frontier.counts()`."""
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, _):
             counts: dict[str, int] = dict(connection.execute("SELECT state, requests FROM counts").fetchall())
         return FrontierCounts(counts["ready"], counts["delayed"], counts["leased"], counts["done"], counts["dead"])
 
-    def next_due(self, now: float) -> float | None:
+    def next_due(self) -> float | None:
         """Return when the next delay passes or Lease expires, if any."""
-        with self._transaction(now) as connection:
+        with self._transaction() as (connection, _):
             return self._next_due(connection)
 
     def close(self) -> None:
@@ -290,13 +289,17 @@ class FrontierStore:
             connection.close()
 
     @contextmanager
-    def _transaction(self, now: float) -> Generator[sqlite3.Connection]:
-        """Run one transaction, after making what fell due by `now` ready; roll it back on an error."""
+    def _transaction(self) -> Generator[tuple[sqlite3.Connection, float]]:
+        """Run one transaction, after making what fell due ready; yield the connection and the time it started.
+
+        It is rolled back on an error.
+        """
         connection = self._connection or self._open()
         connection.execute("BEGIN IMMEDIATE")
         try:
+            now = self._clock()  # once the database is held, which may have taken a while
             self.changed = self._make_due_ready(connection, now)
-            yield connection
+            yield connection, now
             connection.execute("COMMIT")
         except BaseException:
             if connection.in_transaction:  # SQLite may have rolled it back already
