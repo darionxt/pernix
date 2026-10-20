@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import gc
 import os
 import random
 import sqlite3
 import stat
 import sys
 import time
+import weakref
 from contextlib import closing
 from typing import TYPE_CHECKING, Any
 
@@ -235,6 +237,34 @@ async def test_wait_returns_for_a_change_made_since_the_task_last_used_the_front
 
     async with asyncio.timeout(5):
         await frontier.wait()
+
+
+async def test_wait_returns_at_once_for_a_change_only_once(opened: Opener) -> None:
+    frontier = opened()
+    await frontier.counts()
+    await asyncio.create_task(frontier.add([Request(URL)]))
+    await frontier.wait()  # for the Request added since this task looked
+
+    waiting = asyncio.create_task(frontier.wait())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not waiting.done()
+
+    await frontier.add([Request(URL + "next")])
+    async with asyncio.timeout(5):
+        await waiting
+
+
+async def test_a_task_that_used_a_frontier_does_not_keep_it(path: Path) -> None:
+    frontier = SQLiteFrontier(path, Shop())
+    await frontier.counts()  # in this task, whose context lives on
+    await frontier.close()
+    used = weakref.ref(frontier)
+
+    del frontier
+    gc.collect()
+
+    assert used() is None
 
 
 async def test_an_operation_takes_the_time_once_it_holds_the_database(opened: Opener, path: Path) -> None:

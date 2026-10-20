@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
-from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from pernix.fetchers.fetcher_dispatch import is_rendered
@@ -17,7 +16,7 @@ from pernix.frontiers.sqlite_store import FrontierStore, RequestRow
 from pernix.request_codec import decode_request, encode_request
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Sequence
     from concurrent.futures import Future
 
     from pernix.frontiers.frontier import FrontierCounts, Lease
@@ -25,9 +24,6 @@ if TYPE_CHECKING:
     from pernix.spider import Spider
 
 __all__ = ["SQLiteFrontier"]
-
-_seen: ContextVar[Mapping[SQLiteFrontier, int]] = ContextVar("pernix_frontier_seen", default=MappingProxyType({}))
-"""How many changes each SQLiteFrontier had made when the current task last used it."""
 
 
 class SQLiteFrontier:
@@ -94,6 +90,9 @@ class SQLiteFrontier:
         """The operations that changed something, counted in the thread as they end."""
         self._notified = 0
         """The changes the waiters were woken for, counted on the event loop."""
+        # One per Frontier, so that the contexts of tasks keep no Frontier alive.
+        self._seen: ContextVar[int] = ContextVar("pernix_frontier_seen")
+        """The changes the current task had seen when it last used the Frontier."""
         self._closed = False
 
     async def add(self, requests: Sequence[Request]) -> list[bool]:
@@ -193,14 +192,17 @@ class SQLiteFrontier:
         change came while that check was waiting for the database.
         """
         changed = self._changed  # a change the operation below makes sets this one
-        if _seen.get().get(self, self._notified) < self._notified:
-            return
-        due = await self._call(self._store.next_due)
         try:
-            async with asyncio.timeout(None if due is None else max(0.0, due - self._clock())):
-                await changed.wait()
-        except TimeoutError:
-            pass
+            if self._seen.get(self._notified) < self._notified:
+                return
+            due = await self._call(self._store.next_due)
+            try:
+                async with asyncio.timeout(None if due is None else max(0.0, due - self._clock())):
+                    await changed.wait()
+            except TimeoutError:
+                pass
+        finally:
+            self._seen.set(self._notified)  # the caller checks again once it returns
 
     async def close(self) -> None:
         """Close the database once the operations called before are done; closing again does nothing.
@@ -251,7 +253,7 @@ class SQLiteFrontier:
     def _seeing[T](self, outcome: tuple[T, int]) -> T:
         """Record, for the calling task, how many changes the result of an operation saw; return the result."""
         result, changes = outcome
-        _seen.set({**_seen.get(), self: changes})
+        self._seen.set(changes)
         return result
 
     def _release(self, claimed: Future[tuple[list[Lease], int]]) -> None:
