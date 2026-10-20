@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import sys
@@ -99,10 +100,19 @@ def pytest_runtest_makereport(
 
 
 def _without_credentials(text: str, url: str) -> str:
-    """A text with a proxy's URL in it shown without its credentials, and its credentials masked wherever else."""
+    """A text with a proxy's URL in it shown without its credentials, and its credentials masked wherever else.
+
+    A credential is masked as written, and as the `repr` of a string, or JSON,
+    escapes it, as a traceback shows the values of its frames.
+    """
     text = text.replace(url, proxy_address(url))
-    for credential in proxy_credentials(url):
-        text = text.replace(credential, MASK)
+    forms = {
+        form
+        for credential in proxy_credentials(url)
+        for form in (credential, repr(credential)[1:-1], json.dumps(credential)[1:-1])
+    }
+    for form in sorted(forms, key=len, reverse=True):  # the longest first, so that none is left in part
+        text = text.replace(form, MASK)
     return text
 
 
