@@ -11,6 +11,7 @@ import pytest
 from pernix import IgnoreRequest, Request, Response
 from pernix.errors import ConnectError, NetworkBlocked, ProxyError, Timeout, TooManyRedirects
 from pernix.fetchers import FetcherDispatch, StreamedResponse
+from pernix.frontiers import host_slot
 from pernix.headers import Headers
 from pernix.response import Redirect
 from pernix.robots import CACHE_TTL, PARSE_LIMIT, UNREACHABLE_WAIT, RobotsTxt, is_robots_txt
@@ -21,7 +22,7 @@ from pernix.testing.frontier import FakeClock
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable
 
 SITE = "https://site.example"
 HOST = "site.example"
@@ -73,7 +74,14 @@ class Site:
 class Obeying:
     """A robots.txt layer, on a Throttle and a clock of its own."""
 
-    def __init__(self, *, cooldown_max: float = 300.0, delay: float = 0.0, **settings: object) -> None:
+    def __init__(
+        self,
+        *,
+        cooldown_max: float = 300.0,
+        delay: float = 0.0,
+        slot_of: Callable[[Request], str] = host_slot,
+        **settings: object,
+    ) -> None:
         self.clock = FakeClock()
         self.throttle = Throttle(
             DomainSettings(cooldown_max=cooldown_max, delay=delay, delay_jitter=0.0), clock=self.clock
@@ -84,6 +92,7 @@ class Obeying:
             throttle=self.throttle,
             stats=self.stats,
             cooldown_max=cooldown_max,
+            slot_of=slot_of,
             clock=self.clock,
         )
 
@@ -299,12 +308,12 @@ async def test_rules_are_fetched_again_after_a_day() -> None:
     assert len(site.robots) == 2
 
 
-@pytest.mark.parametrize(("settings", "spacing"), [({}, 4.0), ({"crawl_delay_max": 2.5}, 2.5)])
+@pytest.mark.parametrize(("crawl_delay_max", "spacing"), [(None, 4.0), (2.5, 2.5)])
 async def test_a_crawl_delay_longer_than_the_delay_spaces_the_domain(
-    settings: dict[str, float], spacing: float
+    crawl_delay_max: float | None, spacing: float
 ) -> None:
     site = Site(b"User-agent: *\nCrawl-delay: 4\n")
-    obeying = Obeying(delay=1.0, **settings)
+    obeying = Obeying(delay=1.0, crawl_delay_max=crawl_delay_max)
 
     await obeying.fetch(f"{SITE}/a", site)
 
@@ -329,6 +338,18 @@ async def test_the_domain_takes_the_longest_crawl_delay_of_its_origins() -> None
     assert obeying.throttle.blocked() == {HOST}  # the https origin's still does
     obeying.clock.advance(0.01)
     assert obeying.throttle.blocked() == frozenset()
+
+
+async def test_the_slot_of_a_request_is_the_one_the_run_computes() -> None:
+    obeying = Obeying(slot_of=lambda request: "everything")
+
+    await obeying.fetch(f"{SITE}/a", Site(b"User-agent: *\nCrawl-delay: 4\n"))
+    with pytest.raises(NotYet):
+        await obeying.fetch("https://other.example/a", Site(503))
+
+    assert obeying.throttle.blocked() == {"everything"}
+    assert obeying.throttle.cooldown_left("everything") == UNREACHABLE_WAIT
+    assert obeying.throttle.cooldown_left(HOST) == 0
 
 
 async def test_a_crawl_delay_no_longer_than_the_delay_changes_nothing() -> None:

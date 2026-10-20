@@ -9,13 +9,15 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from pernix import IgnoreRequest, Request, Response, Spider, events
+from pernix import IgnoreRequest, Middleware, Request, Response, Spider, events
 from pernix.robots import PARSE_LIMIT
 from pernix.testing import FakeFetcher, crawl, make_response
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from pernix.crawler import Crawler
+    from pernix.middlewares import Download
     from pernix.testing import Answer, LoopbackServer
 
 SITE = "https://site.example"
@@ -191,6 +193,37 @@ async def test_robots_txt_is_fetched_under_the_session_of_the_request_and_never_
     assert robots.session == page.session
     assert _urls(report.items) == [f"{SITE}/a"]
     assert (report.stats.get("responses.blocked", 0), report.stats.get("sessions.retirements", 0)) == (0, 0)
+
+
+class Authorize(Middleware):
+    """Fetches a token from the origin of each Request first, as some APIs need."""
+
+    def __init__(self, crawler: Crawler) -> None:
+        self.crawler = crawler
+
+    async def __call__(self, request: Request, call_next: Download) -> Response:
+        if request.url.endswith("/token"):
+            return await call_next(request)
+        token = await self.crawler.fetch(f"{SITE}/token")
+        return await call_next(request.replace(headers=[*request.headers, ("Authorization", token.text)]))
+
+
+async def test_a_fetch_a_middleware_makes_as_part_of_fetching_robots_txt_does_not_wait_for_it() -> None:
+    site = FakeFetcher(
+        {
+            f"{SITE}/robots.txt": ROBOTS_TXT,
+            f"{SITE}/token": "t0ken",
+            re.compile(rf"{re.escape(SITE)}/.*"): "<p>page</p>",
+        }
+    )
+    settings = {**OBEY, "domain.concurrency": 1, "middlewares": {Authorize: 100}}
+
+    async with asyncio.timeout(5):  # the token fetch shares the slot the page fetch holds
+        report = await crawl(Pages, fetcher=site, settings=settings, urls=[f"{SITE}/a"])
+
+    assert _urls(report.items) == [f"{SITE}/a"]
+    assert _fetched(site) == [f"{SITE}/token", f"{SITE}/robots.txt", f"{SITE}/token", f"{SITE}/a"]
+    assert [request.headers.get("Authorization") for request in site.requests] == [None, "t0ken", None, "t0ken"]
 
 
 async def test_a_crawl_delay_longer_than_the_delay_slows_the_domain_down() -> None:

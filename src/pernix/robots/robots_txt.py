@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import logging
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -52,6 +53,9 @@ REASON = "robots.txt"
 
 _SCHEMES = frozenset({"http", "https"})
 
+_fetching: ContextVar[frozenset[asyncio.Event]] = ContextVar("pernix_fetching_robots_txt", default=frozenset())
+"""The fetches of robots.txt the current code runs inside of, by the Event each sets once it ends."""
+
 
 @dataclass(slots=True)
 class _Origin:
@@ -83,9 +87,11 @@ class RobotsTxt(Middleware):
     start it was paced for, and following five redirects at most. Its Response is
     judged neither Blocked nor logged out, but the cookies it sets are kept in the
     Session. The other fetches to the origin meanwhile wait for it; if it fails as
-    the Request's own fetch would, they fetch it in turn. Each fetch that fetched
-    robots.txt, or waited for it, is paced again before it starts, as robots.txt
-    took a start of its domain.
+    the Request's own fetch would, they fetch it in turn. A fetch made as part of
+    it, such as one a Middleware makes to the origin for a token, and those of the
+    tasks it starts, go through as they are, as they cannot wait for it. Each fetch
+    that fetched robots.txt, or waited for it, is paced again before it starts, as
+    robots.txt took a start of its domain.
 
     What the answer means (RFC 9309 §2.3.1), from the first `PARSE_LIMIT` bytes
     of the body:
@@ -123,6 +129,7 @@ class RobotsTxt(Middleware):
         throttle: Throttle,
         stats: Stats,
         cooldown_max: float,
+        slot_of: Callable[[Request], str] = host_slot,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Obey robots.txt for a Run.
@@ -134,6 +141,8 @@ class RobotsTxt(Middleware):
             stats: Where robots.txt fetches and their outcomes are counted.
             cooldown_max: The longest the Requests to an origin wait for its
                 unreachable robots.txt, as `domain.cooldown_max` limits cooldowns.
+            slot_of: Computes the concurrency slot of a Request, as the Frontier
+                and the Inline Fetch compute it.
             clock: A monotonic clock, in seconds.
         """
         self._user_agent = settings.user_agent
@@ -141,6 +150,7 @@ class RobotsTxt(Middleware):
         self._throttle = throttle
         self._stats = stats
         self._cooldown_max = cooldown_max
+        self._slot_of = slot_of
         self._clock = clock
         self._origins: dict[str, _Origin] = {}
         self._delays: dict[str, dict[str, float]] = {}  # the Crawl-delay of each origin, by slot
@@ -167,17 +177,24 @@ class RobotsTxt(Middleware):
         origin = _origin(request)
         if origin is None or is_robots_txt(request.url) or not _obeys(request):
             return await call_next(request)
-        rules, waited = await self._rules(origin, request, call_next)
+        found = await self._rules(origin, request, call_next)
+        if found is None:  # made as part of fetching the origin's robots.txt
+            return await call_next(request)
+        rules, waited = found
         if not rules.allows(request.url):
             self._stats.inc("robots.disallowed")
             raise IgnoreRequest(REASON)
-        slot = host_slot(request)
+        slot = self._slot_of(request)
         if waited and not await self._throttle.pace(slot):
             raise NotYet(self._throttle.cooldown_left(slot), "domain cooling down")
         return await call_next(request)
 
-    async def _rules(self, origin: str, request: Request, call_next: Download) -> tuple[RobotsRules, bool]:
+    async def _rules(self, origin: str, request: Request, call_next: Download) -> tuple[RobotsRules, bool] | None:
         """The rules in force for an origin, fetching its robots.txt if they are due; and whether it waited for them.
+
+        Returns:
+            The rules and whether it waited; `None` for a fetch made as part of
+            fetching the origin's robots.txt, which cannot wait for it.
 
         Raises:
             pernix.sending.NotYet: robots.txt is unreachable, and no rules are in force.
@@ -192,12 +209,16 @@ class RobotsTxt(Middleware):
                 raise self._deferred(state.refresh_at - now)
             if state.fetching is None:
                 break
+            if state.fetching in _fetching.get():
+                return None
             waited = True
             await state.fetching.wait()
         state.fetching = fetching = asyncio.Event()
+        inside = _fetching.set(_fetching.get() | {fetching})
         try:
             rules = await self._fetch(origin, state, request, call_next)
         finally:
+            _fetching.reset(inside)
             state.fetching = None
             fetching.set()
         if rules is None:
@@ -244,7 +265,7 @@ class RobotsTxt(Middleware):
         else:
             rules = RobotsRules.allowing_all()
         state.rules, state.refresh_at, state.unreachable = rules, self._clock() + CACHE_TTL, 0
-        self._space(origin, host_slot(request), rules.crawl_delay)
+        self._space(origin, self._slot_of(request), rules.crawl_delay)
         logger.debug("Fetched the robots.txt of %s: %s", origin, answer.value)
         return rules
 
@@ -285,7 +306,7 @@ class RobotsTxt(Middleware):
         state.unreachable += 1
         if state.unreachable >= UNREACHABLE_LIMIT:
             state.rules, state.refresh_at, state.unreachable = RobotsRules.disallowing_all(), now + CACHE_TTL, 0
-            self._space(origin, host_slot(request), None)
+            self._space(origin, self._slot_of(request), None)
             logger.warning(
                 "The robots.txt of %s was unreachable %d times in a row (%s); its Requests are ignored until it is "
                 "fetched again, in %d hours",
@@ -295,7 +316,7 @@ class RobotsTxt(Middleware):
                 CACHE_TTL // 3600,
             )
             return state.rules
-        state.refresh_at = now + self._throttle.cool_down(host_slot(request), wait)
+        state.refresh_at = now + self._throttle.cool_down(self._slot_of(request), wait)
         logger.info(
             "The robots.txt of %s is unreachable (%s); the Requests to it wait %.0f s for it to be fetched again",
             origin,
