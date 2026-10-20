@@ -14,6 +14,8 @@
 - Presents the languages of the `locale` setting, `["en-US", "en"]` by default, through Chrome's `--accept-lang`. Chrome replaces some lists with its own for their first language, such as `de-DE,de` with `de-DE,de,en-US,en`; the browser Fetcher then warns, naming the list to set.
 - On Linux, the high-entropy client hints the browser gives scripts are its own. On macOS and Windows, patchright's `user_agent` option gives them an architecture and a platform version it guesses from the User-Agent, such as `x86` and `10_15_7` on a Mac with Apple silicon, where the build itself gives `arm` and the OS version.
 
+- Through an HTTP proxy, sends what Chrome sends: the `CONNECT` of a tunnel with `Proxy-Connection: keep-alive` and the request's `User-Agent`, and a request without a tunnel with `Proxy-Connection` in the place of `Connection`.
+
 **Why no randomization**
 
 Randomly generated headers or page properties only change the surface; they cannot change the TLS and HTTP/2 characteristics at the same time. The result is a UA, Client Hints, and TLS characteristics that contradict each other, which is easier to detect, not harder.
@@ -36,3 +38,5 @@ Randomly generated headers or page properties only change the surface; they cann
 - curl's HPACK encoder never adds `content-length` to the dynamic table, which Chrome's does, so a request with a body is represented otherwise from that field on; the contract compares its headers and leaves its HPACK out, and a test expected to fail records it.
 - Chrome orders the headers a page sets among its own by a hash of their names; a Request's own new headers go first among those instead, and a test expected to fail records it.
 - Where a page puts an image, a script, or a style sheet changes the priority Chrome gives it, and Chrome chains concurrent HTTP/2 streams, pools connections across hosts sharing an address and a certificate, and sends CORS preflights; the HTTP Fetcher sends each kind's default priority, one request at a time on its stream, and no preflight.
+- In headless mode, the browser's `CONNECT` to a proxy names it `HeadlessChrome`, as the User-Agent its contexts present does not reach it; the HTTP Fetcher's names the build as it is with a window. Only the proxy sees it; a test expected to fail records it.
+- Chrome sends its first request through a proxy without credentials, and sends them once the proxy asked, last in a `CONNECT`; curl sends Basic credentials at once, after `Host` in a `CONNECT`. A test expected to fail records it.
