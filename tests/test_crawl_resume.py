@@ -422,7 +422,7 @@ async def test_a_run_killed_mid_crawl_fetches_again_no_request_done_and_each_one
     assert report.reason == "finished"
     assert {f"/page/{n}" for n in (PAGES - 1, PAGES)} <= in_flight
     assert sorted(again) == sorted(pages_kept)  # each Request not done, once
-    assert {path for path in before if path.startswith("/page/")} | set(again) == {
+    assert {path for path in [*before, *again] if path.startswith("/page/")} == {
         f"/page/{n}" for n in range(1, PAGES + 1)
     }
     assert report.stats["run.resumed"] == 1
