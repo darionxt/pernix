@@ -21,6 +21,12 @@ __all__ = ["MemoryFrontier"]
 
 type _State = Literal["ready", "delayed", "leased", "dead"]
 
+type _Entry = tuple[int, int, str]
+"""A ready Request in the queue of its slot: `(-priority, sequence, id)`, which orders it as claims go."""
+
+type _Head = tuple[int, int, int, str]
+"""The first ready Request of a slot, `(-priority, sequence, mark, slot)`; only the slot's latest mark is live."""
+
 
 @dataclass(slots=True)
 class _Item:
@@ -29,8 +35,6 @@ class _Item:
     slot: str
     rendered: bool = False
     state: _State = "ready"
-    sequence: int = 0
-    """Orders ready Requests of one priority; a newer heap entry makes older ones stale."""
     attempts: int = 0
     """Failed attempts that count."""
     spent: dict[str, int] = field(default_factory=dict[str, int])
@@ -41,13 +45,91 @@ class _Item:
     reason: str = ""
 
 
+class _ReadyQueue:
+    """The ready Requests of one kind, queued per slot, with a heap of the first Request of each slot.
+
+    A claim goes through the slots by their first Requests, so it skips a slot at
+    once, however many Requests wait in it. A Request that becomes the first of its
+    slot ahead of another, by a higher priority, leaves the entry of that one in the
+    heap stale, and the heap is rebuilt once it holds more stale entries than live ones.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty queue."""
+        self._slots: dict[str, list[_Entry]] = {}  # a heap per slot with ready Requests
+        self._heads: list[_Head] = []
+        self._marks: dict[str, int] = {}  # the mark of the live entry of each slot in `_heads`
+        self._next_marks = itertools.count()
+        self._skipped: list[_Head] = []  # set aside by `first()` until `restore()`
+
+    def push(self, slot: str, entry: _Entry) -> None:
+        """Queue a ready Request.
+
+        Args:
+            slot: The slot of the Request.
+            entry: The Request's entry.
+        """
+        queue = self._slots.setdefault(slot, [])
+        heapq.heappush(queue, entry)
+        if queue[0] == entry:  # the first of its slot now
+            self._list(slot, entry)
+            if len(self._heads) > 2 * len(self._marks):  # more stale entries than live ones
+                self._heads = [head for head in self._heads if self._marks.get(head[3]) == head[2]]
+                heapq.heapify(self._heads)
+
+    def first(self, skip_slots: Collection[str]) -> _Entry | None:
+        """Find the first Request outside `skip_slots`, leaving it queued.
+
+        The slots skipped on the way are set aside until `restore()`, so finding the
+        next one does not go through them again.
+
+        Args:
+            skip_slots: The slots whose Requests to leave for later.
+
+        Returns:
+            The Request's entry, or `None` if every ready Request is in `skip_slots`.
+        """
+        while self._heads:
+            _, _, mark, slot = self._heads[0]
+            if self._marks.get(slot) != mark:
+                heapq.heappop(self._heads)  # stale
+            elif slot in skip_slots:
+                self._skipped.append(heapq.heappop(self._heads))
+            else:
+                return self._slots[slot][0]
+        return None
+
+    def pop(self) -> str:
+        """Take the Request `first()` found out of the queue; return its id."""
+        _, _, _, slot = heapq.heappop(self._heads)
+        queue = self._slots[slot]
+        _, _, item_id = heapq.heappop(queue)
+        if queue:
+            self._list(slot, queue[0])
+        else:
+            del self._slots[slot], self._marks[slot]
+        return item_id
+
+    def restore(self) -> None:
+        """Queue again the slots `first()` set aside."""
+        for head in self._skipped:
+            heapq.heappush(self._heads, head)
+        self._skipped.clear()
+
+    def _list(self, slot: str, entry: _Entry) -> None:
+        """Make a Request the first of its slot in `_heads`, which leaves the slot's earlier entry stale."""
+        self._marks[slot] = mark = next(self._next_marks)
+        heapq.heappush(self._heads, (entry[0], entry[1], mark, slot))
+
+
 class MemoryFrontier:
     """A Frontier held in memory, implementing the full Lease state machine.
 
     It is lost when the process ends, so it suits Runs that need no resuming. Done
     Requests are forgotten, except for their Fingerprints; Dead Requests are kept.
-    Rendered Requests queue apart from the others, so a claim of one kind never
-    goes through the Requests of the other.
+    Ready Requests queue per slot, and rendered ones apart from the others, so a
+    claim skips a slot at once, however many Requests wait in it, and a claim of one
+    kind never goes through the Requests of the other.
     """
 
     def __init__(
@@ -69,7 +151,7 @@ class MemoryFrontier:
         self._clock = clock
         self._items: dict[str, _Item] = {}
         self._seen: set[str] = set()
-        self._ready: dict[bool, list[tuple[int, int, str]]] = {False: [], True: []}  # (-priority, sequence, id)
+        self._ready = {False: _ReadyQueue(), True: _ReadyQueue()}  # by whether rendered
         self._delayed: list[tuple[float, int, str]] = []  # (not_before, sequence, id)
         self._expiries: list[tuple[float, int, str]] = []  # (expires_at, token, id)
         self._counts: Counter[str] = Counter()
@@ -116,28 +198,16 @@ class MemoryFrontier:
         due = self._next_due()
         queues = list(self._ready.values()) if rendered is None else [self._ready[rendered]]
         leases: list[Lease] = []
-        skipped: list[tuple[list[tuple[int, int, str]], tuple[int, int, str]]] = []
-        while len(leases) < limit:
-            ready = min((queue for queue in queues if queue), key=lambda queue: queue[0], default=None)
-            if ready is None:
-                break
-            entry = heapq.heappop(ready)
-            item = self._items.get(entry[2])
-            if item is None or item.state != "ready" or item.sequence != entry[1]:
-                continue  # stale entry
-            if item.slot in skip_slots:
-                skipped.append((ready, entry))
-                continue
-            item.token = next(self._tokens)
-            item.expires_at = now + ttl
-            self._move(item, "leased")
-            heapq.heappush(self._expiries, (item.expires_at, item.token, item.id))
-            attempt = item.attempts + 1
-            leases.append(
-                Lease(item.id, item.token, attempt, item.expires_at, item.slot, item.request, item.rendered, item.spent)
-            )
-        for ready, entry in skipped:
-            heapq.heappush(ready, entry)
+        try:
+            while len(leases) < limit:
+                firsts = [(entry, queue) for queue in queues if (entry := queue.first(skip_slots)) is not None]
+                if not firsts:
+                    break
+                _, ready = min(firsts, key=lambda first: first[0])
+                leases.append(self._lease(self._items[ready.pop()], now + ttl))
+        finally:
+            for queue in queues:
+                queue.restore()  # the slots skipped
         if leases and (due is None or now + ttl < due):
             self._notify()  # waiters wake up by the earliest deadline, which is now sooner
         return leases
@@ -265,9 +335,16 @@ class MemoryFrontier:
             return None
         return item
 
+    def _lease(self, item: _Item, expires_at: float) -> Lease:
+        item.token = next(self._tokens)
+        item.expires_at = expires_at
+        self._move(item, "leased")
+        heapq.heappush(self._expiries, (item.expires_at, item.token, item.id))
+        attempt = item.attempts + 1
+        return Lease(item.id, item.token, attempt, item.expires_at, item.slot, item.request, item.rendered, item.spent)
+
     def _push_ready(self, item: _Item) -> None:
-        item.sequence = next(self._sequences)
-        heapq.heappush(self._ready[item.rendered], (-item.request.priority, item.sequence, item.id))
+        self._ready[item.rendered].push(item.slot, (-item.request.priority, next(self._sequences), item.id))
 
     def _move(self, item: _Item, state: _State) -> None:
         self._counts[item.state] -= 1
