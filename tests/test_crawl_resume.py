@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from pernix import Request, Spider
-from pernix.errors import JobDirError
+from pernix.errors import JobDirError, SettingsError
 from pernix.frontiers import SQLiteFrontier
 from pernix.job_dir import JobDir, RunRecord
 from pernix.testing import FakeFetcher, crawl
@@ -219,6 +219,47 @@ async def test_a_fingerprint_function_given_as_an_object_is_recorded_by_its_name
     assert report.reason == "finished"
     recorded = json.loads((tmp_path / "run.json").read_text())["fingerprint"]["function"]
     assert recorded in {"test_crawl_resume.by_url", "test_crawl_resume.ByUrl"}
+
+
+class Pages(Spider):
+    name = "pages"
+
+    def __init__(self, pages: tuple[int, ...], labels: dict[int, str]) -> None:
+        self.pages = pages
+
+    async def start(self) -> AsyncIterator[Request]:
+        for n in self.pages:
+            yield Request(f"{SITE}/{n}")
+        self.crawler.stop()
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        yield {"url": response.url}
+
+
+async def test_spider_arguments_compare_as_the_job_directory_records_them(tmp_path: Path) -> None:
+    await crawl(Pages, fetcher=_site(1, 2), settings=_settings(tmp_path), pages=(1, 2), labels={1: "one"})
+
+    report = await crawl(Pages, fetcher=_site(1, 2), settings=_settings(tmp_path), pages=(1, 2), labels={1: "one"})
+
+    assert report.stats["run.resumed"] == 1
+
+
+@pytest.mark.parametrize("name", ["run.json", "frontier.db", "lock"])
+async def test_no_output_may_write_a_file_the_job_directory_keeps(
+    tmp_path: Path, chain: type[Chain], name: str
+) -> None:
+    chain.drain_at = 1
+    await crawl(chain, fetcher=_site(1), settings=_settings(tmp_path))
+    record = (tmp_path / "run.json").read_bytes()
+
+    with pytest.raises(SettingsError, match=rf"job_dir \({name}\) and outcome_file both write "):
+        await crawl(chain, fetcher=_site(2), settings=_settings(tmp_path, outcome_file=str(tmp_path / name)))
+    with pytest.raises(SettingsError, match=rf"job_dir \({name}\) both write "):
+        await crawl(
+            chain, fetcher=_site(2), settings=_settings(tmp_path, feeds={str(tmp_path / name): {"format": "jsonl"}})
+        )
+
+    assert (tmp_path / "run.json").read_bytes() == record
 
 
 class Renamed(Chain):

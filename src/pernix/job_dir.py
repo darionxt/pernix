@@ -15,6 +15,7 @@ import datetime as dt
 import os
 import socket
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,8 @@ __all__ = ["JobDir", "RunRecord"]
 _RECORD = "run.json"
 _FRONTIER = "frontier.db"
 _LOCK = "lock"
+_FILES = (_RECORD, f".{_RECORD}.tmp", _FRONTIER, f"{_FRONTIER}-wal", f"{_FRONTIER}-shm", _LOCK)
+"""The files a job directory keeps, which no output of the Run may write."""
 
 
 class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
@@ -60,6 +63,9 @@ _decoder = msgspec.json.Decoder(RunRecord)
 class JobDir:
     """A job directory, which one process at a time takes for its Run.
 
+    It is taken once: once released, even while `take()` runs in another thread,
+    it cannot be taken again.
+
     Attributes:
         path: The directory.
         record: The record of the Run, once taken.
@@ -77,11 +83,19 @@ class JobDir:
         self.record: RunRecord | None = None
         self.resumed = False
         self._lock: int | None = None
+        self._released = False
+        self._guard = threading.Lock()
+        """Lets `release()` wait for a `take()` in progress, so that the lock it takes is not left held."""
 
     @property
     def frontier_path(self) -> Path:
         """The database of the Run's Frontier."""
         return self.path / _FRONTIER
+
+    @property
+    def files(self) -> tuple[Path, ...]:
+        """The files the directory keeps, which no output of the Run may write."""
+        return tuple(self.path / name for name in _FILES)
 
     def peek(self) -> RunRecord | None:
         """Read the Run recorded without taking the directory, as a guess for what `take()` will find.
@@ -113,7 +127,14 @@ class JobDir:
             JobDirError: Another process holds the directory; it records another
                 Run; it holds a Frontier but no record; or its record cannot be read.
                 Nothing in it was changed.
+            RuntimeError: The directory was released already.
         """
+        with self._guard:
+            if self._released:
+                raise RuntimeError("the job directory was released")
+            return self._take(run)
+
+    def _take(self, run: RunRecord) -> RunRecord:
         self.path.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock = _locked(self.path / _LOCK)
         try:
@@ -135,7 +156,7 @@ class JobDir:
             self.record, self.resumed = found, True
             return found
         except BaseException:
-            self.release()
+            self._unlock()
             raise
 
     def record_start_exhausted(self) -> None:
@@ -150,7 +171,15 @@ class JobDir:
         self._write(self.record)
 
     def release(self) -> None:
-        """Release the lock, for another process to take the directory; releasing it again does nothing."""
+        """Release the lock, for another process to take the directory; releasing it again does nothing.
+
+        A `take()` running in another thread is waited for, so that the lock it takes is released too.
+        """
+        with self._guard:
+            self._released = True
+            self._unlock()
+
+    def _unlock(self) -> None:
         lock, self._lock = self._lock, None
         if lock is not None:
             os.close(lock)  # which releases the lock

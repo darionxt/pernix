@@ -20,6 +20,7 @@ from pernix.fingerprint import request_fingerprint
 from pernix.frontiers import MemoryFrontier, SQLiteFrontier
 from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
+from pernix.job_dir import JobDir
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.pausing import Pausing
@@ -589,7 +590,8 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
 
     Raises:
         pernix.errors.SettingsError: A Feed is invalid, or two Feeds, or a Feed and
-            `items.failed_output`, would write the same file.
+            `items.failed_output`, would write the same file, or one would write a
+            file the job directory keeps.
     """
     feed_settings = crawler.settings.section(FeedSettings).feeds
     configured = [(f"feeds[{template!r}]", template, options) for template, options in feed_settings.items()]
@@ -600,7 +602,7 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
     failed_output = crawler.settings.section(ItemSettings).failed_output
     if failed_output is not None:
         destinations.append(("items.failed_output", _feed_path(crawler, failed_output)))
-    _check_distinct(destinations)
+    _check_distinct([*destinations, *_job_dir_files(crawler)])
     return feeds
 
 
@@ -620,7 +622,8 @@ def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Pat
 
     Raises:
         pernix.errors.SettingsError: The path template is invalid, or a Feed,
-            `output`, or `items.failed_output` writes the same file.
+            `output`, or `items.failed_output` writes the same file, or it is a
+            file the job directory keeps.
     """
     template = crawler.settings.section(CoreSettings).outcome_file
     if template is None:
@@ -641,9 +644,22 @@ def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Pat
         with contextlib.suppress(OSError, ValueError):  # an invalid path is the other output's problem
             if _feed_path(crawler, other).resolve() == resolved:
                 problems.append(f"{label} and outcome_file both write {path}")
+    problems += [
+        f"{label} and outcome_file both write {path}"
+        for label, kept in _job_dir_files(crawler)
+        if kept.resolve() == resolved
+    ]
     if problems:
         raise SettingsError(problems)
     return path
+
+
+def _job_dir_files(crawler: Crawler) -> list[tuple[str, Path]]:
+    """The files the job directory of the `job_dir` setting keeps, which no output may write."""
+    job_dir = crawler.settings.section(CoreSettings).job_dir
+    if job_dir is None:
+        return []
+    return [(f"job_dir ({path.name})", path) for path in JobDir(job_dir).files]
 
 
 def _feed(crawler: Crawler, template: str, options: FeedOptions) -> Feed:

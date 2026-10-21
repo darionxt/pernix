@@ -168,3 +168,13 @@ def test_a_record_that_cannot_be_read_is_refused(tmp_path: Path) -> None:
     assert job.peek() is None
     with pytest.raises(JobDirError, match=r"the record of the Run in .+run\.json cannot be read: "):
         _taken(tmp_path, _run())
+
+
+def test_a_directory_released_before_it_is_taken_is_not_taken(tmp_path: Path) -> None:
+    job = JobDir(tmp_path)
+    job.release()  # as a Run cancelled while another thread was about to take it
+
+    with pytest.raises(RuntimeError, match="the job directory was released"):
+        job.take(_run())
+
+    assert _taken(tmp_path, _run()).run_id == "r1"  # no lock was left held

@@ -444,8 +444,8 @@ class Crawler:
                     self._write_outcome(run_log, result.reason)
                     return result
                 finally:
-                    if self._job is not None:
-                        self._job.release()
+                    if self._job is not None:  # in a thread, as it waits for a take() in progress
+                        await asyncio.to_thread(self._job.release)
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
         try:
@@ -505,7 +505,7 @@ class Crawler:
             run_id=self.run_id,
             spider=self.spider.name,
             started_at=self.started_at,
-            arguments=None if self._arguments is None else msgspec.to_builtins(self._arguments, enc_hook=repr),
+            arguments=None if self._arguments is None else _as_json(self._arguments),
             fingerprint={
                 "headers": list(options.headers),
                 "sort_query": options.sort_query,
@@ -659,6 +659,11 @@ def _log_failure(error: BaseException) -> None:
 
 def _as_request(request: Request | str) -> Request:
     return Request(request) if isinstance(request, str) else request
+
+
+def _as_json(value: object) -> Any:
+    """A value as JSON gives it back, as a job directory records it: tuples as lists, and keys as strings."""
+    return msgspec.json.decode(msgspec.json.encode(value, enc_hook=repr))
 
 
 def _import_path(component: object) -> str:
