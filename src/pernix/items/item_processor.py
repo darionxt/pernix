@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from pernix.errors import DropItem, FeedError
 from pernix.events import ItemDropped, ItemError, ItemScraped
 from pernix.items.item_adapter import is_item
+from pernix.items.pending_items import PendingItems
 from pernix.items.pipeline import FailedItem
 from pernix.items.pipeline_stage import PipelineStage
 
@@ -20,15 +21,19 @@ if TYPE_CHECKING:
     from pernix.items.pipeline import ItemContext
     from pernix.stats import Stats
 
-__all__ = ["ItemProcessor"]
+__all__ = ["ItemProcessor", "Outlet"]
 
 logger = logging.getLogger(__name__)
+
+type Outlet = Callable[[Any, Callable[[], None]], Awaitable[None]]
+"""Receives an Item that passed the Pipelines, and a function to call once done with it."""
 
 
 @dataclass(slots=True)
 class _Entry:
     item: Any
     ctx: ItemContext
+    pending: PendingItems
 
 
 @dataclass(slots=True)
@@ -72,16 +77,21 @@ class ItemProcessor:
     it and emit `ItemScraped`. An Item a Pipeline drops is emitted as `ItemDropped`,
     and one a Pipeline fails on as `ItemError`; either way it goes no further. A
     batch Pipeline collects Items and processes them when its batch is full, inside
-    the worker that filled it, when its timeout passes, and in `join()`; the batch
-    then continues on its way. An Item a batch Pipeline does not accept waits behind
-    the Items pending there, so with one worker no Item overtakes another; once as
-    many of them wait there as the queue holds, the pending batch is processed, even
-    if smaller, so that waiting stays bounded.
+    the worker that filled it, when its timeout passes, on `flush()`, and in
+    `join()`; the batch then continues on its way. An Item a batch Pipeline does not
+    accept waits behind the Items pending there, so with one worker no Item
+    overtakes another; once as many of them wait there as the queue holds, the
+    pending batch is processed, even if smaller, so that waiting stays bounded.
 
     Each Item a Pipeline failed on then goes, as a `FailedItem`, through the failure
     Pipelines in order, each passing it on to the next or stopping it with `None`. A
     failure Pipeline that fails loses the failed Item: it is logged and counted as
     `items.failures_lost`.
+
+    Each Item counts in the `PendingItems` of the attempt that produced it until it
+    is processed: once its Event is emitted, `ItemScraped`, `ItemDropped`, or
+    `ItemError`, and, for a failed Item, once the failure Pipelines had it. An Item
+    the outlet receives counts until the outlet is done with it too.
 
     A `FeedError`, from a Feed or from any Pipeline, is emitted as `ItemError` and
     fails the task that raised it, so the Run fails rather than lose Items silently.
@@ -98,7 +108,7 @@ class ItemProcessor:
         stats: Stats,
         *,
         failed_pipelines: Sequence[object] = (),
-        outlet: Callable[[Any], Awaitable[None]] | None = None,
+        outlet: Outlet | None = None,
         queue_size: int = 1000,
         concurrency: int = 1,
         timeout: float = 0.0,
@@ -115,8 +125,9 @@ class ItemProcessor:
                 failure Pipelines lost as `items.failures_lost`, and discarded Items
                 as `items.discarded`.
             failed_pipelines: The failure Pipelines, in order.
-            outlet: Receives every Item that passes the Pipelines, after the Feeds;
-                waiting in it holds the Items behind.
+            outlet: Receives every Item that passes the Pipelines, after the Feeds,
+                with the function to call once done with it; waiting in it holds the
+                Items behind.
             queue_size: Items waiting at most before `put()` waits.
             concurrency: Items processed at once.
             timeout: Seconds a Pipeline call may take unless the Pipeline sets its
@@ -152,15 +163,21 @@ class ItemProcessor:
         self._concurrency = concurrency
         self._tasks: asyncio.TaskGroup | None = None
         self._unsettled = 0
+        self._flushing: asyncio.Task[None] | None = None
+        self._flush_again = False
 
-    async def put(self, item: Any, ctx: ItemContext) -> None:
+    async def put(self, item: Any, ctx: ItemContext, pending: PendingItems | None = None) -> None:
         """Queue an Item, waiting while the queue is full.
 
         Args:
             item: The Item.
             ctx: Where it came from.
+            pending: The Items of the attempt that produced it, where it counts until
+                it is processed.
         """
-        await self._queue.put(_Entry(item, ctx))
+        entry = _Entry(item, ctx, PendingItems() if pending is None else pending)
+        entry.pending.add()
+        await self._queue.put(entry)
         self._unsettled += 1
 
     def start(self, tasks: asyncio.TaskGroup) -> None:
@@ -175,11 +192,22 @@ class ItemProcessor:
         for _ in range(self._concurrency):
             tasks.create_task(self._work())
 
+    def flush(self) -> None:
+        """Have every queued Item processed, then every pending batch, without waiting for a batch to fill or time out.
+
+        It returns at once, the processing going on in the task group of `start()`;
+        asked for while it goes on, it goes on again once done. Before `start()`, it
+        does nothing.
+        """
+        if self._tasks is None:
+            return
+        self._flush_again = True
+        if self._flushing is None or self._flushing.done():
+            self._flushing = self._tasks.create_task(self._flush_while_asked())
+
     async def join(self) -> None:
         """Process every queued Item and every pending batch, then stop the workers."""
-        await self._queue.join()
-        for index in sorted(self._batches):  # a batch may feed the batches of later Pipelines
-            await self._flush(index)
+        await self._process_pending()
         for batch in self._batches.values():
             if batch.timer is not None:
                 batch.timer.cancel()
@@ -199,6 +227,17 @@ class ItemProcessor:
             self._stats.inc("items.discarded", count)
             logger.warning("Discarded %d Items the Run stopped before they were processed", count)
         return count
+
+    async def _flush_while_asked(self) -> None:
+        while self._flush_again:
+            self._flush_again = False
+            await self._process_pending()
+
+    async def _process_pending(self) -> None:
+        """Process every queued Item, then every pending batch."""
+        await self._queue.join()
+        for index in sorted(self._batches):  # a batch may feed the batches of later Pipelines
+            await self._flush(index)
 
     async def _work(self) -> None:
         while True:
@@ -299,20 +338,24 @@ class ItemProcessor:
                 await self._events.emit(ItemError(entry.item, entry.ctx.response, exc))
                 raise
         if self._outlet is not None:
-            await self._outlet(entry.item)
+            entry.pending.add()  # until the outlet is done with it
+            await self._outlet(entry.item, entry.pending.processed)
         self._unsettled -= 1
         await self._events.emit(ItemScraped(entry.item, entry.ctx.response))
+        entry.pending.processed()
 
     async def _drop(self, entry: _Entry, reason: str) -> None:
         self._unsettled -= 1
         logger.debug("Dropped an Item from %r: %s", entry.ctx.request, reason)
         await self._events.emit(ItemDropped(entry.item, entry.ctx.response, reason))
+        entry.pending.processed()
 
     async def _fail(self, entry: _Entry, stage: PipelineStage, error: Exception) -> None:
         self._unsettled -= 1
         logger.error("Pipeline %s failed on an Item from %r", stage.name, entry.ctx.request, exc_info=error)
         await self._events.emit(ItemError(entry.item, entry.ctx.response, error))
         await self._record_failure(FailedItem(entry.item, stage.name, error), entry.ctx)
+        entry.pending.processed()
 
     async def _record_failure(self, failed: object, ctx: ItemContext) -> None:
         """Pass a failed Item through the failure Pipelines."""

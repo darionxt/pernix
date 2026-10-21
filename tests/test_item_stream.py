@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
 from typing import TYPE_CHECKING, Any
 
@@ -11,9 +12,11 @@ import pytest
 from pernix import Pipeline, Spider, events
 from pernix.crawler import Crawler
 from pernix.errors import FeedError, SpiderArgumentError
+from pernix.items import ItemStream
+from pernix.run_result import RunResult
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
     from pernix import Response
@@ -79,6 +82,29 @@ async def test_a_slow_consumer_pauses_the_callbacks(home: LoopbackServer) -> Non
     assert paused_at == 6
     assert [item["n"] for item in rest] == list(range(1, 100))
     assert crawler.stats.get("run.reason") == "finished"
+    assert crawler.stats.get("frontier.done") == 1
+
+
+async def test_an_item_counts_as_processed_once_the_consumer_asks_for_the_next_one() -> None:
+    channel: asyncio.Queue[tuple[Any, Callable[[], None]]] = asyncio.Queue(1)
+    processed: list[int] = []
+
+    async def crawl() -> RunResult:
+        for n in (1, 2):
+            await channel.put((n, functools.partial(processed.append, n)))
+        return RunResult("run", "finished", {})
+
+    stream = ItemStream(crawl, lambda _mode: None, channel)
+    async with asyncio.timeout(5), stream:
+        first = await anext(stream)
+        while_first = list(processed)
+        second = await anext(stream)
+        while_second = list(processed)
+        rest = [item async for item in stream]
+
+    assert (first, while_first) == (1, [])
+    assert (second, while_second) == (2, [1])
+    assert (rest, processed) == ([], [1, 2])
 
 
 async def test_leaving_early_force_stops_the_run(home: LoopbackServer) -> None:
@@ -95,6 +121,20 @@ async def test_leaving_early_force_stops_the_run(home: LoopbackServer) -> None:
     assert len(produced) == 6
     # The one waiting to enter the stream, and the two queued.
     assert crawler.stats.get("items.discarded") == 3
+
+
+async def test_leaving_early_returns_the_request_of_the_item_held_to_the_frontier(home: LoopbackServer) -> None:
+    crawler = Crawler.from_spider(_counting(home, 1, []), settings=SETTINGS)
+
+    async with asyncio.timeout(10), crawler.stream_items() as items:
+        async for item in items:
+            assert item == {"n": 0}
+            await asyncio.sleep(0.05)  # the Run waits for the consumer to be done with it
+            break
+
+    stats = crawler.stats
+    assert stats.get("run.reason") == "forced"
+    assert (stats.get("frontier.ready"), stats.get("frontier.done"), stats.get("items.scraped")) == (1, 0, 1)
 
 
 async def test_an_abandoned_stream_stops_once_garbage_collected(home: LoopbackServer) -> None:

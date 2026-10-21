@@ -155,7 +155,7 @@ async def _run(spider: Clicking, broken: list[Exception | None], **retry: Any) -
 
     items: list[Any] = []
 
-    async def put(item: Any, _context: object) -> None:
+    async def put(item: Any, _context: object, _pending: object) -> None:
         items.append(item)
 
     engine = Engine(

@@ -87,6 +87,22 @@ async def test_a_pause_holds_the_run_at_once_and_a_resume_releases_it_once_annou
     await announcing
 
 
+async def test_waiting_for_a_hold_returns_once_paused_and_at_once_while_held() -> None:
+    pausing, _, _ = _pausing()
+    pausing.begin()
+    waiting = asyncio.create_task(pausing.holding())
+    await asyncio.sleep(0)
+    before = waiting.done()
+
+    pausing.pause()
+    async with asyncio.timeout(5):
+        await waiting
+        await pausing.holding()
+
+    assert not before
+    await _announced(pausing)
+
+
 async def test_a_run_paused_again_before_its_resume_is_announced_stays_held() -> None:
     bus, announced = events.EventBus(timeout=5), asyncio.Event()
     pausing, spider, recorded = _pausing(bus=bus)

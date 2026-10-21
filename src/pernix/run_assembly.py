@@ -5,7 +5,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from pernix.addons import setup_addon
 from pernix.blocked_responses import BlockedResponses
@@ -54,13 +54,14 @@ from pernix.stats import CoreStats, LoopLag, LoopWatchdog, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from pernix.account import Account
     from pernix.control import ControlSource
     from pernix.crawler import Crawler
     from pernix.frontiers import Frontier
+    from pernix.items.item_processor import Outlet
     from pernix.logs import RunLog
     from pernix.middlewares import Download
     from pernix.proxies import BindingPolicy, ProxyProvider
@@ -148,7 +149,7 @@ class RunAssembly:
         run_log: RunLog,
         *,
         output: str | os.PathLike[str] | None = None,
-        outlet: Callable[[Any], Awaitable[None]] | None = None,
+        outlet: Outlet | None = None,
         accounts: Sequence[Account] = (),
         pausing: Pausing | None = None,
     ) -> RunAssembly:
@@ -168,7 +169,8 @@ class RunAssembly:
             crawler: The Crawler of the Run, which builds the components.
             run_log: The log of the Run, whose counts are reported in the stats.
             output: A Feed for the Items besides the `feeds` setting.
-            outlet: Receives every Item that passes the Pipelines, after the Feeds.
+            outlet: Receives every Item that passes the Pipelines, after the Feeds,
+                with the function to call once done with it.
             accounts: The Accounts the Spider gave, whose Sessions the Session Pool
                 holds, if one is enabled.
             pausing: Pauses and resumes the Run, for the Engine; its counts are
@@ -254,6 +256,7 @@ class RunAssembly:
             download=download,
             handle=handle,
             put_item=items.put,
+            flush_items=items.flush,
             events=events,
             concurrency=settings.section(CoreSettings).concurrency,
             browser_concurrency=_browser_settings(crawler).max_pages,
@@ -635,7 +638,7 @@ def _item_processor(
     pipelines: Sequence[object],
     failed_pipelines: Sequence[object],
     feeds: Sequence[Feed],
-    outlet: Callable[[Any], Awaitable[None]] | None,
+    outlet: Outlet | None,
 ) -> ItemProcessor:
     """Takes the Items through the Pipelines into the Feeds, as the `items.*` settings say."""
     options = crawler.settings.section(ItemSettings)

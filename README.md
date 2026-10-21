@@ -309,9 +309,9 @@ async with Search.stream_items(keyword="dune") as items:  # the Items that pass 
         ...
 ```
 
-Keyword arguments other than `settings=` and `output=` are Spider arguments, declared by the parameters of `__init__`. Strings, as from a command line, are converted to the annotated types: `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; `__init__` may raise `ValueError` to reject a value. `run()` and `crawl()` return a `RunResult` with the `run_id`, the `reason` the Run ended, and the final stats. `stream_items()` holds one Item at a time, so a slow consumer pauses the Callbacks; leaving the loop early stops the Run.
+Keyword arguments other than `settings=` and `output=` are Spider arguments, declared by the parameters of `__init__`. Strings, as from a command line, are converted to the annotated types: `"3"` to `3`, `"true"` to `True`, and JSON to lists, dicts, dataclasses, and Structs; `__init__` may raise `ValueError` to reject a value. `run()` and `crawl()` return a `RunResult` with the `run_id`, the `reason` the Run ended, and the final stats. `stream_items()` holds one Item at a time, so a slow consumer pauses the Callbacks; an Item counts as processed once you ask for the next one, and leaving the loop early stops the Run.
 
-`crawler.stop()` drains a Run: no new Request is claimed, and the Requests in flight and the queued Items are finished within `shutdown.grace`. `crawler.stop("force")` cancels the Requests in flight and returns them to the Frontier, and discards the Items not processed yet; the Feeds are still completed. `crawler.pause()` holds a Run without ending it, as when a downstream store is down: no new Request is claimed or taken from `start()`, the Requests in flight finish, and the Run does not end on its own until `crawler.resume()`, a Drain, or a Force Stop; `SpiderPaused` and `SpiderResumed` tell, and `run.paused_seconds` counts the time. `run()` drains on the first SIGINT or SIGTERM and force-stops on the second, and ends the process with an exit code when the Run does not complete:
+`crawler.stop()` drains a Run: no new Request is claimed, and the Requests in flight and the queued Items are finished within `shutdown.grace`. `crawler.stop("force")` cancels the Requests in flight and returns them to the Frontier, and discards the Items not processed yet, returning the Requests they came from too; the Feeds are still completed. `crawler.pause()` holds a Run without ending it, as when a downstream store is down: no new Request is claimed or taken from `start()`, the Requests in flight finish, with their Items, and the Run does not end on its own until `crawler.resume()`, a Drain, or a Force Stop; `SpiderPaused` and `SpiderResumed` tell, and `run.paused_seconds` counts the time. `run()` drains on the first SIGINT or SIGTERM and force-stops on the second, and ends the process with an exit code when the Run does not complete:
 
 | Exit code | Meaning |
 | --- | --- |
@@ -493,7 +493,9 @@ class Books(Spider):
     }
 ```
 
-Pipelines run in order on each Item, apart from the Callbacks: when they fall behind, the Item queue fills and Callbacks wait. A Pipeline error or timeout drops the Item (emitted as `ItemError`) and never fetches the Request again; the Item then goes, as a `FailedItem`, through the `failed_pipelines`, such as the built-in `FailedItemsFile` that writes to `items.failed_output`. Feeds write the Items that pass every Pipeline; each file is written under a temporary name and moved into place when the Run ends, so it appears complete or not at all. See [`docs/design.md`](docs/design.md) §4.8.
+Pipelines run in order on each Item, apart from the Callbacks: when they fall behind, the Item queue fills and Callbacks wait. A Pipeline error or timeout drops the Item (emitted as `ItemError`) and never fetches the Request again; the Item then goes, as a `FailedItem`, through the `failed_pipelines`, such as the built-in `FailedItemsFile` that writes to `items.failed_output`. Feeds write the Items that pass every Pipeline; each file is written under a temporary name and moved into place when the Run ends, so it appears complete or not at all.
+
+A Request is acknowledged in the Frontier only once its Items are processed: stored, dropped, or failed and passed through the `failed_pipelines`. Meanwhile its worker goes on to the next Request and its Lease is renewed; the Item queue bounds how many Requests wait so, and they count in `frontier.leased`. Delivery is at-least-once: a Run resumed after a crash may produce an Item again, so Pipelines should write idempotently, such as by upserting on a business key. See [`docs/design.md`](docs/design.md) §4.8.
 
 ## Logs and stats
 
@@ -628,6 +630,7 @@ src/pernix/
 │   ├── pipeline_stage.py one Pipeline's filter, options, timeouts, and retries
 │   ├── failed_items_file.py FailedItemsFile: writes failed Items to a file
 │   ├── item_processor.py the Item queue, Pipelines, batches, and Feed delivery
+│   ├── pending_items.py the Items of an attempt not processed yet, which its Lease waits for
 │   └── item_stream.py   ItemStream, the Items of a streamed Run
 ├── feeds/
 │   ├── feed.py          Feed: one output file, finished atomically; path templates
