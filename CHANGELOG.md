@@ -143,6 +143,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 
+- Teaching a browser context the client hints a Session keeps detaches its DevTools session before closing the page it taught them with; that close could hang, and the fetch with it, until `browser.deadline` ran out.
 - `LoopbackServer` no longer prints a traceback when a client, such as a browser, drops a connection it kept open, which landed in the stderr of the tests.
 - The HTTP Fetcher sends cookies in the order Chrome sends them: longer paths first, then the earliest set first, a cookie that replaces another keeping its place. curl ordered them by path, domain, and name length instead, the Request's own, a Session's, and those set on redirects alike.
 - Cookies set over HTTP with values beyond ASCII in UTF-8 are kept in a Session as text, and sent back byte for byte; they were kept as Latin-1 and sent back garbled.
