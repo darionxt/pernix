@@ -27,6 +27,7 @@ from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies
 from pernix.proxies.run_proxies import ProxySupply, RunProxies
 from pernix.retry_policy import DefaultRetryPolicy
+from pernix.robots import RobotsTxt
 from pernix.sending import IndependentSending
 from pernix.session import Session
 from pernix.sessions import MemorySessionPool
@@ -46,6 +47,7 @@ from pernix.settings import (
     LoopSettings,
     ProxySettings,
     RetrySettings,
+    RobotsSettings,
     SessionSettings,
     StatsSettings,
 )
@@ -163,7 +165,8 @@ class RunAssembly:
         download and spider chains, the Pipelines, and the path of the outcome file
         are checked. Steps that do not depend on each other all run, so their
         problems are reported together. The core stats and the Stats Sinks are
-        subscribed.
+        subscribed. With `robots.obey`, the download chain is wrapped in a
+        `pernix.robots.RobotsTxt`, outermost.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
@@ -203,6 +206,7 @@ class RunAssembly:
         problems.attempt(outcome_path, crawler, output)
         fingerprint = problems.attempt(_fingerprint_function, crawler)
         retry_policy = problems.attempt(_retry_policy, crawler)
+        robots = problems.attempt(_robots_settings, crawler)
         handle = None
         if spider_middlewares is not None:
             inherit = _inherits_referer(crawler)
@@ -228,6 +232,7 @@ class RunAssembly:
             or feeds is None
             or fingerprint is None
             or retry_policy is None
+            or robots is None
             or handle is None
             or items is None
         ):
@@ -250,6 +255,14 @@ class RunAssembly:
             proxies, is_blocked=blocked.blocked, render_blocked=settings.section(BlockedSettings).render
         )
         download = core_stats.count_downloads(downloading.download)
+        if robots.obey:  # outermost, so it checks every fetch before any Middleware changes it
+            obeying = RobotsTxt(
+                robots,
+                throttle=throttle,
+                stats=crawler.stats,
+                cooldown_max=settings.section(DomainSettings).cooldown_max,
+            )
+            download = build_download_chain([obeying], download)
         engine = Engine(
             crawler.spider,
             frontier=frontier,
@@ -392,6 +405,24 @@ def _supply(options: ProxySettings) -> ProxySupply:
         max_extracted=options.max_extracted,
         attempts=options.extract_attempts,
     )
+
+
+def _robots_settings(crawler: Crawler) -> RobotsSettings:
+    """The `robots.*` settings, checked against the Fetchers: robots.txt is fetched with the `http` one.
+
+    Raises:
+        pernix.errors.SettingsError: `robots.obey` is set, and no Fetcher is
+            registered as `http`.
+    """
+    options = crawler.settings.section(RobotsSettings)
+    if options.obey and "http" not in crawler.settings.named_components("fetchers"):
+        raise SettingsError(
+            [
+                f"{RobotsSettings.key('obey')}: robots.txt is fetched with the Fetcher registered as 'http', and none "
+                "is; register one, or turn robots.txt off"
+            ]
+        )
+    return options
 
 
 def _http_settings(crawler: Crawler) -> HTTPSettings:

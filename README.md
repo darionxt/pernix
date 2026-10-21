@@ -289,6 +289,21 @@ timezone = "Asia/Shanghai"    # of a date and time written without an offset; or
 
 An answer that does not match, such as an error, gives no proxy, with a warning naming the field it lacks, never the API's URL, and counts toward `proxies.extract_attempts`. Time zone names need the system's time zone data, which Windows lacks unless the `tzdata` package is installed; a fixed offset needs none. See [`docs/design.md`](docs/design.md) §5.3.
 
+## robots.txt
+
+```python
+class Polite(Spider):
+    settings = {"robots.obey": True, "robots.user_agent": "ExampleBot"}  # off by default
+
+    async def parse(self, response: Response):
+        token = await self.fetch(Request("/api/token", ext={"robots": {"obey": False}}))  # fetched whatever it says
+        ...
+```
+
+With `robots.obey`, the first Request to an origin fetches its robots.txt, which the other Requests to it wait for, and which is kept for 24 hours; a Request it disallows is ignored, emitting `RequestIgnored` with the reason `robots.txt`, and an Inline Fetch raises `IgnoreRequest`. Requests from the Frontier, Inline Fetches, and rendered Requests are all checked, by a layer the Run puts outermost in the download chain, before any Middleware changes them. The groups naming `robots.user_agent` apply, or else the `*` group: Pernix sends the bundled browser's User-Agent, which robots.txt groups do not name, so the token is `pernix` unless your crawler names itself. A `Crawl-delay` longer than `domain.delay` spaces the fetches of the domain, at most `robots.crawl_delay_max`.
+
+robots.txt is fetched as part of the Request that needs it, as the same client: with the HTTP Fetcher, under its Session and through its proxy, in its place in the domain's slot, following five redirects at most and reading 500 KiB at most. A 4xx, or more redirects, allows everything. A 5xx, a 429, or a failed fetch makes it unreachable: the rules fetched before stay in force; without them, the domain waits a minute, or as long as a `Retry-After` says, its Requests waiting in the Frontier without counting an attempt and Inline Fetches in place, then robots.txt is fetched again, and after three such answers in a row the origin is disallowed for 24 hours. A proxy that fails fails the Request's attempt instead, which the retry policy retries through another. `pernix shell` does not check robots.txt. See [`docs/design.md`](docs/design.md) §6.3.
+
 ## Running and stopping
 
 ```python
@@ -389,6 +404,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `domain.delay` / `domain.delay_jitter` | `0.0` / `0.5` | Seconds between the starts of two fetches from one domain, randomized by ± the jitter |
 | `domain.rate` / `domain.burst` | `None` / `1` | Fetches per second per domain (GCRA), and how many may start at once |
 | `domain.cooldown_max` | `300.0` | The longest a 429 or 503 with `Retry-After` pauses its domain; with a Session Pool, a 429 cools its Session down instead |
+| `robots.obey` | `false` | Obey the robots.txt of each origin: fetch it with the first Request there, and ignore the Requests it disallows |
+| `robots.user_agent` | `"pernix"` | The product token matched against robots.txt groups, or `*` for the `*` group alone |
+| `robots.crawl_delay_max` | `None` | The longest a robots.txt `Crawl-delay` spaces the fetches of a domain; `None` for no limit |
 | `sessions.enabled` | `false` | Whether Requests lease Sessions from a Session Pool |
 | `sessions.pool` | `"default"` | The pool's name |
 | `sessions.size` / `sessions.eager` | `8` / `false` | Sessions the pool holds at most without Accounts, created as Requests need them, or all at the start with `eager` |
@@ -579,7 +597,7 @@ src/pernix/
 ├── callbacks.py         runs Callbacks and errbacks, collects their outputs
 ├── retry_policy.py      retry decisions, retry budgets, backoff, Retry-After
 ├── blocked_responses.py telling Blocked Responses, and the Request a retry renders instead
-├── throttle.py          per-domain slots: concurrency, delay, rate, cooldowns
+├── throttle.py          per-domain slots: concurrency, delay, spacing, rate, cooldowns
 ├── request.py           Request
 ├── request_kinds.py     the kind of request a Request is: a navigation, a form, a fetch, or a load
 ├── request_codec.py     persisting Requests: msgpack, Callbacks by name
@@ -686,6 +704,9 @@ src/pernix/
 ├── middlewares/
 │   ├── middleware.py    download Middleware, NodeMiddleware, the download chain
 │   └── spider_middleware.py spider Middleware and their chain
+├── robots/
+│   ├── robots_txt.py    RobotsTxt: obeys each origin's robots.txt, from outermost in a Run's download chain
+│   └── robots_rules.py  RobotsRules: what a robots.txt allows, and what the answer to fetching one means
 ├── sessions/
 │   ├── session_pool.py  SessionPool protocol, SessionLease, Outcome, StateDelta
 │   ├── memory_session_pool.py MemorySessionPool: the in-process pool of a Run

@@ -33,7 +33,7 @@ from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings, check_profile
 from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.pinned_pair import client_headers
-from pernix.fetchers.redirects import Hop, redirect_target, redirected
+from pernix.fetchers.redirects import Hop, redirect_limit, redirect_target, redirected
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
 from pernix.request_kinds import is_document, request_kind
@@ -135,9 +135,10 @@ class HTTPFetcher:
     curl's own retries are off: the retry policy decides.
 
     Redirects are followed as browsers follow them (`pernix.fetchers.redirects`), up
-    to `http.max_redirects`, one transfer per hop: each hop gets the cookies matching
-    it, uses the HTTP version its URL calls for, and waits `http.timeout` for its
-    headers. 301 and 302 turn a POST into a GET, and 303 anything but GET and HEAD;
+    to `http.max_redirects`, or fewer inside `following_at_most()`, one transfer per
+    hop: each hop gets the cookies matching it, uses the HTTP version its URL calls
+    for, and waits `http.timeout` for its headers. 301 and 302 turn a POST into a
+    GET, and 303 anything but GET and HEAD;
     `Authorization` and `Proxy-Authorization` never follow a redirect to another
     origin; a `Location` that is not an http or https URL fails the fetch. The body
     of a redirect is dropped.
@@ -403,7 +404,8 @@ class HTTPFetcher:
         """
         proxy = request_proxy(request, session)
         timeout = request.timeout or self._settings.timeout
-        max_redirects = self._settings.max_redirects
+        limited = redirect_limit(self._settings.max_redirects)
+        max_redirects = self._settings.max_redirects if limited is None else limited
         cookies = ChainCookies(request, session)
         hints = ChainHints(session)
         top_level = _top_level(request)
@@ -458,7 +460,8 @@ class HTTPFetcher:
             await _discard(result)
             history.append(Redirect(result.url, result.status_code, _headers(result)))
             if len(history) > max_redirects:
-                raise TooManyRedirects(f"{request.url} redirected more than http.max_redirects ({max_redirects}) times")
+                most = f"http.max_redirects ({max_redirects})" if limited is None else str(max_redirects)
+                raise TooManyRedirects(f"{request.url} redirected more than {most} times")
             redirected_from, hop = result.url, redirected(hop, result.status_code, requote_uri(target))
 
     async def _check_hop(

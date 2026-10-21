@@ -16,7 +16,7 @@ from pernix.fetchers import FetcherDispatch, StreamedResponse
 from pernix.inline_fetch import InlineFetch, handling
 from pernix.middlewares import build_download_chain
 from pernix.retry_policy import Decision, DefaultRetryPolicy
-from pernix.sending import IndependentSending
+from pernix.sending import IndependentSending, NotYet
 from pernix.sessions import MemorySessionPool, Outcome
 from pernix.sessions.session_leasing import SessionLeasing
 from pernix.settings import BlockedSettings, DomainSettings, RetrySettings, SessionSettings
@@ -186,6 +186,63 @@ async def test_a_request_a_middleware_ignores_raises_ignore_request() -> None:
     with pytest.raises(IgnoreRequest, match="not needed"):
         await _inline(ignore, retry_policy=Judging()).fetch(Request(f"{SITE}/a"))
     assert judged == []
+
+
+async def test_an_attempt_the_chain_holds_back_is_made_again_without_counting() -> None:
+    judged: list[tuple[object, int]] = []
+
+    class Judging:
+        def decide(self, request: Request, outcome: Response | Exception, attempt: int) -> Decision:
+            judged.append((outcome, attempt))
+            return Decision.accept()
+
+    held = [NotYet(0, "robots.txt unreachable")]
+
+    async def hold_once(request: Request) -> Response:
+        if held:
+            raise held.pop()
+        return _response(request, b"ok")
+
+    response = await _inline(hold_once, retry_policy=Judging()).fetch(Request(f"{SITE}/a"))
+
+    assert response.body == b"ok"
+    assert judged == [(response, 1)]
+
+
+async def test_an_attempt_held_back_waits_without_its_place_in_the_slot() -> None:
+    holding = asyncio.Event()
+
+    async def hold_a(request: Request) -> Response:
+        if request.url.endswith("/a"):
+            holding.set()
+            raise NotYet(30, "robots.txt unreachable")
+        return _response(request, b"b")
+
+    inline = _inline(hold_a, domain=DomainSettings(concurrency=1))
+    held = asyncio.create_task(inline.fetch(Request(f"{SITE}/a")))
+    try:
+        async with asyncio.timeout(5):
+            await holding.wait()
+            assert (await inline.fetch(Request(f"{SITE}/b"))).body == b"b"
+        assert not held.done()
+    finally:
+        held.cancel()
+
+
+async def test_a_streamed_attempt_the_chain_holds_back_is_made_again() -> None:
+    files = Files([b"data"])
+    held = [NotYet(0, "robots.txt unreachable")]
+
+    async def hold_once(request: Request, call_next: Download) -> Response:
+        if held:
+            raise held.pop()
+        return await call_next(request)
+
+    async with _inline(_chain(files, hold_once)).stream(Request(f"{SITE}/file")) as streamed:
+        body = await _read(streamed)
+
+    assert body == b"data"
+    assert (files.opened, files.open) == (1, 0)
 
 
 async def test_each_attempt_waits_for_its_slot_and_frees_it() -> None:
