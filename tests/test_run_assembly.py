@@ -18,7 +18,7 @@ from pernix.run_assembly import RunAssembly
 from pernix.settings import LogSettings
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 
@@ -159,7 +159,7 @@ def test_two_outputs_may_not_write_the_same_file(tmp_path: Path) -> None:
 
 
 def test_the_output_and_the_outlet_reach_the_item_processing(tmp_path: Path) -> None:
-    async def outlet(_item: Any) -> None:
+    async def outlet(_item: Any, _processed: Callable[[], None]) -> None:
         pass
 
     run = _build({}, output=tmp_path / "books.csv", outlet=outlet)

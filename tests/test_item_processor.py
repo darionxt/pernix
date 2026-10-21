@@ -8,12 +8,12 @@ import pytest
 from pernix import DropItem, ItemContext, Pipeline, Request, events
 from pernix.errors import ComponentError, FeedError
 from pernix.feeds import Feed
-from pernix.items import FailedItem, ItemProcessor
+from pernix.items import FailedItem, ItemProcessor, PendingItems
 from pernix.settings import FeedOptions
 from pernix.stats import Stats
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
 CTX = ItemContext(Request("https://example.com/page"), None)
@@ -181,6 +181,31 @@ async def test_batches_are_processed_once_their_timeout_passes() -> None:
         await processor.join()
 
     assert rows.batches == [[1, 2]]
+
+
+async def test_a_flush_processes_the_queued_items_then_the_pending_batches_at_once() -> None:
+    flushed = asyncio.Event()
+
+    class Watched(Rows):
+        batch_size = 10
+
+        async def process_batch(self, items: list[Any], contexts: list[ItemContext]) -> None:
+            await super().process_batch(items, contexts)
+            flushed.set()
+
+    rows = Watched()
+    processor, _ = _processor([rows])
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        await processor.put({"n": 1}, CTX)
+        await processor.put({"n": 2}, CTX)  # both still queued
+        processor.flush()
+        await flushed.wait()
+        assert rows.batches == [[1, 2]]  # long before the timeout
+        await processor.put({"n": 3}, CTX)
+        await processor.join()
+
+    assert rows.batches == [[1, 2], [3]]
 
 
 @pytest.mark.parametrize(
@@ -534,7 +559,7 @@ async def test_the_outlet_receives_the_items_that_pass_before_they_are_reported(
     bus = events.EventBus(timeout=5)
     recorder = Recorder(bus)
 
-    async def outlet(item: Any) -> None:
+    async def outlet(item: Any, _processed: Callable[[], None]) -> None:
         recorder.log.append(("outlet", item))
 
     processor = ItemProcessor([Tag("a"), Drop()], [feed], bus, Stats(), outlet=outlet)
@@ -559,7 +584,7 @@ async def test_a_waiting_outlet_holds_the_items_behind() -> None:
     gate = asyncio.Event()
     taken: list[Any] = []
 
-    async def outlet(item: Any) -> None:
+    async def outlet(item: Any, _processed: Callable[[], None]) -> None:
         await gate.wait()
         taken.append(item)
 
@@ -625,3 +650,52 @@ async def test_nothing_is_discarded_after_a_complete_processing() -> None:
 
     assert processor.discard() == 0
     assert stats.get("items.discarded") is None
+
+
+# Counting the Items of each attempt
+
+
+async def test_each_item_counts_in_its_attempt_until_it_is_processed() -> None:
+    holding, release = asyncio.Event(), asyncio.Event()
+
+    class Hold(Pipeline):
+        async def process(self, item: FailedItem, ctx: ItemContext) -> FailedItem:
+            holding.set()
+            await release.wait()
+            return item
+
+    processor, recorder = _processor([Drop()], failed_pipelines=[Hold()])
+    pending = PendingItems()
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        for n in (6, 1, 4):  # stored, dropped, and failed
+            await processor.put({"n": n}, CTX, pending)
+        assert pending.count == 3
+        await holding.wait()
+        count = pending.count  # the failed Item is still with the failure Pipelines
+        release.set()
+        await pending.wait()
+        await processor.join()
+
+    assert count == 1
+    assert [entry[0] for entry in recorder.log] == ["scraped", "dropped", "error"]
+    assert pending.count == 0
+
+
+async def test_an_item_the_outlet_receives_counts_until_the_outlet_is_done_with_it() -> None:
+    done_with: list[Callable[[], None]] = []
+
+    async def outlet(_item: Any, processed: Callable[[], None]) -> None:
+        done_with.append(processed)
+
+    processor = ItemProcessor([], [], events.EventBus(timeout=5), Stats(), outlet=outlet)
+    pending = PendingItems()
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        processor.start(tasks)
+        await processor.put({"n": 1}, CTX, pending)
+        await processor.join()
+
+    assert pending.count == 1
+    [processed] = done_with
+    processed()
+    assert pending.count == 0

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Collection
 
     from pernix.frontiers import Lease
-    from pernix.items import ItemContext
+    from pernix.items import ItemContext, PendingItems
 
 SITE = "https://site.example"
 
@@ -89,7 +89,7 @@ def _engine(
         bus.on(event_type, recorded.append)
     items: list[Any] = []
 
-    async def put_item(item: Any, _ctx: ItemContext) -> None:
+    async def put_item(item: Any, _ctx: ItemContext, _pending: PendingItems) -> None:
         items.append(item)
 
     pausing = HeldPausing(spider, bus)
