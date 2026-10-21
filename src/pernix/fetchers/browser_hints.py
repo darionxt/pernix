@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from patchright.async_api import BrowserContext, Response, Route
+    from patchright.async_api import BrowserContext, CDPSession, Response, Route
 
 __all__ = ["accepted_hints", "teach_hints"]
 
@@ -46,6 +46,7 @@ async def teach_hints(context: BrowserContext, origin: str, hints: Sequence[str]
         await route.fulfill(status=200, headers=headers, body="")
 
     page = await context.new_page()
+    devtools: CDPSession | None = None
     try:
         devtools = await context.new_cdp_session(page)
         await devtools.send("Network.enable")  # pyright: ignore[reportUnknownMemberType]  # untyped
@@ -53,7 +54,11 @@ async def teach_hints(context: BrowserContext, origin: str, hints: Sequence[str]
         await page.route("**/*", answer)
         await page.goto(f"{origin}/", wait_until="commit", timeout=_TEACHING_TIMEOUT * 1000)
     finally:
-        await page.close()
+        try:
+            if devtools is not None:
+                await devtools.detach()  # attached, it could keep the page from closing, which then hung the fetch
+        finally:
+            await page.close()
     if not answered:
         raise RuntimeError(f"the navigation that teaches the client hints of {origin} was answered elsewhere")
 
