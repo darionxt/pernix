@@ -181,6 +181,10 @@ _Avoid_: plugin
 The external system that manages projects and starts and stops Runs. Pernix only exposes observation and control interfaces to it.
 _Avoid_: scheduler
 
+**Control Source**:
+A component that tells the state a Platform wants a Run in, running, paused, drained, or force-stopped, such as from a file the Platform writes. Pernix reads it and pauses, resumes, or stops the Run as it changes.
+_Avoid_: command channel
+
 ### Observability
 
 **Stats**:

@@ -324,6 +324,8 @@ Keyword arguments other than `settings=` and `output=` are Spider arguments, dec
 
 For a Platform, `outcome_file` (or `PERNIX_OUTCOME_FILE`), a path template as for Feeds such as `"outcome/{run_id}.json"`, makes the Run write, as its last step, however it ends, a JSON document of how it ended: its `run_id`, `spider`, `reason`, the `exit_code` above, `started_at` and `finished_at`, its `stats`, and for a failure the `error`'s `type` and `message`, masked as logs are. `run()`, `crawl()`, and `stream_items()` write it alike, as does `pernix run`, also for a configuration error found once the Run has begun; invalid settings and Spider arguments, found before, write none. See [`docs/design.md`](docs/design.md) §8.
 
+A Platform controls a Run from outside its process through control sources. With `control.file` set, it writes the state it wants, `running`, `paused`, `drain`, or `force`, in that file, atomically (`printf paused > state.tmp && mv state.tmp state`); the Run reads it as it starts, then every `control.interval` seconds, and pauses, resumes, or stops as it changes. A missing file means `running`. Only changes are applied, so a Run its code paused stays paused while the file says `running`, and a stop left in the file stops the next Run that reads it too. Sources of your own, such as one reading a key in a store, are `ControlSource`s with a `state()`, registered in `control.sources`. See [`docs/design.md`](docs/design.md) §8.
+
 ## Command line
 
 ```bash
@@ -432,6 +434,9 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `log.redact` | `()` | Names whose values are masked in logs, besides the built-in ones |
 | `stats.interval` | `60.0` | Seconds between stats snapshots; `0` keeps only the final one |
 | `stats.sinks` | `{}` | Stats Sinks, as `{sink: order}`, that receive every snapshot |
+| `control.file` | `None` | A file a Platform writes the state it wants the Run in: `running`, `paused`, `drain`, or `force` |
+| `control.sources` | `{}` | Control sources of one's own, as `{source: order}`, read after the file |
+| `control.interval` | `1.0` | Seconds between two reads of the control sources |
 | `loop.block_threshold` | `30.0` | Seconds the event loop may stay blocked before a warning logs the code blocking it; `0` turns the watchdog off |
 | `callbacks.timeout` | `None` | Seconds a Callback, with the spider Middleware, or an errback may take to produce its outputs before it fails with `CallbackTimeout`; `None` for no limit |
 | `items.queue_size` | `1000` | Items waiting for the Pipelines at most; a Callback producing more waits |
@@ -693,6 +698,10 @@ src/pernix/
 │   ├── binding_policy.py BindingPolicy protocol, Binding, and the default policy
 │   ├── proxy_sources.py ProxyProvider protocol; lists, files, and APIs of proxies
 │   └── run_proxies.py   the proxies of a Run: loaded, refreshed, given to fetches, bound to Sessions, and reported on
+├── control/
+│   ├── control_source.py ControlSource protocol, ControlState
+│   ├── control_file.py  ControlFile: the state a Platform writes in a file
+│   └── run_control.py   reads the control sources of a Run, and pauses, resumes, or stops it as they tell
 ├── stats/
 │   ├── stats.py         Stats, the counters and values of a Run
 │   ├── core_stats.py    counts Requests, downloads, Responses, and Items

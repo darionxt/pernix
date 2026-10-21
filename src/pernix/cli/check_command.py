@@ -13,7 +13,7 @@ from pernix.fetchers.launched_browser import probe_browser, require_patchright
 from pernix.logs import RunContext, RunLog
 from pernix.run_assembly import RunAssembly
 from pernix.runner import ExitCode
-from pernix.settings import CoreSettings, LogSettings
+from pernix.settings import ControlSettings, CoreSettings, LogSettings
 from pernix.settings.sources import find_project_file
 
 if TYPE_CHECKING:
@@ -25,6 +25,7 @@ __all__ = ["add_parser"]
 
 _ROLES = (
     ("Stats Sinks", "stats.sinks"),
+    ("Control Sources", "control.sources"),
     ("Extensions", "extensions"),
     ("Download Middleware", "middlewares"),
     ("Spider Middleware", "spider_middlewares"),
@@ -119,8 +120,12 @@ def _components(crawler: Crawler, profile: str | None, browser: str | None) -> l
         lines.append(f"Profile: {profile}")
     if browser is not None:
         lines.append(f"Browser: {browser}")
+    control_file = settings.section(ControlSettings).file
     for title, key in _ROLES:
-        lines.append(f"{title}: {', '.join(_label(spec) for spec in settings.components(key)) or 'none'}")
+        labels = [_label(spec) for spec in settings.components(key)]
+        if key == ControlSettings.key("sources") and control_file is not None:
+            labels.insert(0, f"ControlFile ({control_file})")
+        lines.append(f"{title}: {', '.join(labels) or 'none'}")
     return lines
 
 

@@ -970,6 +970,7 @@ Rules:
 - Requests from `start()` and `on_idle()` are checked against the Drain before each one, since adding to the Frontier need not suspend.
 - **Pause**: `crawler.pause()` holds a Run without ending it, as when a downstream store is down or a site asked for a break; `crawler.resume()` picks it up again. Both return at once and may be called from a Callback, a component, or another task; `crawler.paused` tells whether the Run is paused. The workers stop claiming at once, and no Request is taken from `start()` or `on_idle()`, though the one being produced, such as after an Inline Fetch, still enters the Frontier. The Requests in flight finish, with their Callbacks, Inline Fetches, and Items, and are settled as usual, so a paused Run holds no Lease once they are done. Lease renewals, Cooldowns, proxy refreshes, stats snapshots, and the Item processing go on. A paused Run is never idle, so `SpiderIdle` is not emitted and `on_idle()` does not run, and it does not end on its own, even with nothing left to fetch; it ends once resumed, or with a Drain, as `drained`, or a Force Stop, as `forced`, neither of which resumes it.
 - Pausing and resuming are logged, and emitted as `SpiderPaused` and `SpiderResumed(paused_for)`, in the order requested; a resumed Run claims again once `SpiderResumed` is emitted, so none of its Events come before. `run.pauses` and `run.paused_seconds` count them (§8). A pause requested before the Run starts takes effect when its work does: `SpiderPaused` follows `SpiderOpened`, and nothing is claimed or taken from `start()` until it is resumed. A repeated request, and any request once a stop was requested or after the Run, does nothing. No signal pauses a Run; Pause comes from code or from a control source (§8).
+- **Control sources** (§8) carry out the same requests from outside the process, as a Platform writes them: `paused` and `running` pause and resume the Run, and `drain` and `force` stop it, as `crawler.stop()` does.
 - Signals, in `run()` and the CLI: the first SIGINT/SIGTERM triggers a Drain, and the second triggers a Force Stop. Any further one gets Python's default handling (`KeyboardInterrupt`, or termination), an escape hatch when sync code blocks the event loop. The defaults of 20 s and 5 s together stay below the usual 30 s a container platform waits before killing a process.
 - Each stage of shutdown is fault-tolerant on its own, and multiple exceptions are aggregated into an ExceptionGroup and reported together; a close that times out is one of them.
 
@@ -988,6 +989,7 @@ Rules:
 | Proxies | Enabled when configured | ✓ |
 | Blocked-response detection | Enabled (status-code rules) | ✓ |
 | Stats / event loop lag sampling and watchdog | Enabled | ✓ |
+| Control sources, the control file | Disabled (enable with `control.file` or `control.sources`) | ✓ |
 | Feeds (jsonl/csv/json) | Enabled with `-o` or settings | ✓ |
 | Development response cache | Disabled | ✓ |
 | Link extractor, Sitemap | Utility functions | — |
@@ -1032,6 +1034,7 @@ Rules:
 | `loop.lag_avg`, `loop.lag_max` | Event loop lag in seconds, sampled every second, or every quarter of `loop.block_threshold` when that is shorter |
 | `loop.blocks`, `loop.block_seconds` | Times the event loop was blocked past `loop.block_threshold`, and the seconds those blocks lasted, to within a sample; absent with the watchdog off |
 | `log.warning`, `log.error`, `log.critical`, `log.dropped` | Records logged per level, and records dropped from the full queue |
+| `control.state`, `control.failures` | The state the control sources tell, combined, at their last read, and the reads that failed; absent without a control source |
 | `sessions.*`, `proxies.*`, `browser.*` | Sessions and proxies (§5.3), and the browser's pages and contexts (§5.2) |
 
 - Every `stats.interval` (60 s; 0 turns it off), a `StatsSnapshot` Event is emitted and an INFO line logged, such as "Fetched 120 responses (60/min), scraped 340 items (170/min)", with the stats in its `stats` field. After `SpiderClosed` and before the components are closed, the final snapshot (`final=True`) is emitted and logged as the Run's summary; text output lists every stat.
@@ -1043,7 +1046,11 @@ Rules:
 **Control**
 
 - Control through OS signals is supported (§6.6); within a program, `crawler.stop(mode)`, `crawler.pause()`, and `crawler.resume()` can be called (§6.6).
-- Pluggable `ControlSource`: for example, reading pause/drain/stop commands from a Redis key. The framework only reads the control state and responds to it; writing it is done by the Platform.
+- **Control sources**: a Platform controls a Run from outside its process by writing the state it wants it in, `running`, `paused`, `drain`, or `force`, where a control source reads it; Pernix only reads it and responds (ADR 0008). `control.file` reads it from a file; `control.sources`, as `{source: order}`, adds sources of one's own, such as one reading a key in a store, after it (a Redis source comes with M3). A `ControlSource` has `state()`, sync or async, which tells one of the four states; sources are built and opened like Extensions, after the Stats Sinks. Without a source, nothing is read.
+- The sources are read as they open, before the Run starts, then every `control.interval` (1 s), each read limited to the interval; a change missed is caught at the next read. The states they tell are combined, the most restrictive winning: `force`, then `drain`, then `paused`, then `running`. Only a change of the combined state is applied, starting from `running`: `running` resumes the Run, `paused` pauses it, and `drain` and `force` stop it, as `crawler.stop()` does (§6.6). So a Run paused or resumed by code stays so until the sources tell another state: a file that says `running` all along, or that does not exist, does not resume a Run its code paused. A stop cannot be undone, so `running` and `paused` do nothing once one is applied, while `force` turns a Drain into a Force Stop. Every Worker reading the same source ends in the same state, unless its code changed it since.
+- Read before the Run starts, `paused` makes it start paused, `drain` drains it as its work starts, and `force` ends it before it starts, without `SpiderOpened`. A state left from an earlier Run applies to the next one: a Platform writes `running`, or removes the file, before starting a Run again with it.
+- A source that raises, takes longer than `control.interval`, or tells something else is logged as a warning, once until it tells something else, and the state it told before is kept; one never read yet counts as `running`. The Run goes on either way. Applying a state is logged at INFO, and `control.state` and `control.failures` are in the stats.
+- **The control file** (`control.file`) holds one state, its case and the whitespace around it ignored; a file that does not exist means `running`. An empty file, as one written in place may be read, one holding anything else, and one longer than 1 KiB are logged and ignored. A Platform writes it atomically, to a temporary file in the same directory renamed over it, such as `printf paused > state.tmp && mv state.tmp state`. No `pernix` command writes it.
 
 **Outcome**
 
