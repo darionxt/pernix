@@ -89,7 +89,11 @@ CONFIGURATION_ERRORS: tuple[type[PernixError], ...] = (SettingsError, SpiderArgu
 
 
 class SerializationError(PernixError):
-    """A Request cannot be persisted, or a persisted Request cannot be restored."""
+    """A Request cannot be persisted, a persisted Request cannot be restored, or a Frontier's database cannot be read.
+
+    A database cannot be read when it is not a Frontier's, or when a newer Pernix
+    wrote it; the message names its path, and both schema versions.
+    """
 
 
 class FeedError(PernixError):
