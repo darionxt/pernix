@@ -31,6 +31,7 @@ __all__ = [
     "PATH_FIELDS",
     "BlockedSettings",
     "CallbackSettings",
+    "ControlSettings",
     "CoreSettings",
     "DomainSettings",
     "EventSettings",
@@ -772,6 +773,26 @@ class LoopSettings(Section):
     block_threshold: Annotated[float, msgspec.Meta(ge=0)] = 30.0
 
 
+class ControlSettings(Section):
+    """Settings of controlling a Run from outside its process, as a Platform does (ADR 0008).
+
+    Attributes:
+        sources: Control sources to read, as `{source: order}`; see
+            `pernix.control.ControlSource`.
+        file: A file holding the state a Platform wants the Run in, `running`,
+            `paused`, `drain`, or `force`, read by a `pernix.control.ControlFile`
+            before the sources; a missing file means `running`. `None` for none.
+        interval: Seconds between two reads of the sources, and the time each read
+            may take.
+    """
+
+    __prefix__ = "control"
+
+    sources: ComponentMap = msgspec.field(default_factory=dict[Any, int | None])
+    file: PurePath | None = None
+    interval: Annotated[float, msgspec.Meta(gt=0)] = 1.0
+
+
 class ShutdownSettings(Section):
     """Settings of stopping a Run.
 
@@ -809,6 +830,7 @@ CORE_SECTIONS: tuple[type[Section], ...] = (
     LogSettings,
     StatsSettings,
     LoopSettings,
+    ControlSettings,
     ShutdownSettings,
 )
 """The Sections every Crawler registers."""
