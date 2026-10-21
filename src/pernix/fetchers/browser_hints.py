@@ -5,9 +5,11 @@ other way to set them than a response's `Accept-CH`. A context learns those of a
 Session's origins from a navigation to each that a route answers in the browser
 itself, with an `Accept-CH` naming them, or an empty one to forget them, so the
 request never leaves the browser; the page bypasses service workers, which would
-take the navigation before the route. Chrome still connects to the origin ahead
-of the navigation, as it does for every navigation: one TLS handshake, which the
-next navigation there may use, and no request.
+take the navigation before the route, and names an icon of its own, as Chrome
+would otherwise fetch the origin's `/favicon.ico`, which no route sees. Chrome
+still connects to the origin ahead of the navigation, as it does for every
+navigation: one TLS handshake, which the next navigation there may use, and no
+request.
 """
 
 from __future__ import annotations
@@ -23,6 +25,9 @@ __all__ = ["accepted_hints", "teach_hints"]
 
 _TEACHING_TIMEOUT = 10.0
 """Seconds the navigation that teaches a context an origin's client hints may take; it never leaves the browser."""
+
+_PAGE = '<link rel="icon" href="data:,">'
+"""The page that teaches a context, with an icon of its own, so that Chrome fetches none from the origin."""
 
 
 async def teach_hints(context: BrowserContext, origin: str, hints: Sequence[str]) -> None:
@@ -43,7 +48,7 @@ async def teach_hints(context: BrowserContext, origin: str, hints: Sequence[str]
     async def answer(route: Route) -> None:
         if route.request.is_navigation_request():
             answered.append(route.request.url)
-        await route.fulfill(status=200, headers=headers, body="")
+        await route.fulfill(status=200, headers=headers, body=_PAGE)
 
     page = await context.new_page()
     devtools: CDPSession | None = None
