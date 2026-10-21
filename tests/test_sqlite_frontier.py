@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pernix.frontiers import Frontier
-    from pernix.items import ItemContext
+    from pernix.items import ItemContext, PendingItems
 
 URL = "https://example.com/"
 
@@ -341,8 +341,8 @@ async def test_an_engine_crawls_through_it(opened: Opener) -> None:
     frontier = opened(spider)
     items: list[Any] = []
 
-    async def put_item(item: Any, _ctx: ItemContext) -> None:
-        items.append(item)
+    async def put_item(item: Any, _ctx: ItemContext, _pending: PendingItems) -> None:
+        items.append(item)  # processed at once
 
     engine = Engine(
         spider,
