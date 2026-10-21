@@ -17,7 +17,7 @@ from pernix.events import StatsSnapshot
 from pernix.feeds import Feed, render_path
 from pernix.fetchers import BrowserSettings, FetcherDispatch, HTTPFetcher, HTTPSettings
 from pernix.fingerprint import request_fingerprint
-from pernix.frontiers import MemoryFrontier
+from pernix.frontiers import MemoryFrontier, SQLiteFrontier
 from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
 from pernix.logs import RunContext
@@ -56,7 +56,7 @@ from pernix.stats import CoreStats, LoopLag, LoopWatchdog, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
     from pathlib import Path
 
     from pernix.account import Account
@@ -154,6 +154,8 @@ class RunAssembly:
         outlet: Outlet | None = None,
         accounts: Sequence[Account] = (),
         pausing: Pausing | None = None,
+        frontier_path: Path | None = None,
+        start: Callable[[], AsyncIterator[Request]] | None = None,
     ) -> RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
@@ -178,6 +180,9 @@ class RunAssembly:
                 holds, if one is enabled.
             pausing: Pauses and resumes the Run, for the Engine; its counts are
                 reported in the stats. Defaults to one that nothing pauses.
+            frontier_path: The database of a `SQLiteFrontier` for the Run, as in its
+                job directory; `None` for a `MemoryFrontier`.
+            start: Gives the initial Requests, in place of `Spider.start()`.
 
         Returns:
             The assembly.
@@ -239,7 +244,11 @@ class RunAssembly:
             problems.raise_them()
         core_stats = CoreStats(crawler.stats)
         pausing = pausing or Pausing(crawler.spider, events)
-        frontier = MemoryFrontier(fingerprint=fingerprint)
+        frontier: Frontier = (
+            MemoryFrontier(fingerprint=fingerprint)
+            if frontier_path is None
+            else SQLiteFrontier(frontier_path, crawler.spider, fingerprint=fingerprint)
+        )
         throttle = Throttle(settings.section(DomainSettings))
         proxies = proxying.proxies
         blocked = BlockedResponses(crawler.spider.is_blocked, stats=crawler.stats)
@@ -280,6 +289,7 @@ class RunAssembly:
             callback_timeout=settings.section(CallbackSettings).timeout,
             stats=crawler.stats,
             pausing=pausing,
+            start=start,
         )
         inline_fetch = InlineFetch(
             download=download,

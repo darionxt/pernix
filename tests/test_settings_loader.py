@@ -647,6 +647,7 @@ def test_defaults_come_from_the_sections(tmp_path: Path) -> None:
         "failed_pipelines": {FailedItemsFile: 100},
         "run_id": None,
         "outcome_file": None,
+        "job_dir": None,
         "locale": ("en-US", "en"),
         "timezone": None,
         "domain.delay": 0.0,

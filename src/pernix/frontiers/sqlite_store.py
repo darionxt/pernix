@@ -9,7 +9,9 @@ same transaction: `counts`, the Requests in each state, done ones included, and
 slot by its head rather than by each of its Requests.
 
 `PRAGMA application_id` marks the database as a Frontier's, and `PRAGMA user_version`
-holds its schema version, `SCHEMA_VERSION` for the databases this Pernix creates.
+holds its schema version, `SCHEMA_VERSION` for the databases this Pernix creates. A new
+database is created at version 1 and migrated as an older one is, in the transaction
+that opens it.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
 
 __all__ = ["SCHEMA_VERSION", "FrontierStore", "RequestRow"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 """The version of the database schema this Pernix creates and reads."""
 
 _APPLICATION_ID = 0x706E7866
@@ -112,6 +114,16 @@ CREATE TRIGGER request_done AFTER DELETE ON requests BEGIN
 END;
 """
 
+_MIGRATIONS = {
+    2: "ALTER TABLE requests ADD COLUMN methods TEXT",
+}
+"""What brings a database from the version before to each version; version 1 is `_SCHEMA`.
+
+Version 2 adds `methods`: the names of the Spider methods a Request refers to,
+separated by spaces, which are checked when a Run resumes; NULL for the Requests
+stored before.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class RequestRow:
@@ -124,6 +136,8 @@ class RequestRow:
         priority: Its priority.
         url: Its URL.
         data: The Request, as `pernix.request_codec.encode_request()` encodes it.
+        methods: The names of the Spider methods it refers to, as
+            `pernix.request_codec.method_names()` tells.
     """
 
     fingerprint: str | None
@@ -132,6 +146,7 @@ class RequestRow:
     priority: int
     url: str
     data: bytes
+    methods: tuple[str, ...] = ()
 
 
 class FrontierStore:
@@ -184,21 +199,49 @@ class FrontierStore:
         ttl: float,
         skip_slots: Collection[str],
         rendered: bool | None,
-    ) -> list[Lease]:
+    ) -> tuple[list[Lease], list[str]]:
         """Lease ready Requests; see `Frontier.claim()`.
 
-        Raises:
-            SerializationError: A Request to lease cannot be restored; nothing is
-                leased, and it stays ready.
+        A Request that cannot be restored is kept as a Dead Request instead, with
+        the error as its reason, and the claim goes on.
+
+        Returns:
+            The Leases, and why each Request kept as a Dead Request so failed.
         """
         with self._transaction() as (connection, now):
             due = self._next_due(connection)
             leases: list[Lease] = []
+            lost: list[str] = []
             while len(leases) < limit and (found := self._first_ready(connection, skip_slots, rendered)) is not None:
-                leases.append(self._lease(connection, found, now + ttl, worker_id))
-        if leases and (due is None or now + ttl < due):
-            self.changed = True  # waiters wake up by the earliest deadline, which is now sooner
-        return leases
+                try:
+                    leases.append(self._lease(connection, found, now + ttl, worker_id))
+                except SerializationError as exc:
+                    reason = f"{type(exc).__name__}: {exc}"
+                    connection.execute("UPDATE requests SET state = 'dead', reason = ? WHERE id = ?", (reason, found))
+                    lost.append(str(exc))
+        if lost or (leases and (due is None or now + ttl < due)):
+            self.changed = True  # fewer Requests are unfinished, or the earliest deadline is sooner
+        return leases, lost
+
+    def release_leases(self) -> int:
+        """Make every leased Request ready again, counting an attempt, as if its Lease had expired.
+
+        Returns:
+            How many there were.
+        """
+        with self._transaction() as (connection, now):
+            released = connection.execute("UPDATE requests SET due = ? WHERE state = 'leased'", (now,)).rowcount
+            self._make_due_ready(connection, now)
+        self.changed |= released > 0
+        return released
+
+    def method_names(self) -> set[str]:
+        """Return the names of the Spider methods the Requests that are not done or dead refer to."""
+        with self._transaction() as (connection, _):
+            rows = connection.execute(
+                "SELECT DISTINCT methods FROM requests WHERE state != 'dead' AND methods IS NOT NULL"
+            ).fetchall()
+        return {name for (methods,) in rows for name in methods.split()}
 
     def renew(self, lease: Lease, ttl: float) -> float | None:
         """Extend a Lease; see `Frontier.renew()`.
@@ -333,14 +376,14 @@ class FrontierStore:
         return connection
 
     def _check_schema(self, connection: sqlite3.Connection) -> None:
-        """Create the schema in a new database, or check that this Pernix can read the existing one."""
+        """Create the schema in a new database, or check that this Pernix can read the existing one; migrate either."""
         [(application_id,)] = connection.execute("PRAGMA application_id").fetchall()
         [(version,)] = connection.execute("PRAGMA user_version").fetchall()
         [(objects,)] = connection.execute("SELECT count(*) FROM sqlite_schema").fetchall()
         if (application_id, version, objects) == (0, 0, 0):
             connection.executescript(_SCHEMA)
             connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            version = 1
         elif application_id != _APPLICATION_ID:
             raise SerializationError(f"{self._path} is not a Frontier database")
         elif version > SCHEMA_VERSION:
@@ -348,6 +391,10 @@ class FrontierStore:
                 f"the Frontier database {self._path} has schema version {version}, but this Pernix reads "
                 f"version {SCHEMA_VERSION} and older; upgrade Pernix to resume this Run"
             )
+        for later in range(version + 1, SCHEMA_VERSION + 1):
+            connection.execute(_MIGRATIONS[later])
+        if version < SCHEMA_VERSION:
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _make_due_ready(self, connection: sqlite3.Connection, now: float) -> bool:
         """Make passed delays ready and expired Leases claimable again, counting an attempt; return whether any were.
@@ -373,9 +420,9 @@ class FrontierStore:
             if not cursor.rowcount:
                 return False
         connection.execute(
-            "INSERT INTO requests (state, rendered, priority, sequence, slot, url, request) "
-            "VALUES ('ready', ?, ?, ?, ?, ?, ?)",
-            (row.rendered, row.priority, next(self._sequences), row.slot, row.url, row.data),
+            "INSERT INTO requests (state, rendered, priority, sequence, slot, url, request, methods) "
+            "VALUES ('ready', ?, ?, ?, ?, ?, ?, ?)",
+            (row.rendered, row.priority, next(self._sequences), row.slot, row.url, row.data, " ".join(row.methods)),
         )
         return True
 
@@ -436,8 +483,15 @@ class FrontierStore:
         )
         if replacement is not None:
             connection.execute(
-                "UPDATE requests SET rendered = ?, priority = ?, url = ?, request = ? WHERE id = ?",
-                (replacement.rendered, replacement.priority, replacement.url, replacement.data, int(lease.id)),
+                "UPDATE requests SET rendered = ?, priority = ?, url = ?, request = ?, methods = ? WHERE id = ?",
+                (
+                    replacement.rendered,
+                    replacement.priority,
+                    replacement.url,
+                    replacement.data,
+                    " ".join(replacement.methods),
+                    int(lease.id),
+                ),
             )
         return True
 

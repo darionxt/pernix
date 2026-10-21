@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from pernix.browser import PageCallable, ResourceType
     from pernix.request import Callback
 
-__all__ = ["REQUEST_SCHEMA_VERSION", "decode_request", "encode_request"]
+__all__ = ["REQUEST_SCHEMA_VERSION", "decode_request", "encode_request", "method_names"]
 
 REQUEST_SCHEMA_VERSION = 1
 """The version of the persisted Request format this Pernix writes and reads."""
@@ -175,6 +175,22 @@ def decode_request(data: bytes, spider: object) -> Request:
         impersonate=record.impersonate,
         ext=record.ext,
     )
+
+
+def method_names(request: Request) -> tuple[str, ...]:
+    """Return the names a persisted Request stores its Spider methods by.
+
+    Args:
+        request: The Request.
+
+    Returns:
+        The names of its Callback, its errback, and the page methods of its
+        `Render`, those it has, in that order.
+    """
+    methods: list[Callable[..., object] | None] = [request.callback, request.errback]
+    if isinstance(request.render, Render):
+        methods += [None if page is None else page.method for page in (request.render.setup, request.render.action)]
+    return tuple(method.__name__ for method in methods if method is not None)
 
 
 def _render_record(render: bool | Render, spider: object) -> bool | _RenderRecord:
