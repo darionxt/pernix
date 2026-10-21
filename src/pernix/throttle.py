@@ -4,7 +4,9 @@ Every fetch holds the slot of its Request, the host by default, from just before
 download chain until the Response arrives. A slot admits a new fetch while fewer than
 `domain.concurrency` are in progress, `domain.delay` has passed since the last start,
 the GCRA rate allows it, and the slot is not cooling down. A 429 or 503 Response with
-`Retry-After` cools its whole slot down for that long.
+`Retry-After` cools its whole slot down for that long. A slot may be spaced further
+apart than `domain.delay`, as a robots.txt `Crawl-delay` asks, and cooled down for
+other reasons, as while its robots.txt cannot be fetched.
 
 A fetch nested in another of the same slot, in the same task, such as an Inline Fetch
 a download Middleware makes, shares the outer fetch's place instead of waiting for
@@ -66,8 +68,10 @@ class ThrottleStats:
 @dataclass(slots=True)
 class _Slot:
     active: int = 0
+    started: float | None = None
+    """When the last fetch started, if one did."""
     next_start: float = 0.0
-    """The earliest start `domain.delay` allows."""
+    """The earliest start `domain.delay`, or the slot's spacing, allows."""
     tat: float = 0.0
     """GCRA's theoretical arrival time."""
     cool_until: float = 0.0
@@ -96,6 +100,7 @@ class Throttle:
         self._interval = 1.0 / settings.rate if settings.rate else 0.0
         self._tolerance = self._interval * (settings.burst - 1)
         self._slots: dict[str, _Slot] = {}
+        self._spacing: dict[str, float] = {}
         self._changed = asyncio.Event()
         self.stats = ThrottleStats()
 
@@ -203,7 +208,8 @@ class Throttle:
             waited = True
             await self._wait(ready_at - now)
         self._count_wait(waited, started)
-        state.next_start = now + self._delay()
+        state.started = now
+        state.next_start = now + self._delay(slot)
         if self._interval:
             state.tat = max(state.tat, now) + self._interval
         return True
@@ -251,6 +257,43 @@ class Throttle:
         self._slots[slot].active -= 1
         self._notify()
 
+    def space(self, slot: str, seconds: float) -> None:
+        """Space the starts of a slot's fetches at least so far apart, as a robots.txt `Crawl-delay` asks.
+
+        Each start then waits for the larger of these seconds and the jittered
+        `domain.delay`, counted from the last start, the one already made included.
+
+        Args:
+            slot: The slot.
+            seconds: The least seconds between two starts; 0 to space them by
+                `domain.delay` alone again.
+        """
+        if seconds > 0:
+            self._spacing[slot] = seconds
+        else:
+            self._spacing.pop(slot, None)
+        state = self._slots.get(slot)
+        if state is not None and state.started is not None:
+            state.next_start = max(state.next_start, state.started + seconds)
+        self._notify()
+
+    def cool_down(self, slot: str, seconds: float) -> float:
+        """Pause a slot, so that it starts no fetch for that long, at most `domain.cooldown_max`.
+
+        Args:
+            slot: The slot.
+            seconds: How long, at most.
+
+        Returns:
+            The seconds it cools down for, after the cap.
+        """
+        seconds = min(seconds, self._settings.cooldown_max)
+        state = self._slots.setdefault(slot, _Slot())
+        state.cool_until = max(state.cool_until, self._clock() + seconds)
+        self.stats.cooldowns += 1
+        self._notify()
+        return seconds
+
     def observe(self, slot: str, response: Response, *, statuses: Collection[int] = COOLDOWN_STATUSES) -> None:
         """Cool a slot down if a Response asks its domain to wait.
 
@@ -266,10 +309,7 @@ class Throttle:
         seconds = retry_after_seconds(response.headers.get("Retry-After"), now=dt.datetime.now(dt.UTC))
         if seconds is None or seconds <= 0:
             return
-        state = self._slots.setdefault(slot, _Slot())
-        state.cool_until = max(state.cool_until, self._clock() + min(seconds, self._settings.cooldown_max))
-        self.stats.cooldowns += 1
-        self._notify()
+        self.cool_down(slot, seconds)
 
     async def wait(self) -> None:
         """Wait until a fetch ends, a cooldown starts, or a blocked slot may start again."""
@@ -290,9 +330,11 @@ class Throttle:
             self.stats.waits += 1
             self.stats.wait_seconds += self._clock() - started
 
-    def _delay(self) -> float:
+    def _delay(self, slot: str) -> float:
+        """The seconds until the next start of a slot may follow one now: the jittered delay, or the slot's spacing."""
         delay, jitter = self._settings.delay, self._settings.delay_jitter
-        return delay * self._rng.uniform(1.0 - jitter, 1.0 + jitter) if jitter else delay
+        jittered = delay * self._rng.uniform(1.0 - jitter, 1.0 + jitter) if jitter else delay
+        return max(jittered, self._spacing.get(slot, 0.0))
 
     async def _wait(self, at_most: float | None) -> None:
         """Wait for a change, or for `at_most` seconds."""

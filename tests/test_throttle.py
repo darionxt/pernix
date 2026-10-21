@@ -128,6 +128,52 @@ async def test_a_retry_after_on_429_or_503_cools_the_domain_down() -> None:
     assert (throttle.stats.cooldowns, throttle.stats.refused) == (1, 1)
 
 
+async def test_spacing_a_domain_keeps_its_starts_apart_from_the_last_one() -> None:
+    clock = FakeClock()
+    throttle = _throttle(clock, delay=1.0, delay_jitter=0.0)
+    assert await throttle.acquire(A)
+    throttle.release(A)
+    clock.advance(0.5)
+
+    throttle.space(A, 3.0)  # as a Crawl-delay learned once the fetch started
+
+    assert throttle.blocked() == {A}
+    clock.advance(2.49)
+    assert throttle.blocked() == {A}
+    clock.advance(0.01)
+    assert throttle.blocked() == frozenset()
+    assert await throttle.acquire(A)
+    throttle.release(A)
+    clock.advance(2.99)
+    assert throttle.blocked() == {A}
+
+
+@pytest.mark.parametrize(("spacing", "apart"), [(0.5, 2.0), (3.0, 3.0), (0.0, 2.0)])
+async def test_the_larger_of_the_spacing_and_the_jittered_delay_applies(spacing: float, apart: float) -> None:
+    clock = FakeClock()
+    throttle = Throttle(DomainSettings(delay=1.0, delay_jitter=1.0), clock=clock, rng=Pick(high=True))
+    throttle.space(A, 5.0)
+    throttle.space(A, spacing)  # replaced, and 0 spaces by the delay alone again
+
+    assert await throttle.acquire(A)
+    throttle.release(A)
+    clock.advance(apart - 0.01)
+    assert throttle.blocked() == {A}
+    clock.advance(0.01)
+    assert throttle.blocked() == frozenset()
+
+
+async def test_a_domain_cools_down_for_at_most_the_cap() -> None:
+    clock = FakeClock()
+    throttle = _throttle(clock, cooldown_max=60.0)
+
+    assert throttle.cool_down(A, 90.0) == 60.0
+
+    assert throttle.cooldown_left(A) == 60.0
+    assert not await throttle.acquire(A)
+    assert throttle.stats.cooldowns == 1
+
+
 @pytest.mark.parametrize(
     ("status", "retry_after", "cooldown"),
     [(503, "600", 60.0), (503, None, 0.0), (429, "soon", 0.0), (404, "30", 0.0), (500, "30", 0.0)],

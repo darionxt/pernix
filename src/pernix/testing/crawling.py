@@ -36,6 +36,7 @@ _TEST_SETTINGS: Mapping[str, Any] = MappingProxyType(
         "domain.rate": None,
         "domain.cooldown_max": 0,
         "sessions.cooldown_max": 0,
+        "robots.crawl_delay_max": 0,
         "network.public_only": False,
     }
 )
@@ -71,10 +72,11 @@ async def crawl(
     """Run a Spider to completion for a test, and report its Items and stats.
 
     The Run takes `settings` over settings that keep a test from waiting: no periodic
-    stats, no retry delays, and no per-domain delay, rate, or cooldown; and over
-    `network.public_only`, off, so that a `LoopbackServer` can be reached, as tests
-    reach only loopback hosts under the network guard anyway. The project file, the
-    environment, and the Spider's own settings apply below them, as for any Run.
+    stats, no retry delays, and no per-domain delay, rate, cooldown, or robots.txt
+    `Crawl-delay`; and over `network.public_only`, off, so that a `LoopbackServer`
+    can be reached, as tests reach only loopback hosts under the network guard
+    anyway. The project file, the environment, and the Spider's own settings apply
+    below them, as for any Run.
 
     Args:
         spider_type: The Spider class; a new object is created for the Run.

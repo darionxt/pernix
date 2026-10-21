@@ -318,6 +318,32 @@ async def test_batches_are_flushed_before_the_spider_closes(server: LoopbackServ
     assert crawler.stats.get("items.scraped") == 6
 
 
+async def test_a_drain_processes_the_batched_items_without_waiting_for_their_batch(server: LoopbackServer) -> None:
+    for n in range(1, 4):
+        server.route(f"/{n}", f"<h1>{n}</h1>")
+    batches: list[list[Any]] = []
+
+    class Rows(Pipeline):
+        batch_size = 10
+        batch_timeout = 60.0
+
+        async def process_batch(self, items: list[Any], contexts: list[ItemContext]) -> None:
+            batches.append([item["page"] for item in items])
+
+    class Pages(Spider):
+        start_urls = tuple(server.url(f"/{n}") for n in range(1, 4))
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            self.crawler.stop()
+            yield {"page": response.css("h1::text").get()}
+
+    crawler = await _crawl(Pages, {"pipelines": {Rows: 1}, "concurrency": 1})
+
+    assert batches == [["1"]]
+    stats = crawler.stats
+    assert (stats.get("run.reason"), stats.get("frontier.done"), stats.get("frontier.ready")) == ("drained", 1, 2)
+
+
 async def test_feeds_are_finished_when_the_run_fails(server: LoopbackServer, tmp_path: Path) -> None:
     server.route("/", "ok")
 

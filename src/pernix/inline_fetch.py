@@ -7,7 +7,7 @@ import logging
 from collections import Counter
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pernix.errors import Blocked, IgnoreRequest, LoginExpired, RetriesExhausted, SessionError
 from pernix.events import RequestRetried
@@ -78,10 +78,12 @@ class InlineFetch:
     then meanwhile, then waits for the slot's delay and rate; a Session that must log
     in does so first, in the fetch's place. With the Run's proxies, each attempt goes
     through its Session's proxy, or without a Session through the next one, waiting
-    in place while none is available. A Request without a Session continues
-    the Session of the fetch it is nested in, or of the Request being handled, if it
-    has one; a fetch nested in another of the same Session, in the same task, shares
-    its Lease. A Response that shows the Session logged out is retried as for
+    in place while none is available. An attempt the download chain holds back with
+    `NotYet`, as while the robots.txt of its origin is unreachable, waits that long
+    in place, without its place or its Session, and is made again without counting
+    as one. A Request without a Session continues the Session of the fetch it is
+    nested in, or of the Request being handled, if it has one; a fetch nested in
+    another of the same Session, in the same task, shares its Lease. A Response that shows the Session logged out is retried as for
     `Retry`, once the Session logged in again; for a fetch that shares the Lease of
     the one it is nested in, `LoginExpired` is raised instead, so that the outer
     fetch, which the Session logs in again for, is retried.
@@ -158,6 +160,9 @@ class InlineFetch:
             slot = self._slot_of(request)
             async with self._sending(request, slot) as sending:
                 outcome = await self._attempt(sending, slot, None)
+            if isinstance(outcome, NotYet):
+                await asyncio.sleep(outcome.delay)
+                continue
             decision = consult(self._retry_policy, request, outcome, attempt)
             if decision.action is Action.ACCEPT:
                 return _accepted(outcome)
@@ -196,16 +201,21 @@ class InlineFetch:
         spent = Counter[str]()
         while True:
             slot = self._slot_of(request)
+            decision = None
             async with self._sending(request, slot) as sending:  # through the block too
                 streams = Streams(max_bytes)
                 try:
                     outcome = await self._attempt(sending, slot, streams)
-                    decision = consult(self._retry_policy, request, outcome, attempt)
-                    if decision.action is Action.ACCEPT:
-                        yield await self._streamed(_accepted(outcome), streams)
-                        return
+                    if not isinstance(outcome, NotYet):
+                        decision = consult(self._retry_policy, request, outcome, attempt)
+                        if decision.action is Action.ACCEPT:
+                            yield await self._streamed(_accepted(outcome), streams)
+                            return
                 finally:
                     await streams.close()
+            if decision is None:  # the download chain held it back
+                await asyncio.sleep(cast("NotYet", outcome).delay)
+                continue
             await self._retry_later(request, outcome, decision, attempt, spent)
             request = retried_instead(request, decision) or request
             attempt += decision.budget is None
@@ -256,13 +266,21 @@ class InlineFetch:
             await asyncio.sleep(self._throttle.cooldown_left(slot))
 
     async def _attempt(self, sending: Sending, slot: str, streams: Streams | None) -> Response | Exception:
-        """Fetch once through the download chain, streaming into `streams` if given; return the Response or the exception."""
+        """Fetch once through the download chain, streaming into `streams` if given; return the Response or the exception.
+
+        A `NotYet` the download chain raised, as while the robots.txt of the
+        Request's origin is unreachable, is returned as it is, for the fetch to
+        wait that long in place, without its place in the slot or its Session, and
+        try again without counting an attempt.
+        """
         request = sending.request
         try:
             with streaming_into(streams), without_keeping():
                 response = expect_response(await self._download(request), f"the download chain for {request!r}")
         except (IgnoreRequest, SessionError):
             raise
+        except NotYet as later:
+            return later  # held back, not failed: it tells nothing of the Session or the proxy
         except Exception as exc:
             sending.error = exc
             return exc

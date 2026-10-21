@@ -5,7 +5,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from pernix.addons import setup_addon
 from pernix.blocked_responses import BlockedResponses
@@ -27,6 +27,7 @@ from pernix.proxies import DefaultBindingPolicy, MemoryProxyPool
 from pernix.proxies.proxy_sources import ProxyAPI, ProxyFile, StaticProxies
 from pernix.proxies.run_proxies import ProxySupply, RunProxies
 from pernix.retry_policy import DefaultRetryPolicy
+from pernix.robots import RobotsTxt
 from pernix.sending import IndependentSending
 from pernix.session import Session
 from pernix.sessions import MemorySessionPool
@@ -46,6 +47,7 @@ from pernix.settings import (
     LoopSettings,
     ProxySettings,
     RetrySettings,
+    RobotsSettings,
     SessionSettings,
     StatsSettings,
 )
@@ -54,13 +56,14 @@ from pernix.stats import CoreStats, LoopLag, LoopWatchdog, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from pernix.account import Account
     from pernix.control import ControlSource
     from pernix.crawler import Crawler
     from pernix.frontiers import Frontier
+    from pernix.items.item_processor import Outlet
     from pernix.logs import RunLog
     from pernix.middlewares import Download
     from pernix.proxies import BindingPolicy, ProxyProvider
@@ -148,7 +151,7 @@ class RunAssembly:
         run_log: RunLog,
         *,
         output: str | os.PathLike[str] | None = None,
-        outlet: Callable[[Any], Awaitable[None]] | None = None,
+        outlet: Outlet | None = None,
         accounts: Sequence[Account] = (),
         pausing: Pausing | None = None,
     ) -> RunAssembly:
@@ -162,13 +165,15 @@ class RunAssembly:
         download and spider chains, the Pipelines, and the path of the outcome file
         are checked. Steps that do not depend on each other all run, so their
         problems are reported together. The core stats and the Stats Sinks are
-        subscribed.
+        subscribed. With `robots.obey`, the download chain is wrapped in a
+        `pernix.robots.RobotsTxt`, outermost.
 
         Args:
             crawler: The Crawler of the Run, which builds the components.
             run_log: The log of the Run, whose counts are reported in the stats.
             output: A Feed for the Items besides the `feeds` setting.
-            outlet: Receives every Item that passes the Pipelines, after the Feeds.
+            outlet: Receives every Item that passes the Pipelines, after the Feeds,
+                with the function to call once done with it.
             accounts: The Accounts the Spider gave, whose Sessions the Session Pool
                 holds, if one is enabled.
             pausing: Pauses and resumes the Run, for the Engine; its counts are
@@ -201,6 +206,7 @@ class RunAssembly:
         problems.attempt(outcome_path, crawler, output)
         fingerprint = problems.attempt(_fingerprint_function, crawler)
         retry_policy = problems.attempt(_retry_policy, crawler)
+        robots = problems.attempt(_robots_settings, crawler)
         handle = None
         if spider_middlewares is not None:
             inherit = _inherits_referer(crawler)
@@ -226,6 +232,7 @@ class RunAssembly:
             or feeds is None
             or fingerprint is None
             or retry_policy is None
+            or robots is None
             or handle is None
             or items is None
         ):
@@ -248,12 +255,21 @@ class RunAssembly:
             proxies, is_blocked=blocked.blocked, render_blocked=settings.section(BlockedSettings).render
         )
         download = core_stats.count_downloads(downloading.download)
+        if robots.obey:  # outermost, so it checks every fetch before any Middleware changes it
+            obeying = RobotsTxt(
+                robots,
+                throttle=throttle,
+                stats=crawler.stats,
+                cooldown_max=settings.section(DomainSettings).cooldown_max,
+            )
+            download = build_download_chain([obeying], download)
         engine = Engine(
             crawler.spider,
             frontier=frontier,
             download=download,
             handle=handle,
             put_item=items.put,
+            flush_items=items.flush,
             events=events,
             concurrency=settings.section(CoreSettings).concurrency,
             browser_concurrency=_browser_settings(crawler).max_pages,
@@ -389,6 +405,24 @@ def _supply(options: ProxySettings) -> ProxySupply:
         max_extracted=options.max_extracted,
         attempts=options.extract_attempts,
     )
+
+
+def _robots_settings(crawler: Crawler) -> RobotsSettings:
+    """The `robots.*` settings, checked against the Fetchers: robots.txt is fetched with the `http` one.
+
+    Raises:
+        pernix.errors.SettingsError: `robots.obey` is set, and no Fetcher is
+            registered as `http`.
+    """
+    options = crawler.settings.section(RobotsSettings)
+    if options.obey and "http" not in crawler.settings.named_components("fetchers"):
+        raise SettingsError(
+            [
+                f"{RobotsSettings.key('obey')}: robots.txt is fetched with the Fetcher registered as 'http', and none "
+                "is; register one, or turn robots.txt off"
+            ]
+        )
+    return options
 
 
 def _http_settings(crawler: Crawler) -> HTTPSettings:
@@ -635,7 +669,7 @@ def _item_processor(
     pipelines: Sequence[object],
     failed_pipelines: Sequence[object],
     feeds: Sequence[Feed],
-    outlet: Callable[[Any], Awaitable[None]] | None,
+    outlet: Outlet | None,
 ) -> ItemProcessor:
     """Takes the Items through the Pipelines into the Feeds, as the `items.*` settings say."""
     options = crawler.settings.section(ItemSettings)

@@ -22,7 +22,11 @@ class ItemStream:
     down: the Item processing waits for it, the Item queue fills up, the Callbacks
     pause, and no new Requests are fetched.
 
-    Leaving early force-stops the Run. Leaving an `async with` block, or calling
+    An Item counts as processed once the consumer asks for the next one, so its
+    Request is acknowledged only once the consumer is done with it.
+
+    Leaving early force-stops the Run, which returns the Request of the Item the
+    consumer held to the Frontier. Leaving an `async with` block, or calling
     `aclose()`, waits until the Run has stopped; a stream simply abandoned is
     stopped only once it is garbage-collected.
 
@@ -36,14 +40,15 @@ class ItemStream:
         self,
         crawl: Callable[[], Awaitable[RunResult]],
         stop: Callable[[StopMode], None],
-        channel: asyncio.Queue[Any],
+        channel: asyncio.Queue[tuple[Any, Callable[[], None]]],
     ) -> None:
         """Stream the Items of a Run; `pernix.crawler.Crawler.stream_items()` creates it.
 
         Args:
             crawl: Runs the Run.
             stop: Stops the Run.
-            channel: Where the Run puts its Items; its size bounds the Items held.
+            channel: Where the Run puts its Items, each with the function to call
+                once the consumer is done with it; its size bounds the Items held.
         """
         # Only the stream holds the generator, and nothing the Run holds refers back to
         # either: dropping the stream finalizes the generator, which stops the Run.
@@ -74,23 +79,26 @@ class ItemStream:
 async def _items(
     crawl: Callable[[], Awaitable[RunResult]],
     stop: Callable[[StopMode], None],
-    channel: asyncio.Queue[Any],
+    channel: asyncio.Queue[tuple[Any, Callable[[], None]]],
 ) -> AsyncGenerator[Any]:
     run = asyncio.create_task(_run(crawl, channel))
     try:
         while True:
             try:
-                item = await channel.get()
+                item, processed = await channel.get()
             except asyncio.QueueShutDown:
                 break
             yield item
+            processed()  # the consumer asks for the next one
     finally:
         if not run.done():  # left early
             stop("force")
         await run  # raises the error the Run failed with
 
 
-async def _run(crawl: Callable[[], Awaitable[RunResult]], channel: asyncio.Queue[Any]) -> RunResult:
+async def _run(
+    crawl: Callable[[], Awaitable[RunResult]], channel: asyncio.Queue[tuple[Any, Callable[[], None]]]
+) -> RunResult:
     try:
         return await crawl()
     finally:

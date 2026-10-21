@@ -125,6 +125,38 @@ async def test_a_force_stop_returns_the_request_in_flight_and_discards_the_queue
     assert "Stopping the Run now: cancelling the work in flight" in caplog.text
 
 
+async def test_a_force_stop_returns_the_requests_whose_items_are_not_processed(pages: LoopbackServer) -> None:
+    processing, handled = asyncio.Event(), asyncio.Event()
+
+    class Slow(Pipeline):
+        async def process(self, item: Any, ctx: ItemContext) -> Any:
+            processing.set()
+            await asyncio.Event().wait()
+            return item
+
+    class Few(Spider):
+        start_urls = (pages.url("/1"),)
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            for n in range(3):
+                yield {"n": n}
+            handled.set()
+
+    crawler = _crawler(Few, {"pipelines": {Slow: 100}})
+    run = asyncio.create_task(crawler.crawl())
+    async with asyncio.timeout(10):
+        await processing.wait()
+        await handled.wait()
+        await asyncio.sleep(0.01)  # the Callback has ended; its Request waits for its Items
+        crawler.stop("force")
+        result = await run
+
+    stats = result.stats
+    assert (stats["items.discarded"], stats["items.scraped"]) == (3, 0)
+    assert (stats["frontier.ready"], stats["frontier.leased"], stats["frontier.done"]) == (1, 0, 0)
+    assert stats["requests.retried"] == 0
+
+
 async def test_the_returned_request_keeps_its_attempt(pages: LoopbackServer) -> None:
     entered = asyncio.Event()
     crawler = _crawler(_spider(pages, entered, asyncio.Event()))

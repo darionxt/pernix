@@ -36,13 +36,14 @@ class Pausing:
     """Carries out the pause and resume requests of one Run.
 
     While the Run is `held`, the Engine claims no Request and takes none from
-    `start()` or `on_idle()`, waiting in `released()`. Between `begin()` and `end()`,
-    each change is logged, counted, and queued as `SpiderPaused` or `SpiderResumed`,
-    which `announce()` emits in the order requested. A pause holds the Run at once;
-    a resume releases it once announced, so that no Event of the resumed Run comes
-    before `SpiderResumed`. A pause requested before `begin()` takes effect then; a
-    request after `end()` does nothing, and so does one that changes nothing. `end()`
-    releases the Run for good, as a Drain or the end of the Run need.
+    `start()` or `on_idle()`, waiting in `released()`; `holding()` waits for a pause
+    instead. Between `begin()` and `end()`, each change is logged, counted, and
+    queued as `SpiderPaused` or `SpiderResumed`, which `announce()` emits in the order
+    requested. A pause holds the Run at once; a resume releases it once announced, so
+    that no Event of the resumed Run comes before `SpiderResumed`. A pause requested
+    before `begin()` takes effect then; a request after `end()` does nothing, and so
+    does one that changes nothing. `end()` releases the Run for good, as a Drain or
+    the end of the Run need.
     """
 
     def __init__(self, spider: Spider, events: EventBus, *, clock: Callable[[], float] = time.monotonic) -> None:
@@ -59,6 +60,7 @@ class Pausing:
         self._paused = False
         self._released = asyncio.Event()
         self._released.set()
+        self._held = asyncio.Event()
         self._changes: asyncio.Queue[Event] = asyncio.Queue()
         self._active = False
         self._ended = False
@@ -82,6 +84,7 @@ class Pausing:
             return
         self._paused = True
         self._released.clear()
+        self._held.set()
         if self._active:
             self._start_pause()
 
@@ -91,7 +94,7 @@ class Pausing:
             return
         self._paused = False
         if not self._active:
-            self._released.set()
+            self._release()
             return
         paused_for = self._stop_clock()
         logger.info("Resuming the Run after %.1f s paused", paused_for)
@@ -113,13 +116,17 @@ class Pausing:
         self._active = False
         self._paused = False
         self._stop_clock()
-        self._released.set()
+        self._release()
         self._changes.shutdown()
 
     async def released(self) -> None:
         """Wait until the Run is not held: resumed and announced so, or ended."""
         while self.held:  # a pause right after the release holds it again before the wait returns
             await self._released.wait()
+
+    async def holding(self) -> None:
+        """Wait until the Run is held, as by a pause; while it is, return at once."""
+        await self._held.wait()
 
     async def announce(self) -> None:
         """Emit the changes as `SpiderPaused` and `SpiderResumed`, in order, until `end()`; release a resumed Run."""
@@ -130,7 +137,7 @@ class Pausing:
                 return
             await self._events.emit(event)
             if not self._paused and self._changes.empty():
-                self._released.set()
+                self._release()
 
     def counts(self) -> PauseCounts:
         """Count the pauses and the seconds spent paused so far, a pause in progress included.
@@ -142,6 +149,10 @@ class Pausing:
         if self._paused_since is not None:
             seconds += self._clock() - self._paused_since
         return PauseCounts(self._pauses, round(seconds, 3))
+
+    def _release(self) -> None:
+        self._held.clear()
+        self._released.set()
 
     def _start_pause(self) -> None:
         self._pauses += 1
