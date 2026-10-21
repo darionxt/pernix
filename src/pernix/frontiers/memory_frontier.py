@@ -72,13 +72,13 @@ class _ReadyQueue:
         queue = self._slots.setdefault(slot, [])
         heapq.heappush(queue, entry)
         if queue[0] == entry:  # the first of its slot now
-            self._list(slot, entry)
+            self._set_first(slot, entry)
             if len(self._heads) > 2 * len(self._marks):  # more stale entries than live ones
-                self._heads = [head for head in self._heads if self._marks.get(head[3]) == head[2]]
+                self._heads = [head for head in self._heads if self._live(head)]
                 heapq.heapify(self._heads)
 
     def first(self, skip_slots: Collection[str]) -> _Entry | None:
-        """Find the first Request outside `skip_slots`, leaving it queued.
+        """Find the first Request outside `skip_slots`, leaving it queued for `pop()`.
 
         The slots skipped on the way are set aside until `restore()`, so finding the
         next one does not go through them again.
@@ -90,9 +90,9 @@ class _ReadyQueue:
             The Request's entry, or `None` if every ready Request is in `skip_slots`.
         """
         while self._heads:
-            _, _, mark, slot = self._heads[0]
-            if self._marks.get(slot) != mark:
-                heapq.heappop(self._heads)  # stale
+            _, _, _, slot = head = self._heads[0]
+            if not self._live(head):
+                heapq.heappop(self._heads)
             elif slot in skip_slots:
                 self._skipped.append(heapq.heappop(self._heads))
             else:
@@ -100,12 +100,15 @@ class _ReadyQueue:
         return None
 
     def pop(self) -> str:
-        """Take the Request `first()` found out of the queue; return its id."""
+        """Take the Request the last `first()` found out of the queue; return its id.
+
+        The queue must not change between the two.
+        """
         _, _, _, slot = heapq.heappop(self._heads)
         queue = self._slots[slot]
         _, _, item_id = heapq.heappop(queue)
         if queue:
-            self._list(slot, queue[0])
+            self._set_first(slot, queue[0])
         else:
             del self._slots[slot], self._marks[slot]
         return item_id
@@ -116,10 +119,15 @@ class _ReadyQueue:
             heapq.heappush(self._heads, head)
         self._skipped.clear()
 
-    def _list(self, slot: str, entry: _Entry) -> None:
+    def _set_first(self, slot: str, entry: _Entry) -> None:
         """Make a Request the first of its slot in `_heads`, which leaves the slot's earlier entry stale."""
         self._marks[slot] = mark = next(self._next_marks)
         heapq.heappush(self._heads, (entry[0], entry[1], mark, slot))
+
+    def _live(self, head: _Head) -> bool:
+        """Whether an entry of `_heads` is the latest of its slot, rather than stale."""
+        _, _, mark, slot = head
+        return self._marks.get(slot) == mark
 
 
 class MemoryFrontier:
