@@ -868,7 +868,7 @@ Engine integration:
 
 | Implementation | Role |
 | --- | --- |
-| In-memory | Default; runs the same state machine |
+| In-memory | Default; runs the same state machine, queuing the ready Requests per slot so that `claim(skip_slots=...)` skips a slot by its first Request |
 | SQLite | `SQLiteFrontier`: one SQLite file, for resuming crawls on a single machine with `job_dir` (§6.5) |
 | Redis | Distributed, the preferred implementation (confirmed): ZSET + Lua, with Leases and tokens; the same Redis also handles shared rate limiting and control commands |
 | PostgreSQL | Distributed, implemented later as needed, reusing the same protocol and conformance test suite |

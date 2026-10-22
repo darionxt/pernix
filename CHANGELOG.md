@@ -144,6 +144,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Fixed
 
+- `MemoryFrontier.claim()` skips a slot by its first ready Request, however many Requests wait in it: ready Requests queue per slot, with a heap of the first one of each slot, of each kind. A claim went through every ready Request of the slots it skipped, taking each off the queue and putting it back, on the event loop: 5 ms with 10 000 Requests waiting in a full or paced slot, and 80 ms with 100 000, for each claim of an idle worker, which claims again whenever the Frontier changes. Claims hand Requests out in the same order.
 - Teaching a browser context the client hints a Session keeps detaches its DevTools session before closing the page it taught them with; that close could hang, and the fetch with it, until `browser.deadline` ran out. The page also names an icon of its own, so that Chrome no longer fetches the origin's `/favicon.ico`, which the route did not answer, and teaching sends nothing to the site.
 - `LoopbackServer` no longer prints a traceback when a client, such as a browser, drops a connection it kept open, which landed in the stderr of the tests.
 - The HTTP Fetcher sends cookies in the order Chrome sends them: longer paths first, then the earliest set first, a cookie that replaces another keeping its place. curl ordered them by path, domain, and name length instead, the Request's own, a Session's, and those set on redirects alike.
