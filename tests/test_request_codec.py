@@ -9,7 +9,7 @@ import pytest
 from pernix import Request, Response, Spider
 from pernix.browser import Click, Evaluate, PageMethod, Render, Screenshot, Scroll, Type, WaitFor
 from pernix.errors import SerializationError
-from pernix.request_codec import REQUEST_SCHEMA_VERSION, decode_request, encode_request
+from pernix.request_codec import REQUEST_SCHEMA_VERSION, decode_request, encode_request, method_names
 
 URL = "https://example.com/item?id=1"
 
@@ -278,3 +278,16 @@ def test_integers_must_fit_in_64_bits() -> None:
         encode_request(Request(URL, meta={"ids": [1, 2**80]}), shop)
     with pytest.raises(SerializationError, match=r"kwargs\['offset'\] holds the integer"):
         encode_request(Request(URL, kwargs={"offset": -(2**63) - 1}), shop)
+
+
+def test_the_methods_a_request_is_stored_by_are_named() -> None:
+    shop = Shop()
+    render = Render(setup=shop.log_in, action=PageMethod(shop.close_banner))
+
+    assert method_names(Request(URL)) == ()
+    assert method_names(Request(URL, callback=shop.parse_item, errback=shop.failed, render=render)) == (
+        "parse_item",
+        "failed",
+        "log_in",
+        "close_banner",
+    )

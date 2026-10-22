@@ -108,6 +108,10 @@ _Avoid_: blocked
 One execution of a Spider from start to finish, identified by a `run_id`. A Run can span multiple Workers and multiple restarts (resumed crawls).
 _Avoid_: job, task
 
+**Job Directory**:
+The directory a Run keeps its Frontier and a record of itself in, so that a later process resumes the Run. One process at a time holds it.
+_Avoid_: checkpoint, state directory
+
 **Worker**:
 A single process taking part in a Run.
 _Avoid_: node, instance

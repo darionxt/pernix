@@ -158,6 +158,15 @@ def test_the_run_of_fetch_writes_no_outcome_file(
     assert not (tmp_path / "outcome.json").exists()
 
 
+def test_the_run_of_fetch_keeps_no_job_directory(
+    site: LoopbackServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PERNIX_JOB_DIR", str(tmp_path / "job"))
+
+    assert main(["fetch", site.url("/page")]) == 0
+    assert not (tmp_path / "job").exists()
+
+
 @pytest.mark.usefixtures("browser_engine")
 def test_the_browser_fetcher_prints_the_rendered_page(site: LoopbackServer, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["fetch", site.url("/scripted"), "--fetcher", "browser"]) == 0

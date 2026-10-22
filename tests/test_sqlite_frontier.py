@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import gc
+import logging
 import os
 import random
 import sqlite3
@@ -38,6 +39,12 @@ URL = "https://example.com/"
 
 class Shop(Spider):
     async def parse_item(self, response: Response) -> None:
+        pass
+
+    async def parse_gone(self, response: Response) -> None:
+        pass
+
+    async def failed(self, request: Request, error: Exception) -> None:
         pass
 
 
@@ -110,20 +117,77 @@ async def test_a_request_that_cannot_be_stored_adds_nothing_of_the_batch(opened:
     assert await frontier.add([Request(URL + "good")]) == [True]
 
 
-async def test_a_request_that_cannot_be_restored_fails_the_claim_and_stays_ready(opened: Opener) -> None:
+async def test_a_request_that_cannot_be_restored_is_kept_dead_and_the_claim_goes_on(
+    opened: Opener, path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     shop = Shop()
     frontier = opened(shop)
-    await frontier.add([Request(URL, callback=shop.parse_item)])
+    await frontier.add([Request(URL, callback=shop.parse_item), Request(URL + "next")])
     await frontier.close()
     frontier = opened(Renamed())
 
-    with pytest.raises(
-        SerializationError, match=r"the Request 1 for https://example\.com/ cannot be restored: .*'parse_item'"
-    ):
-        await frontier.claim("worker-1", 1, 30.0)
+    with caplog.at_level(logging.ERROR, logger="pernix.frontiers.sqlite_frontier"):
+        [lease] = await frontier.claim("worker-1", 1, 30.0)
 
+    assert lease.request.url == URL + "next"
     counts = await frontier.counts()
-    assert (counts.ready, counts.leased) == (1, 0)
+    assert (counts.ready, counts.leased, counts.dead) == (0, 1, 1)
+    assert "the Request 1 for https://example.com/ cannot be restored" in caplog.text
+    await frontier.close()
+    with _database(path) as database:
+        [(reason,)] = database.execute("SELECT reason FROM requests WHERE state = 'dead'").fetchall()
+    assert reason.startswith("SerializationError: the Request 1 for https://example.com/ cannot be restored")
+    assert "'parse_item'" in reason
+
+
+async def test_the_methods_requests_not_done_or_dead_refer_to_that_the_spider_lacks_are_told(opened: Opener) -> None:
+    shop = Shop()
+    frontier = opened(shop)
+    await frontier.add(
+        [Request(URL, callback=shop.parse_item, errback=shop.failed), Request(URL + "gone", callback=shop.parse_gone)]
+    )
+    [first] = await frontier.claim("worker-1", 1, 30.0)
+    assert await frontier.dead(first, "ValueError: cannot parse")  # never handed out again
+    await frontier.close()
+
+    assert await opened(Shop()).missing_methods() == []
+    assert await opened(Renamed()).missing_methods() == ["parse_gone"]
+
+
+async def test_leases_of_an_earlier_process_are_released_counting_an_attempt(opened: Opener) -> None:
+    frontier = opened()
+    await frontier.add([Request(URL), Request(URL + "2")])
+    [first] = await frontier.claim("worker-1", 1, 30.0)
+    await frontier.close()  # as a process that died holding the Lease
+    frontier = opened()
+
+    assert await frontier.release_leases() == 1
+
+    leases = await frontier.claim("worker-1", 10, 30.0)
+    assert [(lease.id, lease.attempt) for lease in leases] == [("2", 1), (first.id, 2)]
+    assert await frontier.release_leases() == 2
+
+
+async def test_a_database_of_schema_version_1_is_migrated(opened: Opener, path: Path) -> None:
+    shop = Shop()
+    frontier = opened(shop)
+    await frontier.add([Request(URL, callback=shop.parse_gone)])
+    await frontier.close()
+    with _database(path) as database:  # as version 1 left it
+        database.execute("ALTER TABLE requests DROP COLUMN methods")
+        database.execute("PRAGMA user_version = 1")
+    frontier = opened(shop)
+
+    await frontier.add([Request(URL + "item", callback=shop.parse_item)])
+
+    assert await opened(Renamed()).missing_methods() == ["parse_item"]  # the methods of the first are not known
+    await frontier.close()
+    with _database(path) as database:
+        assert database.execute("PRAGMA user_version").fetchall() == [(SCHEMA_VERSION,)]
+        assert database.execute("SELECT url, methods FROM requests ORDER BY id").fetchall() == [
+            (URL, None),
+            (URL + "item", "parse_item"),
+        ]
 
 
 async def test_done_requests_keep_only_their_fingerprint(opened: Opener, path: Path) -> None:
@@ -158,7 +222,8 @@ async def test_a_database_of_a_newer_schema_is_refused_naming_both_versions(open
     with _database(path) as database:
         database.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
 
-    with pytest.raises(SerializationError, match=r"has schema version 2, but this Pernix reads version 1 and older"):
+    newer = f"has schema version {SCHEMA_VERSION + 1}, but this Pernix reads version {SCHEMA_VERSION} and older"
+    with pytest.raises(SerializationError, match=newer):
         await opened().counts()
 
 

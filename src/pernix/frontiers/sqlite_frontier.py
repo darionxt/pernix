@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +15,7 @@ from pernix.fetchers.fetcher_dispatch import is_rendered
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers.frontier import host_slot
 from pernix.frontiers.sqlite_store import FrontierStore, RequestRow
-from pernix.request_codec import decode_request, encode_request
+from pernix.request_codec import decode_request, encode_request, method_names
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Sequence
@@ -24,6 +26,8 @@ if TYPE_CHECKING:
     from pernix.spider import Spider
 
 __all__ = ["SQLiteFrontier"]
+
+logger = logging.getLogger(__name__)
 
 
 class SQLiteFrontier:
@@ -121,10 +125,9 @@ class SQLiteFrontier:
     ) -> list[Lease]:
         """Lease ready Requests; see `Frontier.claim()`.
 
-        Raises:
-            pernix.errors.SerializationError: A Request to lease cannot be restored,
-                as `decode_request()` tells, such as one whose Callback is no
-                longer a method of the Spider; nothing is leased, and it stays ready.
+        A Request that cannot be restored, as `decode_request()` tells, such as one
+        whose Callback is no longer a method of the Spider, is kept as a Dead Request
+        instead, with the error as its reason, and logged as an error.
         """
         if limit < 1:
             raise ValueError(f"limit must be at least 1, got {limit}")
@@ -132,11 +135,38 @@ class SQLiteFrontier:
         skipped = frozenset(skip_slots)
         claimed = self._submit(lambda: self._store.claim(worker_id, limit, ttl, skipped, rendered))
         try:
-            return self._seeing(await asyncio.shield(asyncio.wrap_future(claimed)))
+            leases, lost = self._seeing(await asyncio.shield(asyncio.wrap_future(claimed)))
         except asyncio.CancelledError:
             if not self._closed:  # the claim goes on in the thread; what it leases goes back after it
                 self._submit(lambda: self._release(claimed))
             raise
+        for error in lost:
+            logger.error("Kept a Request that cannot be restored as a Dead Request: %s", error)
+        return leases
+
+    async def release_leases(self) -> int:
+        """Make every leased Request ready again, counting an attempt, as if its Lease had expired.
+
+        A process that alone uses the database, such as by holding the lock of a job
+        directory, calls it as it starts, so that the Requests the Workers of an
+        earlier process held are fetched again at once, rather than once their
+        Leases expire. A Request that ended its process thus cannot do so forever.
+
+        Returns:
+            How many Requests were leased.
+        """
+        return await self._call(self._store.release_leases)
+
+    async def missing_methods(self) -> list[str]:
+        """Return the methods the Requests not done or dead refer to that the Spider no longer has.
+
+        Those of Requests stored by a Pernix before schema version 2 are not known.
+
+        Returns:
+            Their names, in order.
+        """
+        names = await self._call(self._store.method_names)
+        return sorted(name for name in names if not inspect.ismethod(getattr(self._spider, name, None)))
 
     async def renew(self, lease: Lease, ttl: float) -> Lease | None:
         """Extend a Lease; see `Frontier.renew()`."""
@@ -223,7 +253,9 @@ class SQLiteFrontier:
     def _row(self, request: Request, fingerprint: str | None, slot: str) -> RequestRow:
         """Prepare a Request for the database, on the event loop, where its Fingerprint and slot were computed."""
         data = encode_request(request, self._spider)
-        return RequestRow(fingerprint, slot, is_rendered(request), request.priority, request.url, data)
+        return RequestRow(
+            fingerprint, slot, is_rendered(request), request.priority, request.url, data, method_names(request)
+        )
 
     async def _call[T](self, operation: Callable[[], T]) -> T:
         """Run an operation of the store; it completes even if the caller is cancelled."""
@@ -256,10 +288,10 @@ class SQLiteFrontier:
         self._seen.set(changes)
         return result
 
-    def _release(self, claimed: Future[tuple[list[Lease], int]]) -> None:
+    def _release(self, claimed: Future[tuple[tuple[list[Lease], list[str]], int]]) -> None:
         """Give back what a cancelled claim leased; it ran before, in the same thread."""
         if claimed.exception() is None:
-            self._store.release(claimed.result()[0])
+            self._store.release(claimed.result()[0][0])
 
     def _notify(self) -> None:
         self._notified += 1

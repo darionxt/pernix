@@ -339,6 +339,8 @@ Keyword arguments other than `settings=` and `output=` are Spider arguments, dec
 
 For a Platform, `outcome_file` (or `PERNIX_OUTCOME_FILE`), a path template as for Feeds such as `"outcome/{run_id}.json"`, makes the Run write, as its last step, however it ends, a JSON document of how it ended: its `run_id`, `spider`, `reason`, the `exit_code` above, `started_at` and `finished_at`, its `stats`, and for a failure the `error`'s `type` and `message`, masked as logs are. `run()`, `crawl()`, and `stream_items()` write it alike, as does `pernix run`, also for a configuration error found once the Run has begun; invalid settings and Spider arguments, found before, write none. See [`docs/design.md`](docs/design.md) §8.
 
+With `job_dir` (or `PERNIX_JOB_DIR`, or `pernix run --job-dir DIR`), a Run keeps its Frontier in that directory, so that running it again with the same directory resumes it, after a crash, a Drain, or a Force Stop: the Requests ready, delayed, and in flight continue, those done are not fetched again, Dead Requests stay dead, and `start()` is not iterated again once a process iterated it to its end. Delivery is at-least-once: a Request in flight when its process died is fetched again, counting an attempt, so Pipelines should write idempotently. One process at a time holds the directory; another exits with 2, as does a Run that does not continue the one recorded there, with another Spider, `run_id`, Spider arguments, or Fingerprint settings. A Request the Frontier cannot store, such as one whose `meta` is not JSON-compatible or whose Callback is not a method of the Spider, is dropped with an error. Sessions start anew, and Feeds are not continued yet: each process replaces a Feed's file with its own Items, so store the Items of a resumed Run with Pipelines. The directory must be on a local file system, not a network one, and `outcome_file` may be in it, each process writing its own outcome there. See [`docs/design.md`](docs/design.md) §6.5.
+
 A Platform controls a Run from outside its process through control sources. With `control.file` set, it writes the state it wants, `running`, `paused`, `drain`, or `force`, in that file, atomically (`printf paused > state.tmp && mv state.tmp state`); the Run reads it as it starts, then every `control.interval` seconds, and pauses, resumes, or stops as it changes. A missing file means `running`. Only changes are applied, so a Run its code paused stays paused while the file says `running`, and a stop left in the file stops the next Run that reads it too. Sources of your own, such as one reading a key in a store, are `ControlSource`s with a `state()`, registered in `control.sources`. See [`docs/design.md`](docs/design.md) §8.
 
 ## Command line
@@ -346,6 +348,7 @@ A Platform controls a Run from outside its process through control sources. With
 ```bash
 pernix run books.py -a keyword=dune -s concurrency=4 -o books.jsonl   # Books.run() from the command line
 pernix run myproject.spiders.books:Books                            # an import path, a Spider chosen by name
+pernix run books.py -a keyword=dune --job-dir jobs/dune             # run again with it to resume the Run
 pernix fetch https://example.com/ > page.html                        # headers to stderr, the body to stdout
 pernix fetch https://example.com/ --json                             # one JSON object, errors included
 pernix fetch https://example.com/ --fetcher browser                  # the page as its scripts left it
@@ -397,6 +400,7 @@ Keys are dotted (`domain.delay` is `PERNIX_DOMAIN__DELAY` in the environment). S
 | `feeds` | `{}` | Files Items are written to, as `{path_template: options}` |
 | `run_id` | `None` | Identifies the Run in logs and stats; `None` generates one |
 | `outcome_file` | `None` | A JSON file, a path template as for Feeds, written as the Run ends, telling how it ended: its reason, exit code, stats, and error |
+| `job_dir` | `None` | A directory the Run keeps its Frontier in, so that running again with it resumes the Run; on a local file system |
 | `locale` | `["en-US", "en"]` | The languages the browser presents, as a list or `"en-US,en"`; the HTTP Fetcher sends the `Accept-Language` Chrome makes of them, and the first is the locale of `Intl` in the browser |
 | `timezone` | `None` | The time zone of the browser's pages, their frames, and their web workers, an IANA name such as `"Europe/Berlin"`; `None` keeps the machine's |
 | `events.timeout` | `30.0` | Seconds before an async event subscriber is cancelled |
@@ -591,6 +595,7 @@ src/pernix/
 ├── runner.py            run() as a program
 ├── exit_code.py         ExitCode: the exit codes of run() and the CLI, and the ending each tells
 ├── outcome_file.py      the outcome file: how a Run ended, as JSON for a Platform
+├── job_dir.py           the job directory of a resumable Run: its record, and the lock one process holds
 ├── __main__.py          python -m pernix
 ├── stop_signals.py      SIGINT and SIGTERM stop a Run
 ├── run_result.py        RunResult, how a Run ended

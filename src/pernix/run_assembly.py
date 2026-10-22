@@ -17,9 +17,10 @@ from pernix.events import StatsSnapshot
 from pernix.feeds import Feed, render_path
 from pernix.fetchers import BrowserSettings, FetcherDispatch, HTTPFetcher, HTTPSettings
 from pernix.fingerprint import request_fingerprint
-from pernix.frontiers import MemoryFrontier
+from pernix.frontiers import MemoryFrontier, SQLiteFrontier
 from pernix.inline_fetch import InlineFetch
 from pernix.items import ItemProcessor
+from pernix.job_dir import JobDir
 from pernix.logs import RunContext
 from pernix.middlewares import build_download_chain, build_spider_chain
 from pernix.pausing import Pausing
@@ -56,7 +57,7 @@ from pernix.stats import CoreStats, LoopLag, LoopWatchdog, StatsReporter
 from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
     from pathlib import Path
 
     from pernix.account import Account
@@ -154,6 +155,8 @@ class RunAssembly:
         outlet: Outlet | None = None,
         accounts: Sequence[Account] = (),
         pausing: Pausing | None = None,
+        frontier_path: Path | None = None,
+        start: Callable[[], AsyncIterator[Request]] | None = None,
     ) -> RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
@@ -178,6 +181,9 @@ class RunAssembly:
                 holds, if one is enabled.
             pausing: Pauses and resumes the Run, for the Engine; its counts are
                 reported in the stats. Defaults to one that nothing pauses.
+            frontier_path: The database of a `SQLiteFrontier` for the Run, as in its
+                job directory; `None` for a `MemoryFrontier`.
+            start: Gives the initial Requests, in place of `Spider.start()`.
 
         Returns:
             The assembly.
@@ -239,7 +245,11 @@ class RunAssembly:
             problems.raise_them()
         core_stats = CoreStats(crawler.stats)
         pausing = pausing or Pausing(crawler.spider, events)
-        frontier = MemoryFrontier(fingerprint=fingerprint)
+        frontier: Frontier = (
+            MemoryFrontier(fingerprint=fingerprint)
+            if frontier_path is None
+            else SQLiteFrontier(frontier_path, crawler.spider, fingerprint=fingerprint)
+        )
         throttle = Throttle(settings.section(DomainSettings))
         proxies = proxying.proxies
         blocked = BlockedResponses(crawler.spider.is_blocked, stats=crawler.stats)
@@ -280,6 +290,7 @@ class RunAssembly:
             callback_timeout=settings.section(CallbackSettings).timeout,
             stats=crawler.stats,
             pausing=pausing,
+            start=start,
         )
         inline_fetch = InlineFetch(
             download=download,
@@ -579,7 +590,8 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
 
     Raises:
         pernix.errors.SettingsError: A Feed is invalid, or two Feeds, or a Feed and
-            `items.failed_output`, would write the same file.
+            `items.failed_output`, would write the same file, or one would write a
+            file the job directory keeps.
     """
     feed_settings = crawler.settings.section(FeedSettings).feeds
     configured = [(f"feeds[{template!r}]", template, options) for template, options in feed_settings.items()]
@@ -590,7 +602,7 @@ def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> lis
     failed_output = crawler.settings.section(ItemSettings).failed_output
     if failed_output is not None:
         destinations.append(("items.failed_output", _feed_path(crawler, failed_output)))
-    _check_distinct(destinations)
+    _check_distinct([*destinations, *_job_dir_files(crawler)])
     return feeds
 
 
@@ -610,7 +622,8 @@ def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Pat
 
     Raises:
         pernix.errors.SettingsError: The path template is invalid, or a Feed,
-            `output`, or `items.failed_output` writes the same file.
+            `output`, or `items.failed_output` writes the same file, or it is a
+            file the job directory keeps.
     """
     template = crawler.settings.section(CoreSettings).outcome_file
     if template is None:
@@ -631,9 +644,22 @@ def outcome_path(crawler: Crawler, output: str | os.PathLike[str] | None) -> Pat
         with contextlib.suppress(OSError, ValueError):  # an invalid path is the other output's problem
             if _feed_path(crawler, other).resolve() == resolved:
                 problems.append(f"{label} and outcome_file both write {path}")
+    problems += [
+        f"{label} and outcome_file both write {path}"
+        for label, kept in _job_dir_files(crawler)
+        if kept.resolve() == resolved
+    ]
     if problems:
         raise SettingsError(problems)
     return path
+
+
+def _job_dir_files(crawler: Crawler) -> list[tuple[str, Path]]:
+    """The files the job directory of the `job_dir` setting keeps, which no output may write."""
+    job_dir = crawler.settings.section(CoreSettings).job_dir
+    if job_dir is None:
+        return []
+    return [(f"job_dir ({path.name})", path) for path in JobDir(job_dir).files]
 
 
 def _feed(crawler: Crawler, template: str, options: FeedOptions) -> Feed:

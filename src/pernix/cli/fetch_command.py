@@ -24,10 +24,10 @@ if TYPE_CHECKING:
 __all__ = ["add_parser"]
 
 _RUN_SETTINGS: Mapping[str, Any] = MappingProxyType(
-    {"feeds": {}, "outcome_file": None, "log.level": "CRITICAL", "stats.interval": 0}
+    {"feeds": {}, "outcome_file": None, "job_dir": None, "log.level": "CRITICAL", "stats.interval": 0}
 )
-"""Settings of the Run of `pernix fetch`: no Feeds, no outcome file, as `fetch` exits with codes of its own, no
-periodic stats, and only critical log records, as it reports each URL itself."""
+"""Settings of the Run of `pernix fetch`: no Feeds, no outcome file, as `fetch` exits with codes of its own, no job
+directory, no periodic stats, and only critical log records, as it reports each URL itself."""
 
 _ITEM_COMPONENTS = ("spider_middlewares", "pipelines", "failed_pipelines")
 """The components of a project that handle Callbacks and Items, which `pernix fetch` has none of."""
