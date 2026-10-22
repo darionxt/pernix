@@ -34,6 +34,11 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     )
     parser.add_argument("-o", "--output", metavar="PATH", help="a Feed for the Items: a .jsonl, .csv, or .json file")
     parser.add_argument("--run-id", metavar="ID", help="identifies the Run, as the run_id setting")
+    parser.add_argument(
+        "--job-dir",
+        metavar="DIR",
+        help="keep the Run's state in DIR, as the job_dir setting; running again with it resumes the Run",
+    )
     parser.set_defaults(handler=run)
 
 
@@ -53,5 +58,7 @@ def run(args: argparse.Namespace) -> int:
     command_line = dict(args.settings)
     if args.run_id is not None:
         command_line["run_id"] = args.run_id
+    if args.job_dir is not None:
+        command_line["job_dir"] = args.job_dir
     code, _ = run_program(spider_type, args=dict(args.spider_args), command_line=command_line, output=args.output)
     return code

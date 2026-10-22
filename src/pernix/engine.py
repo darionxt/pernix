@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pernix.callbacks import iterate_and_close
+from pernix.errors import SerializationError
 from pernix.events import RequestDropped, RequestScheduled, SpiderIdle
 from pernix.items import PendingItems
 from pernix.logs import request_context
@@ -84,7 +85,8 @@ class Engine:
     and it is not paused. Then `SpiderIdle` is emitted and `Spider.on_idle()` runs; the
     Run ends when it adds no Request, once it is not paused. Every Request passes the
     `RequestScheduled` gate before entering the Frontier; a vetoed or duplicate
-    Request is emitted as `RequestDropped`.
+    Request is emitted as `RequestDropped`, and so is one the Frontier cannot store,
+    with the reason `unpersistable`, which is also logged as an error.
 
     `drain()` stops the claiming and the scheduling of the Requests `start()` and
     `on_idle()` yield; the Requests in flight are finished, with their Items, and the
@@ -117,6 +119,7 @@ class Engine:
         callback_timeout: float | None = None,
         stats: Stats | None = None,
         pausing: Pausing | None = None,
+        start: Callable[[], AsyncIterator[Request]] | None = None,
     ) -> None:
         """Wire the Engine to its collaborators.
 
@@ -156,6 +159,8 @@ class Engine:
             stats: Where, with a limit, the timeouts are counted.
             pausing: Pauses and resumes the Run, and emits its Events; by default,
                 one of its own, which nothing pauses.
+            start: Gives the initial Requests, in place of `spider.start`, as when
+                an earlier process of the Run gave them already.
 
         Raises:
             ValueError: `concurrency` is less than 1, `browser_concurrency` is
@@ -179,6 +184,7 @@ class Engine:
         self._worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
         self._draining = asyncio.Event()
         self._pausing = pausing or Pausing(spider, events)
+        self._start = start or spider.start
         self._flush_items = flush_items or (lambda: None)
         self._attempts = 0
         """The attempts in progress."""
@@ -243,7 +249,7 @@ class Engine:
         each step rather than left to cancelling this task. A paused Run ends only
         once it is resumed.
         """
-        await self._schedule_all(self._spider.start(), "start()")
+        await self._schedule_all(self._start(), "start()")
         while not self._draining.is_set():
             await self._until_idle()
             await self._events.emit(SpiderIdle(self._spider))
@@ -442,7 +448,12 @@ class Engine:
         if veto is not None:
             await self._events.emit(RequestDropped(request, veto.reason))
             return False
-        [added] = await self._frontier.add([request])
+        try:
+            [added] = await self._frontier.add([request])
+        except SerializationError as exc:  # the Frontier keeps Requests for a later process
+            logger.error("Dropped %r, which the Frontier cannot store: %s", request, exc)
+            await self._events.emit(RequestDropped(request, "unpersistable"))
+            return False
         if not added:
             await self._events.emit(RequestDropped(request, "duplicate"))
         return added

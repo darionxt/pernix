@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import functools
 import logging
 import uuid
+from contextlib import aclosing
+from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import msgspec
 
 from pernix.account import collect_accounts
 from pernix.addons import addon_settings, load_addons
+from pernix.callbacks import iterate_and_close
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
-from pernix.errors import CONFIGURATION_ERRORS, SettingsError
+from pernix.errors import CONFIGURATION_ERRORS, JobDirError, SerializationError, SettingsError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
+from pernix.frontiers import SQLiteFrontier
 from pernix.items import ItemStream
+from pernix.job_dir import JobDir, RunRecord
 from pernix.logs import RunContext, RunLog, revealed_secrets, run_context
 from pernix.outcome_file import OutcomeFile
 from pernix.pausing import Pausing
@@ -22,6 +31,7 @@ from pernix.run_result import RunResult
 from pernix.settings import (
     CoreSettings,
     EventSettings,
+    FingerprintSettings,
     LogSettings,
     Section,
     SessionSettings,
@@ -30,12 +40,12 @@ from pernix.settings import (
     load_settings,
 )
 from pernix.shutdown import Shutdown
-from pernix.spider_arguments import create_spider
+from pernix.spider_arguments import create_spider, spider_arguments
 from pernix.stats import Stats
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
     from signal import Signals
 
@@ -64,13 +74,18 @@ class Crawler:
     them together; the Crawler builds each one with injection, carries the Run
     through its lifecycle, and carries out `stop()`.
 
+    With the `job_dir` setting, the Run keeps its Frontier in that directory, with a
+    record of itself, so that running it again resumes it: see `crawl()`.
+
     Attributes:
         spider: The Spider being run; the Crawler binds itself as its `crawler`.
         settings: The validated, immutable settings of this Run.
         events: The event bus of this Run.
-        run_id: Identifies the Run: the `run_id` setting, or a generated one.
-        started_at: When the Run started, in UTC; until then, when the Crawler was
-            created. Feed paths fill in `{time}` with it.
+        run_id: Identifies the Run: the `run_id` setting, the one the job directory
+            records, or a generated one.
+        started_at: When the Run started, in UTC, in its first process for a resumed
+            Run; until then, when the Crawler was created. Feed paths fill in
+            `{time}` with it.
         stats: The stats of this Run; they stay readable after it ends.
         addons: The loaded Addons, whose `setup()` runs before the Run starts.
     """
@@ -82,8 +97,12 @@ class Crawler:
         settings: Settings,
         output: str | os.PathLike[str] | None = None,
         addons: Sequence[object] = (),
+        arguments: Mapping[str, object] | None = None,
     ) -> None:
         """Configure a Run. `from_spider()` also loads the settings and Addons.
+
+        With the `job_dir` setting, the Run recorded there, if any, gives the
+        `run_id`, unless the setting names one, and the time the Run started.
 
         Args:
             spider: The Spider to run.
@@ -92,6 +111,9 @@ class Crawler:
                 template whose extension names the format: `.jsonl`, `.csv`, or
                 `.json`.
             addons: Loaded Addons whose `setup()` runs before the Run starts.
+            arguments: The Spider arguments the Spider was created with, as
+                converted for it, which a job directory records; `None` when not
+                known.
 
         Raises:
             RuntimeError: The Spider object is bound to another Crawler.
@@ -99,8 +121,14 @@ class Crawler:
         self.spider = spider
         self.settings = settings
         self.events = EventBus(timeout=settings.section(EventSettings).timeout)
-        self.run_id = settings.section(CoreSettings).run_id or uuid.uuid4().hex
-        self.started_at = dt.datetime.now(dt.UTC)
+        core = settings.section(CoreSettings)
+        self._job = None if core.job_dir is None else JobDir(core.job_dir)
+        self._job_taken = False
+        recorded = None if self._job is None else self._job.peek()
+        self.run_id = core.run_id or (None if recorded is None else recorded.run_id) or uuid.uuid4().hex
+        self.started_at = dt.datetime.now(dt.UTC) if recorded is None else recorded.started_at
+        self._resuming = recorded is not None
+        self._arguments = None if arguments is None else dict(arguments)
         self.stats = Stats()
         spider.crawler = self
         self._run_context = RunContext(self.run_id, spider.name)
@@ -164,7 +192,9 @@ class Crawler:
             overrides=settings,
             command_line=command_line,
         )
-        return cls(create_spider(spider_type, args or {}), settings=final, output=output, addons=addons)
+        arguments = spider_arguments(spider_type, args or {})
+        spider = create_spider(spider_type, arguments)
+        return cls(spider, settings=final, output=output, addons=addons, arguments=arguments)
 
     def build_component(self, spec: object) -> object:
         """Construct a component for this Run.
@@ -358,17 +388,29 @@ class Crawler:
         `pernix.run_assembly.RunAssembly.build()` describes, before anything is
         opened. The components are subscribed and opened in order, then the Feeds,
         and `SpiderOpened` is emitted. The Engine
-        runs with an in-memory Frontier while Items go through the Pipelines into the
+        runs with the Frontier while Items go through the Pipelines into the
         Feeds and the stats are reported; once it is done, the queued Items and the
         pending batches are processed. Then `SpiderClosed` is emitted, the final stats
         snapshot is taken, and the components are closed in reverse order, which
         finishes the Feed files. `stop()` ends the Run early, and `pause()` holds it
         until `resume()`.
 
+        The Frontier is held in memory, or, with the `job_dir` setting, in that
+        directory, a `pernix.job_dir.JobDir`, which the Run takes first, before
+        anything else: it records a new Run there, or checks that this one continues
+        the Run recorded, which it resumes. Once the components are built, and before
+        they are opened, the Requests the Frontier holds are checked to name only
+        methods the Spider has, and those the last process left leased are made ready
+        again, each counting an attempt. A resumed Run logs what was left, sets
+        `run.resumed` and `run.first_started_at` in its stats, and iterates
+        `Spider.start()` only if no earlier process of the Run iterated it to its end.
+
         An error that ends the Run is logged, with its traceback unless it is a
         configuration error, and raised. Last, however the Run ends, the file of the
         `outcome_file` setting, if set, is written, as
-        `pernix.outcome_file.OutcomeFile` describes.
+        `pernix.outcome_file.OutcomeFile` describes; but not in a job directory the
+        Run could not take, which it leaves as it was. The job directory is released
+        after that.
 
         Returns:
             How the Run ended.
@@ -380,28 +422,37 @@ class Crawler:
                 its role.
             pernix.errors.SettingsError: Two Fetchers claim the same URL scheme, or a
                 Feed is invalid.
+            pernix.errors.JobDirError: Another process holds the job directory, it
+                holds another Run, or its Requests name methods the Spider lacks.
         """
         if self._started:
             raise RuntimeError("a Crawler runs only once; create a new one for another Run")
         self._started = True
-        self.started_at = dt.datetime.now(dt.UTC)
+        if not self._resuming:
+            self.started_at = dt.datetime.now(dt.UTC)
         secrets = revealed_secrets(self.settings.values())
         with run_context(self._run_context):
             async with RunLog(self.settings.section(LogSettings), self._run_context, secrets=secrets) as run_log:
                 try:
-                    result = await self._crawl(run_log)
-                except BaseException as exc:
-                    _log_failure(exc)
-                    reason = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
-                    self._write_outcome(run_log, reason, exc)
-                    raise
-                self._write_outcome(run_log, result.reason)
-                return result
+                    try:
+                        result = await self._crawl(run_log)
+                    except BaseException as exc:
+                        _log_failure(exc)
+                        reason = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                        self._write_outcome(run_log, reason, exc)
+                        raise
+                    self._write_outcome(run_log, result.reason)
+                    return result
+                finally:
+                    if self._job is not None:  # in a thread, as it waits for a take() in progress
+                        await asyncio.to_thread(self._job.release)
 
     async def _crawl(self, run_log: RunLog) -> RunResult:
         try:
             async with ComponentLifecycle() as lifecycle:
                 self._shutdown.begin(lifecycle)
+                if self._job is not None:
+                    await self._take_job_dir(self._job)
                 accounts: tuple[Account, ...] = ()
 
                 async def import_accounts() -> None:
@@ -412,10 +463,19 @@ class Crawler:
                 if await self._shutdown.run_stage(import_accounts()):
                     return self._forced_before_start()
                 run = RunAssembly.build(
-                    self, run_log, output=self._output, outlet=self._outlet, accounts=accounts, pausing=self._pausing
+                    self,
+                    run_log,
+                    output=self._output,
+                    outlet=self._outlet,
+                    accounts=accounts,
+                    pausing=self._pausing,
+                    frontier_path=None if self._job is None else self._job.frontier_path,
+                    start=None if self._job is None else functools.partial(self._seeding, self._job),
                 )
                 self._shutdown.attach(run.engine)
                 try:
+                    if self._job is not None and isinstance(run.frontier, SQLiteFrontier):
+                        await self._resume(run.frontier, self._job)
                     if await self._shutdown.run_stage(self._open(lifecycle, run.components, run.feeds)):
                         return self._forced_before_start()
                     return await self._run(run)
@@ -428,12 +488,78 @@ class Crawler:
             self._shutdown.end()
             self._pausing.end()  # also when the Engine never ran
 
+    async def _take_job_dir(self, job: JobDir) -> None:
+        """Take the job directory for the Run, recording it or checking that it continues the Run recorded."""
+        record = await asyncio.to_thread(job.take, self._record())
+        self._job_taken = True
+        self.started_at = record.started_at
+        if job.resumed:
+            self.stats.set("run.resumed", 1)
+            self.stats.set("run.first_started_at", _timestamp(record.started_at))
+
+    def _record(self) -> RunRecord:
+        """This Run, as a job directory records it."""
+        options = self.settings.section(FingerprintSettings)
+        function: object = options.function
+        return RunRecord(
+            run_id=self.run_id,
+            spider=self.spider.name,
+            started_at=self.started_at,
+            arguments=None if self._arguments is None else _as_json(self._arguments),
+            fingerprint={
+                "headers": list(options.headers),
+                "sort_query": options.sort_query,
+                "function": function if function is None or isinstance(function, str) else _import_path(function),
+            },
+            pernix=version("pernix"),
+        )
+
+    async def _resume(self, frontier: SQLiteFrontier, job: JobDir) -> None:
+        """Check the Requests of a job directory's Frontier, and make those the last process left leased ready again."""
+        try:
+            missing = await frontier.missing_methods()
+        except SerializationError as exc:  # the database is not one this Pernix reads
+            raise JobDirError(str(exc)) from exc
+        if missing:
+            raise JobDirError(
+                f"the job directory {job.path} holds Requests that name methods the Spider "
+                f"{self.spider.name!r} does not have: {', '.join(missing)}; were they renamed or removed?"
+            )
+        released = await frontier.release_leases()
+        if job.resumed:
+            counts = await frontier.counts()
+            logger.info(
+                "Resuming the Run first started at %s, with %d Requests ready, %d of them left in flight by the last "
+                "process, %d delayed, %d done, and %d dead",
+                _timestamp(self.started_at),
+                counts.ready,
+                released,
+                counts.delayed,
+                counts.done,
+                counts.dead,
+            )
+
+    async def _seeding(self, job: JobDir) -> AsyncGenerator[Request]:
+        """Yield the Requests of `Spider.start()`, unless an earlier process of the Run yielded them all; record when they are."""
+        if job.record is not None and job.record.start_exhausted:
+            return
+        async with aclosing(iterate_and_close(self.spider.start())) as requests:
+            async for request in requests:
+                yield request
+        await asyncio.to_thread(job.record_start_exhausted)
+
     def _write_outcome(self, run_log: RunLog, reason: str, error: BaseException | None = None) -> None:
-        """Write the outcome file, if the `outcome_file` setting names one that no other output writes."""
+        """Write the outcome file, if the `outcome_file` setting names one that no other output writes.
+
+        A job directory the Run could not take is left as it was, without one.
+        """
         try:
             path = outcome_path(self, self._output)
         except SettingsError as exc:
             logger.error("The outcome file is not written: %s", "; ".join(exc.problems))
+            return
+        if path is not None and self._job is not None and not self._job_taken and _within(path, self._job.path):
+            logger.error("The outcome file %s is not written: it is in the job directory the Run could not take", path)
             return
         if path is not None:
             outcome = OutcomeFile(self, path)
@@ -533,3 +659,26 @@ def _log_failure(error: BaseException) -> None:
 
 def _as_request(request: Request | str) -> Request:
     return Request(request) if isinstance(request, str) else request
+
+
+def _as_json(value: object) -> Any:
+    """A value as JSON gives it back, as a job directory records it: tuples as lists, and keys as strings."""
+    return msgspec.json.decode(msgspec.json.encode(value, enc_hook=repr))
+
+
+def _import_path(component: object) -> str:
+    """The import path of a component given as an object: of a class or function, or of the class of another object."""
+    named = component if hasattr(component, "__qualname__") else type(component)
+    return f"{named.__module__}.{getattr(named, '__qualname__', '')}"
+
+
+def _timestamp(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.UTC).isoformat(timespec="milliseconds")
+
+
+def _within(path: os.PathLike[str], directory: os.PathLike[str]) -> bool:
+    """Whether a file is in a directory, at any depth."""
+    try:
+        return Path(path).resolve().is_relative_to(Path(directory).resolve())
+    except (OSError, ValueError):
+        return False

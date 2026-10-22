@@ -91,6 +91,10 @@ class CoreSettings(Section):
             writes as it ends, however it ends, telling a Platform how: the reason,
             the exit code, the stats, and the error it failed with; `None` writes
             none. See `pernix.outcome_file.OutcomeFile`.
+        job_dir: A directory the Run keeps its Frontier in, with a record of
+            itself, so that running again with it resumes the Run; `None` keeps
+            the Frontier in memory. It must be on a local file system, not a
+            network one. See `pernix.job_dir.JobDir`.
         locale: The languages the client presents, in order of preference, as a
             list or a comma-separated string, such as `"de-DE,de,en-US,en"`: the
             browser's `navigator.languages`, from which Chrome makes its
@@ -116,6 +120,7 @@ class CoreSettings(Section):
     failed_pipelines: ComponentMap = msgspec.field(default_factory=lambda: {"pernix.items.FailedItemsFile": 100})
     run_id: Annotated[str, msgspec.Meta(min_length=1)] | None = None
     outcome_file: str | None = None
+    job_dir: PurePath | None = None
     locale: str | tuple[str, ...] = DEFAULT_LOCALE
     timezone: str | None = None
 

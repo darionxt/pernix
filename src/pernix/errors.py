@@ -20,6 +20,7 @@ __all__ = [
     "FeedError",
     "FetchError",
     "IgnoreRequest",
+    "JobDirError",
     "LoginExpired",
     "NetworkBlocked",
     "PageCrashed",
@@ -84,7 +85,21 @@ class AddonError(PernixError):
     """An Addon cannot be loaded, is incompatible, or misused its setup API."""
 
 
-CONFIGURATION_ERRORS: tuple[type[PernixError], ...] = (SettingsError, SpiderArgumentError, ComponentError, AddonError)
+class JobDirError(PernixError):
+    """The job directory of the `job_dir` setting cannot be used by this Run.
+
+    Another process holds it, it holds another Run, or its Requests name methods the
+    Spider no longer has; nothing in it was changed.
+    """
+
+
+CONFIGURATION_ERRORS: tuple[type[PernixError], ...] = (
+    SettingsError,
+    SpiderArgumentError,
+    ComponentError,
+    AddonError,
+    JobDirError,
+)
 """The errors that mean a Run is misconfigured; `Spider.run()` exits with 2 for them."""
 
 

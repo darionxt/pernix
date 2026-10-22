@@ -56,8 +56,8 @@ class CoreStats:
     than letters, digits, `_`, and `-` replaced by `_`.
 
     - `requests.enqueued`: Requests that entered the Frontier.
-    - `requests.dropped`, `requests.dropped_by_reason.<reason>`: Requests vetoed, or
-      dropped as duplicates.
+    - `requests.dropped`, `requests.dropped_by_reason.<reason>`: Requests vetoed,
+      dropped as duplicates, or that the Frontier could not store (`unpersistable`).
     - `requests.retried`, `requests.retried_by_budget.<budget>`, `requests.ignored`:
       Attempts retried, those under a retry budget by its name; Requests ignored.
     - `requests.failed`, `requests.failed_by_error.<ErrorType>`: Requests that failed
