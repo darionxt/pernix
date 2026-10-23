@@ -178,3 +178,20 @@ def test_a_directory_released_before_it_is_taken_is_not_taken(tmp_path: Path) ->
         job.take(_run())
 
     assert _taken(tmp_path, _run()).run_id == "r1"  # no lock was left held
+
+
+def test_the_control_file_is_looked_at_as_the_directory_is_taken(tmp_path: Path) -> None:
+    without, written = JobDir(tmp_path / "without"), JobDir(tmp_path / "written")
+    written.path.mkdir()
+    (written.path / "control").write_text("drain")
+
+    for job in (without, written):
+        job.take(_run())
+        job.release()
+
+    assert written.control_path == tmp_path / "written" / "control"
+    assert without.control_found is None
+    assert written.control_found is not None
+    status = written.control_path.stat()
+    assert (written.control_found.st_ino, written.control_found.st_mtime_ns) == (status.st_ino, status.st_mtime_ns)
+    assert "control" in [path.name for path in written.files]

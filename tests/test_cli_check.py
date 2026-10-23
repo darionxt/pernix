@@ -99,6 +99,16 @@ def test_the_control_file_and_the_control_sources_are_listed(capsys: pytest.Capt
     assert "Control Sources: ControlFile (run/state), FromStore" in capsys.readouterr().out
 
 
+def test_the_control_file_of_the_job_directory_is_listed_unless_turned_off(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["check", "-s", "job_dir=run/job"]) == 0
+    assert "Control Sources: ControlFile (run/job/control)" in capsys.readouterr().out
+
+    assert main(["check", "-s", "job_dir=run/job", "-s", "control.file="]) == 0
+    assert "Control Sources: none" in capsys.readouterr().out
+
+
 def test_a_control_source_without_state_is_reported(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["check", "-s", 'control.sources={"builtins.object": 10}']) == 2
     assert "control.sources: <object object at" in capsys.readouterr().err

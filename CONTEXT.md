@@ -109,7 +109,7 @@ One execution of a Spider from start to finish, identified by a `run_id`. A Run 
 _Avoid_: job, task
 
 **Job Directory**:
-The directory a Run keeps its Frontier and a record of itself in, so that a later process resumes the Run. One process at a time holds it.
+The directory a Run keeps its Frontier and a record of itself in, so that a later process resumes the Run, and where a Platform may write its control file. One process at a time holds it.
 _Avoid_: checkpoint, state directory
 
 **Worker**:
