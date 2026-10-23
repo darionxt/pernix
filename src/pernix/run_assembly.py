@@ -664,7 +664,7 @@ def _job_dir_files(crawler: Crawler) -> list[tuple[str, Path]]:
 
 def _feed(crawler: Crawler, template: str, options: FeedOptions) -> Feed:
     try:
-        return Feed(_feed_path(crawler, template), options)
+        return crawler.feed(template, options)
     except (TypeError, ValueError, ComponentError) as exc:
         raise SettingsError([f"feed {template!r}: {exc}"]) from exc
 
