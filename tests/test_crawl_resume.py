@@ -111,21 +111,25 @@ async def test_start_iterated_to_its_end_is_not_iterated_again(tmp_path: Path, c
 
 
 class Seeds(Spider):
-    """Yields three pages from `start()`, draining the Run after the second the first time."""
+    """Yields three pages from `start()`, draining the Run the first time once the second is parsed."""
 
     name = "seeds"
     drained: ClassVar[bool] = False
 
     async def start(self) -> AsyncIterator[Request]:
+        self.second_parsed = asyncio.Event()
         yield Request(f"{SITE}/1")
         yield Request(f"{SITE}/2", dont_filter=True)
         if not type(self).drained:
             type(self).drained = True
+            await self.second_parsed.wait()  # else the Drain may come before a worker claims it
             self.crawler.stop()
         yield Request(f"{SITE}/3")
 
     async def parse(self, response: Response) -> AsyncIterator[Any]:
         yield {"url": response.url}
+        if response.url == f"{SITE}/2":
+            self.second_parsed.set()
 
 
 async def test_start_stopped_before_its_end_is_iterated_again_its_requests_added_before_being_duplicates(
