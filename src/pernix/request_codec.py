@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from pernix.browser import PageCallable, ResourceType
     from pernix.request import Callback
 
-__all__ = ["REQUEST_SCHEMA_VERSION", "decode_request", "encode_request", "method_names"]
+__all__ = ["REQUEST_SCHEMA_VERSION", "decode_request", "encode_request", "method_names", "stored_callbacks"]
 
 REQUEST_SCHEMA_VERSION = 1
 """The version of the persisted Request format this Pernix writes and reads."""
@@ -77,11 +77,19 @@ class _RequestRecord(msgspec.Struct, kw_only=True, omit_defaults=True):
     ext: dict[str, dict[str, Any]] = msgspec.field(default_factory=dict[str, dict[str, Any]])
 
 
+class _CallbacksRecord(msgspec.Struct):
+    """The Callback and the errback of a persisted Request, which can be read without the Spider."""
+
+    callback: str | None = None
+    errback: str | None = None
+
+
 _MIN_INT = -(2**63)
 _MAX_INT = 2**64 - 1
 
 _encoder = msgspec.msgpack.Encoder()
 _decoder = msgspec.msgpack.Decoder(_RequestRecord)
+_callbacks_decoder = msgspec.msgpack.Decoder(_CallbacksRecord)
 
 
 def encode_request(request: Request, spider: object) -> bytes:
@@ -191,6 +199,28 @@ def method_names(request: Request) -> tuple[str, ...]:
     if isinstance(request.render, Render):
         methods += [None if page is None else page.method for page in (request.render.setup, request.render.action)]
     return tuple(method.__name__ for method in methods if method is not None)
+
+
+def stored_callbacks(data: bytes) -> tuple[str | None, str | None]:
+    """Return the names a persisted Request stores its Callback and errback by, without restoring it.
+
+    Unlike `decode_request()`, it needs no Spider, so the Requests of a Frontier can
+    be described where their Spider cannot be imported.
+
+    Args:
+        data: The encoded Request.
+
+    Returns:
+        The name of its Callback, and that of its errback; `None` for one it does not have.
+
+    Raises:
+        SerializationError: The data is not a persisted Request.
+    """
+    try:
+        record = _callbacks_decoder.decode(data)
+    except msgspec.MsgspecError as exc:
+        raise SerializationError(f"not a valid persisted Request: {exc}") from exc
+    return record.callback, record.errback
 
 
 def _render_record(render: bool | Render, spider: object) -> bool | _RenderRecord:

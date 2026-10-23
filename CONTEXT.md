@@ -121,7 +121,7 @@ The store of Requests waiting to be fetched in a Run. It handles ordering, dedup
 _Avoid_: queue, scheduler
 
 **Dead Request**:
-A Request that exhausted its retries or cannot be processed. It is kept in the Frontier for inspection, never deleted.
+A Request that exhausted its retries or cannot be processed. It is kept in the Frontier for inspection, never deleted; once its cause is fixed, it can be revived, made ready again with its attempts counted anew.
 _Avoid_: failed queue
 
 **Retry Budget**:

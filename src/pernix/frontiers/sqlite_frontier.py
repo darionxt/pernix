@@ -2,32 +2,72 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING
 
+from pernix.errors import SerializationError
 from pernix.fetchers.fetcher_dispatch import is_rendered
 from pernix.fingerprint import request_fingerprint
 from pernix.frontiers.frontier import host_slot
 from pernix.frontiers.sqlite_store import FrontierStore, RequestRow
-from pernix.request_codec import decode_request, encode_request, method_names
+from pernix.request_codec import decode_request, encode_request, method_names, stored_callbacks
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Sequence
+    from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
     from concurrent.futures import Future
 
     from pernix.frontiers.frontier import FrontierCounts, Lease
     from pernix.request import Request
     from pernix.spider import Spider
 
-__all__ = ["SQLiteFrontier"]
+__all__ = ["DeadRequest", "SQLiteFrontier"]
 
 logger = logging.getLogger(__name__)
+
+_DEAD_PAGE = 500
+"""The Dead Requests `SQLiteFrontier.dead_requests()` reads in one transaction."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeadRequest:
+    """A Dead Request, as `SQLiteFrontier.dead_requests()` describes it, without restoring it.
+
+    Attributes:
+        id: The Frontier's id of the Request, as in `Lease.id`.
+        url: Its URL.
+        reason: Why it failed for good: the type of the error, a colon, and its
+            message, such as `RetriesExhausted: HTTP 503`.
+        attempts: Its attempts, the last of which failed for good, as
+            `Lease.attempt` counts them.
+        spent: The retries it had under each retry budget, by name.
+        callback: The name of the Spider method its Callback is; `None` for one
+            without, which the Spider's `parse` handles, and when the Request as
+            stored cannot be read.
+        errback: The name of its errback, if it has one.
+        rendered: Whether it goes to the browser Fetcher.
+    """
+
+    id: str
+    url: str
+    reason: str
+    attempts: int
+    spent: Mapping[str, int] = field(default_factory=dict[str, int])
+    callback: str | None = None
+    errback: str | None = None
+    rendered: bool = False
+
+    @property
+    def error(self) -> str:
+        """The type of the error it failed with: its reason up to the first colon, or all of it without one."""
+        kind, colon, _ = self.reason.partition(": ")
+        return kind if colon else self.reason
 
 
 class SQLiteFrontier:
@@ -55,7 +95,8 @@ class SQLiteFrontier:
     counting an attempt. `wait()` returns on the changes made through this Frontier
     since the calling task last used it, and when the next deadline falls due, so
     one process at a time should use a database. Dead Requests can be inspected in
-    the table `requests`, with their `url` and `reason`.
+    the table `requests`, with their `url` and `reason`, or with `dead_requests()`,
+    and revived with `revive()`.
 
     Example:
         >>> frontier = SQLiteFrontier("run/frontier.db", spider)
@@ -168,6 +209,41 @@ class SQLiteFrontier:
         names = await self._call(self._store.method_names)
         return sorted(name for name in names if not inspect.ismethod(getattr(self._spider, name, None)))
 
+    async def dead_requests(self) -> AsyncIterator[DeadRequest]:
+        """Yield the Dead Requests, oldest first, reading a few hundred at a time.
+
+        They are described without being restored, so the Spider need not have
+        their methods.
+
+        Yields:
+            Each Dead Request.
+        """
+        after = 0
+        while page := await self._call(partial(self._dead_page, after)):
+            for dead in page:
+                yield dead
+            after = int(page[-1].id)
+
+    async def revive(self, ids: Collection[str]) -> int:
+        """Make Dead Requests ready again, with no attempt counted and no retry under any budget.
+
+        The next attempt at each is thus its first. They queue behind the Requests
+        of their priority that are ready, in the order they were added, and keep
+        their reasons until they are settled again.
+
+        Args:
+            ids: Their ids, as `DeadRequest.id`; those of Requests that are not dead
+                are skipped.
+
+        Returns:
+            How many were revived.
+
+        Raises:
+            ValueError: An id is not one this Frontier gives.
+        """
+        rows = sorted({int(request_id) for request_id in ids})
+        return await self._call(lambda: self._store.revive(rows))
+
     async def renew(self, lease: Lease, ttl: float) -> Lease | None:
         """Extend a Lease; see `Frontier.renew()`."""
         _check_ttl(ttl)
@@ -247,6 +323,10 @@ class SQLiteFrontier:
         self._executor.shutdown(wait=False)  # its thread ends once the database is closed
         await asyncio.shield(asyncio.wrap_future(closing))
 
+    def _dead_page(self, after: int) -> list[DeadRequest]:
+        """Read the Dead Requests stored after the one of the id `after`, in the Frontier's thread."""
+        return [_dead_request(*row) for row in self._store.dead_page(after, _DEAD_PAGE)]
+
     def _key(self, request: Request) -> str:
         return request.fingerprint if request.fingerprint is not None else self._fingerprint(request)
 
@@ -297,6 +377,16 @@ class SQLiteFrontier:
         self._notified += 1
         self._changed.set()
         self._changed = asyncio.Event()
+
+
+def _dead_request(
+    request_id: int, url: str, reason: str, attempts: int, spent: str, rendered: int, data: bytes
+) -> DeadRequest:
+    try:
+        callback, errback = stored_callbacks(data)
+    except SerializationError:
+        callback = errback = None
+    return DeadRequest(str(request_id), url, reason, attempts + 1, json.loads(spent), callback, errback, bool(rendered))
 
 
 def _check_ttl(ttl: float) -> None:

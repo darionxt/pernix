@@ -178,3 +178,40 @@ def test_a_directory_released_before_it_is_taken_is_not_taken(tmp_path: Path) ->
         job.take(_run())
 
     assert _taken(tmp_path, _run()).run_id == "r1"  # no lock was left held
+
+
+def test_a_command_takes_the_directory_as_it_is_creating_nothing(tmp_path: Path) -> None:
+    _taken(tmp_path, _run())
+    before = _contents(tmp_path)
+    job = JobDir(tmp_path)
+
+    assert job.take_recorded() == _run()
+
+    with pytest.raises(JobDirError, match=rf"is used by process {os.getpid()} "):
+        _taken(tmp_path, _run())
+    job.release()
+    assert _contents(tmp_path).keys() == before.keys()
+    assert _contents(tmp_path)["run.json"] == before["run.json"]
+
+
+def test_a_command_refuses_a_directory_that_holds_no_run_and_leaves_it_as_it_was(tmp_path: Path) -> None:
+    (tmp_path / "frontier.db").write_bytes(b"")
+
+    with pytest.raises(JobDirError, match=r"is not a job directory: it holds no record of a Run in run\.json"):
+        JobDir(tmp_path).take_recorded()
+    with pytest.raises(JobDirError, match="there is no job directory"):
+        JobDir(tmp_path / "missing").take_recorded()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["frontier.db"]
+
+
+def test_a_command_refuses_a_directory_another_process_holds(tmp_path: Path) -> None:
+    holder = JobDir(tmp_path)
+    holder.take(_run())
+    before = _contents(tmp_path)
+
+    with pytest.raises(JobDirError, match=rf"is used by process {os.getpid()} on .+ since "):
+        JobDir(tmp_path).take_recorded()
+
+    assert _contents(tmp_path) == before
+    holder.release()

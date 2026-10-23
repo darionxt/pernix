@@ -243,6 +243,45 @@ class FrontierStore:
             ).fetchall()
         return {name for (methods,) in rows for name in methods.split()}
 
+    def dead_page(self, after: int, limit: int) -> list[tuple[int, str, str, int, str, int, bytes]]:
+        """Return the Dead Requests stored after another, oldest first.
+
+        Args:
+            after: The id of the Request to start after; 0 to start at the first.
+            limit: The most Requests to return.
+
+        Returns:
+            For each, its id, URL, reason, attempts, retries under each budget as
+            JSON, whether it is rendered, and the Request as stored.
+        """
+        with self._transaction() as (connection, _):
+            return connection.execute(
+                "SELECT id, url, reason, attempts, spent, rendered, request FROM requests "
+                "WHERE state = 'dead' AND id > ? ORDER BY id LIMIT ?",
+                (after, limit),
+            ).fetchall()
+
+    def revive(self, ids: Sequence[int]) -> int:
+        """Make Dead Requests ready again, in order, with no attempt counted and no retry under any budget.
+
+        They queue behind the Requests of their priority that are ready, and keep
+        their reasons until they are settled again.
+
+        Args:
+            ids: The ids of the Requests; those of Requests that are not dead are skipped.
+
+        Returns:
+            How many were revived.
+        """
+        with self._transaction() as (connection, _):
+            revived = connection.executemany(
+                "UPDATE requests SET state = 'ready', due = NULL, sequence = ?, attempts = 0, spent = '{}' "
+                "WHERE id = ? AND state = 'dead'",
+                [(next(self._sequences), request_id) for request_id in ids],
+            ).rowcount
+        self.changed |= revived > 0
+        return revived
+
     def renew(self, lease: Lease, ttl: float) -> float | None:
         """Extend a Lease; see `Frontier.renew()`.
 

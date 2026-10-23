@@ -86,10 +86,11 @@ class AddonError(PernixError):
 
 
 class JobDirError(PernixError):
-    """The job directory of the `job_dir` setting cannot be used by this Run.
+    """The job directory of the `job_dir` setting cannot be used by this Run, or one given to `pernix job-dir`.
 
-    Another process holds it, it holds another Run, or its Requests name methods the
-    Spider no longer has; nothing in it was changed.
+    Another process holds it, it holds another Run or none, this Pernix cannot read
+    its Frontier, or its Requests name methods the Spider no longer has; nothing in
+    it was changed.
     """
 
 
