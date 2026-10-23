@@ -212,6 +212,15 @@ def test_a_json_array_ended_before_is_continued_and_ended_again(tmp_path: Path) 
     assert orjson.loads(_written(tmp_path / "empty.json", {"n": 1}, writing="continued")) == [{"n": 1}]
 
 
+def test_a_continued_json_array_reads_its_elements_in_its_encoding(tmp_path: Path) -> None:
+    target = tmp_path / "books.json"
+    _written(target, {"title": "Café"}, writing="in_place", encoding="latin-1")
+
+    text = _written(target, {"title": "Emma"}, writing="continued", encoding="latin-1")
+
+    assert orjson.loads(text) == [{"title": "Café"}, {"title": "Emma"}]
+
+
 def test_a_continued_csv_takes_its_columns_from_its_header(tmp_path: Path) -> None:
     target = tmp_path / "books.csv"
     _written(target, {"title": "Dune", "year": 1965}, writing="in_place")

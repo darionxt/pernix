@@ -110,7 +110,8 @@ class JsonArrayFormat:
     def recover(self, file: BinaryIO, encoding: str) -> int:
         """Keep the array up to its last whole element, without its closing bracket, if any.
 
-        An element is whole once its line parses, its separating comma aside.
+        An element is whole once its line, decoded, parses, its separating comma
+        aside.
         """
         end = file.seek(0, os.SEEK_END)
         while end > 0:
@@ -124,8 +125,8 @@ class JsonArrayFormat:
             element = text.removesuffix(b",")
             if element not in (b"", b"]"):
                 try:
-                    orjson.loads(element)
-                except orjson.JSONDecodeError:
+                    orjson.loads(element.decode(encoding))
+                except (UnicodeDecodeError, orjson.JSONDecodeError):
                     pass  # a record cut short
                 else:
                     self._empty = False

@@ -108,6 +108,20 @@ async def test_the_failed_items_file_is_continued_the_same_way(tmp_path: Path, p
     assert [record["item"]["n"] for record in _records(failed)] == [1, 2, 3, 4, 5, 6]
 
 
+async def test_a_resumed_run_naming_the_same_file_another_way_continues_it(tmp_path: Path, pages: type[Pages]) -> None:
+    job, out = tmp_path / "job", tmp_path / "items.jsonl"
+    (tmp_path / "sub").mkdir()
+    pages.drain_at = 3
+    await crawl(pages, fetcher=_site(), settings={"job_dir": str(job), "feeds": {str(out): {}}})
+    pages.drain_at = 0
+
+    await crawl(
+        pages, fetcher=_site(), settings={"job_dir": str(job), "feeds": {str(tmp_path / "sub/../items.jsonl"): {}}}
+    )
+
+    assert [record["n"] for record in _records(out)] == [1, 2, 3, 4, 5, 6]
+
+
 async def test_a_new_run_replaces_an_existing_file(tmp_path: Path, pages: type[Pages]) -> None:
     out = tmp_path / "items.jsonl"
     out.write_text('{"old": true}\n')

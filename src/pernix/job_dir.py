@@ -45,7 +45,7 @@ class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
             `function`, named by its import path.
         start_exhausted: Whether `Spider.start()` was iterated to its end.
         pernix: The version of Pernix that started the Run.
-        feeds: The files the Feeds of the Run have begun, as absolute paths, with
+        feeds: The files the Feeds of the Run have begun, as resolved paths, with
             the name of their format, which a resumed Run continues.
     """
 
@@ -184,7 +184,7 @@ class JobDir:
         """
         if self.record is None or self._lock is None:
             raise RuntimeError("the job directory is not taken")
-        return self.record.feeds.get(str(path.absolute()))
+        return self.record.feeds.get(_feed_key(path))
 
     def record_feed(self, path: Path, format_name: str) -> None:
         """Record a file a Feed of the Run began, so that a resumed Run continues it.
@@ -199,7 +199,7 @@ class JobDir:
         """
         if self.record is None or self._lock is None:
             raise RuntimeError("the job directory is not taken")
-        key = str(path.absolute())
+        key = _feed_key(path)
         if self.record.feeds.get(key) == format_name:
             return
         feeds = {**self.record.feeds, key: format_name}
@@ -241,6 +241,11 @@ class JobDir:
         finally:
             os.close(file)
         partial.replace(target)
+
+
+def _feed_key(path: Path) -> str:
+    """A Feed's file as `run.json` records it: resolved, so that any path to the same file names it."""
+    return str(path.resolve())
 
 
 def _differences(found: RunRecord, run: RunRecord) -> list[str]:
