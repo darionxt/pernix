@@ -6,7 +6,8 @@ continuing it; and `lock`, which one process at a time holds. The lock is an
 advisory lock of the operating system, released when its process ends, however it
 ends, so a process killed leaves none behind. Locks and SQLite's shared memory are
 not reliable on network file systems, such as NFS or SMB, so the directory belongs
-on a local one.
+on a local one. A Platform may write `control` there, the state it wants the Run in,
+which the Run reads by default; Pernix never writes it.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ __all__ = ["JobDir", "RunRecord"]
 _RECORD = "run.json"
 _FRONTIER = "frontier.db"
 _LOCK = "lock"
-_FILES = (_RECORD, f".{_RECORD}.tmp", _FRONTIER, f"{_FRONTIER}-wal", f"{_FRONTIER}-shm", _LOCK)
+_CONTROL = "control"
+_FILES = (_RECORD, f".{_RECORD}.tmp", _FRONTIER, f"{_FRONTIER}-wal", f"{_FRONTIER}-shm", _LOCK, _CONTROL)
 """The files a job directory keeps, which no output of the Run may write."""
 
 
@@ -45,6 +47,8 @@ class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
             `function`, named by its import path.
         start_exhausted: Whether `Spider.start()` was iterated to its end.
         pernix: The version of Pernix that started the Run.
+        feeds: The files the Feeds of the Run have begun, as resolved paths, with
+            the name of their format, which a resumed Run continues.
     """
 
     run_id: str
@@ -54,6 +58,7 @@ class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
     fingerprint: dict[str, Any] = msgspec.field(default_factory=dict[str, Any])
     start_exhausted: bool = False
     pernix: str = ""
+    feeds: dict[str, str] = msgspec.field(default_factory=dict[str, str])
 
 
 _encoder = msgspec.json.Encoder()
@@ -71,6 +76,9 @@ class JobDir:
         record: The record of the Run, once taken.
         resumed: Whether the directory held the Run already when taken, so that
             this process resumes it.
+        control_found: The control file as the directory held it when taken, as
+            `os.stat()` tells, so that a stop written for an earlier process is told
+            from one written for this one; `None` if it held none.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
@@ -82,6 +90,7 @@ class JobDir:
         self.path = Path(path)
         self.record: RunRecord | None = None
         self.resumed = False
+        self.control_found: os.stat_result | None = None
         self._lock: int | None = None
         self._released = False
         self._guard = threading.Lock()
@@ -91,6 +100,11 @@ class JobDir:
     def frontier_path(self) -> Path:
         """The database of the Run's Frontier."""
         return self.path / _FRONTIER
+
+    @property
+    def control_path(self) -> Path:
+        """The control file, where a Platform writes the state it wants the Run in."""
+        return self.path / _CONTROL
 
     @property
     def files(self) -> tuple[Path, ...]:
@@ -113,7 +127,7 @@ class JobDir:
         """Take the directory as it is, for a command on the Run recorded there: lock it, and read the record.
 
         Nothing is created or recorded, but for the lock file, which names this
-        process, as `take()` has it.
+        process, as `take()` has it; `control_found` stays `None`, as no Run takes it.
 
         Returns:
             The record.
@@ -148,7 +162,8 @@ class JobDir:
         The directory is created if it is missing, readable by its owner only; an
         existing one keeps its permissions. A Run continues the one recorded if it
         has its `run_id` and its Spider, and, where both are known, its Spider
-        arguments and the settings of its Fingerprints.
+        arguments and the settings of its Fingerprints. As soon as the lock is held,
+        the control file is looked at, for `control_found`.
 
         Args:
             run: The Run of this process, as it would be recorded.
@@ -171,6 +186,7 @@ class JobDir:
         self.path.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock = _locked(self.path / _LOCK)
         try:
+            control = _status(self.control_path)  # at once, as anything written from now on is for this process
             found = self._read()
             if found is None:
                 if self.frontier_path.exists():
@@ -178,7 +194,7 @@ class JobDir:
                         f"the job directory {self.path} holds a Frontier, but no record of its Run in {_RECORD}"
                     )
                 self._write(run)
-                self.record, self.resumed = run, False
+                self.record, self.resumed, self.control_found = run, False, control
                 return run
             problems = _differences(found, run)
             if problems:
@@ -186,7 +202,7 @@ class JobDir:
                     f"the job directory {self.path} holds the Run {found.run_id!r} of the Spider {found.spider!r}, "
                     "which this Run does not continue:\n" + "\n".join(f"  - {problem}" for problem in problems)
                 )
-            self.record, self.resumed = found, True
+            self.record, self.resumed, self.control_found = found, True, control
             return found
         except BaseException:
             self._unlock()
@@ -201,6 +217,39 @@ class JobDir:
         if self.record is None or self._lock is None:
             raise RuntimeError("the job directory is not taken")
         self.record = msgspec.structs.replace(self.record, start_exhausted=True)
+        self._write(self.record)
+
+    def recorded_feed(self, path: Path) -> str | None:
+        """The name of the format a Feed of the Run began a file in, or None if none began it.
+
+        Args:
+            path: The file.
+
+        Raises:
+            RuntimeError: The directory is not taken.
+        """
+        if self.record is None or self._lock is None:
+            raise RuntimeError("the job directory is not taken")
+        return self.record.feeds.get(_feed_key(path))
+
+    def record_feed(self, path: Path, format_name: str) -> None:
+        """Record a file a Feed of the Run began, so that a resumed Run continues it.
+
+        Args:
+            path: The file.
+            format_name: The name of the Feed's format.
+
+        Raises:
+            RuntimeError: The directory is not taken.
+            OSError: The record cannot be written.
+        """
+        if self.record is None or self._lock is None:
+            raise RuntimeError("the job directory is not taken")
+        key = _feed_key(path)
+        if self.record.feeds.get(key) == format_name:
+            return
+        feeds = {**self.record.feeds, key: format_name}
+        self.record = msgspec.structs.replace(self.record, feeds=feeds)
         self._write(self.record)
 
     def release(self) -> None:
@@ -240,6 +289,11 @@ class JobDir:
         partial.replace(target)
 
 
+def _feed_key(path: Path) -> str:
+    """A Feed's file as `run.json` records it: resolved, so that any path to the same file names it."""
+    return str(path.resolve())
+
+
 def _differences(found: RunRecord, run: RunRecord) -> list[str]:
     """What tells a Run apart from the one recorded, one line each."""
     problems: list[str] = []
@@ -264,6 +318,14 @@ _MISSING = object()
 
 def _shown(value: object) -> str:
     return "not given" if value is _MISSING else repr(value)
+
+
+def _status(path: Path) -> os.stat_result | None:
+    """The `os.stat()` of a file; `None` if there is none, or it cannot be read, which reading it tells."""
+    try:
+        return path.stat()
+    except OSError:
+        return None
 
 
 def _locked(path: Path) -> int:

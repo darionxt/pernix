@@ -34,15 +34,18 @@ from pernix.fetchers.browser_settings import BrowserSettings
 from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.kept_pages import KeptPage, page_keeping, sharing_a_kept_slot
 from pernix.fetchers.launched_browser import LaunchedBrowser, launch_browser, report_unpinned
+from pernix.fetchers.navigation_redirects import NavigationRedirects
 from pernix.fetchers.network_guard import admitted, current_guard
 from pernix.fetchers.page_actions import run_page_method, run_render
 from pernix.fetchers.page_slots import PageSlot, PageSlots
 from pernix.fetchers.page_traffic import ResourceBlocker, ResponseCapture, body_headers, captured_response
 from pernix.fetchers.proxy_refusals import ProxyRefusals
+from pernix.fetchers.redirects import redirect_check
 from pernix.fetchers.session_contexts import SessionContexts
 from pernix.fetchers.tripwire import GRACE, Tripwire, first_tripped
 from pernix.headers import Headers
 from pernix.response import Redirect, Response
+from pernix.sending import NotYet
 from pernix.settings import (
     DEFAULT_LOCALE,
     CoreSettings,
@@ -189,7 +192,10 @@ class BrowserFetcher:
     that of any other document, which Chrome would show in a viewer page of its own,
     is the body received. Headers are those of the document as the browser reports
     them, every value kept but not in wire order; `history` holds the redirects of
-    the navigation.
+    the navigation. Inside `checking_redirects()`, as with `robots.obey`, each
+    redirect of the page's main frame is checked while the page loads, before the
+    browser follows it (`pernix.fetchers.navigation_redirects`); one refused fails
+    the fetch with what the check raised.
 
     The browser presents the languages of `locale`, and, in headless mode, its own
     User-Agent without `HeadlessChrome`, so that it names itself as it does with a
@@ -419,7 +425,7 @@ class BrowserFetcher:
             async with self._deadline(request):
                 try:
                     return await self._fetch(request, guard, proxy, session, page)
-                except (PernixError, Retry, IgnoreRequest):  # those of Pernix, as page methods may raise
+                except (PernixError, Retry, IgnoreRequest, NotYet):  # those of Pernix, as page methods may raise
                     raise
                 except Exception as exc:  # the browser's own errors
                     raise _fetch_error(exc, request) from exc
@@ -557,10 +563,19 @@ class BrowserFetcher:
         """Load the page, then run the steps of its Render on it."""
         request = load.request
         timeout = request.timeout or self._settings.timeout
+        check = redirect_check()
+        redirects = None if check is None else await NavigationRedirects.start(page.context, page, check)
         try:
             document = await page.goto(request.url, wait_until="load", timeout=timeout * 1000)
         except Exception as exc:
+            if redirects is not None and redirects.refused is not None:
+                raise redirects.refused from None
             return await self._failed_load(exc, watch, load, session)
+        finally:
+            if redirects is not None:
+                await redirects.stop()
+        if redirects is not None and redirects.refused is not None:
+            raise redirects.refused  # a redirect of another navigation of the page, while it loaded
         if document is None:
             raise FetchError(f"loading {request.url} gave no document")
         action_timeout = self._settings.action_timeout

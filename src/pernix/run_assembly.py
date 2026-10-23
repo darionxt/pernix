@@ -5,6 +5,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, NoReturn, cast
 
 from pernix.addons import setup_addon
@@ -58,7 +59,6 @@ from pernix.throttle import Throttle
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
-    from pathlib import Path
 
     from pernix.account import Account
     from pernix.control import ControlSource
@@ -74,7 +74,7 @@ if TYPE_CHECKING:
     from pernix.spider import Spider
     from pernix.stats import Gauge, Stats, StatsSink
 
-__all__ = ["DownloadAssembly", "RunAssembly", "outcome_path"]
+__all__ = ["DownloadAssembly", "RunAssembly", "control_path", "outcome_path"]
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,7 @@ class RunAssembly:
         pausing: Pausing | None = None,
         frontier_path: Path | None = None,
         start: Callable[[], AsyncIterator[Request]] | None = None,
+        control_found: os.stat_result | None = None,
     ) -> RunAssembly:
         """Build the components of a Run from its settings and wire them together.
 
@@ -184,6 +185,8 @@ class RunAssembly:
             frontier_path: The database of a `SQLiteFrontier` for the Run, as in its
                 job directory; `None` for a `MemoryFrontier`.
             start: Gives the initial Requests, in place of `Spider.start()`.
+            control_found: The control file of the job directory as the Run found it
+                when it took the directory, as `pernix.job_dir.JobDir.control_found`.
 
         Returns:
             The assembly.
@@ -201,7 +204,7 @@ class RunAssembly:
         for addon in crawler.addons:
             problems.attempt(setup_addon, addon, events=events, settings=settings)
         sinks = problems.attempt(_build_sinks, crawler)
-        controlling = problems.attempt(_controlling, crawler)
+        controlling = problems.attempt(_controlling, crawler, control_found)
         extensions = problems.attempt(_build_all, crawler, "extensions")
         proxying = problems.attempt(_proxying, crawler, run_log)
         downloading = problems.attempt(DownloadAssembly.build, crawler)
@@ -554,11 +557,14 @@ def _build_sinks(crawler: Crawler) -> list[StatsSink]:
     return cast("list[StatsSink]", sinks)
 
 
-def _controlling(crawler: Crawler) -> tuple[object, ...]:
+def _controlling(crawler: Crawler, control_found: os.stat_result | None) -> tuple[object, ...]:
     """The control sources of `control.file` and `control.sources`, then the `RunControl` reading them; none without one.
 
     The Platform's control applies to the Run as `crawler.pause()`, `resume()`, and
-    `stop()`.
+    `stop()`. The control file of the job directory, by default or named, does not
+    apply a stop it held when the Run took the directory, `control_found`, as that
+    was written for an earlier process; a control file elsewhere may be shared, and
+    applies a stop left in it.
 
     Raises:
         pernix.errors.ComponentError: A control source cannot be built, or has no
@@ -566,8 +572,11 @@ def _controlling(crawler: Crawler) -> tuple[object, ...]:
     """
     options = crawler.settings.section(ControlSettings)
     sources: list[tuple[str, ControlSource]] = []
-    if options.file is not None:
-        sources.append((ControlSettings.key("file"), ControlFile(options.file)))
+    path = control_path(crawler)
+    if path is not None:
+        label = ControlSettings.key("file") if options.file is not None else "job_dir (control)"
+        left = control_found if _is_job_dir_control(crawler, path) else None
+        sources.append((label, ControlFile(path, left=left)))
     for source in _build_all(crawler, ControlSettings.key("sources")):
         if not callable(getattr(source, "state", None)):
             raise ComponentError(f"{ControlSettings.key('sources')}: {source!r} must have state()")
@@ -583,6 +592,34 @@ def _controlling(crawler: Crawler) -> tuple[object, ...]:
         stats=crawler.stats,
     )
     return (*(source for _, source in sources), control)
+
+
+def control_path(crawler: Crawler) -> Path | None:
+    """The file of the `control.file` setting, or without it, the control file of the job directory of `job_dir`.
+
+    Args:
+        crawler: The Crawler of the Run.
+
+    Returns:
+        The file, or `None` for none: without either setting, or with `control.file`
+        set to an empty path, which turns the default off.
+    """
+    file = crawler.settings.section(ControlSettings).file
+    if file is None:
+        job_dir = crawler.settings.section(CoreSettings).job_dir
+        return None if job_dir is None else JobDir(job_dir).control_path
+    return None if file == PurePath() else Path(file)  # "" reads as "."
+
+
+def _is_job_dir_control(crawler: Crawler, path: Path) -> bool:
+    """Whether a file is the control file of the job directory of `job_dir`."""
+    job_dir = crawler.settings.section(CoreSettings).job_dir
+    if job_dir is None:
+        return False
+    try:
+        return path.resolve() == JobDir(job_dir).control_path.resolve()
+    except (OSError, ValueError):  # such as a NUL in it, which reading it tells
+        return False
 
 
 def _build_feeds(crawler: Crawler, output: str | os.PathLike[str] | None) -> list[Feed]:
@@ -664,7 +701,7 @@ def _job_dir_files(crawler: Crawler) -> list[tuple[str, Path]]:
 
 def _feed(crawler: Crawler, template: str, options: FeedOptions) -> Feed:
     try:
-        return Feed(_feed_path(crawler, template), options)
+        return crawler.feed(template, options)
     except (TypeError, ValueError, ComponentError) as exc:
         raise SettingsError([f"feed {template!r}: {exc}"]) from exc
 

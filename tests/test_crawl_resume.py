@@ -75,6 +75,10 @@ def _record() -> RunRecord:
     return RunRecord(run_id="held", spider="chain", started_at=dt.datetime.now(dt.UTC))
 
 
+def _names(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir())
+
+
 def _first_start(job: Path) -> str:
     """When the Run of a job directory first started, as the stats and the outcome file tell times."""
     recorded = json.loads((job / "run.json").read_text())["started_at"]
@@ -100,6 +104,19 @@ async def test_a_drained_run_run_again_continues_where_it_stopped_and_finishes(
     assert "run.resumed" not in first.stats
 
 
+@pytest.mark.parametrize("empty", ["", "."])
+async def test_an_empty_job_dir_keeps_the_frontier_in_memory_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chain: type[Chain], empty: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    report = await crawl(chain, fetcher=_site(1, 2, 3, 4, 5, 6), settings={"job_dir": empty})
+
+    assert (report.reason, len(report.items)) == ("finished", 6)
+    assert not any(key.startswith(("run.resumed", "control.")) for key in report.stats)
+    assert _names(tmp_path) == []
+
+
 async def test_start_iterated_to_its_end_is_not_iterated_again(tmp_path: Path, chain: type[Chain]) -> None:
     chain.drain_at = 1
     await crawl(chain, fetcher=_site(1), settings=_settings(tmp_path))
@@ -111,21 +128,25 @@ async def test_start_iterated_to_its_end_is_not_iterated_again(tmp_path: Path, c
 
 
 class Seeds(Spider):
-    """Yields three pages from `start()`, draining the Run after the second the first time."""
+    """Yields three pages from `start()`, draining the Run the first time once the second is parsed."""
 
     name = "seeds"
     drained: ClassVar[bool] = False
 
     async def start(self) -> AsyncIterator[Request]:
+        self.second_parsed = asyncio.Event()
         yield Request(f"{SITE}/1")
         yield Request(f"{SITE}/2", dont_filter=True)
         if not type(self).drained:
             type(self).drained = True
+            await self.second_parsed.wait()  # else the Drain may come before a worker claims it
             self.crawler.stop()
         yield Request(f"{SITE}/3")
 
     async def parse(self, response: Response) -> AsyncIterator[Any]:
         yield {"url": response.url}
+        if response.url == f"{SITE}/2":
+            self.second_parsed.set()
 
 
 async def test_start_stopped_before_its_end_is_iterated_again_its_requests_added_before_being_duplicates(
@@ -244,7 +265,7 @@ async def test_spider_arguments_compare_as_the_job_directory_records_them(tmp_pa
     assert report.stats["run.resumed"] == 1
 
 
-@pytest.mark.parametrize("name", ["run.json", "frontier.db", "lock"])
+@pytest.mark.parametrize("name", ["run.json", "frontier.db", "lock", "control"])
 async def test_no_output_may_write_a_file_the_job_directory_keeps(
     tmp_path: Path, chain: type[Chain], name: str
 ) -> None:
@@ -254,7 +275,7 @@ async def test_no_output_may_write_a_file_the_job_directory_keeps(
 
     with pytest.raises(SettingsError, match=rf"job_dir \({name}\) and outcome_file both write "):
         await crawl(chain, fetcher=_site(2), settings=_settings(tmp_path, outcome_file=str(tmp_path / name)))
-    with pytest.raises(SettingsError, match=rf"job_dir \({name}\) both write "):
+    with pytest.raises(SettingsError, match=rf"{name} is a file the job directory keeps"):
         await crawl(
             chain, fetcher=_site(2), settings=_settings(tmp_path, feeds={str(tmp_path / name): {"format": "jsonl"}})
         )

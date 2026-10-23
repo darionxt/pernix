@@ -92,9 +92,11 @@ class CoreSettings(Section):
             the exit code, the stats, and the error it failed with; `None` writes
             none. See `pernix.outcome_file.OutcomeFile`.
         job_dir: A directory the Run keeps its Frontier in, with a record of
-            itself, so that running again with it resumes the Run; `None` keeps
-            the Frontier in memory. It must be on a local file system, not a
-            network one. See `pernix.job_dir.JobDir`.
+            itself, so that running again with it resumes the Run, its Feeds
+            written in place and continued, and where it reads its control file
+            by default (`control.file`); `None`, or an empty path, keeps the
+            Frontier in memory. It must be on a local file system, not a network
+            one. See `pernix.job_dir.JobDir`.
         locale: The languages the client presents, in order of preference, as a
             list or a comma-separated string, such as `"de-DE,de,en-US,en"`: the
             browser's `navigator.languages`, from which Chrome makes its
@@ -127,6 +129,8 @@ class CoreSettings(Section):
     def __post_init__(self) -> None:
         if self.outcome_file is not None:
             _check_path_template(self.key("outcome_file"), self.outcome_file)
+        if self.job_dir == PurePath():  # "" reads as "."; an empty PERNIX_JOB_DIR sets none, not the working directory
+            structs.force_setattr(self, "job_dir", None)
         try:
             structs.force_setattr(self, "locale", locale_languages(self.locale))
         except ValueError as exc:
@@ -685,8 +689,10 @@ class FeedSettings(Section):
 
     Attributes:
         feeds: Feeds by path template, as `{path: options}`. A path may contain
-            `{name}` (the Spider), `{run_id}`, and `{time}` (when the Run started,
-            in UTC, such as `20261013T080405Z`).
+            `{name}` (the Spider), `{run_id}`, and `{time}` (when the Run first
+            started, in UTC, such as `20261013T080405Z`). A file appears complete
+            or not at all; with `job_dir`, it is written in place instead, and
+            continued by a resumed Run: see `pernix.feeds.Feed`.
     """
 
     feeds: dict[str, FeedOptions] = msgspec.field(default_factory=dict[str, FeedOptions])
@@ -786,7 +792,12 @@ class ControlSettings(Section):
             `pernix.control.ControlSource`.
         file: A file holding the state a Platform wants the Run in, `running`,
             `paused`, `drain`, or `force`, read by a `pernix.control.ControlFile`
-            before the sources; a missing file means `running`. `None` for none.
+            before the sources; a missing file means `running`. `None` reads
+            `control` in the job directory of `job_dir`, if the Run has one, and
+            none otherwise; an empty path, `""`, reads none. The control file of
+            the job directory, named or not, ignores a `drain` or `force` it held
+            when the Run took the directory, as that was written for an earlier
+            process, until it is written again.
         interval: Seconds between two reads of the sources, and the time each read
             may take.
     """
