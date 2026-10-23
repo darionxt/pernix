@@ -140,8 +140,33 @@ async def test_spacing_a_domain_keeps_its_starts_apart_from_the_last_one() -> No
     assert throttle.blocked() == {A}
     clock.advance(2.49)
     assert throttle.blocked() == {A}
+    assert await throttle.admit(A)  # held by a fetch, the slot keeps its spacing
     clock.advance(0.01)
     assert throttle.blocked() == frozenset()
+    assert await throttle.pace(A)
+    throttle.release(A)
+    clock.advance(2.99)
+    assert throttle.blocked() == {A}
+
+
+async def test_a_slot_forgotten_once_idle_keeps_no_spacing() -> None:
+    clock = FakeClock()
+    throttle = _throttle(clock, delay=1.0, delay_jitter=0.0)
+    throttle.space(A, 3.0)
+    throttle.space(B, 3.0)  # a slot nothing started in yet
+    assert await throttle.acquire(A)
+    throttle.release(A)
+    clock.advance(3.0)
+    assert throttle.blocked() == frozenset()  # forgotten, as fresh slots would behave the same
+
+    assert await throttle.acquire(A)
+    throttle.release(A)
+    clock.advance(0.99)
+    assert throttle.blocked() == {A}
+    clock.advance(0.01)
+    assert throttle.blocked() == frozenset()  # by the delay alone
+    assert (throttle.spacing(A), throttle.spacing(B)) == (0.0, 0.0)
+    throttle.space(A, 3.0)  # until spaced again
     assert await throttle.acquire(A)
     throttle.release(A)
     clock.advance(2.99)

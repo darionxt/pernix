@@ -236,8 +236,9 @@ class RobotsSettings(Section):
 
     Off by default. With `obey`, the first Request to an origin fetches its
     robots.txt, which the Requests to it then wait for, and which is kept for 24
-    hours; the Requests it disallows are ignored. Its `Crawl-delay` spaces the
-    fetches of the domain when it is longer than `domain.delay`.
+    hours, for `cache_size` origins at most; the Requests it disallows are ignored.
+    Its `Crawl-delay` spaces the fetches of the domain when it is longer than
+    `domain.delay`.
 
     Attributes:
         obey: Obey robots.txt; a Request with `ext={"robots": {"obey": False}}` is
@@ -248,6 +249,11 @@ class RobotsSettings(Section):
             own names its token here.
         crawl_delay_max: The longest a `Crawl-delay` spaces the fetches of a
             domain; `None` for no limit.
+        cache_size: The origins whose rules are kept in memory, at most; beyond
+            them, those of the least recently used are dropped, and fetched again
+            when needed. 0 keeps every origin's. It bounds memory only roughly:
+            parsed rules take about 20 times the size of the robots.txt they are
+            read from.
     """
 
     __prefix__ = "robots"
@@ -255,6 +261,7 @@ class RobotsSettings(Section):
     obey: bool = False
     user_agent: str = "pernix"
     crawl_delay_max: Annotated[float, msgspec.Meta(ge=0)] | None = None
+    cache_size: Annotated[int, msgspec.Meta(ge=0)] = 10_000
 
     def __post_init__(self) -> None:
         if _PRODUCT_TOKEN.fullmatch(self.user_agent) is None:

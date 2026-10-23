@@ -130,6 +130,13 @@ def test_a_product_token_is_letters_underscores_and_hyphens_or_a_star() -> None:
         _build({"robots.user_agent": "ExampleBot/1.0"})
 
 
+def test_the_robots_txt_cache_holds_any_number_of_origins_or_every_one() -> None:
+    _build({"robots.cache_size": 1})
+    _build({"robots.cache_size": 0})
+    with pytest.raises(SettingsError, match=r"robots\.cache_size"):
+        _build({"robots.cache_size": -1})
+
+
 def test_never_rebinding_while_refreshes_replace_the_proxies_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
     _build({"proxies.urls": ["a.example:1"], "proxies.rebind": "never", "proxies.refresh": 60})
 
