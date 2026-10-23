@@ -8,7 +8,7 @@ import functools
 import logging
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -70,6 +70,25 @@ class _Origin:
     """Unreachable answers in a row while no rules were in force."""
     fetching: asyncio.Event | None = None
     """Set once the fetch of robots.txt in progress, if any, ends."""
+    stale: bool = False
+    """Whether the rules in force are those fetched before, as robots.txt was unreachable when fetched last."""
+    spaced: set[str] = field(default_factory=set[str])
+    """The slots its `Crawl-delay` spaces."""
+
+    def held(self, now: float) -> bool:
+        """Whether it may not be evicted: while its robots.txt is fetched, or due again after an unreachable answer.
+
+        An origin without rules then counts its unreachable answers until robots.txt
+        is fetched again; one whose rules stay in force meanwhile waits for the time
+        it is.
+
+        Args:
+            now: The time on the clock of the robots.txt layer.
+
+        Returns:
+            Whether it is held.
+        """
+        return self.fetching is not None or self.unreachable > 0 or (self.stale and now < self.refresh_at)
 
 
 class RobotsTxt(Middleware):
@@ -131,11 +150,21 @@ class RobotsTxt(Middleware):
     it is longer than the jittered `domain.delay`, at most
     `robots.crawl_delay_max`; a slot takes the longest of the origins it fetches.
 
+    The rules of `robots.cache_size` origins at most are kept, unless it is 0:
+    beyond them, those of the origin checked least recently are evicted, with
+    the `Crawl-delay` they space slots by, and fetched again when needed, as rules
+    `CACHE_TTL` old are. An origin whose robots.txt is being fetched, or is to be
+    fetched again after an unreachable answer, is never evicted meanwhile, so that
+    it keeps counting those answers, or its rules, and more may be kept for as
+    long. A slot whose spacing the Throttle forgot, as it does once the slot is
+    idle, is spaced again once one of its fetches is checked.
+
     Stats: `robots.fetched`, the fetches of robots.txt; `robots.by_status.<code>`,
     their statuses; `robots.errors_by_type.<ErrorType>`, those that raised;
     `robots.disallowed`, the fetches disallowed, at their start or at a redirect;
-    `robots.redirects_disallowed`, those disallowed at a redirect; and
-    `robots.deferred`, the fetches sent to wait for an unreachable robots.txt.
+    `robots.redirects_disallowed`, those disallowed at a redirect;
+    `robots.deferred`, the fetches sent to wait for an unreachable robots.txt;
+    and `robots.evicted`, the origins whose rules were evicted.
     """
 
     def __init__(
@@ -163,14 +192,21 @@ class RobotsTxt(Middleware):
         """
         self._user_agent = settings.user_agent
         self._crawl_delay_max = settings.crawl_delay_max
+        self._cache_size = settings.cache_size
         self._throttle = throttle
         self._stats = stats
         self._cooldown_max = cooldown_max
         self._slot_of = slot_of
         self._clock = clock
-        self._origins: dict[str, _Origin] = {}
-        self._delays: dict[str, dict[str, float]] = {}  # the Crawl-delay of each origin, by slot
-        for key in ("robots.fetched", "robots.disallowed", "robots.redirects_disallowed", "robots.deferred"):
+        self._origins: dict[str, _Origin] = {}  # the least recently checked first
+        self._delays: dict[str, dict[str, float]] = {}  # the Crawl-delay of each origin kept, by slot
+        for key in (
+            "robots.fetched",
+            "robots.disallowed",
+            "robots.redirects_disallowed",
+            "robots.deferred",
+            "robots.evicted",
+        ):
             stats.set(key, 0)
 
     async def __call__(self, request: Request, call_next: Download) -> Response:
@@ -246,7 +282,7 @@ class RobotsTxt(Middleware):
         Raises:
             pernix.sending.NotYet: robots.txt is unreachable, and no rules are in force.
         """
-        state = self._origins.setdefault(origin, _Origin())
+        state = self._checked(origin)
         waited = False
         while True:
             now = self._clock()
@@ -260,6 +296,7 @@ class RobotsTxt(Middleware):
                 return None
             waited = True
             await state.fetching.wait()
+            state = self._checked(origin)  # anew if it was evicted meanwhile, so that it is fetched once
         state.fetching = fetching = asyncio.Event()
         inside = _fetching.set(_fetching.get() | {fetching})
         try:
@@ -311,7 +348,7 @@ class RobotsTxt(Middleware):
             rules = RobotsRules.parse(body, self._user_agent, cut=cut)
         else:
             rules = RobotsRules.allowing_all()
-        state.rules, state.refresh_at, state.unreachable = rules, self._clock() + CACHE_TTL, 0
+        state.rules, state.refresh_at, state.unreachable, state.stale = rules, self._clock() + CACHE_TTL, 0, False
         logger.debug("Fetched the robots.txt of %s: %s", origin, answer.value)
         return rules
 
@@ -346,12 +383,13 @@ class RobotsTxt(Middleware):
         wait = min(UNREACHABLE_WAIT if retry_after is None else retry_after, self._cooldown_max)
         now = self._clock()
         if state.rules is not None:  # RFC 9309 §2.4 lets a crawler keep them while it is unreachable
-            state.refresh_at = now + wait
+            state.refresh_at, state.stale = now + wait, True
             logger.info("The robots.txt of %s is unreachable (%s); the rules fetched before stay in force", origin, why)
             return state.rules
         state.unreachable += 1
         if state.unreachable >= UNREACHABLE_LIMIT:
             state.rules, state.refresh_at, state.unreachable = RobotsRules.disallowing_all(), now + CACHE_TTL, 0
+            state.stale = False
             logger.warning(
                 "The robots.txt of %s was unreachable %d times in a row (%s); its Requests are ignored until it is "
                 "fetched again, in %d hours",
@@ -374,24 +412,62 @@ class RobotsTxt(Middleware):
         self._stats.inc("robots.deferred")
         return NotYet(delay, "robots.txt unreachable")
 
+    def _checked(self, origin: str) -> _Origin:
+        """The state of an origin, checked now, so the most recently; a new one makes room for itself first."""
+        state = self._origins.pop(origin, None)
+        if state is None:
+            state = _Origin()
+            self._make_room()
+        self._origins[origin] = state
+        return state
+
+    def _make_room(self) -> None:
+        """Evict the least recently checked origins, but held ones, and their delays, so one more fits the cache."""
+        excess = len(self._origins) + 1 - self._cache_size
+        if not self._cache_size or excess <= 0:
+            return
+        now = self._clock()
+        evicted: list[str] = []
+        for origin, state in self._origins.items():
+            if len(evicted) == excess:
+                break
+            if not state.held(now):
+                evicted.append(origin)
+        for origin in evicted:
+            for slot in self._origins.pop(origin).spaced:
+                delays = self._delays[slot]
+                del delays[origin]
+                if not delays:
+                    del self._delays[slot]
+            self._stats.inc("robots.evicted")
+            logger.debug("Evicted the rules of %s, beyond robots.cache_size (%d)", origin, self._cache_size)
+
     def _space(self, origin: str, slot: str, crawl_delay: float | None) -> None:
         """Space the fetches of a slot by the longest `Crawl-delay` of the origins it fetches, at most `robots.crawl_delay_max`.
 
         Each slot takes the `Crawl-delay` of the rules in force once a fetch of it
         finds them, so a slot that fetches several origins, or an origin fetched
-        in several slots, and rules fetched again, keep it up to date.
+        in several slots, and rules fetched again, keep it up to date; so does a
+        slot whose spacing the Throttle forgot, or one of whose origins was
+        evicted.
         """
         limit = self._crawl_delay_max
         delay = (crawl_delay if limit is None else min(crawl_delay, limit)) if crawl_delay else 0.0
+        state = self._origins.get(origin)
         delays = self._delays.get(slot)
-        if (0.0 if delays is None else delays.get(origin, 0.0)) == delay:
-            return
-        delays = self._delays.setdefault(slot, {})
-        if delay:
+        if delay and state is not None:
+            delays = self._delays.setdefault(slot, {})
             delays[origin] = delay
-        else:
-            delays.pop(origin, None)
-        self._throttle.space(slot, max(delays.values(), default=0.0))
+            state.spaced.add(slot)
+        elif delays is not None and origin in delays:
+            del delays[origin]
+            if state is not None:
+                state.spaced.discard(slot)
+            if not delays:
+                del self._delays[slot]
+        spacing = max(delays.values(), default=0.0) if delays else 0.0
+        if self._throttle.spacing(slot) != spacing:
+            self._throttle.space(slot, spacing)
 
 
 async def _unchecked(request: Request, call_next: Download) -> Response:

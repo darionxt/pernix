@@ -619,8 +619,161 @@ async def test_the_crawl_delay_of_the_origin_a_redirect_leads_to_spaces_its_own_
     await obeying.fetch(f"{SITE}/a", chain)
     assert obeying.throttle.blocked() == frozenset()  # the slot of the Request, which robots.txt took a start of
     assert await obeying.throttle.pace(OTHER_HOST)  # a Request to the other origin starts
+    await obeying.fetch(f"{OTHER}/b", chain)  # with the rules kept
 
     obeying.clock.advance(3.99)
     assert obeying.throttle.blocked() == {OTHER_HOST}
     obeying.clock.advance(0.01)
     assert obeying.throttle.blocked() == frozenset()
+
+
+def _origins(count: int) -> list[str]:
+    return [f"https://o{n}.example" for n in range(count)]
+
+
+async def test_beyond_the_cache_size_the_rules_of_the_origin_checked_least_recently_are_evicted() -> None:
+    site = Site()
+    obeying = Obeying(cache_size=2)
+    first, second, third = _origins(3)
+    assert obeying.stat("robots.evicted") == 0
+
+    for origin in (first, second, first, third):  # the second is now checked least recently
+        await obeying.fetch(f"{origin}/a", site)
+    await obeying.fetch(f"{first}/b", site)
+    with pytest.raises(IgnoreRequest):
+        await obeying.fetch(f"{second}/private", site)  # fetched again, as an expired one is
+
+    assert [request.url for request in site.robots] == [
+        f"{origin}/robots.txt" for origin in (first, second, third, second)
+    ]
+    assert obeying.stat("robots.evicted") == 2  # the second, then the first
+
+
+async def test_without_a_cache_size_every_origins_rules_are_kept() -> None:
+    site = Site()
+    obeying = Obeying(cache_size=0)
+
+    for origin in [*_origins(50), *_origins(50)]:
+        await obeying.fetch(f"{origin}/a", site)
+
+    assert (len(site.robots), obeying.stat("robots.evicted")) == (50, 0)
+
+
+async def test_an_origin_whose_robots_txt_is_being_fetched_is_never_evicted() -> None:
+    held, other = _origins(2)
+    slow = Site()
+    slow.release = asyncio.Event()
+    chain = Redirecting({held: slow, other: Site()}, {})
+    obeying = Obeying(cache_size=1)
+
+    fetching = [asyncio.create_task(obeying.fetch(f"{held}/{n}", chain)) for n in range(2)]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    await obeying.fetch(f"{other}/a", chain)  # the cache holds two meanwhile
+    slow.release.set()
+    async with asyncio.timeout(5):
+        await asyncio.gather(*fetching)
+    await obeying.fetch(f"{held}/2", chain)
+
+    assert len(slow.robots) == 1
+    assert obeying.stat("robots.evicted") == 0
+
+
+async def test_an_origin_counting_unreachable_answers_is_never_evicted_so_that_it_is_disallowed() -> None:
+    held, *others = _origins(4)
+    chain = Redirecting({held: Site(503), **{other: Site() for other in others}}, {})
+    obeying = Obeying(cache_size=1)
+
+    for other in others[:2]:
+        with pytest.raises(NotYet):
+            await obeying.fetch(f"{held}/a", chain)
+        await obeying.fetch(f"{other}/a", chain)  # would evict it, were it not held
+        obeying.clock.advance(UNREACHABLE_WAIT)
+    with pytest.raises(IgnoreRequest):
+        await obeying.fetch(f"{held}/a", chain)  # the third unreachable answer in a row
+    await obeying.fetch(f"{others[2]}/a", chain)  # with the origin disallowed, it may go
+
+    assert chain.reached.count(f"{held}/robots.txt") == 3
+    assert obeying.stat("robots.evicted") == 3  # the first other, then the second and the origin
+
+
+async def test_rules_kept_in_force_while_robots_txt_is_unreachable_are_not_evicted_while_they_are() -> None:
+    held, other, third = _origins(3)
+    chain = Redirecting({held: Site(ROBOTS_TXT, 503), other: Site(), third: Site()}, {})
+    obeying = Obeying(cache_size=1)
+    await obeying.fetch(f"{held}/a", chain)
+    obeying.clock.advance(CACHE_TTL)
+    await obeying.fetch(f"{held}/a", chain)  # unreachable, so the rules fetched before stay in force
+
+    await obeying.fetch(f"{other}/a", chain)
+    with pytest.raises(IgnoreRequest):
+        await obeying.fetch(f"{held}/private", chain)
+    assert chain.reached.count(f"{held}/robots.txt") == 2
+    obeying.clock.advance(UNREACHABLE_WAIT)
+    await obeying.fetch(f"{third}/a", chain)
+
+    assert obeying.stat("robots.evicted") == 2  # the other, then the first, once it is due
+
+
+async def test_the_origins_redirects_lead_to_are_kept_and_evicted_alike() -> None:
+    chain = _two_origins(Site(), (f"{SITE}/a", f"{OTHER}/a"))
+    obeying = Obeying(cache_size=1)
+
+    await obeying.fetch(f"{SITE}/a", chain)
+    await obeying.fetch(f"{SITE}/b", chain)
+
+    assert chain.reached.count(f"{SITE}/robots.txt") == 2
+    assert obeying.stat("robots.evicted") == 2
+
+
+async def test_a_crawl_delay_spaces_its_slot_again_once_its_origin_is_read_again() -> None:
+    spaced, other = _origins(2)
+    host = urlsplit(spaced).hostname or ""
+    chain = Redirecting({spaced: Site(b"User-agent: *\nCrawl-delay: 4\n"), other: Site()}, {})
+    obeying = Obeying(cache_size=1)
+    await obeying.fetch(f"{spaced}/a", chain)
+
+    await obeying.fetch(f"{other}/a", chain)  # evicts the origin, but its slot keeps its spacing meanwhile
+    assert obeying.throttle.spacing(host) == 4.0
+    obeying.clock.advance(4.0)
+    assert obeying.throttle.blocked() == frozenset()  # the slot is forgotten, with its spacing
+    assert obeying.throttle.spacing(host) == 0.0
+    await obeying.fetch(f"{spaced}/b", chain)
+
+    assert chain.reached.count(f"{spaced}/robots.txt") == 2
+    obeying.clock.advance(3.99)
+    assert obeying.throttle.blocked() == {host}
+    obeying.clock.advance(0.01)
+    assert obeying.throttle.blocked() == frozenset()
+
+
+async def test_the_crawl_delay_an_origin_spaces_a_slot_by_goes_with_its_rules() -> None:
+    longer, shorter = _origins(2)
+    chain = Redirecting(
+        {longer: Site(b"User-agent: *\nCrawl-delay: 6\n"), shorter: Site(b"User-agent: *\nCrawl-delay: 2\n")}, {}
+    )
+    obeying = Obeying(cache_size=1, slot_of=lambda request: "everything")
+
+    await obeying.fetch(f"{longer}/a", chain)
+    assert obeying.throttle.spacing("everything") == 6.0
+    obeying.clock.advance(6.0)
+    await obeying.fetch(f"{shorter}/a", chain)  # evicts the longer
+
+    assert obeying.throttle.spacing("everything") == 2.0
+
+
+async def test_a_slot_the_throttle_forgot_is_spaced_again_by_the_rules_kept() -> None:
+    site = Site(b"User-agent: *\nCrawl-delay: 4\n")
+    obeying = Obeying()
+    await obeying.fetch(f"{SITE}/a", site)
+    obeying.clock.advance(4.0)
+    assert obeying.throttle.blocked() == frozenset()
+    assert obeying.throttle.spacing(HOST) == 0.0
+
+    assert await obeying.throttle.pace(HOST)  # as a Run paces a fetch before its download chain
+    await obeying.fetch(f"{SITE}/b", site)
+
+    assert len(site.robots) == 1
+    assert obeying.throttle.spacing(HOST) == 4.0
+    obeying.clock.advance(3.99)
+    assert obeying.throttle.blocked() == {HOST}

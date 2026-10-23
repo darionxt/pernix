@@ -410,3 +410,23 @@ async def test_the_cookies_the_robots_txt_of_a_redirect_sets_reach_the_session_f
         ("/b", None),  # with the cookies its fetch started with
         ("/c", "visited=1"),
     ]
+
+
+async def test_a_run_reaching_more_origins_than_the_cache_holds_still_obeys_each() -> None:
+    site = FakeFetcher(
+        {
+            re.compile(r"https://o\d\.example/robots\.txt"): ROBOTS_TXT,
+            re.compile(r"https://o\d\.example/.*"): "<p>page</p>",
+        }
+    )
+    origins = [f"https://o{n}.example" for n in range(3)]
+    urls = [f"{origin}/a" for origin in origins] + [f"{origins[0]}/private", f"{origins[0]}/b"]
+    settings = {**OBEY, "robots.cache_size": 2, "concurrency": 1}
+
+    report = await crawl(Pages, fetcher=site, settings=settings, urls=urls)
+
+    assert _urls(report.items) == sorted([*urls[:3], urls[4]])
+    assert [url for url in _fetched(site) if url.endswith("/robots.txt")] == [
+        f"{origin}/robots.txt" for origin in (*origins, origins[0])
+    ]
+    assert (report.stats["robots.evicted"], report.stats["robots.disallowed"]) == (2, 1)

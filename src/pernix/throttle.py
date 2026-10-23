@@ -6,7 +6,9 @@ download chain until the Response arrives. A slot admits a new fetch while fewer
 the GCRA rate allows it, and the slot is not cooling down. A 429 or 503 Response with
 `Retry-After` cools its whole slot down for that long. A slot may be spaced further
 apart than `domain.delay`, as a robots.txt `Crawl-delay` asks, and cooled down for
-other reasons, as while its robots.txt cannot be fetched.
+other reasons, as while its robots.txt cannot be fetched. A slot no fetch holds,
+whose delay, rate, and cooldown have passed, is forgotten, its spacing with it, as a
+fresh slot would behave the same.
 
 A fetch nested in another of the same slot, in the same task, such as an Inline Fetch
 a download Middleware makes, shares the outer fetch's place instead of waiting for
@@ -105,14 +107,19 @@ class Throttle:
         self.stats = ThrottleStats()
 
     def blocked(self) -> frozenset[str]:
-        """Return the slots that cannot start a fetch now, for `Frontier.claim(skip_slots=...)`."""
+        """Return the slots that cannot start a fetch now, for `Frontier.claim(skip_slots=...)`.
+
+        The slots no fetch holds, whose delay, rate, and cooldown have passed, are
+        forgotten meanwhile, with their spacing.
+        """
         now = self._clock()
         blocked: set[str] = set()
         for name, slot in list(self._slots.items()):
             if slot.active >= self._settings.concurrency or self._ready_at(slot) > now:
                 blocked.add(name)
             elif slot.active == 0 and max(slot.next_start, slot.tat, slot.cool_until) <= now:
-                del self._slots[name]  # a fresh slot would behave the same
+                del self._slots[name]  # a fresh slot would behave the same, as its spacing passed since its last start
+                self._spacing.pop(name, None)
         return frozenset(blocked)
 
     def cooldown_left(self, slot: str) -> float:
@@ -262,6 +269,8 @@ class Throttle:
 
         Each start then waits for the larger of these seconds and the jittered
         `domain.delay`, counted from the last start, the one already made included.
+        The spacing lasts until `blocked()` forgets the slot, once no fetch holds it
+        and its delay, rate, and cooldown have passed; it is to be set again then.
 
         Args:
             slot: The slot.
@@ -272,10 +281,22 @@ class Throttle:
             self._spacing[slot] = seconds
         else:
             self._spacing.pop(slot, None)
-        state = self._slots.get(slot)
-        if state is not None and state.started is not None:
+        state = self._slots.setdefault(slot, _Slot())  # forgotten, with its spacing, as any other
+        if state.started is not None:
             state.next_start = max(state.next_start, state.started + seconds)
         self._notify()
+
+    def spacing(self, slot: str) -> float:
+        """Return how far apart `space()` spaces the starts of a slot's fetches.
+
+        Args:
+            slot: The slot.
+
+        Returns:
+            The least seconds between two starts it set; 0 for none, as for a slot
+            forgotten since.
+        """
+        return self._spacing.get(slot, 0.0)
 
     def cool_down(self, slot: str, seconds: float) -> float:
         """Pause a slot, so that it starts no fetch for that long, at most `domain.cooldown_max`.
