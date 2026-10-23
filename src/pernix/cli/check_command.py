@@ -11,7 +11,7 @@ from pernix.errors import ComponentError
 from pernix.fetchers import DEFAULT_PROFILE, BrowserFetcher, BrowserSettings, HTTPFetcher, HTTPSettings
 from pernix.fetchers.launched_browser import probe_browser, require_patchright
 from pernix.logs import RunContext, RunLog
-from pernix.run_assembly import RunAssembly
+from pernix.run_assembly import RunAssembly, control_path
 from pernix.runner import ExitCode
 from pernix.settings import ControlSettings, CoreSettings, LogSettings
 from pernix.settings.sources import find_project_file
@@ -120,7 +120,7 @@ def _components(crawler: Crawler, profile: str | None, browser: str | None) -> l
         lines.append(f"Profile: {profile}")
     if browser is not None:
         lines.append(f"Browser: {browser}")
-    control_file = settings.section(ControlSettings).file
+    control_file = control_path(crawler)
     for title, key in _ROLES:
         labels = [_label(spec) for spec in settings.components(key)]
         if key == ControlSettings.key("sources") and control_file is not None:
