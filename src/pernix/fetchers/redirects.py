@@ -8,7 +8,10 @@ the headers that describe it; 307 and 308 keep the method and the body. Credenti
 headers never follow a redirect to another origin.
 
 A fetch follows as many redirects as `http.max_redirects` allows, or fewer inside
-`following_at_most()`, as a robots.txt fetch does.
+`following_at_most()`, as a robots.txt fetch does. Inside `checking_redirects()`, each
+redirect is checked before it is followed, as the robots.txt layer checks it against the
+robots.txt of the origin it leads to; a Fetcher that follows redirects itself reads the
+check with `redirect_check()`.
 """
 
 from __future__ import annotations
@@ -27,9 +30,19 @@ from pernix.headers import Headers
 from pernix.urls import url_host
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Awaitable, Callable, Generator
 
-__all__ = ["REDIRECT_STATUSES", "Hop", "following_at_most", "redirect_limit", "redirect_target", "redirected"]
+__all__ = [
+    "REDIRECT_STATUSES",
+    "Hop",
+    "RedirectCheck",
+    "checking_redirects",
+    "following_at_most",
+    "redirect_check",
+    "redirect_limit",
+    "redirect_target",
+    "redirected",
+]
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 """The statuses browsers follow: other 3xx responses, such as 300 or 304, are final."""
@@ -44,8 +57,14 @@ _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+type RedirectCheck = Callable[[str], Awaitable[None]]
+"""Checks the URL a redirect leads to before the redirect is followed, raising to refuse it."""
+
 _limit: ContextVar[int | None] = ContextVar("pernix_redirect_limit", default=None)
 """The redirects the fetches the current task makes may follow at most, below the Fetcher's own limit, if any."""
+
+_check: ContextVar[RedirectCheck | None] = ContextVar("pernix_redirect_check", default=None)
+"""What checks the redirects of the fetches the current task makes, if anything."""
 
 
 @contextmanager
@@ -78,6 +97,40 @@ def redirect_limit(configured: int) -> int | None:
     """
     limit = _limit.get()
     return limit if limit is not None and limit < configured else None
+
+
+@contextmanager
+def checking_redirects(check: RedirectCheck | None) -> Generator[None]:
+    """Make the fetches inside the block check each redirect before they follow it, or check none.
+
+    The robots.txt layer checks the redirects of each fetch it checks so
+    (`pernix.robots`), and those of the other fetches none, so that a fetch never
+    takes the check of the one it is nested in.
+
+    Args:
+        check: Called with the URL each redirect leads to, before the hop to it
+            is sent; what it raises fails the fetch. `None` checks none.
+
+    Yields:
+        Nothing; the block runs with the check in effect.
+    """
+    token = _check.set(check)
+    try:
+        yield
+    finally:
+        _check.reset(token)
+
+
+def redirect_check() -> RedirectCheck | None:
+    """Return what checks the redirects of the current fetch, as `checking_redirects()` set it, if anything.
+
+    The HTTP Fetcher and the browser Fetcher call it with the URL of each redirect
+    before they follow it; a Fetcher that follows redirects itself does as they do.
+
+    Returns:
+        The check; `None` when none is in effect.
+    """
+    return _check.get()
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,6 +12,7 @@ import pytest
 from pernix import IgnoreRequest, Request, Response
 from pernix.errors import ConnectError, NetworkBlocked, ProxyError, Timeout, TooManyRedirects
 from pernix.fetchers import FetcherDispatch, StreamedResponse
+from pernix.fetchers.redirects import redirect_check
 from pernix.frontiers import host_slot
 from pernix.headers import Headers
 from pernix.response import Redirect
@@ -21,12 +22,17 @@ from pernix.settings import DomainSettings, RobotsSettings
 from pernix.stats import Stats
 from pernix.testing.frontier import FakeClock
 from pernix.throttle import Throttle
+from pernix.urls import url_origin
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+
+    from pernix.middlewares import Download
 
 SITE = "https://site.example"
 HOST = "site.example"
+OTHER = "https://other.example"
+OTHER_HOST = "other.example"
 ROBOTS_TXT = b"User-agent: *\nDisallow: /private\n"
 
 type Answer = int | bytes | Response | Exception
@@ -72,6 +78,33 @@ class Site:
                 return _response(request, 200, answer)
 
 
+class Redirecting:
+    """The rest of a download chain to several origins, a Site each, following redirects as a Fetcher does.
+
+    Each redirect is checked with the check in effect, if any, before it is
+    followed. Every URL reached is recorded, those that redirect included.
+    """
+
+    def __init__(self, sites: Mapping[str, Site], redirects: Mapping[str, str]) -> None:
+        self.sites = sites
+        self.redirects = redirects
+        self.reached: list[str] = []
+        self.checked: list[str] = []
+
+    async def __call__(self, request: Request) -> Response:
+        url = request.url
+        self.reached.append(url)
+        while (target := self.redirects.get(url)) is not None:
+            check = redirect_check()
+            if check is not None:
+                self.checked.append(target)
+                await check(target)
+            url = target
+            self.reached.append(url)
+        site = self.sites[url_origin(url) or ""]
+        return await site(request.replace(url=url))
+
+
 class Obeying:
     """A robots.txt layer, on a Throttle and a clock of its own."""
 
@@ -97,7 +130,7 @@ class Obeying:
             clock=self.clock,
         )
 
-    async def fetch(self, url: str, site: Site, **options: object) -> Response:
+    async def fetch(self, url: str, site: Download, **options: object) -> Response:
         return await self.layer(Request(url, **options), site)  # pyright: ignore[reportArgumentType]
 
     def stat(self, key: str) -> object:
@@ -446,3 +479,148 @@ async def test_robots_txt_is_read_up_to_the_parse_limit_and_its_transfer_closed(
     assert fetcher.open == 0
     assert fetcher.chunks_read == PARSE_LIMIT // (64 * 1024) + 1
     assert obeying.stat("downloads.bytes") == fetcher.chunks_read * 64 * 1024
+
+
+def _two_origins(other: Site, *redirects: tuple[str, str]) -> Redirecting:
+    """SITE, with its robots.txt, and OTHER, as `other` answers, with the redirects given."""
+    return Redirecting({SITE: Site(), OTHER: other}, dict(redirects))
+
+
+async def test_a_redirect_to_a_url_its_origin_disallows_is_not_followed() -> None:
+    chain = Redirecting({SITE: Site()}, {f"{SITE}/a": f"{SITE}/private/a"})
+    obeying = Obeying()
+
+    with pytest.raises(IgnoreRequest) as raised:
+        await obeying.fetch(f"{SITE}/a", chain)
+
+    assert raised.value.reason == "robots.txt"
+    assert chain.reached == [f"{SITE}/robots.txt", f"{SITE}/a"]
+    assert (obeying.stat("robots.disallowed"), obeying.stat("robots.redirects_disallowed")) == (1, 1)
+    assert obeying.stat("robots.fetched") == 1
+
+
+async def test_a_redirect_to_another_origin_reads_its_robots_txt_once_as_the_request_is_sent() -> None:
+    other = Site(b"User-agent: *\nDisallow: /secret\n")
+    chain = _two_origins(
+        other, (f"{SITE}/a", f"{OTHER}/a"), (f"{SITE}/b", f"{OTHER}/b"), (f"{SITE}/c", f"{OTHER}/secret")
+    )
+    obeying = Obeying()
+    options = {"session": "s1", "proxy": "http://proxy.example:8080", "impersonate": "chrome150"}
+
+    first = await obeying.fetch(f"{SITE}/a", chain, **options)
+    await obeying.fetch(f"{SITE}/b", chain)
+    with pytest.raises(IgnoreRequest):
+        await obeying.fetch(f"{SITE}/c", chain)
+
+    assert first.url == f"{OTHER}/a"
+    [robots] = other.robots
+    assert (robots.url, robots.fetcher, robots.headers.get("Referer")) == (f"{OTHER}/robots.txt", "http", "")
+    assert (robots.session, robots.proxy, robots.impersonate) == ("s1", "http://proxy.example:8080", "chrome150")
+    assert other.pages == [f"{OTHER}/a", f"{OTHER}/b"]
+    assert (obeying.stat("robots.fetched"), obeying.stat("robots.redirects_disallowed")) == (2, 1)
+
+
+async def test_each_redirect_of_a_chain_is_checked_and_robots_txt_always_allowed() -> None:
+    chain = _two_origins(
+        Site(b"User-agent: *\nDisallow: /\n"),
+        (f"{SITE}/a", f"{SITE}/b"),
+        (f"{SITE}/b", f"{OTHER}/robots.txt"),
+    )
+
+    response = await Obeying().fetch(f"{SITE}/a", chain)
+
+    assert response.url == f"{OTHER}/robots.txt"
+    assert chain.checked == [f"{SITE}/b", f"{OTHER}/robots.txt"]
+    assert chain.reached == [f"{SITE}/robots.txt", f"{SITE}/a", f"{SITE}/b", f"{OTHER}/robots.txt"]
+
+
+@pytest.mark.parametrize(
+    ("url", "options"),
+    [(f"{SITE}/a", {"ext": {"robots": {"obey": False}}}), (f"{SITE}/robots.txt", {})],
+)
+async def test_the_redirects_of_requests_robots_txt_does_not_apply_to_are_not_checked(
+    url: str, options: dict[str, object]
+) -> None:
+    chain = _two_origins(Site(b"User-agent: *\nDisallow: /\n"), (url, f"{OTHER}/private"))
+
+    response = await Obeying().fetch(url, chain, **options)
+
+    assert response.url == f"{OTHER}/private"
+    assert chain.checked == []
+
+
+async def test_the_redirects_of_robots_txt_itself_are_not_checked() -> None:
+    other = Site(b"User-agent: *\nDisallow: /\n")
+    chain = _two_origins(other, (f"{SITE}/robots.txt", f"{OTHER}/rules.txt"))
+    obeying = Obeying()
+
+    await obeying.fetch(f"{SITE}/a", chain)
+
+    assert chain.checked == []
+    assert [request.url for request in other.requests] == [f"{OTHER}/rules.txt"]
+
+
+async def test_a_fetch_that_does_not_obey_never_takes_the_check_of_the_fetch_it_is_nested_in() -> None:
+    chain = _two_origins(Site(b"User-agent: *\nDisallow: /\n"), (f"{SITE}/token", f"{OTHER}/token"))
+    obeying = Obeying()
+
+    async def authorizing(request: Request) -> Response:
+        if request.url == f"{SITE}/a":  # fetches a token on the way, as some Middleware does
+            exempt = Request(f"{SITE}/token", ext={"robots": {"obey": False}})
+            token = await obeying.layer(exempt, chain)
+            return token.replace(request=request)
+        return await chain(request)
+
+    response = await obeying.layer(Request(f"{SITE}/a"), authorizing)
+
+    assert response.url == f"{OTHER}/token"
+    assert chain.checked == []
+
+
+async def test_an_unreachable_robots_txt_where_a_redirect_leads_holds_the_request_back_then_disallows() -> None:
+    chain = _two_origins(Site(503), (f"{SITE}/a", f"{OTHER}/a"))
+    obeying = Obeying()
+
+    for _ in range(2):
+        with pytest.raises(NotYet) as raised:
+            await obeying.fetch(f"{SITE}/a", chain)
+        assert (raised.value.delay, raised.value.reason) == (UNREACHABLE_WAIT, "robots.txt unreachable")
+        assert (obeying.throttle.cooldown_left(OTHER_HOST), obeying.throttle.cooldown_left(HOST)) == (
+            UNREACHABLE_WAIT,
+            0,
+        )
+        obeying.clock.advance(UNREACHABLE_WAIT)
+    with pytest.raises(IgnoreRequest):
+        await obeying.fetch(f"{SITE}/a", chain)
+
+    assert f"{OTHER}/a" not in chain.reached
+    assert (obeying.stat("robots.deferred"), obeying.stat("robots.redirects_disallowed")) == (2, 1)
+
+
+@pytest.mark.parametrize("error", [ProxyError("proxy down"), ValueError("a bug")])
+async def test_errors_of_the_robots_txt_where_a_redirect_leads_that_tell_of_the_requests_way_are_its_own(
+    error: Exception,
+) -> None:
+    chain = _two_origins(Site(error, b""), (f"{SITE}/a", f"{OTHER}/a"))
+    obeying = Obeying()
+
+    with pytest.raises(type(error)):
+        await obeying.fetch(f"{SITE}/a", chain)
+    await obeying.fetch(f"{SITE}/a", chain)
+
+    assert chain.reached.count(f"{OTHER}/robots.txt") == 2
+    assert obeying.throttle.cooldown_left(OTHER_HOST) == 0
+
+
+async def test_the_crawl_delay_of_the_origin_a_redirect_leads_to_spaces_its_own_slot_alone() -> None:
+    chain = _two_origins(Site(b"User-agent: *\nCrawl-delay: 4\n"), (f"{SITE}/a", f"{OTHER}/a"))
+    obeying = Obeying()
+
+    await obeying.fetch(f"{SITE}/a", chain)
+    assert obeying.throttle.blocked() == frozenset()  # the slot of the Request, which robots.txt took a start of
+    assert await obeying.throttle.pace(OTHER_HOST)  # a Request to the other origin starts
+
+    obeying.clock.advance(3.99)
+    assert obeying.throttle.blocked() == {OTHER_HOST}
+    obeying.clock.advance(0.01)
+    assert obeying.throttle.blocked() == frozenset()
