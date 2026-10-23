@@ -33,7 +33,7 @@ from pernix.fetchers.fetcher import request_proxy
 from pernix.fetchers.http_settings import DEFAULT_PROFILE, HTTPSettings, check_profile
 from pernix.fetchers.network_guard import current_guard
 from pernix.fetchers.pinned_pair import client_headers
-from pernix.fetchers.redirects import Hop, redirect_limit, redirect_target, redirected
+from pernix.fetchers.redirects import Hop, redirect_check, redirect_limit, redirect_target, redirected
 from pernix.fetchers.streamed_response import StreamedResponse
 from pernix.headers import Headers
 from pernix.request_kinds import is_document, request_kind
@@ -141,7 +141,9 @@ class HTTPFetcher:
     GET, and 303 anything but GET and HEAD;
     `Authorization` and `Proxy-Authorization` never follow a redirect to another
     origin; a `Location` that is not an http or https URL fails the fetch. The body
-    of a redirect is dropped.
+    of a redirect is dropped. Inside `checking_redirects()`, as with `robots.obey`,
+    each redirect is checked before its hop is sent, the time the check takes
+    added to `http.deadline`.
 
     Requests are independent (ADR 0011): each fetch sends only the cookies the
     Request carries, as `cookies=` or as a `Cookie` header, cookies set during it
@@ -311,8 +313,8 @@ class HTTPFetcher:
         pool, profile = self._pool_and_profile(request, session)
         limit = self._settings.max_body_size or None
         started = time.monotonic()
-        async with pool.session(profile, owner=_owner(session)) as curl, self._deadline(request):
-            fetched = await self._follow(curl, request, session, profile, limit)
+        async with pool.session(profile, owner=_owner(session)) as curl, self._deadline(request) as deadline:
+            fetched = await self._follow(curl, request, session, profile, limit, deadline)
             result, transfer = fetched.result, fetched.transfer
             try:
                 _check_declared_size(result, request, limit)
@@ -360,8 +362,8 @@ class HTTPFetcher:
         limit = (self._settings.max_body_size if max_bytes is None else max_bytes) or None
         started = time.monotonic()
         async with pool.session(profile, owner=_owner(session)) as curl:
-            async with self._deadline(request):
-                fetched = await self._follow(curl, request, session, profile, limit)
+            async with self._deadline(request) as deadline:
+                fetched = await self._follow(curl, request, session, profile, limit, deadline)
             result, transfer = fetched.result, fetched.transfer
             try:
                 _check_declared_size(result, request, limit)
@@ -380,27 +382,34 @@ class HTTPFetcher:
         return self._pool, self._settings.impersonate if named is None else check_profile(named)
 
     @asynccontextmanager
-    async def _deadline(self, request: Request) -> AsyncGenerator[None]:
-        """Limit a fetch to `http.deadline`, as a `Timeout`."""
+    async def _deadline(self, request: Request) -> AsyncGenerator[asyncio.Timeout]:
+        """Limit a fetch to `http.deadline`, as a `Timeout`; the scope it gives may be moved on."""
         deadline = self._settings.deadline
         scope = asyncio.timeout(deadline)
         try:
             async with scope:
-                yield
+                yield scope
         except TimeoutError:
             if scope.expired():
                 raise Timeout(f"fetching {request.url} took longer than http.deadline ({deadline} s)") from None
             raise
 
     async def _follow(
-        self, curl: CurlSession, request: Request, session: Session | None, profile: str, limit: int | None
+        self,
+        curl: CurlSession,
+        request: Request,
+        session: Session | None,
+        profile: str,
+        limit: int | None,
+        deadline: asyncio.Timeout,
     ) -> _Fetched:
         """Send a Request and wait for the headers of its last response, following redirects one hop at a time.
 
         The `Set-Cookie` headers of each hop apply to the cookies of the next ones, as
         the `Accept-CH` of a top-level navigation's apply to its client hints, and the
         body of each redirect is dropped. A navigation whose `Critical-CH` needs hints
-        it did not send starts again.
+        it did not send starts again. `deadline`, the scope of `http.deadline`, is
+        moved on by the time the checks of the redirects take.
         """
         proxy = request_proxy(request, session)
         timeout = request.timeout or self._settings.timeout
@@ -424,7 +433,9 @@ class HTTPFetcher:
             missing.append(hints.receive(url, accept_ch, critical_ch))
 
         while True:
-            pinned = await self._check_hop(hop.url, proxy, resolve_timeout=timeout, redirected_from=redirected_from)
+            pinned = await self._check_hop(
+                hop.url, proxy, resolve_timeout=timeout, redirected_from=redirected_from, deadline=deadline
+            )
             sent = None if chrome is None else chrome.next(hop)
             missing.clear()
             result, transfer = await self._send(
@@ -465,13 +476,22 @@ class HTTPFetcher:
             redirected_from, hop = result.url, redirected(hop, result.status_code, requote_uri(target))
 
     async def _check_hop(
-        self, url: str, proxy: str | None, *, resolve_timeout: float, redirected_from: str | None
+        self,
+        url: str,
+        proxy: str | None,
+        *,
+        resolve_timeout: float,
+        redirected_from: str | None,
+        deadline: asyncio.Timeout,
     ) -> PinnedHost | None:
         """Refuse a hop of a redirect chain, the first included, before it is sent.
 
         Under a network guard, a hop to a host the guard does not admit is refused;
         with `network.public_only`, a hop to a host not on public addresses, which
-        is resolved within `resolve_timeout`.
+        is resolved within `resolve_timeout`. A redirect the guards let through is
+        then checked with the check in effect, if any
+        (`pernix.fetchers.redirects.redirect_check()`), `deadline` moved on by the
+        time it takes.
 
         Returns:
             The host and the addresses the hop may connect to, once resolved.
@@ -480,6 +500,7 @@ class HTTPFetcher:
             pernix.errors.NetworkBlocked: A guard refused the hop.
             pernix.errors.ConnectError: The host cannot be resolved.
             pernix.errors.Timeout: Resolving the host took longer than `resolve_timeout`.
+            Exception: The check refused the redirect, such as with `IgnoreRequest`.
         """
         guard = current_guard()
         if guard is not None:
@@ -489,6 +510,15 @@ class HTTPFetcher:
                 if redirected_from is None:
                     raise
                 raise NetworkBlocked(f"the network guard refused the redirect from {redirected_from} to {url}") from exc
+        pinned = await self._resolved(url, proxy, resolve_timeout, redirected_from)
+        if redirected_from is not None:
+            await _checked_redirect(url, deadline)
+        return pinned
+
+    async def _resolved(
+        self, url: str, proxy: str | None, resolve_timeout: float, redirected_from: str | None
+    ) -> PinnedHost | None:
+        """Check the host of a hop with the address guard, if on, within `resolve_timeout`."""
         if self._address_guard is None:
             return None
         scope = asyncio.timeout(resolve_timeout)
@@ -685,6 +715,26 @@ class _ChromeHops:
             return self._hints.asked(url)
         page = (url_origin(self._referrer) if self._referrer else None) or url_origin(self._chain[0])
         return self._hints.asked(url) if url_origin(url) == page else ()
+
+
+async def _checked_redirect(url: str, deadline: asyncio.Timeout) -> None:
+    """Check a redirect with the check in effect, if any, moving the fetch's deadline on by the time it takes.
+
+    The check may fetch, as robots.txt is fetched, under deadlines of its own, so the
+    fetch's deadline is lifted meanwhile.
+    """
+    check = redirect_check()
+    if check is None:
+        return
+    when = deadline.when()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline.reschedule(None)
+    try:
+        await check(url)
+    finally:
+        if when is not None:
+            deadline.reschedule(when + loop.time() - started)
 
 
 async def _chunks(result: curl_cffi.Response, request: Request, transfer: Transfer) -> AsyncIterator[bytes]:

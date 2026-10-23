@@ -6,7 +6,8 @@ continuing it; and `lock`, which one process at a time holds. The lock is an
 advisory lock of the operating system, released when its process ends, however it
 ends, so a process killed leaves none behind. Locks and SQLite's shared memory are
 not reliable on network file systems, such as NFS or SMB, so the directory belongs
-on a local one.
+on a local one. A Platform may write `control` there, the state it wants the Run in,
+which the Run reads by default; Pernix never writes it.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ __all__ = ["JobDir", "RunRecord"]
 _RECORD = "run.json"
 _FRONTIER = "frontier.db"
 _LOCK = "lock"
-_FILES = (_RECORD, f".{_RECORD}.tmp", _FRONTIER, f"{_FRONTIER}-wal", f"{_FRONTIER}-shm", _LOCK)
+_CONTROL = "control"
+_FILES = (_RECORD, f".{_RECORD}.tmp", _FRONTIER, f"{_FRONTIER}-wal", f"{_FRONTIER}-shm", _LOCK, _CONTROL)
 """The files a job directory keeps, which no output of the Run may write."""
 
 
@@ -74,6 +76,9 @@ class JobDir:
         record: The record of the Run, once taken.
         resumed: Whether the directory held the Run already when taken, so that
             this process resumes it.
+        control_found: The control file as the directory held it when taken, as
+            `os.stat()` tells, so that a stop written for an earlier process is told
+            from one written for this one; `None` if it held none.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
@@ -85,6 +90,7 @@ class JobDir:
         self.path = Path(path)
         self.record: RunRecord | None = None
         self.resumed = False
+        self.control_found: os.stat_result | None = None
         self._lock: int | None = None
         self._released = False
         self._guard = threading.Lock()
@@ -94,6 +100,11 @@ class JobDir:
     def frontier_path(self) -> Path:
         """The database of the Run's Frontier."""
         return self.path / _FRONTIER
+
+    @property
+    def control_path(self) -> Path:
+        """The control file, where a Platform writes the state it wants the Run in."""
+        return self.path / _CONTROL
 
     @property
     def files(self) -> tuple[Path, ...]:
@@ -118,7 +129,8 @@ class JobDir:
         The directory is created if it is missing, readable by its owner only; an
         existing one keeps its permissions. A Run continues the one recorded if it
         has its `run_id` and its Spider, and, where both are known, its Spider
-        arguments and the settings of its Fingerprints.
+        arguments and the settings of its Fingerprints. As soon as the lock is held,
+        the control file is looked at, for `control_found`.
 
         Args:
             run: The Run of this process, as it would be recorded.
@@ -141,6 +153,7 @@ class JobDir:
         self.path.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock = _locked(self.path / _LOCK)
         try:
+            control = _status(self.control_path)  # at once, as anything written from now on is for this process
             found = self._read()
             if found is None:
                 if self.frontier_path.exists():
@@ -148,7 +161,7 @@ class JobDir:
                         f"the job directory {self.path} holds a Frontier, but no record of its Run in {_RECORD}"
                     )
                 self._write(run)
-                self.record, self.resumed = run, False
+                self.record, self.resumed, self.control_found = run, False, control
                 return run
             problems = _differences(found, run)
             if problems:
@@ -156,7 +169,7 @@ class JobDir:
                     f"the job directory {self.path} holds the Run {found.run_id!r} of the Spider {found.spider!r}, "
                     "which this Run does not continue:\n" + "\n".join(f"  - {problem}" for problem in problems)
                 )
-            self.record, self.resumed = found, True
+            self.record, self.resumed, self.control_found = found, True, control
             return found
         except BaseException:
             self._unlock()
@@ -272,6 +285,14 @@ _MISSING = object()
 
 def _shown(value: object) -> str:
     return "not given" if value is _MISSING else repr(value)
+
+
+def _status(path: Path) -> os.stat_result | None:
+    """The `os.stat()` of a file; `None` if there is none, or it cannot be read, which reading it tells."""
+    try:
+        return path.stat()
+    except OSError:
+        return None
 
 
 def _locked(path: Path) -> int:

@@ -518,6 +518,7 @@ class Crawler:
                     pausing=self._pausing,
                     frontier_path=None if self._job is None else self._job.frontier_path,
                     start=None if self._job is None else functools.partial(self._seeding, self._job),
+                    control_found=None if self._job is None else self._job.control_found,
                 )
                 self._shutdown.attach(run.engine)
                 try:

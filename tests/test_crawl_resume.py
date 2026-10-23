@@ -75,6 +75,10 @@ def _record() -> RunRecord:
     return RunRecord(run_id="held", spider="chain", started_at=dt.datetime.now(dt.UTC))
 
 
+def _names(directory: Path) -> list[str]:
+    return sorted(path.name for path in directory.iterdir())
+
+
 def _first_start(job: Path) -> str:
     """When the Run of a job directory first started, as the stats and the outcome file tell times."""
     recorded = json.loads((job / "run.json").read_text())["started_at"]
@@ -98,6 +102,19 @@ async def test_a_drained_run_run_again_continues_where_it_stopped_and_finishes(
     assert (second.stats["run.resumed"], second.stats["frontier.done"]) == (1, 6)
     assert second.stats["run.first_started_at"] == _first_start(tmp_path)
     assert "run.resumed" not in first.stats
+
+
+@pytest.mark.parametrize("empty", ["", "."])
+async def test_an_empty_job_dir_keeps_the_frontier_in_memory_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chain: type[Chain], empty: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    report = await crawl(chain, fetcher=_site(1, 2, 3, 4, 5, 6), settings={"job_dir": empty})
+
+    assert (report.reason, len(report.items)) == ("finished", 6)
+    assert not any(key.startswith(("run.resumed", "control.")) for key in report.stats)
+    assert _names(tmp_path) == []
 
 
 async def test_start_iterated_to_its_end_is_not_iterated_again(tmp_path: Path, chain: type[Chain]) -> None:
@@ -248,7 +265,7 @@ async def test_spider_arguments_compare_as_the_job_directory_records_them(tmp_pa
     assert report.stats["run.resumed"] == 1
 
 
-@pytest.mark.parametrize("name", ["run.json", "frontier.db", "lock"])
+@pytest.mark.parametrize("name", ["run.json", "frontier.db", "lock", "control"])
 async def test_no_output_may_write_a_file_the_job_directory_keeps(
     tmp_path: Path, chain: type[Chain], name: str
 ) -> None:

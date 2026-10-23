@@ -11,14 +11,14 @@ import pytest
 
 from pernix import IgnoreRequest, Middleware, Request, Response, Spider, events
 from pernix.robots import PARSE_LIMIT
-from pernix.testing import FakeFetcher, crawl, make_response
+from pernix.testing import FakeFetcher, LoopbackServer, Reply, crawl, make_response
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
 
     from pernix.crawler import Crawler
     from pernix.middlewares import Download
-    from pernix.testing import Answer, LoopbackServer
+    from pernix.testing import Answer, ReceivedRequest
 
 SITE = "https://site.example"
 OTHER = "https://other.example"
@@ -29,13 +29,14 @@ OBEY = {"robots.obey": True}
 class Pages(Spider):
     name = "pages"
 
-    def __init__(self, urls: list[str], render: bool = False) -> None:
+    def __init__(self, urls: list[str], render: bool = False, obey: bool = True) -> None:
         self.urls = urls
         self.render = render
+        self.obey = obey
 
     async def start(self) -> AsyncIterator[Request]:
         for url in self.urls:
-            yield Request(url, render=self.render)
+            yield Request(url, render=self.render, ext={} if self.obey else {"robots": {"obey": False}})
 
     async def parse(self, response: Response) -> AsyncIterator[Any]:
         yield {"url": response.url}
@@ -295,3 +296,117 @@ async def test_the_cookies_robots_txt_sets_are_kept_in_the_session(server: Loopb
     robots, page = server.received
     assert (robots.path, robots.header("Cookie"), robots.header("Referer")) == ("/robots.txt", None, None)
     assert (page.path, page.header("Cookie")) == ("/a", "visited=1")
+
+
+HTML = [("Content-Type", "text/html")]
+
+
+@pytest.fixture
+def other_server() -> Iterator[LoopbackServer]:
+    with LoopbackServer() as server:
+        yield server
+
+
+@pytest.fixture(params=[False, True], ids=["http", "rendered"])
+def render(request: pytest.FixtureRequest) -> bool:
+    """Fetch over HTTP, or render in the browser, which the rendered tests launch."""
+    if request.param:
+        request.getfixturevalue("browser_engine")
+    return bool(request.param)
+
+
+def _paths(server: LoopbackServer) -> list[str]:
+    return [hop.path for hop in server.received]
+
+
+async def test_a_redirect_to_a_url_robots_txt_disallows_is_not_fetched(server: LoopbackServer, render: bool) -> None:
+    server.route("/robots.txt", ROBOTS_TXT)
+    server.route("/a", status=302, headers=[("Location", "/private/page")])
+    server.route("/private/page", "<p>private</p>", headers=HTML)
+    ignored = Ignored()
+
+    report = await crawl(Pages, settings={**OBEY, "extensions": {ignored: 200}}, urls=[server.url("/a")], render=render)
+
+    assert report.items == []
+    assert _paths(server) == ["/robots.txt", "/a"]
+    assert ignored.reasons == ["robots.txt"]
+    assert (report.stats["robots.disallowed"], report.stats["robots.redirects_disallowed"]) == (1, 1)
+    assert (report.stats["requests.ignored"], report.stats["requests.failed"]) == (1, 0)
+
+
+async def test_a_redirect_to_another_origin_reads_its_robots_txt_once(
+    server: LoopbackServer, other_server: LoopbackServer, render: bool
+) -> None:
+    server.route("/robots.txt", "User-agent: *\n")
+    other_server.route("/robots.txt", ROBOTS_TXT)
+    for path in ("/a", "/b", "/c"):
+        target = "/private" if path == "/c" else path
+        server.route(path, status=301, headers=[("Location", other_server.url(target))])
+        other_server.route(target, f"<p>{target}</p>", headers=HTML)
+    urls = [server.url(path) for path in ("/a", "/b", "/c")]
+
+    report = await crawl(Pages, settings=OBEY, urls=urls, render=render)
+
+    assert _urls(report.items) == [other_server.url("/a"), other_server.url("/b")]
+    assert sorted(_paths(other_server)) == ["/a", "/b", "/robots.txt"]
+    assert report.stats["robots.fetched"] == 2
+    assert report.stats["robots.redirects_disallowed"] == 1
+
+
+@pytest.mark.parametrize(("settings", "obey"), [({}, True), (OBEY, False)], ids=["off", "exempt"])
+async def test_redirects_are_followed_unchecked_without_robots_obey_or_for_a_request_that_does_not_obey(
+    server: LoopbackServer, other_server: LoopbackServer, settings: dict[str, Any], obey: bool
+) -> None:
+    for robots in (server, other_server):
+        robots.route("/robots.txt", "User-agent: *\nDisallow: /\n")
+    server.route("/a", status=302, headers=[("Location", other_server.url("/private"))])
+    other_server.route("/private", "<p>private</p>")
+
+    report = await crawl(Pages, settings=settings, urls=[server.url("/a")], obey=obey)
+
+    assert _urls(report.items) == [other_server.url("/private")]
+    assert (_paths(server), _paths(other_server)) == (["/a"], ["/private"])
+
+
+async def test_a_redirect_to_an_origin_whose_robots_txt_is_unreachable_waits_for_it(
+    server: LoopbackServer, other_server: LoopbackServer
+) -> None:
+    answers = [Reply(status=503), Reply("User-agent: *\n")]
+
+    def robots_txt(_request: ReceivedRequest) -> Reply:
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    server.route("/robots.txt", "User-agent: *\n")
+    other_server.route("/robots.txt", handler=robots_txt)
+    server.route("/a", status=302, headers=[("Location", other_server.url("/b"))])
+    other_server.route("/b", "<p>b</p>")
+
+    report = await crawl(Pages, settings=OBEY, urls=[server.url("/a")])
+
+    assert _urls(report.items) == [other_server.url("/b")]
+    assert (_paths(server), _paths(other_server)) == (["/robots.txt", "/a", "/a"], ["/robots.txt", "/robots.txt", "/b"])
+    assert report.stats["robots.deferred"] == 1
+    assert (report.stats["requests.retried"], report.stats["requests.failed"], report.stats["downloads.errors"]) == (
+        0,
+        0,
+        0,
+    )
+
+
+async def test_the_cookies_the_robots_txt_of_a_redirect_sets_reach_the_session_for_the_fetches_after_it(
+    server: LoopbackServer, other_server: LoopbackServer
+) -> None:
+    server.route("/robots.txt", "User-agent: *\n")
+    other_server.route("/robots.txt", "User-agent: *\n", headers=[("Set-Cookie", "visited=1; Path=/")])
+    server.route("/a", status=302, headers=[("Location", other_server.url("/b"))])
+    for path in ("/b", "/c"):
+        other_server.route(path, f"<p>{path}</p>")
+    settings = {**OBEY, "sessions.enabled": True, "sessions.size": 1, "concurrency": 1}
+
+    await crawl(Pages, settings=settings, urls=[server.url("/a"), other_server.url("/c")])
+
+    assert [(hop.path, hop.header("Cookie")) for hop in other_server.received] == [
+        ("/robots.txt", None),
+        ("/b", None),  # with the cookies its fetch started with
+        ("/c", "visited=1"),
+    ]
