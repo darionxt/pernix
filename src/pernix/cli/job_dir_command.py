@@ -17,6 +17,7 @@ from pernix.cli.options import UsageError
 from pernix.errors import JobDirError, SerializationError
 from pernix.frontiers import FrontierCounts, SQLiteFrontier
 from pernix.job_dir import JobDir
+from pernix.logs import Redactor
 from pernix.runner import ExitCode
 from pernix.spider import Spider
 
@@ -30,6 +31,10 @@ __all__ = ["SCHEMA", "add_parser"]
 
 SCHEMA = 1
 """The version of the objects `pernix job-dir --json` writes, raised when a field changes meaning or goes away."""
+
+_REDACTOR = Redactor()
+"""Masks the credentials and the values of sensitive names in the URLs and reasons listed, as the built-in rules of
+the logs find them; the names of `log.redact` and the `Secret` settings are not known, as no settings are loaded."""
 
 
 class _StandIn(Spider):
@@ -105,9 +110,11 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="list the Dead Requests",
         description=(
             "List the Dead Requests, oldest first, one per line: its id, attempts, Callback, URL, and reason, "
-            "separated by tabs; with --json, one JSON object per line. Filters pick some: any of the values given "
-            "for a filter, and every filter given, must match. Exits with 0, 1 when stdout was closed before the "
-            "end, and 2 as status does."
+            "separated by tabs; with --json, one JSON object per line. Credentials in URLs and the values of "
+            "sensitive names, such as token or password, are masked as in the logs, though not the names of "
+            "log.redact or the values of Secret settings, as no settings are loaded. Filters pick some, matching "
+            "the reasons unmasked: any of the values given for a filter, and every filter given, must match. Exits "
+            "with 0, 1 when stdout was closed before the end, and 2 as status does."
         ),
     )
     dead.add_argument("--json", action="store_true", help="print each Dead Request as one JSON object")
@@ -323,9 +330,9 @@ def _json_line(dead: DeadRequest) -> str:
     described = {
         "schema": SCHEMA,
         "id": dead.id,
-        "url": dead.url,
-        "error": dead.error,
-        "reason": dead.reason,
+        "url": _REDACTOR.redact(dead.url),
+        "error": _REDACTOR.redact(dead.error),
+        "reason": _REDACTOR.redact(dead.reason),
         "attempts": dead.attempts,
         "spent": dict(dead.spent),
         "callback": dead.callback,
@@ -336,8 +343,9 @@ def _json_line(dead: DeadRequest) -> str:
 
 
 def _text_line(dead: DeadRequest) -> str:
-    reason = " ".join(dead.reason.splitlines()).replace("\t", " ")  # one line for each Dead Request
-    return f"{dead.id}\t{dead.attempts}\t{dead.callback or 'parse'}\t{dead.url}\t{reason}\n"
+    # Masked first, as a header line is masked to its end, then on one line for each Dead Request.
+    reason = " ".join(_REDACTOR.redact(dead.reason).splitlines()).replace("\t", " ")
+    return f"{dead.id}\t{dead.attempts}\t{dead.callback or 'parse'}\t{_REDACTOR.redact(dead.url)}\t{reason}\n"
 
 
 def _timestamp(moment: dt.datetime) -> str:

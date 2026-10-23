@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import io
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -292,6 +293,35 @@ def test_reasons_are_listed_on_one_line_each(tmp_path: Path, capsys: pytest.Capt
     assert orjson.loads(_job_dir(capsys, "dead", str(tmp_path), "--json")[1])["reason"] == (
         "ValueError: first line\nsecond\tline"
     )
+
+
+class Private(Spider):
+    """Fails on a page whose URL carries a token, naming credentials in its error."""
+
+    name = "private"
+    start_urls = (f"{SITE}/private?token=t-0451&page=1",)
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        raise ValueError(
+            f"no access through http://alice:pw-0451@proxy.example:8080 with api_key=k-0451 to {response.url}"
+        )
+        yield
+
+
+def test_the_listing_masks_credentials_in_urls_and_reasons_which_filters_match_unmasked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _crawl(Private, tmp_path, FakeFetcher({re.compile(rf"{re.escape(SITE)}/private.*"): "<p>private</p>"}))
+    capsys.readouterr()
+
+    text = _job_dir(capsys, "dead", str(tmp_path), "--reason", "api_key=k-0451")[1]
+    listed = orjson.loads(_job_dir(capsys, "dead", str(tmp_path), "--json", "--error", "ValueError")[1])
+
+    masked_url = f"{SITE}/private?token=***&page=1"
+    masked_reason = f"ValueError: no access through http://***@proxy.example:8080 with api_key=*** to {masked_url}"
+    assert text.split("\t")[3:] == [masked_url, masked_reason + "\n"]
+    assert (listed["url"], listed["reason"]) == (masked_url, masked_reason)
+    assert "0451" not in text + json.dumps(listed)
 
 
 class _ClosedStdout:
