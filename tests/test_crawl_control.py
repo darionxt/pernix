@@ -78,12 +78,39 @@ def _paths(server: LoopbackServer) -> list[str]:
     return [request.path for request in server.received]
 
 
+def _control(tmp_path: Path, where: str) -> tuple[dict[str, Any], Path]:
+    """Settings reading a control file, named by `control.file` or the one of a job directory, and the file."""
+    if where == "job_dir":
+        return {"job_dir": str(tmp_path / "job")}, tmp_path / "job" / "control"
+    return {"control.file": str(tmp_path / "state")}, tmp_path / "state"
+
+
+async def _stop_through(control: Path, pages: LoopbackServer, settings: Mapping[str, Any], state: ControlState) -> str:
+    """Run until the first page is in flight, then stop the Run by writing `state` to its control file; how it ended."""
+    entered, gate, applied = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    crawler, _ = _crawler(_spider(pages, entered, gate), {**settings, "stats.interval": 0.01})
+    # The state read is applied before the stats show it, so a snapshot showing it follows the Drain.
+    crawler.events.on(
+        events.StatsSnapshot, lambda event: applied.set() if event.stats.get("control.state") == state else None
+    )
+
+    run = asyncio.create_task(crawler.crawl())
+    async with asyncio.timeout(10):
+        await entered.wait()
+        _write(control, state)
+        if state == "drain":  # the Request in flight finishes once released; a Force Stop cancels it
+            await applied.wait()
+            gate.set()
+        return (await run).reason
+
+
+@pytest.mark.parametrize("where", ["control.file", "job_dir"])
 async def test_writing_paused_to_the_file_pauses_the_run_and_running_resumes_it(
-    pages: LoopbackServer, tmp_path: Path
+    pages: LoopbackServer, tmp_path: Path, where: str
 ) -> None:
     entered, gate, paused = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    state = tmp_path / "state"
-    crawler, emitted = _crawler(_spider(pages, entered, gate), {"control.file": str(state), "stats.interval": 0.01})
+    settings, state = _control(tmp_path, where)
+    crawler, emitted = _crawler(_spider(pages, entered, gate), {**settings, "stats.interval": 0.01})
     crawler.events.on(events.SpiderPaused, lambda _event: paused.set())
     fetched_while_paused: list[list[str]] = []
 
@@ -137,10 +164,12 @@ async def test_writing_drain_or_force_stops_the_run(
     assert emitted == ["SpiderOpened", "SpiderClosed"]
 
 
-async def test_a_run_whose_file_says_paused_starts_paused(pages: LoopbackServer, tmp_path: Path) -> None:
-    path = tmp_path / "state"
-    _write(path, "paused\n")
-    crawler, emitted = _crawler(_spider(pages, asyncio.Event(), _open()), {"control.file": str(path)})
+@pytest.mark.parametrize("where", ["control.file", "job_dir"])
+async def test_a_run_whose_file_says_paused_starts_paused(pages: LoopbackServer, tmp_path: Path, where: str) -> None:
+    settings, path = _control(tmp_path, where)
+    path.parent.mkdir(exist_ok=True)
+    _write(path, "paused\n")  # left there, even by an earlier process of the Run
+    crawler, emitted = _crawler(_spider(pages, asyncio.Event(), _open()), settings)
     fetched_while_paused: list[list[str]] = []
 
     def paused(_event: events.SpiderPaused) -> None:
@@ -157,13 +186,15 @@ async def test_a_run_whose_file_says_paused_starts_paused(pages: LoopbackServer,
     assert emitted == ["SpiderOpened", "SpiderPaused", "SpiderResumed", "SpiderIdle", "SpiderClosed"]
 
 
+@pytest.mark.parametrize("job_dir", [False, True])
 @pytest.mark.parametrize(("state", "reason", "emitted"), [("drain", "drained", 2), ("force", "forced", 0)])
-async def test_a_stop_left_in_the_file_stops_the_next_run_at_once(
-    pages: LoopbackServer, tmp_path: Path, state: ControlState, reason: str, emitted: int
+async def test_a_stop_left_in_a_file_outside_the_job_directory_stops_the_next_run_at_once(
+    pages: LoopbackServer, tmp_path: Path, state: ControlState, reason: str, emitted: int, job_dir: bool
 ) -> None:
     path = tmp_path / "state"
     _write(path, state)
-    crawler, events_emitted = _crawler(_spider(pages, asyncio.Event(), _open()), {"control.file": str(path)})
+    settings = {"control.file": str(path), **({"job_dir": str(tmp_path / "job")} if job_dir else {})}
+    crawler, events_emitted = _crawler(_spider(pages, asyncio.Event(), _open()), settings)
 
     async with asyncio.timeout(10):
         result = await crawler.crawl()
@@ -171,6 +202,64 @@ async def test_a_stop_left_in_the_file_stops_the_next_run_at_once(
     assert result.reason == reason
     assert pages.received == []
     assert len(events_emitted) == emitted  # a Force Stop while opening ends the Run before SpiderOpened
+
+
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("state", ["drain", "force"])
+async def test_a_stop_left_in_the_control_file_of_the_job_directory_does_not_stop_the_resumed_run(
+    pages: LoopbackServer, tmp_path: Path, caplog: pytest.LogCaptureFixture, state: ControlState, named: bool
+) -> None:
+    caplog.set_level(logging.WARNING, logger="pernix")
+    control = tmp_path / "job" / "control"
+    settings = {"job_dir": str(tmp_path / "job"), **({"control.file": str(control)} if named else {})}
+    stopped = await _stop_through(control, pages, settings, state)
+    crawler, emitted = _crawler(_spider(pages, asyncio.Event(), _open()), settings)
+
+    async with asyncio.timeout(10):
+        result = await crawler.crawl()
+
+    assert stopped == {"drain": "drained", "force": "forced"}[state]
+    assert (result.reason, result.stats["run.resumed"], result.stats["control.state"]) == ("finished", 1, "running")
+    assert emitted == ["SpiderOpened", "SpiderIdle", "SpiderClosed"]
+    assert sorted(set(_paths(pages))) == ["/1", "/2", "/3"]
+    warnings = [record.getMessage() for record in caplog.records if record.name == "pernix.control.control_file"]
+    assert warnings == [
+        f"The control file {control} holds {state}, written before this process took the job directory; it is "
+        "ignored until the file is written again"
+    ]
+
+
+async def test_a_stop_left_in_the_control_file_of_the_job_directory_applies_once_written_again(
+    pages: LoopbackServer, tmp_path: Path
+) -> None:
+    settings, control = _control(tmp_path, "job_dir")
+
+    # A Force Stop returns the first page to the Frontier, so the resumed Run fetches it again.
+    assert await _stop_through(control, pages, settings, "force") == "forced"
+    assert await _stop_through(control, pages, settings, "force") == "forced"  # the same state, written again
+
+
+async def test_a_control_file_named_is_read_in_place_of_the_one_of_the_job_directory(
+    pages: LoopbackServer, tmp_path: Path
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    _write(job / "control", "paused")  # which would hold the Run before its first page
+    settings = {"job_dir": str(job), "control.file": str(tmp_path / "state")}
+
+    assert await _stop_through(tmp_path / "state", pages, settings, "drain") == "drained"
+
+
+@pytest.mark.parametrize("job_dir", [False, True])
+async def test_an_empty_control_file_reads_none(pages: LoopbackServer, tmp_path: Path, job_dir: bool) -> None:
+    settings = {"control.file": "", **({"job_dir": str(tmp_path / "job")} if job_dir else {})}
+    crawler, _ = _crawler(_spider(pages, asyncio.Event(), _open()), settings)
+
+    async with asyncio.timeout(10):
+        result = await crawler.crawl()
+
+    assert result.reason == "finished"
+    assert not any(key.startswith("control.") for key in result.stats)
 
 
 async def test_a_pause_made_by_code_is_kept_while_the_file_still_says_running(

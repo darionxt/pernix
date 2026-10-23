@@ -251,6 +251,13 @@ def test_a_time_zone_is_read_from_any_layer(tmp_path: Path) -> None:
     assert _load(tmp_path, environ={"PERNIX_TIMEZONE": "Asia/Tokyo"}).section(CoreSettings).timezone == "Asia/Tokyo"
 
 
+@pytest.mark.parametrize("empty", ["", "."])
+def test_an_empty_job_dir_is_none(tmp_path: Path, empty: str) -> None:
+    assert _load(tmp_path, spider_settings={"job_dir": empty}).section(CoreSettings).job_dir is None
+    assert _load(tmp_path, environ={"PERNIX_JOB_DIR": empty}).section(CoreSettings).job_dir is None
+    assert _load(tmp_path, environ={"PERNIX_JOB_DIR": "jobs/books"}).section(CoreSettings).job_dir == Path("jobs/books")
+
+
 @pytest.mark.parametrize("timezone", ["+08:00", "Mars/Olympus", "posix/Europe/Berlin"])
 def test_a_time_zone_is_an_iana_name_the_system_knows(tmp_path: Path, timezone: str) -> None:
     with pytest.raises(SettingsError) as excinfo:
