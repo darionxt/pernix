@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -11,11 +13,12 @@ import trustme
 from curl_cffi import CurlECode
 
 from cookie_server import CookieServer
-from pernix import Request
-from pernix.errors import FetchError, TooManyRedirects
+from pernix import IgnoreRequest, Request
+from pernix.errors import FetchError, NetworkBlocked, TooManyRedirects
 from pernix.fetchers import HTTPFetcher, HTTPSettings
+from pernix.fetchers.http_fetcher import _checked_redirect  # pyright: ignore[reportPrivateUsage]
 from pernix.fetchers.network_guard import blocking_network
-from pernix.fetchers.redirects import following_at_most
+from pernix.fetchers.redirects import checking_redirects, following_at_most
 from pernix.testing import LoopbackServer
 
 if TYPE_CHECKING:
@@ -287,3 +290,79 @@ async def test_only_the_last_body_is_streamed_and_limited(server: LoopbackServer
     assert (streamed.response.url, body) == (server.url("/end"), b"streamed")
     assert [(hop.url, hop.status) for hop in streamed.response.history] == [(server.url("/start"), 302)]
     assert fetched.body == b"streamed"
+
+
+class Checks:
+    """Records the redirects it checks, refusing those that lead to a path."""
+
+    def __init__(self, refused: str | None = None) -> None:
+        self.refused = refused
+        self.urls: list[str] = []
+
+    async def __call__(self, url: str) -> None:
+        self.urls.append(url)
+        if self.refused is not None and urlsplit(url).path == self.refused:
+            raise IgnoreRequest("refused")
+
+
+async def test_inside_checking_redirects_each_redirect_is_checked_before_it_is_followed(
+    server: LoopbackServer, other_server: LoopbackServer
+) -> None:
+    _redirect(server, "/a", 302, "/b")
+    _redirect(server, "/b", 307, other_server.url("/c"))
+    _answer(other_server, "/c")
+    checks = Checks()
+
+    async with HTTPFetcher() as fetcher:
+        with checking_redirects(checks):
+            response = await fetcher.fetch(Request(server.url("/a")))
+            async with fetcher.stream(Request(server.url("/b"))) as streamed:
+                pass
+        await fetcher.fetch(Request(server.url("/a")))  # outside the block, none is checked
+
+    assert (response.url, streamed.response.url) == (other_server.url("/c"), other_server.url("/c"))
+    assert checks.urls == [server.url("/b"), other_server.url("/c"), other_server.url("/c")]
+
+
+async def test_a_redirect_the_check_refuses_is_not_followed(server: LoopbackServer) -> None:
+    _redirect(server, "/a", 302, "/b")
+    _redirect(server, "/b", 302, "/c")
+    _answer(server, "/c")
+
+    async with HTTPFetcher() as fetcher:
+        with checking_redirects(Checks(refused="/c")), pytest.raises(IgnoreRequest):
+            await fetcher.fetch(Request(server.url("/a")))
+
+    assert [hop.path for hop in server.received] == ["/a", "/b"]
+
+
+async def test_a_redirect_the_network_guard_refuses_is_never_checked(server: LoopbackServer) -> None:
+    server.route("/a", status=302, headers=[("Location", "http://shop.example/b")])
+    checks = Checks()
+
+    async with HTTPFetcher() as fetcher:
+        with blocking_network(), checking_redirects(checks), pytest.raises(NetworkBlocked):
+            await fetcher.fetch(Request(server.url("/a")))
+
+    assert checks.urls == []
+
+
+@pytest.mark.parametrize("refused", [None, "/b"])
+async def test_the_deadline_is_lifted_while_a_redirect_is_checked_and_moved_on_after(refused: str | None) -> None:
+    async with asyncio.timeout(60) as deadline:
+        lifted: list[float | None] = []
+        checks = Checks(refused)
+
+        async def check(url: str) -> None:
+            lifted.append(deadline.when())
+            await checks(url)
+
+        when = deadline.when()
+        assert when is not None
+        with checking_redirects(check), pytest.raises(IgnoreRequest) if refused else contextlib.nullcontext():
+            await _checked_redirect("http://127.0.0.1/b", deadline)
+        moved = deadline.when()
+
+    assert lifted == [None]
+    assert moved is not None
+    assert moved >= when

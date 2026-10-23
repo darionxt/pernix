@@ -18,6 +18,7 @@ from pernix.events import (
     on,
 )
 from pernix.response import Response
+from pernix.sending import NotYet
 
 if TYPE_CHECKING:
     from pernix.middlewares import Download
@@ -67,7 +68,8 @@ class CoreStats:
       Inline Fetches, and their body bytes; the Inline Fetch counts streamed bodies
       as they are read.
     - `downloads.errors`, `downloads.errors_by_type.<ErrorType>`: Exceptions it raised,
-      other than `IgnoreRequest` and `Retry`.
+      other than `IgnoreRequest`, `Retry`, and `NotYet`, which holds a Request back
+      rather than failing it.
     - `responses.received`: Responses handed to Callbacks.
     - `items.scraped`, `items.dropped`, `items.errors`: Items stored, dropped, or failed.
     - `items.retried`, `items.failures_lost`, `items.discarded`: Pipeline calls retried,
@@ -101,7 +103,7 @@ class CoreStats:
         async def counted(request: Request) -> Response:
             try:
                 response = await download(request)
-            except (IgnoreRequest, Retry):
+            except (IgnoreRequest, Retry, NotYet):
                 raise
             except Exception as exc:
                 stats.inc("downloads.errors")

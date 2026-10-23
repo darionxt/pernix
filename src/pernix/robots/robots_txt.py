@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import functools
 import logging
 import time
 from contextvars import ContextVar
@@ -13,7 +14,7 @@ from urllib.parse import urlsplit
 
 from pernix.errors import FetchError, IgnoreRequest, NetworkBlocked, ProxyError, TooManyRedirects
 from pernix.fetchers.fetcher_dispatch import Streams, streaming_into
-from pernix.fetchers.redirects import following_at_most
+from pernix.fetchers.redirects import checking_redirects, following_at_most
 from pernix.frontiers import host_slot
 from pernix.middlewares import Middleware
 from pernix.request import Request
@@ -93,6 +94,16 @@ class RobotsTxt(Middleware):
     that fetched robots.txt, or waited for it, is paced again before it starts, as
     robots.txt took a start of its domain.
 
+    Each redirect of a fetch it checks is checked too, before the Fetcher follows
+    it (`pernix.fetchers.redirects.checking_redirects()`), against the robots.txt
+    of the origin it leads to. That robots.txt is fetched as the fetch's own
+    origin's is, but from within the fetch, so through the download Middleware the
+    fetch is in: one that holds a lock, or a semaphore, across `call_next` waits
+    for itself there forever. The fetch is not paced again for it, and the
+    cookies it sets reach the Session for the fetches that start after it, not the
+    redirect, which goes on with the cookies of its fetch. The fetches it does not
+    check, robots.txt itself included, check no redirect.
+
     What the answer means (RFC 9309 §2.3.1), from the first `PARSE_LIMIT` bytes
     of the body:
 
@@ -111,16 +122,20 @@ class RobotsTxt(Middleware):
       than of the site, and an exception other than a `FetchError`, are raised as
       the Request's own, which is retried as its fetch failing would be.
 
-    A Request the rules disallow raises `IgnoreRequest` with the reason
-    `"robots.txt"`. The `Crawl-delay` of the rules spaces the starts of the
-    fetches of the slot of each Request they are found for, when it is longer than
-    the jittered `domain.delay`, at most `robots.crawl_delay_max`; a slot takes the
-    longest of the origins it fetches.
+    A Request the rules disallow, or a redirect of it, raises `IgnoreRequest`
+    with the reason `"robots.txt"`; while the robots.txt of the origin a redirect
+    leads to is unreachable, the fetch waits as one to that origin would, raising
+    `NotYet` from within the download chain. The `Crawl-delay` of the rules spaces
+    the starts of the fetches of the slot of each Request they are found for, or,
+    for a redirect, of the slot a Request to the URL it leads to would take, when
+    it is longer than the jittered `domain.delay`, at most
+    `robots.crawl_delay_max`; a slot takes the longest of the origins it fetches.
 
     Stats: `robots.fetched`, the fetches of robots.txt; `robots.by_status.<code>`,
     their statuses; `robots.errors_by_type.<ErrorType>`, those that raised;
-    `robots.disallowed`, the fetches disallowed; and `robots.deferred`, the
-    fetches sent to wait for an unreachable robots.txt.
+    `robots.disallowed`, the fetches disallowed, at their start or at a redirect;
+    `robots.redirects_disallowed`, those disallowed at a redirect; and
+    `robots.deferred`, the fetches sent to wait for an unreachable robots.txt.
     """
 
     def __init__(
@@ -155,7 +170,7 @@ class RobotsTxt(Middleware):
         self._clock = clock
         self._origins: dict[str, _Origin] = {}
         self._delays: dict[str, dict[str, float]] = {}  # the Crawl-delay of each origin, by slot
-        for key in ("robots.fetched", "robots.disallowed", "robots.deferred"):
+        for key in ("robots.fetched", "robots.disallowed", "robots.redirects_disallowed", "robots.deferred"):
             stats.set(key, 0)
 
     async def __call__(self, request: Request, call_next: Download) -> Response:
@@ -169,18 +184,20 @@ class RobotsTxt(Middleware):
             The Response.
 
         Raises:
-            pernix.errors.IgnoreRequest: robots.txt disallows the Request.
-            pernix.sending.NotYet: The Request is to wait, as its robots.txt is
-                unreachable, or its domain started cooling down while it waited.
+            pernix.errors.IgnoreRequest: robots.txt disallows the Request, or a
+                redirect of it.
+            pernix.sending.NotYet: The Request is to wait, as its robots.txt, or
+                that of the origin a redirect leads to, is unreachable, or its
+                domain started cooling down while it waited.
             Exception: Fetching robots.txt raised what the Request's own fetch
                 raises too, such as a `ProxyError`.
         """
         origin = _origin(request)
         if origin is None or is_robots_txt(request.url) or not _obeys(request):
-            return await call_next(request)
+            return await _unchecked(request, call_next)
         found = await self._rules(origin, request, call_next)
         if found is None:  # made as part of fetching the origin's robots.txt
-            return await call_next(request)
+            return await _unchecked(request, call_next)
         rules, waited = found
         slot = self._slot_of(request)
         self._space(origin, slot, rules.crawl_delay)
@@ -189,7 +206,35 @@ class RobotsTxt(Middleware):
             raise IgnoreRequest(REASON)
         if waited and not await self._throttle.pace(slot):
             raise NotYet(self._throttle.cooldown_left(slot), "domain cooling down")
-        return await call_next(request)
+        with checking_redirects(functools.partial(self._check_redirect, request, call_next)):
+            return await call_next(request)
+
+    async def _check_redirect(self, request: Request, call_next: Download, url: str) -> None:
+        """Check the URL a redirect of a Request leads to against the robots.txt of its origin, fetching it if due.
+
+        robots.txt is fetched as for a Request to that URL, sent as the Request is;
+        the fetch is not paced again for it, as the redirect is not paced.
+
+        Raises:
+            pernix.errors.IgnoreRequest: robots.txt disallows the URL.
+            pernix.sending.NotYet: robots.txt is unreachable, and no rules are in force.
+            Exception: Fetching robots.txt raised what the Request's own fetch
+                raises too, such as a `ProxyError`.
+        """
+        redirected = request.replace(url=url)
+        origin = _origin(redirected)
+        if origin is None or is_robots_txt(url):
+            return
+        found = await self._rules(origin, redirected, call_next)
+        if found is None:  # made as part of fetching that origin's robots.txt, which it cannot wait for
+            return
+        rules, _waited = found
+        self._space(origin, self._slot_of(redirected), rules.crawl_delay)
+        if not rules.allows(url):
+            self._stats.inc("robots.disallowed")
+            self._stats.inc("robots.redirects_disallowed")
+            logger.debug("robots.txt disallows %s, which %r is redirected to", url, request)
+            raise IgnoreRequest(REASON)
 
     async def _rules(self, origin: str, request: Request, call_next: Download) -> tuple[RobotsRules, bool] | None:
         """The rules in force for an origin, fetching its robots.txt if they are due; and whether it waited for them.
@@ -274,7 +319,7 @@ class RobotsTxt(Middleware):
         """Fetch robots.txt, and read the first `PARSE_LIMIT` bytes of its body; return whether it had more."""
         streams = Streams(0)  # read as it arrives, and closed once the limit is reached
         try:
-            with streaming_into(streams), following_at_most(MAX_REDIRECTS):
+            with streaming_into(streams), following_at_most(MAX_REDIRECTS), checking_redirects(None):
                 response = await call_next(robots)
             transfer = streams.latest if response.streamed else None
             if transfer is None:
@@ -347,6 +392,12 @@ class RobotsTxt(Middleware):
         else:
             delays.pop(origin, None)
         self._throttle.space(slot, max(delays.values(), default=0.0))
+
+
+async def _unchecked(request: Request, call_next: Download) -> Response:
+    """Fetch a Request robots.txt does not apply to, checking none of its redirects."""
+    with checking_redirects(None):
+        return await call_next(request)
 
 
 def _origin(request: Request) -> str | None:
