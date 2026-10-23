@@ -92,10 +92,11 @@ class CoreSettings(Section):
             the exit code, the stats, and the error it failed with; `None` writes
             none. See `pernix.outcome_file.OutcomeFile`.
         job_dir: A directory the Run keeps its Frontier in, with a record of
-            itself, so that running again with it resumes the Run, and where it
-            reads its control file by default (`control.file`); `None`, or an
-            empty path, keeps the Frontier in memory. It must be on a local file
-            system, not a network one. See `pernix.job_dir.JobDir`.
+            itself, so that running again with it resumes the Run, its Feeds
+            written in place and continued, and where it reads its control file
+            by default (`control.file`); `None`, or an empty path, keeps the
+            Frontier in memory. It must be on a local file system, not a network
+            one. See `pernix.job_dir.JobDir`.
         locale: The languages the client presents, in order of preference, as a
             list or a comma-separated string, such as `"de-DE,de,en-US,en"`: the
             browser's `navigator.languages`, from which Chrome makes its
@@ -688,8 +689,10 @@ class FeedSettings(Section):
 
     Attributes:
         feeds: Feeds by path template, as `{path: options}`. A path may contain
-            `{name}` (the Spider), `{run_id}`, and `{time}` (when the Run started,
-            in UTC, such as `20261013T080405Z`).
+            `{name}` (the Spider), `{run_id}`, and `{time}` (when the Run first
+            started, in UTC, such as `20261013T080405Z`). A file appears complete
+            or not at all; with `job_dir`, it is written in place instead, and
+            continued by a resumed Run: see `pernix.feeds.Feed`.
     """
 
     feeds: dict[str, FeedOptions] = msgspec.field(default_factory=dict[str, FeedOptions])

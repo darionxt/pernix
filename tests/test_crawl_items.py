@@ -406,4 +406,6 @@ async def test_invalid_pipelines_and_outputs_fail_before_the_run(tmp_path: Path)
         await Idle.crawl(settings={"pipelines": {NotAPipeline: 1}})
     with pytest.raises(SettingsError, match="cannot infer the feed format"):
         await Idle.crawl(output=tmp_path / "items.txt")
+    with pytest.raises(SettingsError, match=r"invalid path template: KeyError\('who'\)"):
+        await Idle.crawl(output=tmp_path / "{who}.jsonl")
     assert _names(tmp_path) == []

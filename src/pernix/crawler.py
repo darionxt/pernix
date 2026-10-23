@@ -17,8 +17,9 @@ from pernix.addons import addon_settings, load_addons
 from pernix.callbacks import iterate_and_close
 from pernix.component_lifecycle import ComponentLifecycle
 from pernix.components import build_component
-from pernix.errors import CONFIGURATION_ERRORS, JobDirError, SerializationError, SettingsError
+from pernix.errors import CONFIGURATION_ERRORS, FeedError, JobDirError, SerializationError, SettingsError
 from pernix.events import EventBus, SpiderClosed, SpiderOpened
+from pernix.feeds import Feed, render_path
 from pernix.frontiers import SQLiteFrontier
 from pernix.items import ItemStream
 from pernix.job_dir import JobDir, RunRecord
@@ -31,6 +32,7 @@ from pernix.run_result import RunResult
 from pernix.settings import (
     CoreSettings,
     EventSettings,
+    FeedOptions,
     FingerprintSettings,
     LogSettings,
     Section,
@@ -51,7 +53,6 @@ if TYPE_CHECKING:
 
     from pernix.account import Account
     from pernix.engine import Engine
-    from pernix.feeds import Feed
     from pernix.fetchers import StreamedResponse
     from pernix.inline_fetch import InlineFetch
     from pernix.items import ItemProcessor
@@ -195,6 +196,52 @@ class Crawler:
         arguments = spider_arguments(spider_type, args or {})
         spider = create_spider(spider_type, arguments)
         return cls(spider, settings=final, output=output, addons=addons, arguments=arguments)
+
+    def feed(self, template: str, options: FeedOptions | None = None) -> Feed:
+        """Create a Feed of this Run, writing the file a path template names.
+
+        The template's `{name}`, `{run_id}`, and `{time}` are filled in. Without the
+        `job_dir` setting, the Feed writes its file atomically, a temporary file
+        renamed over it once closed. With it, the Feed writes its file in place,
+        each Item flushed as it is written, and the job directory records the file
+        once the Feed has begun it: a resumed Run continues the files its earlier
+        processes began, and replaces any other, as a new Run does. See
+        `pernix.feeds.Feed`.
+
+        Args:
+            template: The path template.
+            options: The format, fields, accepted Items, and encoding.
+
+        Returns:
+            The Feed, not yet open.
+
+        Raises:
+            ValueError: The template is invalid, the format cannot be inferred, the
+                encoding does not allow writing in place, or the file is one the job
+                directory keeps.
+            TypeError: `options.accepts` is neither types nor a function.
+            pernix.errors.FeedError: An earlier process of the Run wrote the file in
+                another format.
+            RuntimeError: The Run has not taken its job directory yet, as before it
+                starts.
+        """
+        try:
+            path = render_path(template, name=self.spider.name, run_id=self.run_id, started=self.started_at)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(f"invalid path template: {exc!r}") from exc
+        if self._job is None:
+            return Feed(path, options)
+        if _within(path, self._job.path) and any(path.resolve() == kept.resolve() for kept in self._job.files):
+            raise ValueError(f"{path} is a file the job directory keeps")
+        recorded = self._job.recorded_feed(path)
+        if recorded is None:
+            return _RecordedFeed(path, options, job=self._job)
+        feed = Feed(path, options, writing="continued")
+        if feed.format != recorded:
+            raise FeedError(
+                f"cannot continue the feed {path}: the Run wrote it as {recorded} before, not as {feed.format}"
+            )
+        return feed
 
     def build_component(self, spec: object) -> object:
         """Construct a component for this Run.
@@ -648,6 +695,33 @@ class Crawler:
             except KeyError:
                 return None
         return None
+
+
+class _RecordedFeed(Feed):
+    """A Feed of a Run with a job directory that writes a new file in place, which it records there once begun.
+
+    Recorded only then, a file is continued by a resumed Run only once a process of
+    the Run replaced it: one that ends before opening its Feeds, as on a
+    configuration error, leaves the files it named as they were, for the Run to
+    replace when it resumes.
+    """
+
+    def __init__(self, path: Path, options: FeedOptions | None, *, job: JobDir) -> None:
+        super().__init__(path, options, writing="in_place")
+        self._job = job
+
+    def open(self) -> None:
+        """Replace the file, begin the format, and record the file in the job directory.
+
+        Raises:
+            pernix.errors.FeedError: The job directory cannot record the file.
+        """
+        super().open()
+        try:
+            self._job.record_feed(self.path, self.format)
+        except OSError as exc:
+            self.close()
+            raise FeedError(f"cannot record the feed {self.path} in the job directory: {exc}") from exc
 
 
 def _log_failure(error: BaseException) -> None:

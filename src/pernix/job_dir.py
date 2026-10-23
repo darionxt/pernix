@@ -47,6 +47,8 @@ class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
             `function`, named by its import path.
         start_exhausted: Whether `Spider.start()` was iterated to its end.
         pernix: The version of Pernix that started the Run.
+        feeds: The files the Feeds of the Run have begun, as resolved paths, with
+            the name of their format, which a resumed Run continues.
     """
 
     run_id: str
@@ -56,6 +58,7 @@ class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
     fingerprint: dict[str, Any] = msgspec.field(default_factory=dict[str, Any])
     start_exhausted: bool = False
     pernix: str = ""
+    feeds: dict[str, str] = msgspec.field(default_factory=dict[str, str])
 
 
 _encoder = msgspec.json.Encoder()
@@ -183,6 +186,39 @@ class JobDir:
         self.record = msgspec.structs.replace(self.record, start_exhausted=True)
         self._write(self.record)
 
+    def recorded_feed(self, path: Path) -> str | None:
+        """The name of the format a Feed of the Run began a file in, or None if none began it.
+
+        Args:
+            path: The file.
+
+        Raises:
+            RuntimeError: The directory is not taken.
+        """
+        if self.record is None or self._lock is None:
+            raise RuntimeError("the job directory is not taken")
+        return self.record.feeds.get(_feed_key(path))
+
+    def record_feed(self, path: Path, format_name: str) -> None:
+        """Record a file a Feed of the Run began, so that a resumed Run continues it.
+
+        Args:
+            path: The file.
+            format_name: The name of the Feed's format.
+
+        Raises:
+            RuntimeError: The directory is not taken.
+            OSError: The record cannot be written.
+        """
+        if self.record is None or self._lock is None:
+            raise RuntimeError("the job directory is not taken")
+        key = _feed_key(path)
+        if self.record.feeds.get(key) == format_name:
+            return
+        feeds = {**self.record.feeds, key: format_name}
+        self.record = msgspec.structs.replace(self.record, feeds=feeds)
+        self._write(self.record)
+
     def release(self) -> None:
         """Release the lock, for another process to take the directory; releasing it again does nothing.
 
@@ -218,6 +254,11 @@ class JobDir:
         finally:
             os.close(file)
         partial.replace(target)
+
+
+def _feed_key(path: Path) -> str:
+    """A Feed's file as `run.json` records it: resolved, so that any path to the same file names it."""
+    return str(path.resolve())
 
 
 def _differences(found: RunRecord, run: RunRecord) -> list[str]:
