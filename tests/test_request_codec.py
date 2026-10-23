@@ -9,7 +9,13 @@ import pytest
 from pernix import Request, Response, Spider
 from pernix.browser import Click, Evaluate, PageMethod, Render, Screenshot, Scroll, Type, WaitFor
 from pernix.errors import SerializationError
-from pernix.request_codec import REQUEST_SCHEMA_VERSION, decode_request, encode_request, method_names
+from pernix.request_codec import (
+    REQUEST_SCHEMA_VERSION,
+    decode_request,
+    encode_request,
+    method_names,
+    stored_callbacks,
+)
 
 URL = "https://example.com/item?id=1"
 
@@ -291,3 +297,15 @@ def test_the_methods_a_request_is_stored_by_are_named() -> None:
         "log_in",
         "close_banner",
     )
+
+
+def test_the_callbacks_of_a_stored_request_are_named_without_its_spider() -> None:
+    shop = Shop()
+
+    assert stored_callbacks(encode_request(Request(URL, callback=shop.parse_item, errback=shop.failed), shop)) == (
+        "parse_item",
+        "failed",
+    )
+    assert stored_callbacks(encode_request(Request(URL), shop)) == (None, None)
+    with pytest.raises(SerializationError, match="not a valid persisted Request"):
+        stored_callbacks(b"\x00not msgpack")

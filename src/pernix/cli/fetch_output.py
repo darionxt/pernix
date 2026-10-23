@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
-import os
 import sys
 from typing import TYPE_CHECKING, Any
 
 import orjson
 
+from pernix.cli.closed_stdout import discard_stdout
 from pernix.cli.page_reading import ReadingOptions, is_text, read
 from pernix.errors import RetriesExhausted
 
@@ -164,9 +163,7 @@ class FetchOutput:
     def _close(self) -> None:
         """Stop writing to the stdout a reader closed, sending what Python still flushes at exit nowhere."""
         self.closed = True
-        with contextlib.suppress(OSError, ValueError, AttributeError):
-            devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
+        discard_stdout()
 
 
 def describe_response(

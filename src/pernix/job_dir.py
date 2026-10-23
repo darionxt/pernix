@@ -123,6 +123,39 @@ class JobDir:
         except (OSError, JobDirError):
             return None
 
+    def take_recorded(self) -> RunRecord:
+        """Take the directory as it is, for a command on the Run recorded there: lock it, and read the record.
+
+        Nothing is created or recorded, but for the lock file, which names this
+        process, as `take()` has it; `control_found` stays `None`, as no Run takes it.
+
+        Returns:
+            The record.
+
+        Raises:
+            JobDirError: The directory does not exist, holds no record of a Run,
+                its record cannot be read, or another process holds it.
+            RuntimeError: The directory was released already.
+        """
+        with self._guard:
+            if self._released:
+                raise RuntimeError("the job directory was released")
+            if not self.path.is_dir():
+                raise JobDirError(f"there is no job directory {self.path}")
+            unrecorded = f"{self.path} is not a job directory: it holds no record of a Run in {_RECORD}"
+            if not (self.path / _RECORD).is_file():  # checked first, so that no lock file is left in it
+                raise JobDirError(unrecorded)
+            self._lock = _locked(self.path / _LOCK)
+            try:
+                found = self._read()
+                if found is None:
+                    raise JobDirError(unrecorded)
+            except BaseException:
+                self._unlock()
+                raise
+            self.record = found
+            return found
+
     def take(self, run: RunRecord) -> RunRecord:
         """Take the directory for a Run: lock it, then record the Run, or check that it continues the one recorded.
 

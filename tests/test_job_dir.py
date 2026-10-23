@@ -195,3 +195,49 @@ def test_the_control_file_is_looked_at_as_the_directory_is_taken(tmp_path: Path)
     status = written.control_path.stat()
     assert (written.control_found.st_ino, written.control_found.st_mtime_ns) == (status.st_ino, status.st_mtime_ns)
     assert "control" in [path.name for path in written.files]
+
+
+def test_a_command_takes_the_directory_as_it_is_creating_nothing(tmp_path: Path) -> None:
+    recorded = _run(start_exhausted=True, feeds={str((tmp_path / "books.jsonl").resolve()): "jsonl"})
+    first = JobDir(tmp_path)
+    first.take(_run())
+    first.record_start_exhausted()
+    first.record_feed(tmp_path / "books.jsonl", "jsonl")
+    first.release()
+    (tmp_path / "control").write_text("paused")
+    before = _contents(tmp_path)
+    job = JobDir(tmp_path)
+
+    assert job.take_recorded() == recorded
+
+    with pytest.raises(JobDirError, match=rf"is used by process {os.getpid()} "):
+        _taken(tmp_path, _run())
+    job.release()
+    after = _contents(tmp_path)
+    assert after.keys() == before.keys()
+    assert {name: after[name] for name in ("run.json", "control")} == {
+        name: before[name] for name in ("run.json", "control")
+    }
+
+
+def test_a_command_refuses_a_directory_that_holds_no_run_and_leaves_it_as_it_was(tmp_path: Path) -> None:
+    (tmp_path / "frontier.db").write_bytes(b"")
+
+    with pytest.raises(JobDirError, match=r"is not a job directory: it holds no record of a Run in run\.json"):
+        JobDir(tmp_path).take_recorded()
+    with pytest.raises(JobDirError, match="there is no job directory"):
+        JobDir(tmp_path / "missing").take_recorded()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["frontier.db"]
+
+
+def test_a_command_refuses_a_directory_another_process_holds(tmp_path: Path) -> None:
+    holder = JobDir(tmp_path)
+    holder.take(_run())
+    before = _contents(tmp_path)
+
+    with pytest.raises(JobDirError, match=rf"is used by process {os.getpid()} on .+ since "):
+        JobDir(tmp_path).take_recorded()
+
+    assert _contents(tmp_path) == before
+    holder.release()
