@@ -20,7 +20,7 @@ from pernix import Request, Response, Spider, events
 from pernix.callbacks import run_callbacks
 from pernix.engine import Engine
 from pernix.errors import SerializationError
-from pernix.frontiers import FrontierCounts, Lease, MemoryFrontier, SQLiteFrontier
+from pernix.frontiers import DeadRequest, FrontierCounts, Lease, MemoryFrontier, SQLiteFrontier, sqlite_frontier
 from pernix.frontiers.sqlite_store import SCHEMA_VERSION
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import RetrySettings
@@ -213,6 +213,99 @@ async def test_dead_requests_keep_their_request_and_reason(opened: Opener, path:
         rows = database.execute("SELECT state, url, reason, worker FROM requests").fetchall()
 
     assert rows == [("dead", URL, "ValueError: cannot parse", "worker-1")]
+
+
+async def _claim_one(frontier: SQLiteFrontier) -> Lease:
+    [lease] = await frontier.claim("worker-1", 1, 30.0)
+    return lease
+
+
+async def test_dead_requests_are_described_oldest_first_without_their_spider(
+    opened: Opener, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sqlite_frontier, "_DEAD_PAGE", 2)  # read over several pages
+    shop = Shop()
+    frontier = opened(shop)
+    await frontier.add([Request(URL + "0")])
+    assert await frontier.nack(await _claim_one(frontier))
+    assert await frontier.nack(await _claim_one(frontier), budget="blocked")
+    assert await frontier.dead(await _claim_one(frontier), "RetriesExhausted: HTTP 503")
+    await frontier.add(
+        [
+            Request(URL + "1", callback=shop.parse_item, errback=shop.failed),
+            Request(URL + "2", callback=shop.parse_item, render=True),
+            Request(URL + "3", callback=shop.parse_gone),
+            Request(URL + "alive"),
+        ]
+    )
+    reasons = ["KeyError: 'price'", "TLSError: bad certificate", "failed"]
+    for reason in reasons:
+        assert await frontier.dead(await _claim_one(frontier), reason)
+    await frontier.close()
+
+    listed = [dead async for dead in opened(Renamed()).dead_requests()]
+
+    assert listed == [
+        DeadRequest("1", URL + "0", "RetriesExhausted: HTTP 503", 2, {"blocked": 1}),
+        DeadRequest("2", URL + "1", "KeyError: 'price'", 1, {}, "parse_item", "failed"),
+        DeadRequest("3", URL + "2", "TLSError: bad certificate", 1, {}, "parse_item", rendered=True),
+        DeadRequest("4", URL + "3", "failed", 1, {}, "parse_gone"),
+    ]
+    assert [dead.error for dead in listed] == ["RetriesExhausted", "KeyError", "TLSError", "failed"]
+
+
+async def test_revived_requests_are_ready_again_their_next_attempt_their_first(opened: Opener, path: Path) -> None:
+    frontier = opened()
+    await frontier.add([Request(URL)])
+    assert await frontier.nack(await _claim_one(frontier))
+    assert await frontier.nack(await _claim_one(frontier), budget="blocked")
+    dead = await _claim_one(frontier)
+    assert (dead.attempt, dead.spent) == (2, {"blocked": 1})
+    assert await frontier.dead(dead, "RetriesExhausted: HTTP 503")
+    await frontier.add([Request(URL + "ready")])
+
+    assert await frontier.revive([dead.id]) == 1
+
+    assert await frontier.counts() == FrontierCounts(ready=2, delayed=0, leased=0, done=0, dead=0)
+    leases = await frontier.claim("worker-1", 2, 30.0)
+    assert [(lease.request.url, lease.attempt, lease.spent) for lease in leases] == [
+        (URL + "ready", 1, {}),  # it queues behind the Requests ready
+        (URL, 1, {}),
+    ]
+    await frontier.close()
+    with _database(path) as database:  # its reason is kept until it is settled again
+        assert database.execute("SELECT reason FROM requests WHERE url = ?", (URL,)).fetchall() == [
+            ("RetriesExhausted: HTTP 503",)
+        ]
+
+
+async def test_only_dead_requests_are_revived(opened: Opener) -> None:
+    frontier = opened()
+    await frontier.add([Request(URL + str(n)) for n in range(4)])
+    done, dead, leased = await frontier.claim("worker-1", 3, 30.0)
+    assert await frontier.ack(done)
+    assert await frontier.dead(dead, "failed")
+
+    assert await frontier.revive(["1", "2", "3", "4", "99"]) == 1
+
+    assert await frontier.counts() == FrontierCounts(ready=2, delayed=0, leased=1, done=1, dead=0)
+    assert await frontier.revive([dead.id]) == 0
+    assert await frontier.renew(leased, 30.0) is not None  # its Lease still holds
+    with pytest.raises(ValueError, match="invalid literal for int"):
+        await frontier.revive(["first"])
+
+
+async def test_reviving_wakes_the_workers_waiting_for_the_frontier(opened: Opener) -> None:
+    frontier = opened()
+    await frontier.add([Request(URL)])
+    lease = await _claim_one(frontier)
+    assert await frontier.dead(lease, "failed")
+    waiting = asyncio.create_task(frontier.wait())  # nothing is due, so it waits for a change
+
+    await frontier.revive([lease.id])
+
+    async with asyncio.timeout(10):
+        await waiting
 
 
 async def test_a_database_of_a_newer_schema_is_refused_naming_both_versions(opened: Opener, path: Path) -> None:
