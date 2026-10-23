@@ -99,8 +99,10 @@ class RobotsTxt(Middleware):
     of the origin it leads to. That robots.txt is fetched as the fetch's own
     origin's is, but from within the fetch, so through the download Middleware the
     fetch is in: one that holds a lock, or a semaphore, across `call_next` waits
-    for itself there forever. The fetch is not paced again for it. The fetches it
-    does not check, robots.txt itself included, check no redirect.
+    for itself there forever. The fetch is not paced again for it, and the
+    cookies it sets reach the Session for the fetches that start after it, not the
+    redirect, which goes on with the cookies of its fetch. The fetches it does not
+    check, robots.txt itself included, check no redirect.
 
     What the answer means (RFC 9309 §2.3.1), from the first `PARSE_LIMIT` bytes
     of the body:

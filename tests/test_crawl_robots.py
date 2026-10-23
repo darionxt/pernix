@@ -391,3 +391,22 @@ async def test_a_redirect_to_an_origin_whose_robots_txt_is_unreachable_waits_for
         0,
         0,
     )
+
+
+async def test_the_cookies_the_robots_txt_of_a_redirect_sets_reach_the_session_for_the_fetches_after_it(
+    server: LoopbackServer, other_server: LoopbackServer
+) -> None:
+    server.route("/robots.txt", "User-agent: *\n")
+    other_server.route("/robots.txt", "User-agent: *\n", headers=[("Set-Cookie", "visited=1; Path=/")])
+    server.route("/a", status=302, headers=[("Location", other_server.url("/b"))])
+    for path in ("/b", "/c"):
+        other_server.route(path, f"<p>{path}</p>")
+    settings = {**OBEY, "sessions.enabled": True, "sessions.size": 1, "concurrency": 1}
+
+    await crawl(Pages, settings=settings, urls=[server.url("/a"), other_server.url("/c")])
+
+    assert [(hop.path, hop.header("Cookie")) for hop in other_server.received] == [
+        ("/robots.txt", None),
+        ("/b", None),  # with the cookies its fetch started with
+        ("/c", "visited=1"),
+    ]
