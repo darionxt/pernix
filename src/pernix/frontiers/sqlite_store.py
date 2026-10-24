@@ -545,10 +545,12 @@ def open_read_only(path: str) -> sqlite3.Connection | None:
     was killed, the database is read with the log, through SQLite's shared-memory
     index, which is not written to (`readonly_shm`). Without a log, it holds every
     change, and is read as a file nothing changes (`immutable`), so that neither the
-    log nor the index is created: should a store open it meanwhile, it writes its log
-    alone, and this connection reads the database as it was last complete. A store
-    that closes as the database is opened takes its log and index away; the database
-    is then read without them, though SQLite may leave an empty log behind.
+    log nor the index is created. Such a connection takes no lock, and does not see
+    a store that opens the database after it was opened, which writes its log alone
+    until it checkpoints into the database; so it is for one read, as of when it was
+    opened, the next read opening the database anew. A store that closes as the
+    database is opened takes its log and index away; the database is then read
+    without them, though SQLite may leave an empty log behind.
 
     No schema is created or migrated: one of any version up to `SCHEMA_VERSION` is
     read as it is.

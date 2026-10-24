@@ -7,10 +7,11 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING
 
 from pernix.errors import SerializationError
 from pernix.fetchers.fetcher_dispatch import is_rendered
@@ -20,9 +21,9 @@ from pernix.frontiers.sqlite_store import FrontierStore, RequestRow, open_read_o
 from pernix.request_codec import decode_request, encode_request, method_names, stored_callbacks
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
+    import sqlite3
+    from collections.abc import AsyncIterator, Callable, Collection, Generator, Iterator, Mapping, Sequence
     from concurrent.futures import Future
-    from types import TracebackType
 
     from pernix.frontiers.frontier import Lease
     from pernix.request import Request
@@ -386,31 +387,34 @@ class FrontierReader:
     Its counts and Dead Requests are read as `SQLiteFrontier.counts()` and
     `dead_requests()` read them, but without first making the delays that passed
     and the Leases that expired ready, nor migrating an older schema, nor creating
-    anything, as `pernix.frontiers.sqlite_store.open_read_only()` tells. Beside a
-    Run, the counts are those of the moment they are read, and the Dead Requests are
-    read a few hundred at a time, each page as it then is, so that the reader never
-    holds back the Run's log. Once it is closed, reading raises `RuntimeError`.
+    anything. Each read opens the database anew, read-only, as
+    `pernix.frontiers.sqlite_store.open_read_only()` tells by what it then finds, and
+    closes it before what it read is handed over: the reader holds nothing between
+    reads, so that it never holds back a Run's log, and a database read as one
+    nothing changes is so read once only, which a Run resumed later may change. The
+    counts are those of the moment they are read, and the Dead Requests are read a
+    few hundred at a time, each page as it then is.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
-        """Open the database read-only.
+        """Check that the database can be read.
 
         Args:
             path: The database file.
 
         Raises:
             pernix.errors.SerializationError: The file is not a Frontier's
-                database, or one of a schema newer than this Pernix reads.
+                database, or one of a schema newer than this Pernix reads, as each
+                read raises too should the database become one.
         """
-        self._connection = open_read_only(os.fspath(path))
-        self._closed = False
+        self._path = os.fspath(path)
+        with self._reading():
+            pass
 
     def counts(self) -> FrontierCounts:
         """Count the Requests in each state, as they are stored: none for a database no Frontier made its schema in."""
-        self._check_open()
-        if self._connection is None:
-            return FrontierCounts(0, 0, 0, 0, 0)
-        return read_counts(self._connection)
+        with self._reading() as connection:
+            return FrontierCounts(0, 0, 0, 0, 0) if connection is None else read_counts(connection)
 
     def dead_requests(self) -> Iterator[DeadRequest]:
         """Yield the Dead Requests, oldest first, as `SQLiteFrontier.dead_requests()` describes them.
@@ -418,33 +422,24 @@ class FrontierReader:
         Yields:
             Each Dead Request.
         """
-        self._check_open()
-        if self._connection is None:
-            return
         after = 0
-        while page := read_dead_page(self._connection, after, _DEAD_PAGE):
+        while True:
+            with self._reading() as connection:
+                page = [] if connection is None else read_dead_page(connection, after, _DEAD_PAGE)
+            if not page:
+                return
             for row in page:
                 yield _dead_request(*row)
             after = page[-1][0]
 
-    def close(self) -> None:
-        """Close the database; closing it again does nothing."""
-        self._closed = True
-        connection, self._connection = self._connection, None
-        if connection is not None:
-            connection.close()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
-    ) -> None:
-        self.close()
-
-    def _check_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("the Frontier reader is closed")
+    @contextmanager
+    def _reading(self) -> Generator[sqlite3.Connection | None]:
+        connection = open_read_only(self._path)
+        try:
+            yield connection
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def _dead_request(

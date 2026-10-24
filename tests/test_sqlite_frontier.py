@@ -674,8 +674,8 @@ async def test_a_database_is_read_as_it_was_left_changing_nothing(opened: Opener
     await (await _left(opened)).close()
     before = _files(path)
 
-    with FrontierReader(path) as frontier:  # long after the delay passed and the Lease expired
-        counts, dead = frontier.counts(), list(frontier.dead_requests())
+    frontier = FrontierReader(path)  # long after the delay passed and the Lease expired
+    counts, dead = frontier.counts(), list(frontier.dead_requests())
 
     assert counts == FrontierCounts(ready=1, delayed=1, leased=1, done=1, dead=1)
     assert dead == [DeadRequest("2", URL + "1", "KeyError: 'price'", 1)]
@@ -686,12 +686,12 @@ async def test_a_database_is_read_as_it_was_left_changing_nothing(opened: Opener
 async def test_a_database_a_frontier_writes_is_read_as_each_change_is_made(opened: Opener, path: Path) -> None:
     frontier = await _left(opened)
 
-    with FrontierReader(path) as reader:
-        first = reader.counts()
-        await frontier.add([Request(URL + "more")])
-        assert await frontier.dead(await _claim_one(frontier), "failed")
-        later = reader.counts()
-        dead = [request.url for request in reader.dead_requests()]
+    reader = FrontierReader(path)
+    first = reader.counts()
+    await frontier.add([Request(URL + "more")])
+    assert await frontier.dead(await _claim_one(frontier), "failed")
+    later = reader.counts()
+    dead = [request.url for request in reader.dead_requests()]
 
     assert (first.ready, first.dead) == (1, 1)
     assert (later.ready, later.dead) == (1, 2)
@@ -723,8 +723,7 @@ def test_a_database_a_killed_process_left_is_read_with_its_log_changing_nothing(
     before = _files(path)
     assert {"frontier.db-wal", "frontier.db-shm"} <= before.keys()
 
-    with FrontierReader(path) as frontier:
-        counts = frontier.counts()
+    counts = FrontierReader(path).counts()
 
     assert counts == FrontierCounts(ready=2, delayed=0, leased=1, done=0, dead=0)
     assert _files(path) == before
@@ -740,8 +739,8 @@ async def test_a_database_of_schema_version_1_is_read_as_it_is(opened: Opener, p
         database.execute("PRAGMA user_version = 1")
     before = _files(path)
 
-    with FrontierReader(path) as reader:
-        counts, dead = reader.counts(), list(reader.dead_requests())
+    reader = FrontierReader(path)
+    counts, dead = reader.counts(), list(reader.dead_requests())
 
     assert (counts.dead, [request.url for request in dead]) == (1, [URL])
     assert _files(path) == before
@@ -767,8 +766,8 @@ def test_a_file_that_is_not_a_frontiers_database_is_refused_and_an_empty_one_hol
 
     with pytest.raises(SerializationError, match=r"is not a Frontier database: file is not a database"):
         FrontierReader(path)
-    with FrontierReader(empty) as reader:
-        assert (reader.counts(), list(reader.dead_requests())) == (FrontierCounts(0, 0, 0, 0, 0), [])
+    reader = FrontierReader(empty)
+    assert (reader.counts(), list(reader.dead_requests())) == (FrontierCounts(0, 0, 0, 0, 0), [])
     assert sorted(file.name for file in path.parent.iterdir()) == ["empty.db", "frontier.db"]
     assert empty.read_bytes() == b""
 
@@ -778,17 +777,27 @@ async def test_a_database_whose_log_went_away_as_it_was_opened_is_read_without_i
     (path.with_name("frontier.db-wal")).write_bytes(b"")  # as left by a Frontier closing as it was opened
     before = _files(path)
 
-    with FrontierReader(path) as frontier:
-        assert frontier.counts().ready == 1
+    assert FrontierReader(path).counts().ready == 1
 
     assert _files(path) == before
 
 
-def test_a_closed_reader_reads_nothing(path: Path) -> None:
-    path.write_bytes(b"")
-    reader = FrontierReader(path)
-    reader.close()
-    reader.close()
+@pytest.mark.parametrize("closed", [True, False], ids=["closed since", "still open"])
+async def test_dead_requests_listed_as_a_run_resumes_are_read_as_each_page_then_is(
+    opened: Opener, path: Path, monkeypatch: pytest.MonkeyPatch, closed: bool
+) -> None:
+    monkeypatch.setattr(sqlite_frontier, "_DEAD_PAGE", 2)
+    frontier = opened()
+    await frontier.add([Request(URL + str(n)) for n in range(6)])
+    for _ in range(6):
+        assert await frontier.dead(await _claim_one(frontier), "failed")
+    await frontier.close()
+    listing = FrontierReader(path).dead_requests()
+    first = [next(listing).id for _ in range(2)]  # read from the database as no Run had it open
 
-    with pytest.raises(RuntimeError, match="the Frontier reader is closed"):
-        reader.counts()
+    resumed = opened()
+    assert await resumed.revive(["3", "6"]) == 2
+    if closed:
+        await resumed.close()  # which writes its log into the database
+
+    assert first + [dead.id for dead in listing] == ["1", "2", "4", "5"]

@@ -306,11 +306,9 @@ def _read(job: JobDir) -> Generator[FrontierReader | None]:
         yield None
         return
     try:
-        frontier = FrontierReader(job.frontier_path)
+        yield FrontierReader(job.frontier_path)
     except SerializationError as exc:  # the database is not one this Pernix reads
         raise JobDirError(str(exc)) from exc
-    with frontier:
-        yield frontier
 
 
 def _list(frontier: FrontierReader, selection: _Selection, *, json: bool) -> bool:
