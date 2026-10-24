@@ -25,6 +25,9 @@ HOSTS = ("127.0.0.1", "::1", "localhost", "app.localhost", "intranet")
 _TLS_HANDSHAKE = 0x16
 """The first byte of a TLS connection."""
 
+_ACCEPT_POLL = 0.05
+"""Seconds the server waits for a connection before checking whether it is stopped."""
+
 
 @dataclass(frozen=True)
 class Received:
@@ -76,6 +79,8 @@ class CookieServer:
     def __post_init__(self) -> None:
         family = socket.AF_INET6 if ":" in self.address else socket.AF_INET
         self._socket = socket.create_server((self.address, 0), family=family)
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
         self._tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         self.ca.issue_cert(*HOSTS).configure_cert(self._tls)
         self._tls.set_alpn_protocols(["h2", "http/1.1"])
@@ -103,21 +108,27 @@ class CookieServer:
         return f"{scheme}://{self._authority(host or self.address)}{path}"
 
     def __enter__(self) -> Self:
-        threading.Thread(target=self._serve, daemon=True).start()
+        self._socket.settimeout(_ACCEPT_POLL)  # closing the socket would not wake an accept() on Linux
+        self._thread.start()
         return self
 
     def __exit__(self, *_exc: object) -> None:
+        self._stopped.set()
+        self._thread.join(timeout=5)
         self._socket.close()
 
     def _authority(self, host: str) -> str:
         return f"[{host}]:{self.port}" if ":" in host else f"{host}:{self.port}"
 
     def _serve(self) -> None:
-        while True:
+        while not self._stopped.is_set():
             try:
                 connection, _ = self._socket.accept()
+            except TimeoutError:
+                continue
             except OSError:
                 return  # closed
+            connection.settimeout(None)
             threading.Thread(target=self._answer, args=(connection,), daemon=True).start()
 
     def _answer(self, connection: socket.socket) -> None:
