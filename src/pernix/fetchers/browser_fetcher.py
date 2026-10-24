@@ -96,8 +96,12 @@ _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
 
 _NET_ERROR = re.compile(r"net::(ERR_[A-Z0-9_]+)")
 
-_PAGE_GONE = ("Target crashed", "Page crashed", "Target page, context or browser has been closed")
-"""Parts of the messages of patchright's errors for a page that went away."""
+_PAGE_GONE = ("Target crashed", "Page crashed", "Target page, context or browser has been closed", "net::ERR_ABORTED")
+"""Parts of the messages of patchright's errors for a page that went away, or may have.
+
+Chrome aborts the navigation of a page whose renderer died, so a navigation that
+failed with `net::ERR_ABORTED` may tell of a crash, as the `crash` event comes later.
+"""
 
 _NET_ERROR_KINDS: tuple[tuple[str, type[FetchError]], ...] = (
     ("ERR_PROXY_", ProxyError),

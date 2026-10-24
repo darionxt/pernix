@@ -63,6 +63,27 @@ async def test_a_page_whose_renderer_dies_fails_with_page_crashed(
     assert stats.get("browser.contexts_open") == 0
 
 
+async def test_a_page_whose_renderer_dies_before_its_document_arrives_fails_with_page_crashed(
+    server: LoopbackServer,
+) -> None:
+    document = Held()
+    server.route("/late", handler=document)
+    server.route("/", "<p>up</p>", headers=HTML)
+    stats = Stats()
+
+    async with BrowserFetcher(stats=stats) as fetcher:
+        loading = asyncio.create_task(fetcher.fetch(_render(server.url("/late"))))
+        await document.wait(loading)
+        kill(renderers())  # Chrome aborts the navigation, with net::ERR_ABORTED, before the page's crash event
+        with pytest.raises((PageCrashed, BrowserLost), match=r"http://127\.0\.0\.1:\d+/late"):
+            await loading
+        document.release.set()
+        response = await fetcher.fetch(_render(server.url("/")))
+
+    assert response.css("p::text").get() == "up"
+    assert stats.get("browser.contexts_open") == 0
+
+
 async def test_a_browser_that_dies_fails_its_fetches_with_browser_lost_and_the_next_starts_another(
     server: LoopbackServer, held: Held
 ) -> None:
