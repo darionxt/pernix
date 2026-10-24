@@ -594,7 +594,8 @@ class Crawler:
         async with aclosing(iterate_and_close(self.spider.start())) as requests:
             async for request in requests:
                 yield request
-        await asyncio.to_thread(job.record_start_exhausted)
+        # Here, as a Feed records its file, not in a thread, which a Drain cancelling the seeding would leave writing.
+        job.record_start_exhausted()
 
     def _write_outcome(self, run_log: RunLog, reason: str, error: BaseException | None = None) -> None:
         """Write the outcome file, if the `outcome_file` setting names one that no other output writes.
