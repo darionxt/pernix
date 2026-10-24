@@ -6,10 +6,13 @@ import asyncio
 import datetime as dt
 import io
 import json
+import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 from contextlib import closing
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -19,6 +22,7 @@ import pytest
 from pernix import Request, Spider
 from pernix.cli import main
 from pernix.errors import TLSError
+from pernix.frontiers import SQLiteFrontier
 from pernix.job_dir import JobDir, RunRecord
 from pernix.testing import FakeFetcher, crawl, make_response
 
@@ -117,6 +121,7 @@ def test_status_tells_the_run_and_how_many_of_its_requests_are_in_each_state(
         f"First started: {started}",
         f"Started by: Pernix {record['pernix']}",
         "start(): iterated to its end",
+        "Held by: no process",
         "Requests: 0 ready, 0 delayed, 0 leased, 3 done, 3 dead",
     ]
     code, out, _ = _job_dir(capsys, "status", str(job), "--json")
@@ -128,6 +133,7 @@ def test_status_tells_the_run_and_how_many_of_its_requests_are_in_each_state(
         "started_at": started,
         "start_exhausted": True,
         "pernix": record["pernix"],
+        "holder": None,
         "requests": {"ready": 0, "delayed": 0, "leased": 0, "done": 3, "dead": 3},
     }
 
@@ -217,22 +223,103 @@ def test_reviving_needs_filters_or_all(job: Path, capsys: pytest.CaptureFixture[
     assert _job_dir(capsys, "revive", str(job), "--all")[2] == f"Revived Dead Requests in {job}: 0 of 0.\n"
 
 
-def test_a_job_directory_a_run_holds_is_refused_with_exit_code_2_and_left_as_it_was(
-    job: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    holder = JobDir(job)
-    recorded = holder.peek()
-    assert recorded is not None
-    holder.take(recorded)  # as the Run resumed from it does
-    before = _contents(job)
-    try:
-        for command in (["status"], ["dead"], ["revive", "--all"]):
-            code, out, err = _job_dir(capsys, *command, str(job))
+class Held(Spider):
+    """Holds the Callback of its one page until released, as a Run still at work does."""
 
-            assert (code, out) == (2, "")
-            assert f"Error: the job directory {job} is used by process " in err
+    name = "held"
+    start_urls = (f"{SITE}/index",)
+    working: ClassVar[threading.Event]
+    released: ClassVar[threading.Event]
+
+    async def parse(self, response: Response) -> AsyncIterator[Any]:
+        type(self).working.set()
+        await asyncio.to_thread(type(self).released.wait, 30)
+        yield {"page": response.url}
+
+
+@pytest.fixture
+def held() -> Iterator[type[Held]]:
+    Held.working, Held.released = threading.Event(), threading.Event()
+    yield Held
+    Held.released.set()
+
+
+def test_a_job_directory_a_run_holds_is_read_naming_it_and_the_run_goes_on_but_not_revived(
+    tmp_path: Path, held: type[Held], capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = tmp_path / "job"
+    reports: list[CrawlReport] = []
+    run = threading.Thread(target=lambda: reports.append(_crawl(held, job, FakeFetcher({f"{SITE}/index": "<p>i</p>"}))))
+    run.start()
+    try:
+        assert held.working.wait(30)
+        lock = (job / "lock").read_bytes()
+        code, out, _ = _job_dir(capsys, "status", str(job))
+        assert code == 0
+        assert re.fullmatch(
+            rf"process {os.getpid()} on {re.escape(socket.gethostname())} since \S+",
+            out.splitlines()[5].removeprefix("Held by: "),
+        )
+        assert out.splitlines()[6:] == [
+            "Requests: 0 ready, 0 delayed, 1 leased, 0 done, 0 dead",
+            "Counts: as they are at this moment; the Run holding the directory goes on changing them",
+        ]
+        code, out, _ = _job_dir(capsys, "status", str(job), "--json")
+        described = orjson.loads(out)
+        assert (code, described["holder"]["pid"], described["holder"]["host"]) == (0, os.getpid(), socket.gethostname())
+        assert described["requests"]["leased"] == 1
+        assert _job_dir(capsys, "dead", str(job))[:2] == (0, "")
+        code, out, err = _job_dir(capsys, "revive", str(job), "--all")
+        assert (code, out) == (2, "")
+        assert f"Error: the job directory {job} is used by process {os.getpid()} " in err
+        assert (job / "lock").read_bytes() == lock
     finally:
-        holder.release()
+        held.released.set()
+        run.join(30)
+
+    [report] = reports
+    assert (report.reason, report.items) == ("finished", [{"page": f"{SITE}/index"}])
+    code, out, _ = _job_dir(capsys, "status", str(job))
+    assert out.splitlines()[5:] == ["Held by: no process", "Requests: 0 ready, 0 delayed, 0 leased, 1 done, 0 dead"]
+
+
+def test_reading_a_job_directory_leaves_every_file_in_it_as_it_was(
+    job: Path, shelf: type[Shelf], capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def leave_a_lease() -> None:
+        spider = shelf()
+        frontier = SQLiteFrontier(job / "frontier.db", spider, clock=lambda: 1_000.0)
+        await frontier.add([Request(f"{SITE}/book/5", callback=spider.parse_book)])
+        await frontier.claim("killed", 1, 30.0)  # its Lease expired long ago, in 1970
+        await frontier.close()
+
+    asyncio.run(leave_a_lease())
+    (job / "lock").write_bytes(b"process 1 on elsewhere since 2026-10-21T08:00:00Z\n")
+    before = _contents(job)
+
+    code, out, _ = _job_dir(capsys, "status", str(job))
+
+    assert code == 0
+    assert out.splitlines()[5:] == [
+        "Held by: no process",
+        "Requests: 0 ready, 0 delayed, 1 leased, 3 done, 3 dead",
+        "Leased: 1, left in flight by a process that ended; the next Run makes them ready again, each counting an "
+        "attempt",
+    ]
+    assert _job_dir(capsys, "status", str(job), "--json")[0] == 0
+    assert len(_job_dir(capsys, "dead", str(job))[1].splitlines()) == 3
+    assert _job_dir(capsys, "dead", str(job), "--json")[0] == 0
+    assert _contents(job) == before
+
+
+def test_a_frontier_of_an_older_schema_is_read_as_it_is(job: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    with closing(sqlite3.connect(job / "frontier.db", autocommit=True)) as database:  # as version 1 left it
+        database.execute("ALTER TABLE requests DROP COLUMN methods")
+        database.execute("PRAGMA user_version = 1")
+    before = _contents(job)
+
+    assert "Requests: 0 ready, 0 delayed, 0 leased, 3 done, 3 dead" in _job_dir(capsys, "status", str(job))[1]
+    assert len(_job_dir(capsys, "dead", str(job))[1].splitlines()) == 3
 
     assert _contents(job) == before
 

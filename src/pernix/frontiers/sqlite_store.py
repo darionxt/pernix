@@ -12,6 +12,10 @@ slot by its head rather than by each of its Requests.
 holds its schema version, `SCHEMA_VERSION` for the databases this Pernix creates. A new
 database is created at version 1 and migrated as an older one is, in the transaction
 that opens it.
+
+`open_read_only()` opens a database to read it as it is, changing nothing in it or
+beside it, also while a `FrontierStore` writes it; `read_counts()` and
+`read_dead_page()` read it, as `FrontierStore` does.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import os
 import sqlite3
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pernix.errors import SerializationError
@@ -32,7 +37,7 @@ if TYPE_CHECKING:
 
     from pernix.request import Request
 
-__all__ = ["SCHEMA_VERSION", "FrontierStore", "RequestRow"]
+__all__ = ["SCHEMA_VERSION", "FrontierStore", "RequestRow", "open_read_only", "read_counts", "read_dead_page"]
 
 SCHEMA_VERSION = 2
 """The version of the database schema this Pernix creates and reads."""
@@ -255,11 +260,7 @@ class FrontierStore:
             JSON, whether it is rendered, and the Request as stored.
         """
         with self._transaction() as (connection, _):
-            return connection.execute(
-                "SELECT id, url, reason, attempts, spent, rendered, request FROM requests "
-                "WHERE state = 'dead' AND id > ? ORDER BY id LIMIT ?",
-                (after, limit),
-            ).fetchall()
+            return read_dead_page(connection, after, limit)
 
     def revive(self, ids: Sequence[int]) -> int:
         """Make Dead Requests ready again, in order, with no attempt counted and no retry under any budget.
@@ -356,8 +357,7 @@ class FrontierStore:
     def counts(self) -> FrontierCounts:
         """Count the Requests in each state; see `Frontier.counts()`."""
         with self._transaction() as (connection, _):
-            counts: dict[str, int] = dict(connection.execute("SELECT state, requests FROM counts").fetchall())
-        return FrontierCounts(counts["ready"], counts["delayed"], counts["leased"], counts["done"], counts["dead"])
+            return read_counts(connection)
 
     def next_due(self) -> float | None:
         """Return when the next delay passes or Lease expires, if any."""
@@ -416,20 +416,11 @@ class FrontierStore:
 
     def _check_schema(self, connection: sqlite3.Connection) -> None:
         """Create the schema in a new database, or check that this Pernix can read the existing one; migrate either."""
-        [(application_id,)] = connection.execute("PRAGMA application_id").fetchall()
-        [(version,)] = connection.execute("PRAGMA user_version").fetchall()
-        [(objects,)] = connection.execute("SELECT count(*) FROM sqlite_schema").fetchall()
-        if (application_id, version, objects) == (0, 0, 0):
+        version = _schema_version(connection, self._path)
+        if version is None:
             connection.executescript(_SCHEMA)
             connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
             version = 1
-        elif application_id != _APPLICATION_ID:
-            raise SerializationError(f"{self._path} is not a Frontier database")
-        elif version > SCHEMA_VERSION:
-            raise SerializationError(
-                f"the Frontier database {self._path} has schema version {version}, but this Pernix reads "
-                f"version {SCHEMA_VERSION} and older; upgrade Pernix to resume this Run"
-            )
         for later in range(version + 1, SCHEMA_VERSION + 1):
             connection.execute(_MIGRATIONS[later])
         if version < SCHEMA_VERSION:
@@ -545,6 +536,99 @@ class FrontierStore:
     def _next_due(self, connection: sqlite3.Connection) -> float | None:
         [(due,)] = connection.execute("SELECT min(due) FROM requests WHERE due IS NOT NULL").fetchall()
         return due
+
+
+def open_read_only(path: str) -> sqlite3.Connection | None:
+    """Open a Frontier's database to read it as it is, changing nothing in it or beside it, also while it is written.
+
+    Next to its write-ahead log, as while a `FrontierStore` has it open, or once one
+    was killed, the database is read with the log, through SQLite's shared-memory
+    index, which is not written to (`readonly_shm`). Without a log, it holds every
+    change, and is read as a file nothing changes (`immutable`), so that neither the
+    log nor the index is created: should a store open it meanwhile, it writes its log
+    alone, and this connection reads the database as it was last complete. A store
+    that closes as the database is opened takes its log and index away; the database
+    is then read without them, though SQLite may leave an empty log behind.
+
+    No schema is created or migrated: one of any version up to `SCHEMA_VERSION` is
+    read as it is.
+
+    Args:
+        path: The database file.
+
+    Returns:
+        The connection, each query read on its own; `None` for a database no
+        `FrontierStore` made its schema in yet, which holds no Requests.
+
+    Raises:
+        SerializationError: The file is not a Frontier's database, or one of a
+            schema newer than this Pernix reads.
+    """
+    database = Path(path).resolve()
+    if os.path.exists(f"{database}-wal"):
+        try:
+            return _read_only(database, "readonly_shm=1", path)
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode != sqlite3.SQLITE_CANTOPEN or os.path.exists(f"{database}-shm"):
+                raise
+    return _read_only(database, "immutable=1", path)
+
+
+def read_counts(connection: sqlite3.Connection) -> FrontierCounts:
+    """Count the Requests in each state, as the triggers keep them in `counts`."""
+    counts: dict[str, int] = dict(connection.execute("SELECT state, requests FROM counts").fetchall())
+    return FrontierCounts(counts["ready"], counts["delayed"], counts["leased"], counts["done"], counts["dead"])
+
+
+def read_dead_page(
+    connection: sqlite3.Connection, after: int, limit: int
+) -> list[tuple[int, str, str, int, str, int, bytes]]:
+    """Read the Dead Requests stored after another, oldest first; see `FrontierStore.dead_page()`."""
+    return connection.execute(
+        "SELECT id, url, reason, attempts, spent, rendered, request FROM requests "
+        "WHERE state = 'dead' AND id > ? ORDER BY id LIMIT ?",
+        (after, limit),
+    ).fetchall()
+
+
+def _read_only(database: Path, mode: str, path: str) -> sqlite3.Connection | None:
+    connection = sqlite3.connect(f"{database.as_uri()}?mode=ro&{mode}", uri=True, autocommit=True)
+    try:
+        version = _schema_version(connection, path)
+    except sqlite3.DatabaseError as exc:
+        connection.close()
+        if exc.sqlite_errorcode == sqlite3.SQLITE_NOTADB:
+            raise SerializationError(f"{path} is not a Frontier database: {exc}") from exc
+        raise
+    except BaseException:
+        connection.close()
+        raise
+    if version is None:
+        connection.close()
+        return None
+    return connection
+
+
+def _schema_version(connection: sqlite3.Connection, path: str) -> int | None:
+    """The schema version of a Frontier's database; `None` for an empty one, in which no Frontier made its schema.
+
+    Raises:
+        SerializationError: The database is not a Frontier's, or its schema is newer
+            than this Pernix reads.
+    """
+    [(application_id,)] = connection.execute("PRAGMA application_id").fetchall()
+    [(version,)] = connection.execute("PRAGMA user_version").fetchall()
+    [(objects,)] = connection.execute("SELECT count(*) FROM sqlite_schema").fetchall()
+    if (application_id, version, objects) == (0, 0, 0):
+        return None
+    if application_id != _APPLICATION_ID:
+        raise SerializationError(f"{path} is not a Frontier database")
+    if version > SCHEMA_VERSION:
+        raise SerializationError(
+            f"the Frontier database {path} has schema version {version}, but this Pernix reads "
+            f"version {SCHEMA_VERSION} and older; upgrade Pernix to resume this Run"
+        )
+    return version
 
 
 def _create_private(path: str) -> None:
