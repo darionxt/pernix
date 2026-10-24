@@ -49,7 +49,7 @@ def drivers() -> list[psutil.Process]:
 
 def browsers() -> list[psutil.Process]:
     """The browsers' own processes, which the drivers started."""
-    return [child for driver in drivers() for child in driver.children()]
+    return [child for driver in drivers() for child in _children(driver)]
 
 
 def renderers() -> list[psutil.Process]:
@@ -73,5 +73,12 @@ async def gone(processes: list[psutil.Process]) -> list[psutil.Process]:
 def _command(process: psutil.Process) -> str:
     try:
         return " ".join(process.cmdline())
-    except psutil.Error:
+    except (psutil.Error, SystemError):  # psutil 7.2.2 raises SystemError, on macOS, for a process ending meanwhile
         return ""
+
+
+def _children(process: psutil.Process) -> list[psutil.Process]:
+    try:
+        return process.children()
+    except psutil.Error:  # it ended meanwhile
+        return []
