@@ -11,7 +11,7 @@ import pytest
 from pernix.fetchers.page_intl import present_intl
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from patchright.async_api import BrowserContext, Page
 
@@ -26,26 +26,45 @@ RELATED = {
 
 
 class DevTools:
-    """A stand-in for a page's DevTools session: it records the commands sent, and fails those it is told to."""
+    """A stand-in for a page's DevTools session: it records the commands sent, and fails those it is told to.
+
+    It lists the targets it is given, the page's own context being `own`, and
+    attaches to them as Chrome does, telling of the attach before it answers.
+    """
 
     def __init__(
-        self, failing: Callable[[str, dict[str, Any]], Exception | None] = lambda _method, _params: None
+        self,
+        failing: Callable[[str, dict[str, Any]], Exception | None] = lambda _method, _params: None,
+        *,
+        targets: Sequence[dict[str, Any]] = (),
     ) -> None:
         self.sent: list[tuple[str, dict[str, Any]]] = []
         self.handlers: dict[str, Callable[[dict[str, Any]], None]] = {}
         self.arriving: asyncio.Queue[tuple[tuple[str, ...], str]] = asyncio.Queue()
         self._failing = failing
+        self._targets = list(targets)
 
     def on(self, event: str, handler: Callable[[dict[str, Any]], None]) -> None:
         self.handlers[event] = handler
 
-    async def send(self, method: str, params: dict[str, Any]) -> None:
+    async def send(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.sent.append((method, params))
         route, command = _unwrapped(method, params)
         self.arriving.put_nowait((route, command["method"]))
         failure = self._failing(method, params)
         if failure is not None:
             raise failure
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": "page", "type": "page", "browserContextId": "own"}}
+        if method == "Target.getTargets":
+            return {"targetInfos": self._targets}
+        if method == "Target.attachToTarget":
+            [info] = [target for target in self._targets if target["targetId"] == params["targetId"]]
+            session = f"{info['targetId']} attached"
+            event = {"sessionId": session, "targetInfo": info, "waitingForDebugger": False}
+            self.handlers["Target.attachedToTarget"](event)
+            return {"sessionId": session}
+        return {}
 
     def attach(self, session: str, kind: str, *, through: tuple[str, ...] = ()) -> None:
         """Tell of a target attached, through the targets of `through`, outermost first."""
@@ -69,8 +88,9 @@ class DevTools:
 
 
 class Context:
-    def __init__(self, devtools: DevTools) -> None:
+    def __init__(self, devtools: DevTools, *, service_workers: int = 0) -> None:
         self.devtools = devtools
+        self.service_workers = [object()] * service_workers  # those running, as patchright lists them
 
     async def new_cdp_session(self, _page: object) -> DevTools:
         return self.devtools
@@ -85,9 +105,13 @@ def _unwrapped(method: str, params: dict[str, Any]) -> tuple[tuple[str, ...], di
     return tuple(route), command
 
 
-async def _present(devtools: DevTools, *, timezone: str | None = "Europe/Berlin") -> None:
-    context = cast("BrowserContext", Context(devtools))
+async def _present(devtools: DevTools, *, timezone: str | None = "Europe/Berlin", service_workers: int = 0) -> None:
+    context = cast("BrowserContext", Context(devtools, service_workers=service_workers))
     await present_intl(context, cast("Page", object()), locale="de-DE", timezone=timezone)
+
+
+def _service_worker(target: str, *, context: str = "own") -> dict[str, Any]:
+    return {"targetId": target, "type": "service_worker", "browserContextId": context}
 
 
 async def _arrived(devtools: DevTools, method: str, count: int) -> list[tuple[str, ...]]:
@@ -111,6 +135,36 @@ async def test_the_page_takes_the_locale_and_its_cross_site_frames_and_service_w
     await _present(devtools)
 
     assert devtools.commands() == [((), *LOCALE), ((), "Target.setAutoAttach", RELATED)]
+
+
+async def test_the_running_service_workers_of_its_context_take_both_before_the_page_navigates() -> None:
+    page = {"targetId": "page", "type": "page", "browserContextId": "own"}
+    devtools = DevTools(targets=[page, _service_worker("worker"), _service_worker("elsewhere", context="other")])
+
+    await _present(devtools, service_workers=1)
+
+    assert devtools.commands()[2:] == [
+        ((), "Target.getTargetInfo", {}),
+        ((), "Target.getTargets", {}),
+        ((), "Target.attachToTarget", {"targetId": "worker", "flatten": False}),
+        (("worker attached",), *LOCALE),
+        (("worker attached",), *TIMEZONE),
+        (("worker attached",), "Runtime.runIfWaitingForDebugger", {}),
+    ]
+
+
+async def test_a_running_service_worker_that_stops_before_it_is_attached_is_left_out() -> None:
+    def failing(method: str, params: dict[str, Any]) -> Exception | None:
+        if method == "Target.attachToTarget" and params["targetId"] == "stopped":
+            return RuntimeError("No target with given id found")
+        return None
+
+    devtools = DevTools(failing, targets=[_service_worker("stopped"), _service_worker("running")])
+
+    await _present(devtools, service_workers=2)
+
+    ran = [route for route, method, _params in devtools.commands() if method == "Runtime.runIfWaitingForDebugger"]
+    assert ran == [("running attached",)]
 
 
 async def test_a_page_whose_process_holds_the_locale_already_goes_on() -> None:
