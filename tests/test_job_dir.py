@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
+import socket
 import stat
 import subprocess
 import sys
@@ -10,13 +12,17 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import pytest
 
+from pernix import job_dir
 from pernix.errors import JobDirError
 from pernix.job_dir import JobDir, RunRecord
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 STARTED = dt.datetime(2026, 10, 22, 8, 0, tzinfo=dt.UTC)
+EARLIER_HOLDER = b"process 1 on elsewhere since 2026-10-21T08:00:00Z\n"
+"""The lock file as a process that held the directory before left it."""
 
 
 def _run(**changes: Any) -> RunRecord:
@@ -135,6 +141,7 @@ def test_a_run_that_does_not_continue_the_one_recorded_is_refused_with_what_diff
     tmp_path: Path, changes: dict[str, Any], problems: list[str]
 ) -> None:
     _taken(tmp_path, _run())
+    (tmp_path / "lock").write_bytes(EARLIER_HOLDER)
     before = _contents(tmp_path)
 
     with pytest.raises(JobDirError) as raised:
@@ -168,6 +175,90 @@ def test_a_record_that_cannot_be_read_is_refused(tmp_path: Path) -> None:
     assert job.peek() is None
     with pytest.raises(JobDirError, match=r"the record of the Run in .+run\.json cannot be read: "):
         _taken(tmp_path, _run())
+
+
+def _take(path: Path) -> None:
+    _taken(path, _run())
+
+
+def _take_recorded(path: Path) -> None:
+    job = JobDir(path)
+    try:
+        job.take_recorded()
+    finally:
+        job.release()
+
+
+@pytest.mark.parametrize("lock", [None, EARLIER_HOLDER], ids=["without a lock file", "with an earlier holder's"])
+@pytest.mark.parametrize(
+    ("files", "take"),
+    [
+        ({"frontier.db": b""}, _take),
+        ({"run.json": b'{"run_id": 1}'}, _take),
+        ({"run.json": msgspec.json.encode(_run(run_id="r0"))}, _take),
+        ({"frontier.db": b""}, _take_recorded),
+        ({"run.json": b'{"run_id": 1}'}, _take_recorded),
+    ],
+    ids=[
+        "a Frontier but no record",
+        "a record that cannot be read",
+        "another Run",
+        "a command, no record",
+        "a command, a record that cannot be read",
+    ],
+)
+def test_a_take_refused_for_what_the_directory_holds_leaves_every_file_as_it_was_creating_none(
+    tmp_path: Path, files: dict[str, bytes], take: Callable[[Path], object], lock: bytes | None
+) -> None:
+    for name, data in files.items():
+        (tmp_path / name).write_bytes(data)
+    if lock is not None:
+        (tmp_path / "lock").write_bytes(lock)
+    before = _contents(tmp_path)
+
+    with pytest.raises(JobDirError):
+        take(tmp_path)
+
+    assert _contents(tmp_path) == before
+
+
+def test_a_run_recorded_meanwhile_is_checked_again_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    locked = job_dir._locked
+    left: dict[str, bytes] = {}
+
+    def taken_meanwhile(path: Path) -> int:
+        """Let another process take the directory between the check of this one and its lock."""
+        monkeypatch.setattr(job_dir, "_locked", locked)
+        _taken(tmp_path, _run(run_id="r0"))
+        left.update(_contents(tmp_path))
+        return locked(path)
+
+    monkeypatch.setattr(job_dir, "_locked", taken_meanwhile)
+
+    with pytest.raises(JobDirError, match=r"holds the Run 'r0' of the Spider 'books', which this Run"):
+        _taken(tmp_path, _run())
+
+    assert _contents(tmp_path) == left
+
+
+@pytest.mark.parametrize("take", [lambda job: job.take(_run()), JobDir.take_recorded], ids=["a Run", "a command"])
+def test_a_process_refused_names_the_one_that_took_the_directory_since_another(
+    tmp_path: Path, take: Callable[[JobDir], object]
+) -> None:
+    _taken(tmp_path, _run())
+    (tmp_path / "lock").write_bytes(EARLIER_HOLDER)
+    holder = JobDir(tmp_path)
+    take(holder)
+
+    try:
+        with pytest.raises(
+            JobDirError, match=rf"is used by process {os.getpid()} on {re.escape(socket.gethostname())} since "
+        ):
+            _taken(tmp_path, _run())
+    finally:
+        holder.release()
 
 
 def test_a_directory_released_before_it_is_taken_is_not_taken(tmp_path: Path) -> None:
