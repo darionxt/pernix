@@ -18,11 +18,14 @@ import socket
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 
 from pernix.errors import JobDirError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 __all__ = ["JobDir", "RunRecord"]
 
@@ -94,7 +97,7 @@ class JobDir:
         self._lock: int | None = None
         self._released = False
         self._guard = threading.Lock()
-        """Lets `release()` wait for a `take()` in progress, so that the lock it takes is not left held."""
+        """Lets `release()` wait for a `take()` or a write in progress: no lock is left held, nothing written after."""
 
     @property
     def frontier_path(self) -> Path:
@@ -134,7 +137,8 @@ class JobDir:
 
         Raises:
             JobDirError: The directory does not exist, holds no record of a Run,
-                its record cannot be read, or another process holds it.
+                its record cannot be read, or another process holds it. Nothing in
+                it was changed.
             RuntimeError: The directory was released already.
         """
         with self._guard:
@@ -142,17 +146,7 @@ class JobDir:
                 raise RuntimeError("the job directory was released")
             if not self.path.is_dir():
                 raise JobDirError(f"there is no job directory {self.path}")
-            unrecorded = f"{self.path} is not a job directory: it holds no record of a Run in {_RECORD}"
-            if not (self.path / _RECORD).is_file():  # checked first, so that no lock file is left in it
-                raise JobDirError(unrecorded)
-            self._lock = _locked(self.path / _LOCK)
-            try:
-                found = self._read()
-                if found is None:
-                    raise JobDirError(unrecorded)
-            except BaseException:
-                self._unlock()
-                raise
+            found = self._lock_checked(self._recorded)
             self.record = found
             return found
 
@@ -163,7 +157,9 @@ class JobDir:
         existing one keeps its permissions. A Run continues the one recorded if it
         has its `run_id` and its Spider, and, where both are known, its Spider
         arguments and the settings of its Fingerprints. As soon as the lock is held,
-        the control file is looked at, for `control_found`.
+        the control file is looked at, for `control_found`. The lock file names this
+        process once the directory is taken, not before, so that a Run refused
+        leaves it as it was, or leaves none.
 
         Args:
             run: The Run of this process, as it would be recorded.
@@ -184,40 +180,32 @@ class JobDir:
 
     def _take(self, run: RunRecord) -> RunRecord:
         self.path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._lock = _locked(self.path / _LOCK)
-        try:
-            control = _status(self.control_path)  # at once, as anything written from now on is for this process
-            found = self._read()
-            if found is None:
-                if self.frontier_path.exists():
-                    raise JobDirError(
-                        f"the job directory {self.path} holds a Frontier, but no record of its Run in {_RECORD}"
-                    )
-                self._write(run)
-                self.record, self.resumed, self.control_found = run, False, control
-                return run
-            problems = _differences(found, run)
-            if problems:
-                raise JobDirError(
-                    f"the job directory {self.path} holds the Run {found.run_id!r} of the Spider {found.spider!r}, "
-                    "which this Run does not continue:\n" + "\n".join(f"  - {problem}" for problem in problems)
-                )
+        # Under the lock, the control file comes first, as anything written to it from then on is for this process.
+        control, found = self._lock_checked(lambda: (_status(self.control_path), self._continued(run)))
+        if found is not None:
             self.record, self.resumed, self.control_found = found, True, control
             return found
+        try:
+            self._write(run)
         except BaseException:
             self._unlock()
             raise
+        self.record, self.resumed, self.control_found = run, False, control
+        return run
 
     def record_start_exhausted(self) -> None:
         """Record that `Spider.start()` was iterated to its end, so that a resumed Run does not iterate it again.
 
+        A `release()` in another thread waits for the record to be written.
+
         Raises:
             RuntimeError: The directory is not taken.
         """
-        if self.record is None or self._lock is None:
-            raise RuntimeError("the job directory is not taken")
-        self.record = msgspec.structs.replace(self.record, start_exhausted=True)
-        self._write(self.record)
+        with self._guard:
+            if self.record is None or self._lock is None:
+                raise RuntimeError("the job directory is not taken")
+            self.record = msgspec.structs.replace(self.record, start_exhausted=True)
+            self._write(self.record)
 
     def recorded_feed(self, path: Path) -> str | None:
         """The name of the format a Feed of the Run began a file in, or None if none began it.
@@ -235,6 +223,8 @@ class JobDir:
     def record_feed(self, path: Path, format_name: str) -> None:
         """Record a file a Feed of the Run began, so that a resumed Run continues it.
 
+        A `release()` in another thread waits for the record to be written.
+
         Args:
             path: The file.
             format_name: The name of the Feed's format.
@@ -243,19 +233,21 @@ class JobDir:
             RuntimeError: The directory is not taken.
             OSError: The record cannot be written.
         """
-        if self.record is None or self._lock is None:
-            raise RuntimeError("the job directory is not taken")
-        key = _feed_key(path)
-        if self.record.feeds.get(key) == format_name:
-            return
-        feeds = {**self.record.feeds, key: format_name}
-        self.record = msgspec.structs.replace(self.record, feeds=feeds)
-        self._write(self.record)
+        with self._guard:
+            if self.record is None or self._lock is None:
+                raise RuntimeError("the job directory is not taken")
+            key = _feed_key(path)
+            if self.record.feeds.get(key) == format_name:
+                return
+            feeds = {**self.record.feeds, key: format_name}
+            self.record = msgspec.structs.replace(self.record, feeds=feeds)
+            self._write(self.record)
 
     def release(self) -> None:
         """Release the lock, for another process to take the directory; releasing it again does nothing.
 
-        A `take()` running in another thread is waited for, so that the lock it takes is released too.
+        A `take()` or a write of the record running in another thread is waited for, so that the lock it
+        takes is released too, and nothing is written in the directory once it is released.
         """
         with self._guard:
             self._released = True
@@ -265,6 +257,67 @@ class JobDir:
         lock, self._lock = self._lock, None
         if lock is not None:
             os.close(lock)  # which releases the lock
+
+    def _lock_checked[T](self, check: Callable[[], T]) -> T:
+        """Lock the directory, check it with `check`, and only then write in the lock file that this process holds it.
+
+        `check` reads the directory, raising `JobDirError` to refuse it, which is
+        then left as it was, its lock file included. Without a lock file, which no
+        process then holds, `check` runs before the lock too, so that a directory it
+        refuses is not given one; it runs again under the lock, as another process
+        may have taken the directory meanwhile.
+
+        Returns:
+            What `check` returns under the lock.
+
+        Raises:
+            JobDirError: Another process holds the directory, which the error names,
+                or `check` refused it.
+        """
+        path = self.path / _LOCK
+        if not path.exists():
+            check()
+        self._lock = _locked(path)
+        try:
+            checked = check()
+            _name_holder(self._lock)
+        except BaseException:
+            self._unlock()
+            raise
+        return checked
+
+    def _continued(self, run: RunRecord) -> RunRecord | None:
+        """The record that `run` continues, or `None` if the directory holds no Run yet; nothing is changed.
+
+        Raises:
+            JobDirError: The directory records another Run, holds a Frontier but no
+                record, or its record cannot be read.
+        """
+        found = self._read()
+        if found is None:
+            if self.frontier_path.exists():
+                raise JobDirError(
+                    f"the job directory {self.path} holds a Frontier, but no record of its Run in {_RECORD}"
+                )
+            return None
+        problems = _differences(found, run)
+        if problems:
+            raise JobDirError(
+                f"the job directory {self.path} holds the Run {found.run_id!r} of the Spider {found.spider!r}, "
+                "which this Run does not continue:\n" + "\n".join(f"  - {problem}" for problem in problems)
+            )
+        return found
+
+    def _recorded(self) -> RunRecord:
+        """The record of the Run the directory holds, for a command on it; nothing is changed.
+
+        Raises:
+            JobDirError: The directory holds no record of a Run, or it cannot be read.
+        """
+        found = self._read() if (self.path / _RECORD).is_file() else None
+        if found is None:
+            raise JobDirError(f"{self.path} is not a job directory: it holds no record of a Run in {_RECORD}")
+        return found
 
     def _read(self) -> RunRecord | None:
         try:
@@ -329,7 +382,7 @@ def _status(path: Path) -> os.stat_result | None:
 
 
 def _locked(path: Path) -> int:
-    """Open and lock the lock file, writing who holds it.
+    """Open and lock the lock file, creating it if it is missing, but writing nothing in it.
 
     Raises:
         JobDirError: Another process holds it; the error names that process.
@@ -344,10 +397,14 @@ def _locked(path: Path) -> int:
     except BaseException:
         os.close(lock)
         raise
+    return lock
+
+
+def _name_holder(lock: int) -> None:
+    """Write in the lock file held that this process holds it, for another process refused to name it."""
     since = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     os.ftruncate(lock, 0)
     os.write(lock, f"process {os.getpid()} on {socket.gethostname()} since {since}\n".encode())
-    return lock
 
 
 if sys.platform == "win32":
