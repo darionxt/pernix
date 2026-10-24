@@ -127,6 +127,33 @@ async def test_start_iterated_to_its_end_is_not_iterated_again(tmp_path: Path, c
     assert report.stats.get("requests.dropped_by_reason.duplicate") is None
 
 
+async def test_the_end_of_start_is_recorded_before_the_run_ends_however_long_writing_it_takes(
+    tmp_path: Path, chain: type[Chain], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chain.drain_at = 1  # at once, which cancels the seeding if the end of start() is still being written
+    run_thread = threading.current_thread()
+    ended, written = threading.Event(), threading.Event()
+    late: list[bool] = []
+    write = JobDir._write
+
+    def write_slowly(job: JobDir, record: RunRecord) -> None:
+        """Write the end of start() from a thread other than the Run's only once the Run ended, as a slow disk may."""
+        if record.start_exhausted and threading.current_thread() is not run_thread:
+            ended.wait(30)
+        write(job, record)
+        if record.start_exhausted:
+            late.append(ended.is_set())
+            written.set()
+
+    monkeypatch.setattr(JobDir, "_write", write_slowly)
+
+    await crawl(chain, fetcher=_site(1), settings=_settings(tmp_path))
+    ended.set()
+
+    assert await asyncio.to_thread(written.wait, 30)
+    assert late == [False]
+
+
 class Seeds(Spider):
     """Yields three pages from `start()`, draining the Run the first time once the second is parsed."""
 
