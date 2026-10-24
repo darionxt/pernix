@@ -46,7 +46,7 @@ async def test_a_page_whose_renderer_dies_fails_with_page_crashed(
 
     async with BrowserFetcher(stats=stats) as fetcher:
         loading = asyncio.create_task(fetcher.fetch(_render(server.url("/held")), session=session))
-        await held.wait()
+        await held.wait(loading)
         kill(renderers())
         # A browser can stall once its renderers die, on a loaded runner, until its health probe finds it lost.
         with pytest.raises((PageCrashed, BrowserLost), match=r"http://127\.0\.0\.1:\d+/held") as failed:
@@ -63,6 +63,27 @@ async def test_a_page_whose_renderer_dies_fails_with_page_crashed(
     assert stats.get("browser.contexts_open") == 0
 
 
+async def test_a_page_whose_renderer_dies_before_its_document_arrives_fails_with_page_crashed(
+    server: LoopbackServer,
+) -> None:
+    document = Held()
+    server.route("/late", handler=document)
+    server.route("/", "<p>up</p>", headers=HTML)
+    stats = Stats()
+
+    async with BrowserFetcher(stats=stats) as fetcher:
+        loading = asyncio.create_task(fetcher.fetch(_render(server.url("/late"))))
+        await document.wait(loading)
+        kill(renderers())  # Chrome aborts the navigation, with net::ERR_ABORTED, before the page's crash event
+        with pytest.raises((PageCrashed, BrowserLost), match=r"http://127\.0\.0\.1:\d+/late"):
+            await loading
+        document.release.set()
+        response = await fetcher.fetch(_render(server.url("/")))
+
+    assert response.css("p::text").get() == "up"
+    assert stats.get("browser.contexts_open") == 0
+
+
 async def test_a_browser_that_dies_fails_its_fetches_with_browser_lost_and_the_next_starts_another(
     server: LoopbackServer, held: Held
 ) -> None:
@@ -70,7 +91,7 @@ async def test_a_browser_that_dies_fails_its_fetches_with_browser_lost_and_the_n
 
     async with BrowserFetcher(stats=stats) as fetcher:
         loading = asyncio.create_task(fetcher.fetch(_render(server.url("/held"))))
-        await held.wait()
+        await held.wait(loading)
         first = descendants()
         kill(browsers())
         with pytest.raises(BrowserLost, match="the browser disconnected"):
@@ -89,7 +110,7 @@ async def test_a_driver_that_dies_takes_its_browser_with_it(server: LoopbackServ
 
     async with BrowserFetcher(stats=stats) as fetcher:
         loading = asyncio.create_task(fetcher.fetch(_render(server.url("/held"))))
-        await held.wait()
+        await held.wait(loading)
         first = descendants()
         kill(drivers())
         with pytest.raises(BrowserLost, match="patchright's driver died"):
@@ -107,15 +128,16 @@ async def test_a_browser_that_stops_answering_is_killed_with_its_driver(
     server: LoopbackServer, held: Held, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(browser_generations, "PROBE_INTERVAL", 0.2)
-    monkeypatch.setattr(browser_generations, "PROBE_TIMEOUT", 0.5)
     stats = Stats()
 
     async with BrowserFetcher(stats=stats) as fetcher:
         loading = asyncio.create_task(fetcher.fetch(_render(server.url("/held"))))
-        await held.wait()
+        await held.wait(loading)
         first = descendants()
         [browser] = browsers()
         os.kill(browser.pid, signal.SIGSTOP)  # its driver waits for it, as for one that hangs
+        # Only once it is stopped: one loading its page on a slow runner may answer a probe later than this.
+        monkeypatch.setattr(browser_generations, "PROBE_TIMEOUT", 0.5)
         with pytest.raises(BrowserLost, match="the browser stopped answering"):
             await loading
         held.release.set()

@@ -54,7 +54,7 @@ async def test_a_run_retries_the_requests_a_dead_process_failed_and_completes(
         server.route(path, f"<p>{path}</p>", headers=HTML)
 
     running = asyncio.create_task(crawl(Pages, base=server.url("").rstrip("/")))
-    await held.wait()
+    await held.wait(running)
     kill(victims())
     held.release.set()
     report = await running
