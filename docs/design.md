@@ -666,7 +666,7 @@ The `HTTPFetcher`, registered as `http`, registers the `http.*` settings.
 | Driver process dies | No event tells of it: an error of a fetch that names the closed connection, or a driver process that ended, as its health probe finds, loses the Generation as above |
 | Browser or driver stops answering | A health probe that gets no answer within 10 s loses the Generation as above, and its driver is killed, so that what waits for it, cancelled or not, ends |
 
-patchright may fail a call before it emits the event of what failed it, so an error that names a closed page, browser, or driver waits up to a second for the event, and becomes `PageCrashed` or `BrowserLost` if it comes. So does a navigation that failed with `net::ERR_ABORTED`: Chrome aborts the navigation of a page whose renderer died, before the page's `crash` event.
+patchright may fail a call before it emits the event of what failed it, so an error that names a closed page, browser, or driver waits up to a second for the event, and becomes `PageCrashed` or `BrowserLost` if it comes. So does a navigation that failed with `net::ERR_ABORTED`: Chrome aborts the navigation of a page whose renderer died, before the page's `crash` event. The error of a Callback that keeps its page, which may come of a fetch in another browser, is judged by the state of the page's own Generation, read again once that second has passed, as a driver killed closes its connection before its process ends.
 
 **Defaults**
 

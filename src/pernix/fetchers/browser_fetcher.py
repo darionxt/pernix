@@ -767,6 +767,7 @@ class BrowserFetcher:
                 if generation.lost is None and generation.launched.processes is None:
                     await self._generations.ask(generation)  # its driver's process cannot tell whether it died
                 await first_tripped([opened.crash, generation.tripwire], within=GRACE)
+                self._generations.check(generation)  # a driver killed closes its connection before its process ends
             if opened.crash.reason is not None:
                 return PageCrashed(f"the page of {url}, kept for its Callback, crashed")
             return generation.lost_error(url)
