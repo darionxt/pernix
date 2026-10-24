@@ -7,6 +7,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -269,6 +270,65 @@ def test_a_directory_released_before_it_is_taken_is_not_taken(tmp_path: Path) ->
         job.take(_run())
 
     assert _taken(tmp_path, _run()).run_id == "r1"  # no lock was left held
+
+
+class _Guard:
+    """A lock in place of the guard of a job directory, which tells when a thread has to wait for it."""
+
+    def __init__(self, waited: threading.Event) -> None:
+        self._lock = threading.Lock()
+        self._waited = waited
+
+    def __enter__(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            self._waited.set()
+            self._lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._lock.release()
+
+
+@pytest.mark.parametrize(
+    "record",
+    [JobDir.record_start_exhausted, lambda job: job.record_feed(job.path / "books.jsonl", "jsonl")],
+    ids=["the end of start()", "a Feed"],
+)
+def test_a_record_written_as_the_directory_is_released_is_written_first_and_none_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: Callable[[JobDir], object]
+) -> None:
+    job = JobDir(tmp_path)
+    job.take(_run())
+    writing, go = threading.Event(), threading.Event()
+    events: list[str] = []
+    write = JobDir._write
+
+    def held_write(self: JobDir, written: RunRecord) -> None:
+        """Write once `release()` waits for it, or returned without waiting."""
+        writing.set()
+        go.wait(30)
+        write(self, written)
+        events.append("written while taken" if self._lock is not None else "written once released")
+
+    def release() -> None:
+        job.release()
+        events.append("released")
+        go.set()
+
+    monkeypatch.setattr(JobDir, "_write", held_write)
+    monkeypatch.setattr(job, "_guard", _Guard(waited=go))
+    recording = threading.Thread(target=record, args=(job,))
+    recording.start()
+    assert writing.wait(30)
+    releasing = threading.Thread(target=release)
+    releasing.start()
+    recording.join(30)
+    releasing.join(30)
+
+    assert events == ["written while taken", "released"]
+    before = _contents(tmp_path)
+    with pytest.raises(RuntimeError, match="the job directory is not taken"):
+        record(job)
+    assert _contents(tmp_path) == before
 
 
 def test_the_control_file_is_looked_at_as_the_directory_is_taken(tmp_path: Path) -> None:

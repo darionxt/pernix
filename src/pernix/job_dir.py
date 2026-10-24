@@ -97,7 +97,7 @@ class JobDir:
         self._lock: int | None = None
         self._released = False
         self._guard = threading.Lock()
-        """Lets `release()` wait for a `take()` in progress, so that the lock it takes is not left held."""
+        """Lets `release()` wait for a `take()` or a write in progress: no lock is left held, nothing written after."""
 
     @property
     def frontier_path(self) -> Path:
@@ -196,13 +196,16 @@ class JobDir:
     def record_start_exhausted(self) -> None:
         """Record that `Spider.start()` was iterated to its end, so that a resumed Run does not iterate it again.
 
+        A `release()` in another thread waits for the record to be written.
+
         Raises:
             RuntimeError: The directory is not taken.
         """
-        if self.record is None or self._lock is None:
-            raise RuntimeError("the job directory is not taken")
-        self.record = msgspec.structs.replace(self.record, start_exhausted=True)
-        self._write(self.record)
+        with self._guard:
+            if self.record is None or self._lock is None:
+                raise RuntimeError("the job directory is not taken")
+            self.record = msgspec.structs.replace(self.record, start_exhausted=True)
+            self._write(self.record)
 
     def recorded_feed(self, path: Path) -> str | None:
         """The name of the format a Feed of the Run began a file in, or None if none began it.
@@ -220,6 +223,8 @@ class JobDir:
     def record_feed(self, path: Path, format_name: str) -> None:
         """Record a file a Feed of the Run began, so that a resumed Run continues it.
 
+        A `release()` in another thread waits for the record to be written.
+
         Args:
             path: The file.
             format_name: The name of the Feed's format.
@@ -228,19 +233,21 @@ class JobDir:
             RuntimeError: The directory is not taken.
             OSError: The record cannot be written.
         """
-        if self.record is None or self._lock is None:
-            raise RuntimeError("the job directory is not taken")
-        key = _feed_key(path)
-        if self.record.feeds.get(key) == format_name:
-            return
-        feeds = {**self.record.feeds, key: format_name}
-        self.record = msgspec.structs.replace(self.record, feeds=feeds)
-        self._write(self.record)
+        with self._guard:
+            if self.record is None or self._lock is None:
+                raise RuntimeError("the job directory is not taken")
+            key = _feed_key(path)
+            if self.record.feeds.get(key) == format_name:
+                return
+            feeds = {**self.record.feeds, key: format_name}
+            self.record = msgspec.structs.replace(self.record, feeds=feeds)
+            self._write(self.record)
 
     def release(self) -> None:
         """Release the lock, for another process to take the directory; releasing it again does nothing.
 
-        A `take()` running in another thread is waited for, so that the lock it takes is released too.
+        A `take()` or a write of the record running in another thread is waited for, so that the lock it
+        takes is released too, and nothing is written in the directory once it is released.
         """
         with self._guard:
             self._released = True
