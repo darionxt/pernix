@@ -8,15 +8,22 @@ ends, so a process killed leaves none behind. Locks and SQLite's shared memory a
 not reliable on network file systems, such as NFS or SMB, so the directory belongs
 on a local one. A Platform may write `control` there, the state it wants the Run in,
 which the Run reads by default; Pernix never writes it.
+
+Whether a process holds the directory is told by testing its lock for an instant,
+under a gate, a lock of its own, which a process taking the directory waits for
+when it finds the lock held, so that the test never refuses it.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import socket
 import sys
 import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,9 +32,9 @@ import msgspec
 from pernix.errors import JobDirError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
-__all__ = ["JobDir", "RunRecord"]
+__all__ = ["Holder", "JobDir", "RunRecord"]
 
 _RECORD = "run.json"
 _FRONTIER = "frontier.db"
@@ -66,6 +73,24 @@ class RunRecord(msgspec.Struct, kw_only=True, frozen=True):
 
 _encoder = msgspec.json.Encoder()
 _decoder = msgspec.json.Decoder(RunRecord)
+
+
+@dataclass(frozen=True, slots=True)
+class Holder:
+    """The process that holds a job directory, as its lock file names it.
+
+    Each is `None` when the lock file does not name it, as for an instant after a
+    process took the directory, before it wrote its name.
+
+    Attributes:
+        pid: Its process id.
+        host: The name of its host.
+        since: When it took the directory, in UTC, to the second.
+    """
+
+    pid: int | None = None
+    host: str | None = None
+    since: dt.datetime | None = None
 
 
 class JobDir:
@@ -125,6 +150,46 @@ class JobDir:
             return self._read()
         except (OSError, JobDirError):
             return None
+
+    def read_record(self) -> RunRecord:
+        """Read the Run recorded without taking the directory, also while a Run holds it; nothing is changed.
+
+        The record is replaced at once when it changes, so it is read whole.
+
+        Returns:
+            The record.
+
+        Raises:
+            JobDirError: The directory does not exist, holds no record of a Run,
+                or its record cannot be read.
+        """
+        if not self.path.is_dir():
+            raise JobDirError(f"there is no job directory {self.path}")
+        return self._recorded()
+
+    def holder(self) -> Holder | None:
+        """Tell which process holds the directory, without taking it; nothing is changed.
+
+        The lock is tested for an instant, under the gate, so that a process taking
+        the directory meanwhile waits for the test rather than being refused.
+
+        Returns:
+            The process, as the lock file names it, or `None` if no process holds
+            the directory. For an instant after a process took the directory, the
+            lock file names none, or still the process that held it before.
+        """
+        try:
+            lock = os.open(self.path / _LOCK, os.O_RDONLY)
+        except FileNotFoundError:
+            return None  # a process makes it before it holds the directory
+        try:
+            with _gate(lock, self.path):
+                if _locks(lock):
+                    _unlock_file(lock)
+                    return None
+                return _holder(_holder_line(lock))
+        finally:
+            os.close(lock)
 
     def take_recorded(self) -> RunRecord:
         """Take the directory as it is, for a command on the Run recorded there: lock it, and read the record.
@@ -384,20 +449,52 @@ def _status(path: Path) -> os.stat_result | None:
 def _locked(path: Path) -> int:
     """Open and lock the lock file, creating it if it is missing, but writing nothing in it.
 
+    The lock found held is tried once more under the gate, as a process testing it
+    holds it for an instant, under the gate, and so no longer once the gate is had.
+
     Raises:
         JobDirError: Another process holds it; the error names that process.
     """
     lock = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        _lock(lock)
-    except OSError:
-        holder = os.read(lock, 512).decode(errors="replace").strip() or "another process"
-        os.close(lock)
-        raise JobDirError(f"the job directory {path.parent} is used by {holder}") from None
+        if not _locks(lock):
+            with _gate(lock, path.parent):
+                if not _locks(lock):
+                    holder = _holder_line(lock) or "another process"
+                    raise JobDirError(f"the job directory {path.parent} is used by {holder}")
     except BaseException:
         os.close(lock)
         raise
     return lock
+
+
+def _locks(lock: int) -> bool:
+    """Lock the lock file if no process holds it; whether it did."""
+    try:
+        _lock(lock)
+    except OSError:
+        return False
+    return True
+
+
+def _holder_line(lock: int) -> str:
+    """The line the lock file holds, which names the process that last took the directory."""
+    return os.read(lock, 512).decode(errors="replace").strip()
+
+
+_HOLDER = re.compile(r"process (\d+) on (\S+) since (\S+)")
+
+
+def _holder(line: str) -> Holder:
+    """The process a line of the lock file names; nothing of it when the line does not name one."""
+    named = _HOLDER.fullmatch(line)
+    if named is None:
+        return Holder()
+    try:
+        since = dt.datetime.strptime(named[3], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
+    except ValueError:
+        since = None
+    return Holder(int(named[1]), named[2], since)
 
 
 def _name_holder(lock: int) -> None:
@@ -412,11 +509,29 @@ if sys.platform == "win32":
 
     _LOCKED_BYTE = 1 << 30
     """The byte locked, beyond the text, which other processes can then read."""
+    _GATE_BYTE = _LOCKED_BYTE + 1
+    """The byte of the gate, which is held for an instant only."""
 
     def _lock(lock: int) -> None:
-        os.lseek(lock, _LOCKED_BYTE, os.SEEK_SET)
+        _locking(lock, _LOCKED_BYTE, msvcrt.LK_NBLCK)
+
+    def _unlock_file(lock: int) -> None:
+        _locking(lock, _LOCKED_BYTE, msvcrt.LK_UNLCK)
+
+    @contextmanager
+    def _gate(lock: int, directory: Path) -> Generator[None]:
+        """Hold the gate: a byte of the lock file, waited for, as msvcrt.locking() waits, ten seconds at most."""
+        _locking(lock, _GATE_BYTE, msvcrt.LK_LOCK)
         try:
-            msvcrt.locking(lock, msvcrt.LK_NBLCK, 1)
+            yield
+        finally:
+            _locking(lock, _GATE_BYTE, msvcrt.LK_UNLCK)
+
+    def _locking(lock: int, byte: int, mode: int) -> None:
+        """Lock or unlock a byte of the lock file, leaving it read from its start."""
+        os.lseek(lock, byte, os.SEEK_SET)
+        try:
+            msvcrt.locking(lock, mode, 1)
         finally:
             os.lseek(lock, 0, os.SEEK_SET)
 
@@ -425,3 +540,16 @@ else:
 
     def _lock(lock: int) -> None:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_file(lock: int) -> None:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @contextmanager
+    def _gate(lock: int, directory: Path) -> Generator[None]:
+        """Hold the gate: a lock of the directory itself, waited for, as its holders hold it for an instant only."""
+        gate = os.open(directory, os.O_RDONLY)
+        try:
+            fcntl.flock(gate, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(gate)  # which releases it

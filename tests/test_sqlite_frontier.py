@@ -8,6 +8,7 @@ import os
 import random
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 import weakref
@@ -21,6 +22,7 @@ from pernix.callbacks import run_callbacks
 from pernix.engine import Engine
 from pernix.errors import SerializationError
 from pernix.frontiers import DeadRequest, FrontierCounts, Lease, MemoryFrontier, SQLiteFrontier, sqlite_frontier
+from pernix.frontiers.sqlite_frontier import FrontierReader
 from pernix.frontiers.sqlite_store import SCHEMA_VERSION
 from pernix.retry_policy import DefaultRetryPolicy
 from pernix.settings import RetrySettings
@@ -647,3 +649,155 @@ async def test_a_process_killed_while_writing_leaves_every_request_in_one_state(
         counted["dead"],
     )
     assert counts.done > 20
+
+
+# Reading a database as it is
+
+
+def _files(path: Path) -> dict[str, bytes]:
+    """The files of the directory a database is in, as they are."""
+    return {file.name: file.read_bytes() for file in sorted(path.parent.iterdir())}
+
+
+async def _left(opened: Opener) -> SQLiteFrontier:
+    """A Frontier left with a Request ready, one leased, one delayed, one done, and one dead, on a clock at 1000."""
+    frontier = opened(clock=FakeClock())
+    await frontier.add([Request(URL + str(n)) for n in range(5)])
+    assert await frontier.ack(await _claim_one(frontier))
+    assert await frontier.dead(await _claim_one(frontier), "KeyError: 'price'")
+    assert await frontier.nack(await _claim_one(frontier), delay=10.0)
+    await _claim_one(frontier)  # its Lease expires at 1030
+    return frontier
+
+
+async def test_a_database_is_read_as_it_was_left_changing_nothing(opened: Opener, path: Path) -> None:
+    await (await _left(opened)).close()
+    before = _files(path)
+
+    frontier = FrontierReader(path)  # long after the delay passed and the Lease expired
+    counts, dead = frontier.counts(), list(frontier.dead_requests())
+
+    assert counts == FrontierCounts(ready=1, delayed=1, leased=1, done=1, dead=1)
+    assert dead == [DeadRequest("2", URL + "1", "KeyError: 'price'", 1)]
+    assert _files(path) == before  # neither a log nor its index made beside it
+    assert await opened(clock=FakeClock()).counts() == counts
+
+
+async def test_a_database_a_frontier_writes_is_read_as_each_change_is_made(opened: Opener, path: Path) -> None:
+    frontier = await _left(opened)
+
+    reader = FrontierReader(path)
+    first = reader.counts()
+    await frontier.add([Request(URL + "more")])
+    assert await frontier.dead(await _claim_one(frontier), "failed")
+    later = reader.counts()
+    dead = [request.url for request in reader.dead_requests()]
+
+    assert (first.ready, first.dead) == (1, 1)
+    assert (later.ready, later.dead) == (1, 2)
+    assert dead == [URL + "1", URL + "4"]
+    await frontier.add([Request(URL + "after")])  # the Frontier goes on
+    assert (await frontier.counts()).ready == 2
+
+
+LEFT_OPEN = """
+import asyncio, os, sys
+
+from pernix import Request, Spider
+from pernix.frontiers import SQLiteFrontier
+
+
+async def main():
+    frontier = SQLiteFrontier(sys.argv[1], Spider())
+    await frontier.add([Request(f"https://example.com/{n}") for n in range(3)])
+    await frontier.claim("killed", 1, 60.0)
+    os._exit(0)  # as a process killed with the database open, its log not checkpointed
+
+
+asyncio.run(main())
+"""
+
+
+def test_a_database_a_killed_process_left_is_read_with_its_log_changing_nothing(path: Path) -> None:
+    subprocess.run([sys.executable, "-c", LEFT_OPEN, str(path)], check=True)  # noqa: S603  # this interpreter
+    before = _files(path)
+    assert {"frontier.db-wal", "frontier.db-shm"} <= before.keys()
+
+    counts = FrontierReader(path).counts()
+
+    assert counts == FrontierCounts(ready=2, delayed=0, leased=1, done=0, dead=0)
+    assert _files(path) == before
+
+
+async def test_a_database_of_schema_version_1_is_read_as_it_is(opened: Opener, path: Path) -> None:
+    frontier = opened()
+    await frontier.add([Request(URL)])
+    assert await frontier.dead(await _claim_one(frontier), "failed")
+    await frontier.close()
+    with _database(path) as database:  # as version 1 left it
+        database.execute("ALTER TABLE requests DROP COLUMN methods")
+        database.execute("PRAGMA user_version = 1")
+    before = _files(path)
+
+    reader = FrontierReader(path)
+    counts, dead = reader.counts(), list(reader.dead_requests())
+
+    assert (counts.dead, [request.url for request in dead]) == (1, [URL])
+    assert _files(path) == before
+    with _database(path) as database:
+        assert database.execute("PRAGMA user_version").fetchall() == [(1,)]
+
+
+async def test_a_database_of_a_newer_schema_is_refused(opened: Opener, path: Path) -> None:
+    frontier = opened()
+    await frontier.counts()
+    await frontier.close()
+    with _database(path) as database:
+        database.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+
+    with pytest.raises(SerializationError, match=f"has schema version {SCHEMA_VERSION + 1}, but this Pernix reads"):
+        FrontierReader(path)
+
+
+def test_a_file_that_is_not_a_frontiers_database_is_refused_and_an_empty_one_holds_nothing(path: Path) -> None:
+    _not_a_database(path)
+    empty = path.with_name("empty.db")
+    empty.write_bytes(b"")  # as a Frontier leaves it before it made its schema
+
+    with pytest.raises(SerializationError, match=r"is not a Frontier database: file is not a database"):
+        FrontierReader(path)
+    reader = FrontierReader(empty)
+    assert (reader.counts(), list(reader.dead_requests())) == (FrontierCounts(0, 0, 0, 0, 0), [])
+    assert sorted(file.name for file in path.parent.iterdir()) == ["empty.db", "frontier.db"]
+    assert empty.read_bytes() == b""
+
+
+async def test_a_database_whose_log_went_away_as_it_was_opened_is_read_without_it(opened: Opener, path: Path) -> None:
+    await (await _left(opened)).close()
+    (path.with_name("frontier.db-wal")).write_bytes(b"")  # as left by a Frontier closing as it was opened
+    before = _files(path)
+
+    assert FrontierReader(path).counts().ready == 1
+
+    assert _files(path) == before
+
+
+@pytest.mark.parametrize("closed", [True, False], ids=["closed since", "still open"])
+async def test_dead_requests_listed_as_a_run_resumes_are_read_as_each_page_then_is(
+    opened: Opener, path: Path, monkeypatch: pytest.MonkeyPatch, closed: bool
+) -> None:
+    monkeypatch.setattr(sqlite_frontier, "_DEAD_PAGE", 2)
+    frontier = opened()
+    await frontier.add([Request(URL + str(n)) for n in range(6)])
+    for _ in range(6):
+        assert await frontier.dead(await _claim_one(frontier), "failed")
+    await frontier.close()
+    listing = FrontierReader(path).dead_requests()
+    first = [next(listing).id for _ in range(2)]  # read from the database as no Run had it open
+
+    resumed = opened()
+    assert await resumed.revive(["3", "6"]) == 2
+    if closed:
+        await resumed.close()  # which writes its log into the database
+
+    assert first + [dead.id for dead in listing] == ["1", "2", "4", "5"]

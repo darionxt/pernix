@@ -392,3 +392,87 @@ def test_a_command_refuses_a_directory_another_process_holds(tmp_path: Path) -> 
 
     assert _contents(tmp_path) == before
     holder.release()
+
+
+def test_the_record_is_read_without_taking_the_directory_changing_nothing(tmp_path: Path) -> None:
+    with pytest.raises(JobDirError, match="there is no job directory"):
+        JobDir(tmp_path / "missing").read_record()
+    with pytest.raises(JobDirError, match=r"is not a job directory: it holds no record of a Run in run\.json"):
+        JobDir(tmp_path).read_record()
+    (tmp_path / "run.json").write_text('{"run_id": 1}')
+    with pytest.raises(JobDirError, match=r"the record of the Run in .+run\.json cannot be read: "):
+        JobDir(tmp_path).read_record()
+    (tmp_path / "run.json").unlink()
+    holder = JobDir(tmp_path)
+    holder.take(_run())
+    before = _contents(tmp_path)
+
+    try:
+        assert JobDir(tmp_path).read_record() == _run()
+    finally:
+        holder.release()
+
+    assert _contents(tmp_path) == before
+
+
+def _named(path: Path) -> job_dir.Holder:
+    """The process the lock file names, as it names it."""
+    named = re.fullmatch(r"process (\d+) on (\S+) since (\S+)\n", (path / "lock").read_text())
+    assert named is not None
+    return job_dir.Holder(int(named[1]), named[2], dt.datetime.fromisoformat(named[3]))
+
+
+def test_the_process_holding_the_directory_is_named_without_taking_it_changing_nothing(tmp_path: Path) -> None:
+    assert JobDir(tmp_path).holder() is None  # no lock file
+    holder = JobDir(tmp_path)
+    holder.take(_run())
+    before = _contents(tmp_path)
+
+    try:
+        held = JobDir(tmp_path).holder()
+        assert _contents(tmp_path) == before
+        (tmp_path / "lock").write_bytes(b"")  # as for an instant after a process took it
+        unnamed = JobDir(tmp_path).holder()
+        (tmp_path / "lock").write_bytes(before["lock"])
+    finally:
+        holder.release()
+
+    assert held is not None
+    assert held == _named(tmp_path)
+    assert (held.pid, held.host) == (os.getpid(), socket.gethostname())
+    assert unnamed == job_dir.Holder()
+    assert JobDir(tmp_path).holder() is None  # the lock file names it still
+    assert _contents(tmp_path) == before
+    assert _taken(tmp_path, _run()).run_id == "r1"  # no lock was left held
+
+
+def test_a_take_meeting_a_test_of_the_lock_waits_for_it_rather_than_being_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _taken(tmp_path, _run())
+    tester = threading.current_thread()
+    refused = threading.Event()
+    taken: list[RunRecord] = []
+    taking = threading.Thread(target=lambda: taken.append(_taken(tmp_path, _run())))
+    lock = job_dir._lock
+
+    def test_or_take(file: int) -> None:
+        """Hold the lock, as the test does, until the take found it held; or try it, as the take does."""
+        if threading.current_thread() is not tester:
+            try:
+                lock(file)
+            except OSError:
+                refused.set()
+                raise
+            return
+        lock(file)
+        taking.start()
+        assert refused.wait(30)
+
+    monkeypatch.setattr(job_dir, "_lock", test_or_take)
+
+    assert JobDir(tmp_path).holder() is None
+
+    taking.join(30)
+    assert refused.is_set()
+    assert taken == [_run()]

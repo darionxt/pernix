@@ -16,6 +16,7 @@ from pernix.cli.closed_stdout import discard_stdout
 from pernix.cli.options import UsageError
 from pernix.errors import JobDirError, SerializationError
 from pernix.frontiers import FrontierCounts, SQLiteFrontier
+from pernix.frontiers.sqlite_frontier import FrontierReader
 from pernix.job_dir import JobDir
 from pernix.logs import Redactor
 from pernix.runner import ExitCode
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Generator
 
     from pernix.frontiers import DeadRequest
-    from pernix.job_dir import RunRecord
+    from pernix.job_dir import Holder, RunRecord
 
 __all__ = ["SCHEMA", "add_parser"]
 
@@ -85,21 +86,23 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         help="inspect the Run a job directory keeps, and revive its Dead Requests",
         description=(
             "Inspect the Run a job directory keeps, list its Dead Requests, and revive them, so that the next Run "
-            "resumed from the directory fetches them again. Each command takes the directory's lock, so it refuses "
-            "a directory a Run is using, and deletes nothing. Opening the Frontier brings its database to the "
-            "schema of this Pernix, and makes the Requests whose Leases expired ready, counting an attempt, as a "
-            "resumed Run would."
+            "resumed from the directory fetches them again. status and dead read the directory as it is, also "
+            "while a Run uses it, changing nothing. revive takes the directory's lock, so it refuses a directory a "
+            "Run is using, and opening the Frontier then brings its database to the schema of this Pernix, and "
+            "makes the Requests whose Leases expired ready, counting an attempt, as a resumed Run would. No "
+            "command deletes anything."
         ),
     )
     job_commands = parser.add_subparsers(title="commands", metavar="COMMAND", required=True)
     status = job_commands.add_parser(
         "status",
         parents=[_directory_parser()],
-        help="print the Run and how many of its Requests are in each state",
+        help="print the Run, the process holding the directory, and how many of its Requests are in each state",
         description=(
-            "Print the Run the job directory records, its run_id, Spider, and first start, and how many of its "
-            "Requests are ready, delayed, leased, done, and dead. Exits with 0, and with 2 when the directory is "
-            "not a job directory, a Run is using it, or this Pernix cannot read its Frontier."
+            "Print the Run the job directory records, its run_id, Spider, and first start, the process that holds "
+            "the directory, if any, and how many of its Requests are ready, delayed, leased, done, and dead, as "
+            "they are stored: while a Run holds the directory, as they are at that moment. Exits with 0, and with "
+            "2 when the directory is not a job directory, or this Pernix cannot read its Frontier."
         ),
     )
     status.add_argument("--json", action="store_true", help="print it as one JSON object")
@@ -113,8 +116,9 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "separated by tabs; with --json, one JSON object per line. Credentials in URLs and the values of "
             "sensitive names, such as token or password, are masked as in the logs, though not the names of "
             "log.redact or the values of Secret settings, as no settings are loaded. Filters pick some, matching "
-            "the reasons unmasked: any of the values given for a filter, and every filter given, must match. Exits "
-            "with 0, 1 when stdout was closed before the end, and 2 as status does."
+            "the reasons unmasked: any of the values given for a filter, and every filter given, must match. While "
+            "a Run holds the directory, they are read a few hundred at a time, each as it then is. Exits with 0, 1 "
+            "when stdout was closed before the end, and 2 as status does."
         ),
     )
     dead.add_argument("--json", action="store_true", help="print each Dead Request as one JSON object")
@@ -127,7 +131,8 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
             "Make the Dead Requests the filters pick, or all of them with --all, ready again, with their attempts "
             "and retry budgets reset, so that the next Run resumed from the directory fetches them, counting "
             "their attempts from 1; they keep their reasons until then. dead with the same filters lists them. "
-            "Exits with 0, and with 2 as status does, or with neither filters nor --all, or both."
+            "Exits with 0, and with 2 as status does, when a Run is using the directory, or with neither filters "
+            "nor --all, or both."
         ),
     )
     revive.add_argument("--all", action="store_true", help="revive every Dead Request; needed without filters")
@@ -135,7 +140,9 @@ def add_parser(commands: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 
 
 def run_status(args: argparse.Namespace) -> int:
-    """Print the Run of the job directory, and how many of its Requests are in each state.
+    """Print the Run of the job directory, the process holding it, and how many of its Requests are in each state.
+
+    Nothing in the directory is changed, and a Run holding it goes on.
 
     Args:
         args: The parsed command line.
@@ -144,13 +151,16 @@ def run_status(args: argparse.Namespace) -> int:
         The exit status.
 
     Raises:
-        pernix.errors.JobDirError: The directory is not a job directory, another
-            process holds it, or its Frontier cannot be read by this Pernix.
+        pernix.errors.JobDirError: The directory is not a job directory, or its
+            Frontier cannot be read by this Pernix.
     """
-    with _taken(args.directory) as (job, record):
-        counts = asyncio.run(_counts(job))
+    job = JobDir(args.directory)
+    record = job.read_record()
+    holder = job.holder()
+    with _read(job) as frontier:
+        counts = FrontierCounts(0, 0, 0, 0, 0) if frontier is None else frontier.counts()
     if args.json:
-        sys.stdout.write(orjson.dumps(_described_run(record, counts)).decode() + "\n")
+        sys.stdout.write(orjson.dumps(_described_run(record, holder, counts)).decode() + "\n")
         return ExitCode.COMPLETED
     start = "iterated to its end" if record.start_exhausted else "not iterated to its end; a resumed Run iterates it"
     lines = [
@@ -159,15 +169,25 @@ def run_status(args: argparse.Namespace) -> int:
         f"First started: {_timestamp(record.started_at)}",
         f"Started by: Pernix {record.pernix or '(version unknown)'}",
         f"start(): {start}",
+        f"Held by: {_holder_shown(holder)}",
         f"Requests: {counts.ready} ready, {counts.delayed} delayed, {counts.leased} leased, {counts.done} done, "
         f"{counts.dead} dead",
     ]
+    if holder is not None:
+        lines.append("Counts: as they are at this moment; the Run holding the directory goes on changing them")
+    elif counts.leased:
+        lines.append(
+            f"Leased: {counts.leased}, left in flight by a process that ended; the next Run makes them ready again, "
+            "each counting an attempt"
+        )
     sys.stdout.write("\n".join(lines) + "\n")
     return ExitCode.COMPLETED
 
 
 def run_dead(args: argparse.Namespace) -> int:
     """List the Dead Requests of the job directory the filters pick.
+
+    Nothing in the directory is changed, and a Run holding it goes on.
 
     Args:
         args: The parsed command line.
@@ -176,12 +196,14 @@ def run_dead(args: argparse.Namespace) -> int:
         The exit status.
 
     Raises:
-        pernix.errors.JobDirError: The directory is not a job directory, another
-            process holds it, or its Frontier cannot be read by this Pernix.
+        pernix.errors.JobDirError: The directory is not a job directory, or its
+            Frontier cannot be read by this Pernix.
     """
     selection = _selection(args)
-    with _taken(args.directory) as (job, _):
-        listed = asyncio.run(_list(job, selection, json=args.json))
+    job = JobDir(args.directory)
+    job.read_record()  # which tells a directory that is not a job directory
+    with _read(job) as frontier:
+        listed = frontier is None or _list(frontier, selection, json=args.json)
     return ExitCode.COMPLETED if listed else ExitCode.FAILED
 
 
@@ -277,24 +299,28 @@ async def _frontier(job: JobDir) -> AsyncGenerator[SQLiteFrontier | None]:
         await frontier.close()
 
 
-async def _counts(job: JobDir) -> FrontierCounts:
-    async with _frontier(job) as frontier:
-        return FrontierCounts(0, 0, 0, 0, 0) if frontier is None else await frontier.counts()
+@contextmanager
+def _read(job: JobDir) -> Generator[FrontierReader | None]:
+    """Read the Frontier of a job directory as it is, or give `None` when it has none, which is then not created."""
+    if not job.frontier_path.exists():
+        yield None
+        return
+    try:
+        yield FrontierReader(job.frontier_path)
+    except SerializationError as exc:  # the database is not one this Pernix reads
+        raise JobDirError(str(exc)) from exc
 
 
-async def _list(job: JobDir, selection: _Selection, *, json: bool) -> bool:
+def _list(frontier: FrontierReader, selection: _Selection, *, json: bool) -> bool:
     """Write the Dead Requests picked to stdout; whether stdout stayed open until the end."""
-    async with _frontier(job) as frontier:
-        if frontier is None:
-            return True
-        try:
-            async for dead in frontier.dead_requests():
-                if selection.picks(dead):
-                    sys.stdout.write(_json_line(dead) if json else _text_line(dead))
-            sys.stdout.flush()
-        except BrokenPipeError:
-            discard_stdout()
-            return False
+    try:
+        for dead in frontier.dead_requests():
+            if selection.picks(dead):
+                sys.stdout.write(_json_line(dead) if json else _text_line(dead))
+        sys.stdout.flush()
+    except BrokenPipeError:
+        discard_stdout()
+        return False
     return True
 
 
@@ -308,7 +334,16 @@ async def _revive(job: JobDir, selection: _Selection) -> tuple[int, int]:
         return await frontier.revive(picked), total
 
 
-def _described_run(record: RunRecord, counts: FrontierCounts) -> dict[str, Any]:
+def _holder_shown(holder: Holder | None) -> str:
+    if holder is None:
+        return "no process"
+    if holder.pid is None:
+        return "another process"
+    since = "" if holder.since is None else f" since {_timestamp(holder.since)}"
+    return f"process {holder.pid} on {holder.host}{since}"
+
+
+def _described_run(record: RunRecord, holder: Holder | None, counts: FrontierCounts) -> dict[str, Any]:
     return {
         "schema": SCHEMA,
         "run_id": record.run_id,
@@ -316,6 +351,7 @@ def _described_run(record: RunRecord, counts: FrontierCounts) -> dict[str, Any]:
         "started_at": _timestamp(record.started_at),
         "start_exhausted": record.start_exhausted,
         "pernix": record.pernix,
+        "holder": None if holder is None else _described_holder(holder),
         "requests": {
             "ready": counts.ready,
             "delayed": counts.delayed,
@@ -324,6 +360,11 @@ def _described_run(record: RunRecord, counts: FrontierCounts) -> dict[str, Any]:
             "dead": counts.dead,
         },
     }
+
+
+def _described_holder(holder: Holder) -> dict[str, Any]:
+    since = None if holder.since is None else _timestamp(holder.since)
+    return {"pid": holder.pid, "host": holder.host, "since": since}
 
 
 def _json_line(dead: DeadRequest) -> str:
