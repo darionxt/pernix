@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from typing import Any
 
 import psutil
 
@@ -32,9 +34,20 @@ class Held:
             self.release.wait(30)
         return Reply(b"", headers=[("Content-Type", "image/png")])
 
-    async def wait(self) -> None:
-        """Wait until the first request arrived."""
-        assert await asyncio.to_thread(self.arrived.wait, 30), "the held request never arrived"
+    async def wait(self, work: asyncio.Future[Any]) -> None:
+        """Wait up to 30 s until the first request arrived, failing at once if the work meant to make it ended first.
+
+        Args:
+            work: The fetch, or the Run, whose page asks for the request; one that
+                ended first fails the wait with its own error, if it has one.
+        """
+        deadline = time.monotonic() + 30
+        while not self.arrived.is_set():  # set by a thread of the server
+            if work.done():
+                work.result()
+                raise AssertionError("the work ended before its held request arrived")
+            assert time.monotonic() < deadline, "the held request never arrived"
+            await asyncio.sleep(0.05)
 
 
 def descendants() -> list[psutil.Process]:
@@ -49,7 +62,7 @@ def drivers() -> list[psutil.Process]:
 
 def browsers() -> list[psutil.Process]:
     """The browsers' own processes, which the drivers started."""
-    return [child for driver in drivers() for child in driver.children()]
+    return [child for driver in drivers() for child in _children(driver)]
 
 
 def renderers() -> list[psutil.Process]:
@@ -73,5 +86,12 @@ async def gone(processes: list[psutil.Process]) -> list[psutil.Process]:
 def _command(process: psutil.Process) -> str:
     try:
         return " ".join(process.cmdline())
-    except psutil.Error:
+    except (psutil.Error, SystemError):  # psutil 7.2.2 raises SystemError, on macOS, for a process ending meanwhile
         return ""
+
+
+def _children(process: psutil.Process) -> list[psutil.Process]:
+    try:
+        return process.children()
+    except psutil.Error:  # it ended meanwhile
+        return []

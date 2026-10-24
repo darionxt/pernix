@@ -11,6 +11,7 @@ from browser_kills import browsers, drivers, kill
 from pernix import Request, Response, Spider
 from pernix.browser import Render
 from pernix.crawler import Crawler
+from pernix.fetchers.browser_processes import BrowserProcesses
 from pernix.testing import crawl
 
 if TYPE_CHECKING:
@@ -215,3 +216,36 @@ async def test_a_callback_whose_browser_was_lost_is_retried_under_its_budget(
     assert report.stats["requests.retried_by_budget.browser_lost"] == 1
     assert report.stats[f"browser.lost_by_reason.{lost}"] == 1
     assert report.stats["browser.generations"] == 2
+
+
+async def test_a_callback_whose_driver_died_is_retried_though_its_process_reads_alive_at_first(
+    site: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alive = BrowserProcesses.driver_alive
+    stale: list[bool] = []
+
+    def driver_alive(processes: BrowserProcesses) -> bool:
+        # A driver killed closes its connection before its process ends, so a read in between finds it running. The
+        # first read after the kill judges the Callback's error; were another made first, this one would not be stale.
+        return stale.pop() if stale else alive(processes)
+
+    monkeypatch.setattr(BrowserProcesses, "driver_alive", driver_alive)
+
+    class Losing(Kept):
+        attempts = 0
+
+        async def parse(self, response: Response) -> AsyncIterator[Any]:
+            page = response.page
+            assert page is not None
+            self.attempts += 1
+            if self.attempts == 1:
+                kill(drivers())
+                stale.append(True)
+            yield {"text": await page.text_content("#next"), "attempt": self.attempts}
+
+    report = await crawl(Losing, base=site)
+
+    assert stale == []  # the driver was read as running once
+    assert report.items == [{"text": "next", "attempt": 2}]
+    assert report.stats["requests.retried_by_budget.browser_lost"] == 1
+    assert report.stats["browser.lost_by_reason.driver"] == 1
