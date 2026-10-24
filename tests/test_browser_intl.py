@@ -91,13 +91,22 @@ LEFT_ALONE = """async () => {
     addEventListener("message", event => resolve(event.data), {once: true});
     left.contentWindow.postMessage(null, "*");
   });
+  const presents = ([_where, locale, timeZone]) => locale === "de-DE" && timeZone === "TIMEZONE";
   const reports = [await ask()];
-  for (let tries = 0; reports.at(-1)[1] !== "de-DE" && tries < 200; tries++) {  // what it presents a moment later
+  for (let tries = 0; !presents(reports.at(-1)) && tries < 200; tries++) {  // both, a moment later
     await new Promise(resolve => setTimeout(resolve, 50));
     reports.push(await ask());
   }
   return reports.at(-1);
-}"""
+}""".replace("TIMEZONE", TIMEZONE)
+
+EARLY = f"""<!doctype html><script>{INTL}
+window.reports = new Promise(resolve => {{
+  const channel = new MessageChannel();
+  channel.port1.onmessage = event => resolve([intl("page"), event.data]);
+  navigator.serviceWorker.controller.postMessage(null, [channel.port2]);
+}});
+</script>"""
 
 REPORTS = Render(actions=[Evaluate("() => window.reports")])
 
@@ -118,6 +127,7 @@ def _serve(server: LoopbackServer) -> None:
     server.route("/twins", TWINS.replace("TWIN", f"http://localhost:{port}/twin"), headers=html)
     server.route("/twin", TWIN, headers=html)
     server.route("/away", status=302, headers=[("Location", f"http://localhost:{port}/")])
+    server.route("/early", EARLY, headers=html)
 
 
 def _reports(response: Response) -> list[list[str]]:
@@ -138,6 +148,19 @@ async def test_a_page_and_its_web_workers_present_the_first_language_of_the_loca
 
     expected = [[where, "de-DE", TIMEZONE] for where in WORKERS_REPORTING]
     assert _reports(first) == _reports(second) == expected
+
+
+async def test_a_service_worker_an_earlier_page_of_a_session_started_presents_them_to_the_first_script_of_the_next(
+    server: LoopbackServer,
+) -> None:
+    _serve(server)
+    session = Session("alice")
+
+    async with BrowserFetcher(locale=LOCALE, timezone=TIMEZONE) as fetcher:
+        await fetcher.fetch(Request(server.url("/"), render=REPORTS), session=session)  # registers it
+        response = await fetcher.fetch(Request(server.url("/early"), render=REPORTS), session=session)
+
+    assert _reports(response) == [["page", "de-DE", TIMEZONE], ["service worker", "de-DE", TIMEZONE]]
 
 
 async def test_cross_site_frames_at_any_depth_and_their_workers_present_them_too(server: LoopbackServer) -> None:

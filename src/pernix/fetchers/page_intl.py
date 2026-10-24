@@ -29,9 +29,11 @@ _RELATED = {
 }
 """Attach to the cross-site frames and the service workers of a target, each paused until told to run.
 
-Not flattened, as a patchright `CDPSession` can reach the session of a target
-attached to it only through `Target.sendMessageToTarget`. Dedicated workers run in
-the process of the frame that starts them, so they are left alone.
+A service worker runs all the same once patchright's own session, which attaches
+to it too, tells it to. Not flattened, as a patchright `CDPSession` can reach the
+session of a target attached to it only through `Target.sendMessageToTarget`.
+Dedicated workers run in the process of the frame that starts them, so they are
+left alone.
 """
 
 _ALREADY_OVERRIDDEN = "Another locale override is already in effect"
@@ -45,21 +47,26 @@ async def present_intl(context: BrowserContext, page: Page, *, locale: str | Non
     for the renderer process of the target they are sent to, so for the page's
     same-site frames and the dedicated and shared workers that run in it. A
     DevTools session of the page's own sets the locale, and attaches to the page's
-    cross-site frames, at any depth, and its service workers, which may run in
-    processes of their own, pausing each until both are set; it lets each run
-    whatever failed. patchright's `locale` option would set the locale too, but it
+    cross-site frames, at any depth, pausing each until both are set, and to its
+    service workers, which may run in processes of their own; it lets each run
+    whatever failed. A service worker runs as soon as patchright's own session,
+    attached to it too, lets it: one the page starts runs in the process of the
+    page, or of a frame of its site, which presents both already, and one in a
+    process of its own takes them a moment after it starts. The service workers of
+    the context already running, as one an earlier page of the context started, are
+    attached and sent both before this returns, so before the page navigates and
+    can reach them. patchright's `locale` option would set the locale too, but it
     moves `Accept-Language` after `User-Agent`. The page's time zone, and that of
-    its frames, is patchright's `timezone_id`; a service worker that started for an
-    earlier page of the context needs its own.
+    its frames, is patchright's `timezone_id`; a service worker in a process of its
+    own needs its own.
 
     An override belongs to the target whose session set it first in a process: the
     others sharing the process are refused it, and it ends with that target, so
     once a frame or a service worker goes, both are set again in those left, which
-    present the machine's meanwhile. The page's own last as long as the session,
-    which closes with the page. A page the page opens in another process, as with
-    `noopener`, presents the machine's locale; a service worker already running
-    when the page loads takes the locale and the time zone once attached, as the
-    page navigates.
+    present the machine's locale, time zone, or both meanwhile, as another target
+    may have held either. The page's own last as long as the session, which closes
+    with the page. A page the page opens in another process, as with `noopener`,
+    presents the machine's locale.
 
     Args:
         context: The page's context.
@@ -81,6 +88,27 @@ async def present_intl(context: BrowserContext, page: Page, *, locale: str | Non
             if _ALREADY_OVERRIDDEN not in str(exc):
                 raise
     await _send(devtools, "Target.setAutoAttach", _RELATED)
+    if context.service_workers:  # the auto-attach would reach them only once the page navigates into their scope
+        await _attach_running_service_workers(devtools)
+        await related.settled()
+
+
+async def _attach_running_service_workers(devtools: CDPSession) -> None:
+    """Attach a page's session to its context's running service workers, set up then as any target it attaches.
+
+    Chrome tells of each with `Target.attachedToTarget` before it answers, so each
+    is being set up once this returns.
+    """
+    page = await _send(devtools, "Target.getTargetInfo", {})
+    context_id = page["targetInfo"]["browserContextId"]
+    targets = await _send(devtools, "Target.getTargets", {})
+    for target in cast("list[dict[str, Any]]", targets["targetInfos"]):
+        if target["type"] != "service_worker" or target.get("browserContextId") != context_id:
+            continue
+        try:
+            await _send(devtools, "Target.attachToTarget", {"targetId": target["targetId"], "flatten": False})
+        except Exception:  # the worker stopped meanwhile
+            logger.debug("Attaching to a running service worker of a page's context failed", exc_info=True)
 
 
 class _RelatedTargets:
@@ -134,6 +162,11 @@ class _RelatedTargets:
             del self._targets[target]
         if gone and self._targets and self._overrides:
             self._start(self._set_again(list(self._targets)))
+
+    async def settled(self) -> None:
+        """Wait until the targets attached so far were sent their overrides, and told to run."""
+        if self._setting:
+            await asyncio.wait(tuple(self._setting))  # left running, were the wait cancelled
 
     def received(self, event: dict[str, Any], parent: Route = ()) -> None:
         """Follow a message from a target attached through the session, which may tell of a target attached to it.
@@ -202,6 +235,6 @@ class _RelatedTargets:
         )
 
 
-async def _send(devtools: CDPSession, method: str, params: dict[str, Any]) -> None:
-    """Send a command of the DevTools protocol."""
-    await devtools.send(method, params)  # pyright: ignore[reportUnknownMemberType]  # untyped
+async def _send(devtools: CDPSession, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Send a command of the DevTools protocol, and return its result."""
+    return cast("dict[str, Any]", await devtools.send(method, params))  # pyright: ignore[reportUnknownMemberType]  # untyped
